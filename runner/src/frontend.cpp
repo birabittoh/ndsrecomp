@@ -2538,7 +2538,10 @@ int nds_run_interactive_frontend(const NdsFrontendOptions& initial_options) {
          RECOMP_RUNTIME_UI_ACTION, 0, 0, 0, nullptr, 0, nullptr},
     };
     RecompRuntimeUiConfig runtime_menu_config{};
-    runtime_menu_config.title = "Metroid Prime Hunters";
+    // Title from the game config's [game].name; this menu used to say
+    // "Metroid Prime Hunters" for every title.
+    runtime_menu_config.title = options.game_name.empty()
+        ? "Nintendo DS" : options.game_name.c_str();
     runtime_menu_config.subtitle = "Runtime Settings";
     runtime_menu_config.items = runtime_menu_items;
     runtime_menu_config.item_count =

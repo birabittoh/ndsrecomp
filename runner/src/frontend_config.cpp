@@ -472,6 +472,8 @@ bool nds_load_frontend_config(const std::string& path,
     }
 
     if (const toml::table* game = root["game"].as_table()) {
+        if (const auto value = (*game)["name"].value<std::string>())
+            options->game_name = *value;
         if (const auto value = (*game)["sha1"].value<std::string>()) {
             const bool invalid_length = value->size() != 40u;
             const bool invalid_character = std::any_of(

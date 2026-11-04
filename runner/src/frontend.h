@@ -193,6 +193,8 @@ struct NdsFrontendOptions {
     // Optional exact cartridge identity from [game]. When present, every
     // title-owned setting in this config is rejected for any other ROM.
     std::string expected_rom_sha1;
+    // Display name from [game].name (runtime settings menu title).
+    std::string game_name;
     NdsScreenLayout screen_layout = NdsScreenLayout::Stacked;
     NdsFullscreenMode fullscreen = NdsFullscreenMode::Off;
     // Zero preserves the standalone runner's historical 2x sizing. Title
