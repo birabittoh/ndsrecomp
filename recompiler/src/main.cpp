@@ -683,12 +683,16 @@ void emit_function_body(std::FILE* f, const Function& fn,
                         bool msr_fast_path,
                         const std::unordered_map<uint64_t, armv4t::InlineLeaf>*
                             inline_leaves,
-                        unsigned* inline_leaf_sites) {
+                        unsigned* inline_leaf_sites,
+                        uint32_t local_label_addr,
+                        uint32_t local_label_end_addr) {
     const uint32_t step = (fn.mode == CpuMode::Thumb) ? 2u : 4u;
     armv4t::CodegenCtx ctx;
     ctx.names_by_key = &func_names_by_key;
     ctx.current_function_addr = fn.addr;
     ctx.current_function_end_addr = fn.end_addr;
+    ctx.local_label_addr = local_label_addr;
+    ctx.local_label_end_addr = local_label_end_addr;
     ctx.current_function_thumb = (fn.mode == CpuMode::Thumb);
     ctx.trace_live_transfers = trace_live_transfers;
     ctx.msr_fast_path = msr_fast_path;
@@ -1245,13 +1249,20 @@ void write_bank_body(const std::string& dir,
         }
         if (coalesced)
             emit_resume_switch(f, funcs, index, block_end);
+        // build_superblocks only coalesces contiguous same-mode members of
+        // one 4 KiB page, each of which labels every instruction, and the
+        // block carries one validation; so the whole span is local-goto
+        // territory for plain branches.
+        const uint32_t block_lo = coalesced ? fn.addr : 0xFFFFFFFFu;
+        const uint32_t block_hi =
+            coalesced ? funcs[block_end - 1u].end_addr : 0xFFFFFFFFu;
         for (std::size_t member = index; member < block_end; ++member) {
             emit_function_body(
                 f, funcs[member], rom, rom_size, rom_base, name_by_key,
                 !coalesced, member + 1u < block_end,
                 trace_live_transfers, msr_fast_path,
                 shard_leaves.empty() ? nullptr : &shard_leaves,
-                inline_leaf_sites);
+                inline_leaf_sites, block_lo, block_hi);
         }
         std::fprintf(f, "}\n\n");
         if (hle) {
