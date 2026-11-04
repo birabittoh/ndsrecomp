@@ -1,6 +1,7 @@
 #include "frontend.h"
 #include "host_profile.h"
 #include "frontend_window_size.h"
+#include "frontend_screen_route.h"
 #include "arm9_native.h"
 #include "cpu_render_handoff.h"
 
@@ -438,6 +439,9 @@ SDL_Scancode scancode_from_binding_name(const std::string& value) {
         return SDL_SCANCODE_RSHIFT;
     if (normalized == "space")
         return SDL_SCANCODE_SPACE;
+    if (normalized == "grave" || normalized == "backtick" ||
+        normalized == "backquote")
+        return SDL_SCANCODE_GRAVE;
     if (normalized == "tab")
         return SDL_SCANCODE_TAB;
     if (normalized == "enter" || normalized == "return")
@@ -974,7 +978,9 @@ void set_touch_from_mouse(float x, float y, bool down,
                           NdsScreenLayout layout, int logical_width) {
     // Coordinates are expected in the renderer's logical DS-space.
     const float bottom_origin =
-        layout == NdsScreenLayout::Separate ? 0.0f : kScreenHeight;
+        layout == NdsScreenLayout::Separate ||
+                layout == NdsScreenLayout::Single
+            ? 0.0f : kScreenHeight;
     const float left =
         static_cast<float>((logical_width - kScreenWidth) / 2);
     if (!down || x < left || x >= left + kScreenWidth ||
@@ -1408,6 +1414,10 @@ const uint32_t* runtime_menu_overlay(RecompRuntimeUi* ui,
 
 struct FrontendPresentation {
     bool separate = false;
+    // Single-screen layout: one window (windows[1] aliases windows[0]) that
+    // shows the physical LCD `shown_screen`. With gl_top it is the GL window.
+    bool single = false;
+    int shown_screen = 0;
     bool gl_top = false;
     SDL_Window* windows[2]{};
     SDL_Renderer* renderers[2]{};
@@ -1598,6 +1608,9 @@ void window_content_size(const FrontendPresentation& presentation,
                          int screen, int* width, int* height) {
     if (presentation.separate) {
         *width = presentation.screen_widths[screen];
+        *height = kScreenHeight;
+    } else if (presentation.single) {
+        *width = presentation.screen_widths[presentation.shown_screen & 1];
         *height = kScreenHeight;
     } else {
         *width = presentation.canvas_width;
@@ -1797,47 +1810,69 @@ const char* notice_glyph(char ch) {
 }
 
 // Overlays are authored in DS-space pixels of one screen and drawn scaled
-// into that screen's drawable-pixel rect, so they keep their size relative to
-// the image in every window mode.
+// into that screen's rect, so they keep their size relative to the image in
+// every window mode. The target is either an SDL renderer (rect in drawable
+// pixels) or a CPU ARGB overlay buffer for the GL presenter (rect in buffer
+// pixels, alpha 0 = transparent).
 struct DsCanvas {
     SDL_Rect dest;
     int width;   // DS-space width the dest rect represents
     int height;  // DS-space height the dest rect represents
 };
 
-void fill_ds_rect(SDL_Renderer* renderer, const DsCanvas& canvas, int x,
-                  int y, int w, int h) {
-    if (canvas.width <= 0 || canvas.height <= 0) return;
-    auto map_x = [&](int v) {
-        return canvas.dest.x + static_cast<int>(std::floor(
-            static_cast<double>(v) * canvas.dest.w / canvas.width));
-    };
-    auto map_y = [&](int v) {
-        return canvas.dest.y + static_cast<int>(std::floor(
-            static_cast<double>(v) * canvas.dest.h / canvas.height));
-    };
-    const int x0 = map_x(x), y0 = map_y(y);
-    const SDL_Rect rect{x0, y0, std::max(1, map_x(x + w) - x0),
-                        std::max(1, map_y(y + h) - y0)};
-    fill_rect(renderer, rect);
-}
+struct DsTarget {
+    SDL_Renderer* renderer = nullptr;
+    uint32_t* pixels = nullptr;
+    int pixels_width = 0;
+    int pixels_height = 0;
+    DsCanvas canvas{};
+    uint32_t color = 0xFFFFFFFFu;
 
-void draw_savestate_notice(SDL_Renderer* renderer,
-                           const DsCanvas& screen,
-                           const char* text) {
-    if (!renderer || !text || !*text) return;
+    void set_color(uint8_t r, uint8_t g, uint8_t b) {
+        if (renderer) SDL_SetRenderDrawColor(renderer, r, g, b, 255);
+        color = 0xFF000000u | (uint32_t(r) << 16) | (uint32_t(g) << 8) | b;
+    }
+    void fill(int x, int y, int w, int h) const {
+        if (canvas.width <= 0 || canvas.height <= 0) return;
+        auto map_x = [&](int v) {
+            return canvas.dest.x + static_cast<int>(std::floor(
+                static_cast<double>(v) * canvas.dest.w / canvas.width));
+        };
+        auto map_y = [&](int v) {
+            return canvas.dest.y + static_cast<int>(std::floor(
+                static_cast<double>(v) * canvas.dest.h / canvas.height));
+        };
+        const int x0 = map_x(x), y0 = map_y(y);
+        const SDL_Rect rect{x0, y0, std::max(1, map_x(x + w) - x0),
+                            std::max(1, map_y(y + h) - y0)};
+        if (renderer) {
+            fill_rect(renderer, rect);
+            return;
+        }
+        if (!pixels) return;
+        const int left = std::max(rect.x, 0);
+        const int top = std::max(rect.y, 0);
+        const int right = std::min(rect.x + rect.w, pixels_width);
+        const int bottom = std::min(rect.y + rect.h, pixels_height);
+        for (int py = top; py < bottom; ++py)
+            std::fill(pixels + size_t(py) * pixels_width + left,
+                      pixels + size_t(py) * pixels_width + right, color);
+    }
+};
+
+void draw_savestate_notice(DsTarget target, const char* text) {
+    if ((!target.renderer && !target.pixels) || !text || !*text) return;
     constexpr int kColumns = 40;
     constexpr int kRows = 5;
     constexpr int kGlyphWidth = 6;
     constexpr int kGlyphHeight = 8;
     const SDL_Rect background{5,
-                              screen.height - kRows * kGlyphHeight - 5,
+                              target.canvas.height - kRows * kGlyphHeight - 5,
                               kColumns * kGlyphWidth + 6,
                               kRows * kGlyphHeight + 4};
-    SDL_SetRenderDrawColor(renderer, 10, 10, 10, 255);
-    fill_ds_rect(renderer, screen, background.x, background.y,
-                 background.w, background.h);
-    SDL_SetRenderDrawColor(renderer, 255, 255, 255, 255);
+    target.set_color(10, 10, 10);
+    target.fill(background.x, background.y, background.w, background.h);
+    target.set_color(255, 255, 255);
     int row = 0;
     int column = 0;
     for (const char* p = text; *p && row < kRows; ++p) {
@@ -1851,14 +1886,33 @@ void draw_savestate_notice(SDL_Renderer* renderer,
         for (int gy = 0; gy < 7; ++gy) {
             for (int gx = 0; gx < 5; ++gx) {
                 if (glyph[gy * 5 + gx] != '1') continue;
-                fill_ds_rect(renderer, screen,
-                             background.x + 3 + column * kGlyphWidth + gx,
-                             background.y + 2 + row * kGlyphHeight + gy, 1,
-                             1);
+                target.fill(background.x + 3 + column * kGlyphWidth + gx,
+                            background.y + 2 + row * kGlyphHeight + gy, 1, 1);
             }
         }
         ++column;
     }
+}
+
+// The stylus lives in the 256x192 touch space spread over the screen's rect.
+void draw_virtual_stylus(DsTarget target, float stylus_x, float stylus_y) {
+    target.canvas.width = 256;
+    target.canvas.height = 192;
+    const int x = static_cast<int>(std::lround(stylus_x));
+    const int y = static_cast<int>(std::lround(stylus_y));
+    target.set_color(255, 255, 255);
+    target.fill(x - 5, y, 4, 1);
+    target.fill(x + 2, y, 4, 1);
+    target.fill(x, y - 5, 1, 4);
+    target.fill(x, y + 2, 1, 4);
+}
+
+DsTarget sdl_ds_target(SDL_Renderer* renderer, const SDL_Rect& dest,
+                       int ds_width) {
+    DsTarget target{};
+    target.renderer = renderer;
+    target.canvas = {dest, ds_width, kScreenHeight};
+    return target;
 }
 
 bool create_presentation(const NdsFrontendOptions& options,
@@ -1866,6 +1920,7 @@ bool create_presentation(const NdsFrontendOptions& options,
                          bool allow_gl_top = true) {
     presentation.separate =
         options.screen_layout == NdsScreenLayout::Separate;
+    presentation.single = options.screen_layout == NdsScreenLayout::Single;
 #if defined(NDS_HAVE_COMPUTE_RENDERER)
     const char* direct_selection =
         std::getenv("NDS_COMPUTE_DIRECT_PRESENT");
@@ -1875,7 +1930,7 @@ bool create_presentation(const NdsFrontendOptions& options,
     const bool direct_top_requested =
         (options.adaptive_screens & NDS_ADAPTIVE_TOP) != 0u ||
         options.internal_resolution > 1u;
-    presentation.gl_top = presentation.separate &&
+    presentation.gl_top = (presentation.separate || presentation.single) &&
         allow_gl_top &&
         direct_top_requested &&
         nds_gpu3d_renderer_prefers_compute() &&
@@ -1901,16 +1956,19 @@ bool create_presentation(const NdsFrontendOptions& options,
     presentation.canvas_width = std::max(
         presentation.screen_widths[0],
         presentation.screen_widths[1]);
-    const int first_height = presentation.separate
+    const int first_height = presentation.separate || presentation.single
         ? kScreenHeight * kWindowScale
         : kScreenHeight * 2 * kWindowScale;
     const uint64_t top_window_flags =
         SDL_WINDOW_RESIZABLE | SDL_WINDOW_ALLOW_HIGHDPI |
         (presentation.gl_top
              ? static_cast<uint64_t>(SDL_WINDOW_OPENGL) : 0u);
+    const std::string single_title =
+        options.game_name.empty() ? "ndsrecomp" : options.game_name;
     presentation.windows[0] = create_window(
         presentation.separate ? "ndsrecomp - Top Screen"
-                               : "ndsrecomp firmware preview",
+        : presentation.single ? single_title.c_str()
+                              : "ndsrecomp firmware preview",
         SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED,
         (presentation.separate ? presentation.screen_widths[0]
                                : presentation.canvas_width) * kWindowScale,
@@ -1939,7 +1997,7 @@ bool create_presentation(const NdsFrontendOptions& options,
         initial_size = nds_initial_window_size(
             presentation.screen_widths[0], presentation.screen_widths[1],
             presentation.separate, options.window_scale, coordinate_scale,
-            usable.w, usable.h);
+            usable.w, usable.h, presentation.single);
         SDL_SetWindowSize(presentation.windows[0],
             presentation.separate ? initial_size.top_width
                 : std::max(initial_size.top_width, initial_size.bottom_width),
@@ -2008,7 +2066,8 @@ bool create_presentation(const NdsFrontendOptions& options,
     }
 
     for (int screen = 0; screen < 2; ++screen) {
-        if (screen == 0 && presentation.gl_top) {
+        // The single GL window presents both LCDs through the GL presenter.
+        if ((screen == 0 || presentation.single) && presentation.gl_top) {
             presentation.window_ids[screen] =
                 SDL_GetWindowID(presentation.windows[screen]);
             continue;
@@ -2112,19 +2171,6 @@ bool apply_performance_governor_stage(
     return true;
 }
 
-void draw_virtual_stylus(SDL_Renderer* renderer, const SDL_Rect& destination,
-                         float stylus_x, float stylus_y) {
-    // The stylus lives in the 256x192 touch space spread over the screen.
-    const DsCanvas canvas{destination, 256, 192};
-    const int x = static_cast<int>(std::lround(stylus_x));
-    const int y = static_cast<int>(std::lround(stylus_y));
-    SDL_SetRenderDrawColor(renderer, 255, 255, 255, 255);
-    fill_ds_rect(renderer, canvas, x - 5, y, 4, 1);
-    fill_ds_rect(renderer, canvas, x + 2, y, 4, 1);
-    fill_ds_rect(renderer, canvas, x, y - 5, 1, 4);
-    fill_ds_rect(renderer, canvas, x, y + 2, 1, 4);
-}
-
 #if defined(NDS_HAVE_COMPUTE_RENDERER)
 // Two native-sized slots. Only the producer writes the building slot; main
 // presents the prior completed slot, then joins before consuming/reusing either
@@ -2208,14 +2254,106 @@ void draw_separate_screen(FrontendPresentation& presentation, int screen,
         window_present_rect(presentation, screen, drawable_w, drawable_h);
     const SDL_Rect screen_rect{rect.x, rect.y, rect.w, rect.h};
     render_screen(presentation, screen, screen_rect);
+    const DsTarget target = sdl_ds_target(
+        renderer, screen_rect, presentation.screen_widths[screen]);
     if (virtual_stylus_visible)
-        draw_virtual_stylus(renderer, screen_rect, virtual_stylus_x,
-                            virtual_stylus_y);
-    draw_savestate_notice(
-        renderer,
-        DsCanvas{screen_rect, presentation.screen_widths[screen],
-                 kScreenHeight},
-        savestate_notice);
+        draw_virtual_stylus(target, virtual_stylus_x, virtual_stylus_y);
+    draw_savestate_notice(target, savestate_notice);
+}
+
+// Single-screen layout: present only presentation.shown_screen, with the
+// runtime menu, virtual stylus (bottom LCD only) and savestate notice on it.
+// The GL window has no SDL renderer, so there the stylus and notice go
+// through the presenter's overlay layer, and an open runtime menu (drawn into
+// the CPU pixels) makes that frame present the CPU composite instead of HD.
+PresentationTicks present_single_screen(FrontendPresentation& presentation,
+                                        const uint32_t* top_pixels,
+                                        int top_width,
+                                        const uint32_t* bottom_pixels,
+                                        int bottom_width,
+                                        RecompRuntimeUi* runtime_ui,
+                                        bool virtual_stylus_visible,
+                                        float virtual_stylus_x,
+                                        float virtual_stylus_y,
+                                        const char* savestate_notice) {
+    PresentationTicks ticks{};
+    const int shown = presentation.shown_screen & 1;
+    const uint32_t* pixels = shown ? bottom_pixels : top_pixels;
+    const int width = shown ? bottom_width : top_width;
+    const bool stylus = virtual_stylus_visible && shown == 1;
+    const bool menu_open = runtime_ui && recomp_runtime_ui_is_open(runtime_ui);
+    pixels = runtime_menu_overlay(runtime_ui, pixels, width, kScreenHeight);
+    if (presentation.gl_top) {
+#if defined(NDS_HAVE_COMPUTE_RENDERER)
+        // The OBJ-only direct path draws engine A on the top LCD only.
+        NdsGpu2dDirectFrame direct_frame{};
+        const bool direct = shown == 0 && !menu_open &&
+                            nds_gpu2d_direct_frame(&direct_frame);
+        if (menu_open) nds_gpu2d_invalidate_hd_frame();
+        static std::vector<uint32_t> overlay;
+        const bool want_overlay =
+            stylus || (savestate_notice && *savestate_notice);
+        if (want_overlay) {
+            overlay.assign(size_t(width) * kScreenHeight, 0u);
+            DsTarget target{};
+            target.pixels = overlay.data();
+            target.pixels_width = width;
+            target.pixels_height = kScreenHeight;
+            target.canvas = {SDL_Rect{0, 0, width, kScreenHeight}, width,
+                             kScreenHeight};
+            if (stylus)
+                draw_virtual_stylus(target, virtual_stylus_x,
+                                    virtual_stylus_y);
+            draw_savestate_notice(target, savestate_notice);
+        }
+        nds_compute_host_set_overlay(want_overlay ? overlay.data() : nullptr,
+                                     static_cast<unsigned>(width));
+        NdsComputePresentTicks gl_ticks{};
+        gl_ticks.diagnostic =
+            nds_frontend_latency::enabled.load(std::memory_order_relaxed);
+        nds_compute_host_set_present_mode(presentation.window_mode,
+                                          presentation.scaling);
+        const bool ok = nds_compute_host_present_top(
+            pixels, static_cast<uint16_t>(width),
+            direct ? &direct_frame : nullptr, &gl_ticks,
+            presentation.antialiasing);
+        nds_compute_host_set_overlay(nullptr, 0);
+        if (!ok) {
+            std::fprintf(stderr, "[gpu3d] single-screen presentation failed\n");
+            ticks.ok = false;
+            return ticks;
+        }
+        ticks.upload += gl_ticks.upload;
+        ticks.draw += gl_ticks.draw;
+        ticks.swap += gl_ticks.swap;
+        ticks.gl_setup = gl_ticks.setup;
+        ticks.gl_error = gl_ticks.error;
+#endif
+        return ticks;
+    }
+    uint64_t start = SDL_GetPerformanceCounter();
+    SDL_UpdateTexture(presentation.textures[shown], nullptr, pixels,
+                      width * sizeof(uint32_t));
+    ticks.upload += SDL_GetPerformanceCounter() - start;
+    SDL_Renderer* renderer = presentation.renderers[0];
+    start = SDL_GetPerformanceCounter();
+    SDL_SetRenderDrawColor(renderer, 20, 20, 20, 255);
+    SDL_RenderClear(renderer);
+    int drawable_w = 0, drawable_h = 0;
+    window_drawable_size(presentation, 0, &drawable_w, &drawable_h);
+    const NdsPresentRect rect =
+        window_present_rect(presentation, 0, drawable_w, drawable_h);
+    const SDL_Rect screen_rect{rect.x, rect.y, rect.w, rect.h};
+    render_screen(presentation, shown, screen_rect);
+    const DsTarget target = sdl_ds_target(renderer, screen_rect, width);
+    if (stylus)
+        draw_virtual_stylus(target, virtual_stylus_x, virtual_stylus_y);
+    draw_savestate_notice(target, savestate_notice);
+    ticks.draw += SDL_GetPerformanceCounter() - start;
+    start = SDL_GetPerformanceCounter();
+    SDL_RenderPresent(renderer);
+    ticks.swap += SDL_GetPerformanceCounter() - start;
+    return ticks;
 }
 
 PresentationTicks present_screens(FrontendPresentation& presentation,
@@ -2233,6 +2371,11 @@ PresentationTicks present_screens(FrontendPresentation& presentation,
 #endif
                                   ) {
     PresentationTicks ticks{};
+    if (presentation.single)
+        return present_single_screen(
+            presentation, top_pixels, top_width, bottom_pixels, bottom_width,
+            runtime_ui, virtual_stylus_visible, virtual_stylus_x,
+            virtual_stylus_y, savestate_notice);
     if (presentation.gl_top) {
 #if defined(NDS_HAVE_COMPUTE_RENDERER)
         NdsGpu2dDirectFrame direct_frame{};
@@ -2307,14 +2450,11 @@ PresentationTicks present_screens(FrontendPresentation& presentation,
             presentation.screen_widths[1], kScreenHeight);
         render_screen(presentation, 0, top_rect);
         render_screen(presentation, 1, bottom_rect);
+        const DsTarget target = sdl_ds_target(
+            renderer, bottom_rect, presentation.screen_widths[1]);
         if (virtual_stylus_visible)
-            draw_virtual_stylus(renderer, bottom_rect,
-                                virtual_stylus_x, virtual_stylus_y);
-        draw_savestate_notice(
-            renderer,
-            DsCanvas{bottom_rect, presentation.screen_widths[1],
-                     kScreenHeight},
-            savestate_notice);
+            draw_virtual_stylus(target, virtual_stylus_x, virtual_stylus_y);
+        draw_savestate_notice(target, savestate_notice);
         ticks.draw += SDL_GetPerformanceCounter() - start;
         start = SDL_GetPerformanceCounter();
         SDL_RenderPresent(renderer);
@@ -2367,7 +2507,8 @@ int nds_run_interactive_frontend(const NdsFrontendOptions& initial_options) {
         SDL_Quit();
         return 1;
     }
-    const int bottom_logical_width = presentation.separate
+    const int bottom_logical_width =
+        presentation.separate || presentation.single
         ? presentation.screen_widths[1]
         : presentation.canvas_width;
     const int bottom_content_left =
@@ -2605,6 +2746,19 @@ int nds_run_interactive_frontend(const NdsFrontendOptions& initial_options) {
     }
     MphPrimeBinding virtual_stylus_binding =
         parse_mph_prime_binding(options.virtual_stylus.binding);
+    const MphPrimeBinding screen_toggle_binding =
+        parse_mph_prime_binding(options.screen_toggle_binding);
+    if (presentation.single &&
+        screen_toggle_binding.kind != MphPrimeInputKind::Key &&
+        binding_name_lower(options.screen_toggle_binding) != "none") {
+        std::fprintf(stderr,
+                     "[display] screen toggle binding \"%s\" is not a key; "
+                     "toggle disabled\n",
+                     options.screen_toggle_binding.c_str());
+    }
+    // Single-screen layout state: the debounced main LCD and the toggle.
+    NdsMainScreenDebounce main_screen{};
+    bool screen_toggled = false;
     MphPrimeBinding virtual_stylus_tap_binding =
         parse_mph_prime_binding(options.virtual_stylus.tap_binding);
     bool virtual_stylus_hold_recognized = true;
@@ -3184,7 +3338,8 @@ int nds_run_interactive_frontend(const NdsFrontendOptions& initial_options) {
     handoff_title_supported=options.savestate_rom_sha1=="691e00d9a5dd80b04f80cc7559503e8b06848785";
 #endif
     const std::string backend=nds_gpu3d_compiled_accelerated_backend();
-    if (handoff_requested && handoff_title_supported && presentation.gl_top && backend=="compute" &&
+    if (handoff_requested && handoff_title_supported && presentation.gl_top &&
+        !presentation.single && backend=="compute" &&
         !interpolation_active && options.perf_governor_mode==NdsPerfGovernorMode::Off &&
         !selftest_menu && !selftest_relative_mouse &&
         !std::getenv("NDS_GUEST_JOB_PROFILE_OUTPUT")) {
@@ -3552,6 +3707,12 @@ int nds_run_interactive_frontend(const NdsFrontendOptions& initial_options) {
                         running = false;
                 } else if (process_virtual_stylus_key(scancode, true)) {
                     // Consumed by the generic lower-screen pointer helper.
+                } else if (presentation.single &&
+                           binding_matches_key(screen_toggle_binding,
+                                               scancode)) {
+                    screen_toggled = !screen_toggled;
+                    std::fprintf(stderr, "[display] showing the %s screen\n",
+                                 screen_toggled ? "other" : "main");
                 } else if (process_mph_prime_key(
                                scancode, true, false)) {
                     // Consumed by the MPH-specific keyboard/mouse layer.
@@ -3677,7 +3838,8 @@ int nds_run_interactive_frontend(const NdsFrontendOptions& initial_options) {
                 primary_left_down ||
                 (bottom_left_down && mph_prime_unified_window_focus);
             const NdsStackedRelativeMouseRoute stacked_left_route =
-                primary_left_down && !presentation.separate
+                primary_left_down && !presentation.separate &&
+                        !presentation.single
                     ? nds_route_stacked_relative_mouse_button(
                         options.relative_mouse_touch,
                         relative_mouse.captured(), stacked_top_screen,
@@ -3762,8 +3924,10 @@ int nds_run_interactive_frontend(const NdsFrontendOptions& initial_options) {
                 event.button.windowID == presentation.window_ids[1] &&
                 !(mph_prime_unified_window_focus &&
                   relative_mouse.captured()) &&
-                (presentation.separate
-                    ? event.button.x >= bottom_content_left &&
+                (presentation.separate || presentation.single
+                    ? (!presentation.single ||
+                       presentation.shown_screen == 1) &&
+                          event.button.x >= bottom_content_left &&
                           event.button.x < bottom_content_left + kScreenWidth
                     : stacked_left_route ==
                           NdsStackedRelativeMouseRoute::Touchscreen)) {
@@ -4309,13 +4473,44 @@ int nds_run_interactive_frontend(const NdsFrontendOptions& initial_options) {
             native_top=nds_gpu2d_framebuffer(0);
             top_pixels=native_top; bottom_pixels=nds_gpu2d_framebuffer(1);
             nds_gpu2d_invalidate_hd_frame();
+            // The window that consumes HD surfaces: the top one, or in the
+            // single-screen layout whichever LCD it shows. gpu2d emits them
+            // only while engine A drew that LCD.
+            int hd_screen = 0;
+            if (presentation.single) {
+                if (nds_main_screen_update(
+                        main_screen, nds_gpu2d_presented_main_screen(),
+                        nds_gpu2d_presented_both_blank())) {
+                    std::fprintf(stderr,
+                                 "[display] main screen -> %s (frame %llu)\n",
+                                 main_screen.main ? "bottom" : "top",
+                                 static_cast<unsigned long long>(shown_frames));
+                    screen_toggled = false;
+                }
+                const int shown = nds_single_shown_screen(
+                    main_screen.main, screen_toggled,
+                    mph_prime_virtual_stylus || generic_virtual_stylus);
+                if (shown != presentation.shown_screen) {
+                    // A held mouse touch belongs to the LCD it started on.
+                    if (mouse_down) {
+                        mouse_down = false;
+                        touch_release_pending = false;
+                        nds_set_touch(0, 0, false);
+                    }
+                    presentation.shown_screen = shown;
+                }
+                hd_screen = shown;
+            }
+            nds_gpu2d_set_hd_screen(hd_screen);
             const bool native_hd=presentation.gl_top && nds_gpu3d_internal_scale()>1u &&
                                  nds_gpu3d_output_width()==256u;
             direct_present=nds_gpu2d_direct_present_frame_active();
-            if (((options.adaptive_screens & NDS_ADAPTIVE_TOP) || native_hd) && !direct_present)
+            if (((options.adaptive_screens & NDS_ADAPTIVE_TOP) ||
+                 (native_hd && hd_screen == 0)) && !direct_present)
                 top_pixels=nds_gpu2d_adaptive_framebuffer(0,&top_width);
             else if (direct_present) top_width=nds_gpu3d_output_width();
-            if (options.adaptive_screens & NDS_ADAPTIVE_BOTTOM)
+            if ((options.adaptive_screens & NDS_ADAPTIVE_BOTTOM) ||
+                (native_hd && hd_screen == 1))
                 bottom_pixels=nds_gpu2d_adaptive_framebuffer(1,&bottom_width);
             phase_adaptive_ticks+=SDL_GetPerformanceCounter()-adaptive_start;
             observe_top_black_bands(native_top,shown_frames);
@@ -4624,6 +4819,10 @@ int nds_run_interactive_frontend(const NdsFrontendOptions& initial_options) {
                     : "";
             const std::string top_title = !savestate_notice.empty()
                 ? "ndsrecomp - " + savestate_notice
+                : presentation.single
+                ? (options.game_name.empty() ? std::string("ndsrecomp")
+                                             : options.game_name) +
+                      " - " + fps_text + governor_text
                 : presentation.separate
                 ? "ndsrecomp - Top Screen - " + fps_text + governor_text
                 : "ndsrecomp firmware preview - " + fps_text +
