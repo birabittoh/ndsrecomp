@@ -20,6 +20,8 @@
 #include <memory>
 #include <stdexcept>
 #include <string>
+#include <type_traits>
+#include <utility>
 #include <vector>
 
 #include "debug_server.h"
@@ -1381,6 +1383,10 @@ struct FrontendPresentation {
     int configured_sample_scale = 1;
     int sample_scale = 1;
     uint8_t antialiasing = 0;
+    // Live copies of the [display] geometry options; the runtime menu edits
+    // the options and the frame loop syncs them here before each present.
+    NdsWindowMode window_mode = NdsWindowMode::Letterbox;
+    NdsScalingFilter scaling = NdsScalingFilter::Integer;
 };
 
 // docs/frame_interpolation.md, MVP blend mode. Holds the previous DS frame's
@@ -1530,13 +1536,61 @@ bool set_window_fullscreen(SDL_Window* window, NdsFullscreenMode mode) {
 #endif
 }
 
-bool set_render_logical_size(SDL_Renderer* renderer, int width, int height) {
+// Presentation works in drawable (physical) pixels: no SDL logical
+// presentation, because SDL has no mode for a centred, unscaled 1:1 image.
+// Every rect comes from nds_present_rect(), which the GL presenter and the
+// mouse-to-touch inversion share.
+void window_drawable_size(const FrontendPresentation& presentation,
+                          int screen, int* width, int* height) {
+    *width = *height = 0;
+    SDL_Window* window = presentation.windows[screen];
+    if (!window) return;
 #if defined(NDS_HAVE_SDL3)
-    return SDL_SetRenderLogicalPresentation(
-        renderer, width, height, SDL_LOGICAL_PRESENTATION_INTEGER_SCALE);
+    SDL_GetWindowSizeInPixels(window, width, height);
 #else
-    return SDL_RenderSetLogicalSize(renderer, width, height) == 0;
+    if (presentation.renderers[screen])
+        SDL_GetRendererOutputSize(presentation.renderers[screen], width,
+                                  height);
+    else
+        SDL_GL_GetDrawableSize(window, width, height);
 #endif
+}
+
+// The DS-space content a window shows: one screen in the separate layout,
+// both screens stacked on one canvas otherwise.
+void window_content_size(const FrontendPresentation& presentation,
+                         int screen, int* width, int* height) {
+    if (presentation.separate) {
+        *width = presentation.screen_widths[screen];
+        *height = kScreenHeight;
+    } else {
+        *width = presentation.canvas_width;
+        *height = kScreenHeight * 2;
+    }
+}
+
+NdsPresentRect window_present_rect(const FrontendPresentation& presentation,
+                                   int screen, int drawable_w,
+                                   int drawable_h) {
+    int content_w = 0, content_h = 0;
+    window_content_size(presentation, screen, &content_w, &content_h);
+    return nds_present_rect(presentation.window_mode, presentation.scaling,
+                            drawable_w, drawable_h, content_w, content_h);
+}
+
+// A DS-space sub-rect of a window's content, mapped into drawable pixels.
+SDL_Rect content_sub_rect(const NdsPresentRect& rect, int content_w,
+                          int content_h, int x, int y, int w, int h) {
+    auto map_x = [&](int v) {
+        return rect.x + static_cast<int>(
+            static_cast<long long>(v) * rect.w / content_w);
+    };
+    auto map_y = [&](int v) {
+        return rect.y + static_cast<int>(
+            static_cast<long long>(v) * rect.h / content_h);
+    };
+    const int x0 = map_x(x), y0 = map_y(y);
+    return SDL_Rect{x0, y0, map_x(x + w) - x0, map_y(y + h) - y0};
 }
 
 // Current refresh rate of the display the window sits on, in whole Hz, or 0
@@ -1562,44 +1616,51 @@ int window_refresh_hz(SDL_Window* window) {
 #endif
 }
 
+// Mouse positions arrive in window coordinates. Everything downstream (touch,
+// the stacked-layout routing, the self-tests) works in the window's logical
+// DS-space content coordinates, so convert here through the same rect the
+// presenter draws into: window -> drawable pixels -> content. Clicks on the
+// bars land outside [0, content) and are therefore never touches. Relative
+// motion (xrel/yrel) is left in window units.
 void convert_mouse_event_to_logical_coordinates(
     SDL_Event& event, const FrontendPresentation& presentation) {
-#if defined(NDS_HAVE_SDL3)
-    auto renderer_for_window = [&](uint32_t window_id) -> SDL_Renderer* {
+    auto screen_for_window = [&](uint32_t window_id) -> int {
         for (int screen = 0; screen < 2; ++screen) {
-            if (window_id == presentation.window_ids[screen])
-                return presentation.renderers[screen];
+            if (window_id == presentation.window_ids[screen] &&
+                presentation.windows[screen])
+                return screen;
         }
-        return nullptr;
+        return -1;
+    };
+    auto convert = [&](uint32_t window_id, auto& x, auto& y) {
+        const int screen = screen_for_window(window_id);
+        if (screen < 0) return;
+        int window_w = 0, window_h = 0;
+        SDL_GetWindowSize(presentation.windows[screen], &window_w, &window_h);
+        int drawable_w = 0, drawable_h = 0;
+        window_drawable_size(presentation, screen, &drawable_w, &drawable_h);
+        if (window_w <= 0 || window_h <= 0 || drawable_w <= 0 ||
+            drawable_h <= 0)
+            return;
+        const float px = static_cast<float>(x) * drawable_w / window_w;
+        const float py = static_cast<float>(y) * drawable_h / window_h;
+        int content_w = 0, content_h = 0;
+        window_content_size(presentation, screen, &content_w, &content_h);
+        const NdsPresentRect rect = window_present_rect(
+            presentation, screen, drawable_w, drawable_h);
+        float cx = 0.0f, cy = 0.0f;
+        nds_present_rect_to_content(rect, content_w, content_h, px, py,
+                                    &cx, &cy);
+        using Coordinate = std::remove_reference_t<decltype(x)>;
+        x = static_cast<Coordinate>(std::floor(cx));
+        y = static_cast<Coordinate>(std::floor(cy));
     };
     if (event.type == SDL_MOUSEBUTTONDOWN ||
         event.type == SDL_MOUSEBUTTONUP) {
-        if (SDL_Renderer* renderer =
-                renderer_for_window(event.button.windowID)) {
-            float x = event.button.x;
-            float y = event.button.y;
-            if (SDL_RenderCoordinatesFromWindow(
-                    renderer, event.button.x, event.button.y, &x, &y)) {
-                event.button.x = x;
-                event.button.y = y;
-            }
-        }
+        convert(event.button.windowID, event.button.x, event.button.y);
     } else if (event.type == SDL_MOUSEMOTION) {
-        if (SDL_Renderer* renderer =
-                renderer_for_window(event.motion.windowID)) {
-            float x = event.motion.x;
-            float y = event.motion.y;
-            if (SDL_RenderCoordinatesFromWindow(
-                    renderer, event.motion.x, event.motion.y, &x, &y)) {
-                event.motion.x = x;
-                event.motion.y = y;
-            }
-        }
+        convert(event.motion.windowID, event.motion.x, event.motion.y);
     }
-#else
-    (void)event;
-    (void)presentation;
-#endif
 }
 
 bool set_texture_scale_nearest(SDL_Texture* texture) {
@@ -1607,6 +1668,15 @@ bool set_texture_scale_nearest(SDL_Texture* texture) {
     return SDL_SetTextureScaleMode(texture, SDL_SCALEMODE_NEAREST);
 #else
     return SDL_SetTextureScaleMode(texture, SDL_ScaleModeNearest) == 0;
+#endif
+}
+
+bool set_texture_scale_linear(SDL_Texture* texture, bool linear) {
+    if (!linear) return set_texture_scale_nearest(texture);
+#if defined(NDS_HAVE_SDL3)
+    return SDL_SetTextureScaleMode(texture, SDL_SCALEMODE_LINEAR);
+#else
+    return SDL_SetTextureScaleMode(texture, SDL_ScaleModeLinear) == 0;
 #endif
 }
 
@@ -1625,15 +1695,6 @@ void render_texture(SDL_Renderer* renderer, SDL_Texture* texture,
     SDL_RenderTexture(renderer, texture, nullptr, dst_ptr);
 #else
     SDL_RenderCopy(renderer, texture, nullptr, destination);
-#endif
-}
-
-void render_line(SDL_Renderer* renderer, int x1, int y1, int x2, int y2) {
-#if defined(NDS_HAVE_SDL3)
-    SDL_RenderLine(renderer, static_cast<float>(x1), static_cast<float>(y1),
-                   static_cast<float>(x2), static_cast<float>(y2));
-#else
-    SDL_RenderDrawLine(renderer, x1, y1, x2, y2);
 #endif
 }
 
@@ -1699,20 +1760,47 @@ const char* notice_glyph(char ch) {
     }
 }
 
+// Overlays are authored in DS-space pixels of one screen and drawn scaled
+// into that screen's drawable-pixel rect, so they keep their size relative to
+// the image in every window mode.
+struct DsCanvas {
+    SDL_Rect dest;
+    int width;   // DS-space width the dest rect represents
+    int height;  // DS-space height the dest rect represents
+};
+
+void fill_ds_rect(SDL_Renderer* renderer, const DsCanvas& canvas, int x,
+                  int y, int w, int h) {
+    if (canvas.width <= 0 || canvas.height <= 0) return;
+    auto map_x = [&](int v) {
+        return canvas.dest.x + static_cast<int>(std::floor(
+            static_cast<double>(v) * canvas.dest.w / canvas.width));
+    };
+    auto map_y = [&](int v) {
+        return canvas.dest.y + static_cast<int>(std::floor(
+            static_cast<double>(v) * canvas.dest.h / canvas.height));
+    };
+    const int x0 = map_x(x), y0 = map_y(y);
+    const SDL_Rect rect{x0, y0, std::max(1, map_x(x + w) - x0),
+                        std::max(1, map_y(y + h) - y0)};
+    fill_rect(renderer, rect);
+}
+
 void draw_savestate_notice(SDL_Renderer* renderer,
-                           const SDL_Rect& screen,
+                           const DsCanvas& screen,
                            const char* text) {
     if (!renderer || !text || !*text) return;
     constexpr int kColumns = 40;
     constexpr int kRows = 5;
     constexpr int kGlyphWidth = 6;
     constexpr int kGlyphHeight = 8;
-    const SDL_Rect background{screen.x + 5,
-                              screen.y + screen.h - kRows * kGlyphHeight - 5,
+    const SDL_Rect background{5,
+                              screen.height - kRows * kGlyphHeight - 5,
                               kColumns * kGlyphWidth + 6,
                               kRows * kGlyphHeight + 4};
     SDL_SetRenderDrawColor(renderer, 10, 10, 10, 255);
-    fill_rect(renderer, background);
+    fill_ds_rect(renderer, screen, background.x, background.y,
+                 background.w, background.h);
     SDL_SetRenderDrawColor(renderer, 255, 255, 255, 255);
     int row = 0;
     int column = 0;
@@ -1727,10 +1815,10 @@ void draw_savestate_notice(SDL_Renderer* renderer,
         for (int gy = 0; gy < 7; ++gy) {
             for (int gx = 0; gx < 5; ++gx) {
                 if (glyph[gy * 5 + gx] != '1') continue;
-                const SDL_Rect pixel{
-                    background.x + 3 + column * kGlyphWidth + gx,
-                    background.y + 2 + row * kGlyphHeight + gy, 1, 1};
-                fill_rect(renderer, pixel);
+                fill_ds_rect(renderer, screen,
+                             background.x + 3 + column * kGlyphWidth + gx,
+                             background.y + 2 + row * kGlyphHeight + gy, 1,
+                             1);
             }
         }
         ++column;
@@ -1758,6 +1846,8 @@ bool create_presentation(const NdsFrontendOptions& options,
         direct_enabled;
 #endif
     presentation.antialiasing = options.antialiasing;
+    presentation.window_mode = options.window_mode;
+    presentation.scaling = options.scaling;
     const int aa_scale = presentation.gl_top ? 1 : options.antialiasing >= 8 ? 4 :
                          options.antialiasing >= 4 ? 3 :
                          options.antialiasing >= 2 ? 2 : 1;
@@ -1887,21 +1977,6 @@ bool create_presentation(const NdsFrontendOptions& options,
                 SDL_GetWindowID(presentation.windows[screen]);
             continue;
         }
-        const int logical_height =
-            !presentation.separate && screen == 0
-                ? kScreenHeight * 2 : kScreenHeight;
-        if (screen == 0 || presentation.separate) {
-            set_render_logical_size(
-                presentation.renderers[screen],
-                presentation.separate
-                    ? presentation.screen_widths[screen]
-                    : presentation.canvas_width,
-                logical_height);
-#if !defined(NDS_HAVE_SDL3)
-            SDL_RenderSetIntegerScale(presentation.renderers[screen],
-                                      SDL_TRUE);
-#endif
-        }
         presentation.textures[screen] = SDL_CreateTexture(
             presentation.renderers[screen], SDL_PIXELFORMAT_ARGB8888,
             SDL_TEXTUREACCESS_STREAMING,
@@ -1952,7 +2027,12 @@ void render_screen(FrontendPresentation& presentation, int screen,
                    const SDL_Rect& destination) {
     SDL_Renderer* renderer = presentation.renderers[screen];
     SDL_Texture* source = presentation.textures[screen];
+    // The supersample target is an exact multiple of the native texture, so
+    // that hop stays nearest; only the final draw into `destination` follows
+    // the scaling filter.
+    const bool linear = presentation.scaling == NdsScalingFilter::Bilinear;
     if (presentation.sample_scale > 1 && presentation.sample_targets[screen]) {
+        set_texture_scale_nearest(source);
         SDL_SetRenderTarget(renderer, presentation.sample_targets[screen]);
         SDL_SetRenderDrawColor(renderer, 0, 0, 0, 255);
         SDL_RenderClear(renderer);
@@ -1960,6 +2040,7 @@ void render_screen(FrontendPresentation& presentation, int screen,
         SDL_SetRenderTarget(renderer, nullptr);
         source = presentation.sample_targets[screen];
     }
+    set_texture_scale_linear(source, linear);
     render_texture(renderer, source, &destination);
 }
 
@@ -1997,16 +2078,15 @@ bool apply_performance_governor_stage(
 
 void draw_virtual_stylus(SDL_Renderer* renderer, const SDL_Rect& destination,
                          float stylus_x, float stylus_y) {
-    const int x = destination.x + static_cast<int>(
-        std::lround(stylus_x * destination.w / 256.0f));
-    const int y = destination.y + static_cast<int>(
-        std::lround(stylus_y * destination.h / 192.0f));
-
+    // The stylus lives in the 256x192 touch space spread over the screen.
+    const DsCanvas canvas{destination, 256, 192};
+    const int x = static_cast<int>(std::lround(stylus_x));
+    const int y = static_cast<int>(std::lround(stylus_y));
     SDL_SetRenderDrawColor(renderer, 255, 255, 255, 255);
-    render_line(renderer, x - 5, y, x - 2, y);
-    render_line(renderer, x + 2, y, x + 5, y);
-    render_line(renderer, x, y - 5, x, y - 2);
-    render_line(renderer, x, y + 2, x, y + 5);
+    fill_ds_rect(renderer, canvas, x - 5, y, 4, 1);
+    fill_ds_rect(renderer, canvas, x + 2, y, 4, 1);
+    fill_ds_rect(renderer, canvas, x, y - 5, 1, 4);
+    fill_ds_rect(renderer, canvas, x, y + 2, 1, 4);
 }
 
 #if defined(NDS_HAVE_COMPUTE_RENDERER)
@@ -2077,6 +2157,31 @@ struct OwnedPresentationFrame {
 };
 #endif
 
+// One separate-layout window: clear, draw its screen into the presentation
+// rect, then the overlays that belong to it. Does not present.
+void draw_separate_screen(FrontendPresentation& presentation, int screen,
+                          bool virtual_stylus_visible, float virtual_stylus_x,
+                          float virtual_stylus_y,
+                          const char* savestate_notice) {
+    SDL_Renderer* renderer = presentation.renderers[screen];
+    SDL_SetRenderDrawColor(renderer, 20, 20, 20, 255);
+    SDL_RenderClear(renderer);
+    int drawable_w = 0, drawable_h = 0;
+    window_drawable_size(presentation, screen, &drawable_w, &drawable_h);
+    const NdsPresentRect rect =
+        window_present_rect(presentation, screen, drawable_w, drawable_h);
+    const SDL_Rect screen_rect{rect.x, rect.y, rect.w, rect.h};
+    render_screen(presentation, screen, screen_rect);
+    if (virtual_stylus_visible)
+        draw_virtual_stylus(renderer, screen_rect, virtual_stylus_x,
+                            virtual_stylus_y);
+    draw_savestate_notice(
+        renderer,
+        DsCanvas{screen_rect, presentation.screen_widths[screen],
+                 kScreenHeight},
+        savestate_notice);
+}
+
 PresentationTicks present_screens(FrontendPresentation& presentation,
                                   const uint32_t* top_pixels,
                                   int top_width,
@@ -2102,6 +2207,8 @@ PresentationTicks present_screens(FrontendPresentation& presentation,
         if (latency) ticks.pool_wait = SDL_GetPerformanceCounter() - pool_begin;
         NdsComputePresentTicks gl_ticks{};
         gl_ticks.diagnostic = latency;
+        nds_compute_host_set_present_mode(presentation.window_mode,
+                                          presentation.scaling);
         if (!nds_compute_host_present_top(
                 top_pixels, static_cast<uint16_t>(top_width),
                 direct ? &direct_frame : nullptr, &gl_ticks,
@@ -2123,17 +2230,11 @@ PresentationTicks present_screens(FrontendPresentation& presentation,
         SDL_UpdateTexture(presentation.textures[1], nullptr, bottom_pixels,
                           bottom_width * sizeof(uint32_t));
         ticks.upload += SDL_GetPerformanceCounter() - start;
-        const SDL_Rect screen_rect{
-            0, 0, presentation.screen_widths[1], kScreenHeight};
         SDL_Renderer* renderer = presentation.renderers[1];
         start = SDL_GetPerformanceCounter();
-        SDL_SetRenderDrawColor(renderer, 20, 20, 20, 255);
-        SDL_RenderClear(renderer);
-        render_screen(presentation, 1, screen_rect);
-        if (virtual_stylus_visible)
-            draw_virtual_stylus(renderer, screen_rect,
-                                virtual_stylus_x, virtual_stylus_y);
-        draw_savestate_notice(renderer, screen_rect, savestate_notice);
+        draw_separate_screen(presentation, 1, virtual_stylus_visible,
+                             virtual_stylus_x, virtual_stylus_y,
+                             savestate_notice);
         ticks.draw += SDL_GetPerformanceCounter() - start;
         start = SDL_GetPerformanceCounter();
         SDL_RenderPresent(renderer);
@@ -2154,20 +2255,30 @@ PresentationTicks present_screens(FrontendPresentation& presentation,
         start = SDL_GetPerformanceCounter();
         SDL_SetRenderDrawColor(renderer, 20, 20, 20, 255);
         SDL_RenderClear(renderer);
-        const SDL_Rect top_rect{
-            (presentation.canvas_width -
-             presentation.screen_widths[0]) / 2,
-            0, presentation.screen_widths[0], kScreenHeight};
-        const SDL_Rect bottom_rect{
-            (presentation.canvas_width -
-             presentation.screen_widths[1]) / 2,
-            kScreenHeight, presentation.screen_widths[1], kScreenHeight};
+        int drawable_w = 0, drawable_h = 0;
+        window_drawable_size(presentation, 0, &drawable_w, &drawable_h);
+        const NdsPresentRect rect =
+            window_present_rect(presentation, 0, drawable_w, drawable_h);
+        const int canvas_w = presentation.canvas_width;
+        const int canvas_h = kScreenHeight * 2;
+        const SDL_Rect top_rect = content_sub_rect(
+            rect, canvas_w, canvas_h,
+            (canvas_w - presentation.screen_widths[0]) / 2, 0,
+            presentation.screen_widths[0], kScreenHeight);
+        const SDL_Rect bottom_rect = content_sub_rect(
+            rect, canvas_w, canvas_h,
+            (canvas_w - presentation.screen_widths[1]) / 2, kScreenHeight,
+            presentation.screen_widths[1], kScreenHeight);
         render_screen(presentation, 0, top_rect);
         render_screen(presentation, 1, bottom_rect);
         if (virtual_stylus_visible)
             draw_virtual_stylus(renderer, bottom_rect,
                                 virtual_stylus_x, virtual_stylus_y);
-        draw_savestate_notice(renderer, bottom_rect, savestate_notice);
+        draw_savestate_notice(
+            renderer,
+            DsCanvas{bottom_rect, presentation.screen_widths[1],
+                     kScreenHeight},
+            savestate_notice);
         ticks.draw += SDL_GetPerformanceCounter() - start;
         start = SDL_GetPerformanceCounter();
         SDL_RenderPresent(renderer);
@@ -2176,18 +2287,12 @@ PresentationTicks present_screens(FrontendPresentation& presentation,
     }
 
     for (int screen = 0; screen < 2; ++screen) {
-        const SDL_Rect screen_rect{
-            0, 0, presentation.screen_widths[screen], kScreenHeight};
         SDL_Renderer* renderer = presentation.renderers[screen];
         start = SDL_GetPerformanceCounter();
-        SDL_SetRenderDrawColor(renderer, 20, 20, 20, 255);
-        SDL_RenderClear(renderer);
-        render_screen(presentation, screen, screen_rect);
-        if (screen == 1 && virtual_stylus_visible)
-            draw_virtual_stylus(renderer, screen_rect,
-                                virtual_stylus_x, virtual_stylus_y);
-        if (screen == 1)
-            draw_savestate_notice(renderer, screen_rect, savestate_notice);
+        draw_separate_screen(presentation, screen,
+                             screen == 1 && virtual_stylus_visible,
+                             virtual_stylus_x, virtual_stylus_y,
+                             screen == 1 ? savestate_notice : nullptr);
         ticks.draw += SDL_GetPerformanceCounter() - start;
         start = SDL_GetPerformanceCounter();
         SDL_RenderPresent(renderer);
@@ -2238,10 +2343,12 @@ int nds_run_interactive_frontend(const NdsFrontendOptions& initial_options) {
     const NdsLogicalRect stacked_bottom_touch{
         bottom_content_left, kScreenHeight, kScreenWidth, kScreenHeight};
     std::fprintf(stderr,
-        "[sdl] layout=%s fullscreen=%s adaptive=%s supersampling=%ux aa=%ux "
-        "internal=%ux\n",
+        "[sdl] layout=%s fullscreen=%s window_mode=%s scaling=%s "
+        "adaptive=%s supersampling=%ux aa=%ux internal=%ux\n",
         nds_screen_layout_name(options.screen_layout),
         nds_fullscreen_mode_name(options.fullscreen),
+        nds_window_mode_name(options.window_mode),
+        nds_scaling_filter_name(options.scaling),
         nds_adaptive_screens_name(options.adaptive_screens),
         static_cast<unsigned>(options.supersampling),
         static_cast<unsigned>(options.antialiasing),
@@ -4185,6 +4292,8 @@ int nds_run_interactive_frontend(const NdsFrontendOptions& initial_options) {
             blend_half(blend_cache.previous[1].data(), bottom_pixels,
                        blend_cache.blended[1].data(),
                        blend_cache.previous[1].size());
+            presentation.window_mode = options.window_mode;
+            presentation.scaling = options.scaling;
             const PresentationTicks synthetic_ticks = present_screens(
                 presentation, blend_cache.blended[0].data(), top_width,
                 blend_cache.blended[1].data(), bottom_width,
@@ -4209,6 +4318,8 @@ int nds_run_interactive_frontend(const NdsFrontendOptions& initial_options) {
             // extra present.
             SDL_PumpEvents();
         }
+        presentation.window_mode = options.window_mode;
+        presentation.scaling = options.scaling;
         const PresentationTicks presentation_ticks = present_screens(
             presentation, top_pixels, top_width,
             bottom_pixels, bottom_width,
