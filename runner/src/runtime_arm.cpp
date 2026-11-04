@@ -269,18 +269,25 @@ void append_json_string(std::string& out, const char* text) {
 #endif
 
 constexpr uint32_t kDispatchCacheSize = 65536u;
+// Field order is a host-cache layout, not an ABI: everything the hit test
+// reads (key, epoch, flags, fn, serial, generations and the first three
+// generation pointers) sits in the first 64-byte line. The table is 16 MiB,
+// larger than a laptop L3, and the former order split the hit test across
+// both lines of the slot (pc at +0, occupied at +0x62): two misses per
+// dispatch. The second line holds what only the slow path and rare 4-page
+// candidates need.
 struct alignas(64) CachedStaticLookup {
     uint32_t pc = 0u;
-    uint32_t page_addr[4]{};
-    uint32_t generation[4]{};
-    const uint32_t* generation_ptr[4]{};
-    void (*fn)(void) = nullptr;
-    const NdsStaticValidation* validation = nullptr;
-    uint32_t live_bank_serial = 0u;
     uint32_t dispatch_epoch = 0u;
     uint8_t page_count = 0u;
     uint8_t thumb = 0u;
     uint8_t occupied = 0u;
+    uint32_t live_bank_serial = 0u;
+    void (*fn)(void) = nullptr;
+    uint32_t generation[4]{};
+    const uint32_t* generation_ptr[4]{};
+    uint32_t page_addr[4]{};
+    const NdsStaticValidation* validation = nullptr;
 };
 static_assert(sizeof(CachedStaticLookup) == 128u);
 std::array<std::array<CachedStaticLookup, kDispatchCacheSize>, 2>
