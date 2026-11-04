@@ -20,9 +20,7 @@
 #include "savestate.h"
 #include "state.h"
 #include "execution_model.h"
-#if defined(NDS_ARM9_DYNARMIC)
 #include "arm9_native.h"
-#endif
 #include "execution_region.h"
 #include "execution_region_stats.h"
 #include "io.h"
