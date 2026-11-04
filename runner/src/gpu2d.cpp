@@ -150,6 +150,11 @@ bool g_direct_frame_active = false;
 // stack with the 3D layer removed; see NdsGpu2dHdFrame in gpu2d.h.
 bool g_hd_emit_enabled = false;
 bool g_hd_frame_valid = false;
+int g_hd_screen = 0;
+// Per framebuffer: engine A's LCD (0 top, 1 bottom) and whether both LCDs
+// were blank, as the scanlines that drew that buffer latched them.
+std::array<uint8_t, 2> g_route_main_screen{};
+std::array<uint8_t, 2> g_route_both_blank{};
 std::vector<uint32_t> g_hd_top_pixels;
 std::vector<uint32_t> g_hd_below_pixels;
 NdsGpu2dHdFrame g_hd_frame{};
@@ -1649,6 +1654,17 @@ void latch_line(int y, LineJob& job) {
     job.line3d = nullptr;
     job.direct_class = static_cast<uint8_t>(g_direct_frame_class);
     job.direct_extra_bg_mask = g_direct_extra_bg_mask;
+    {
+        // Overwritten every line, so the buffer ends up carrying the routing
+        // of its last scanline.
+        auto blank = [](int e) {
+            const uint32_t dispcnt = g_unit[e].dispcnt;
+            return !enabled(e) || (dispcnt & 0x80u) != 0u ||
+                   ((dispcnt >> 16) & 3u) == 0u;
+        };
+        g_route_main_screen[job.buffer] = engine_a_on_top ? 0u : 1u;
+        g_route_both_blank[job.buffer] = blank(0) && blank(1) ? 1u : 0u;
+    }
     for (int e = 0; e < 2; ++e) {
         job.unit[e] = g_unit[e];
         job.screen[e] = static_cast<uint32_t>(engine_a_on_top ? e : (e ^ 1));
@@ -2130,6 +2146,8 @@ void nds_gpu2d_reset(){
     drain_pool(NDS_GPU2D_FENCE_FRAME);
     g_unit={};
     g_front = 0;
+    g_route_main_screen = {};
+    g_route_both_blank = {};
     g_direct_frame_active = false;
     g_direct_present_frame_active = false;
     g_frame_capture_active = false;
@@ -2473,6 +2491,14 @@ void nds_gpu2d_vblank(){
 const uint32_t* nds_gpu2d_framebuffer(int screen){
     drain_pool(NDS_GPU2D_FENCE_PRESENT);
     return g_fb[g_front][screen & 1].data();
+}
+int nds_gpu2d_presented_main_screen(){
+    drain_pool(NDS_GPU2D_FENCE_PRESENT);
+    return g_route_main_screen[g_front];
+}
+bool nds_gpu2d_presented_both_blank(){
+    drain_pool(NDS_GPU2D_FENCE_PRESENT);
+    return g_route_both_blank[g_front] != 0u;
 }
 void nds_gpu2d_set_adaptive_skybox_fill(bool enabled) {
     g_adaptive_skybox_fill = enabled;
@@ -2955,7 +2981,9 @@ void composite_adaptive_frame(const AdaptiveCtx& ctx) {
 const uint32_t* nds_gpu2d_adaptive_framebuffer(int screen, uint16_t* width) {
     drain_pool(NDS_GPU2D_FENCE_PRESENT);
     const uint32_t* native = nds_gpu2d_framebuffer(screen);
-    const bool engine_a_on_top = (nds_powercontrol9() & 0x8000u) != 0;
+    // The routing the native buffer was drawn with, not the live POWCNT1: a
+    // VBlank write must not re-attribute an already drawn frame.
+    const bool engine_a_on_top = g_route_main_screen[g_front] == 0u;
     const int engine = engine_a_on_top ? screen : (screen ^ 1);
     // Cleared so every early return below (native width, unsupported scene)
     // leaves the presenter on the CPU composite rather than re-reading last
@@ -3064,12 +3092,13 @@ const uint32_t* nds_gpu2d_adaptive_framebuffer(int screen, uint16_t* width) {
     // presenter samples the raw hi-res surface and cannot see that repair, so
     // rather than silently dropping it, HD stands down for those frames and
     // the CPU composite is presented instead.
-    // screen == 0 as well as engine == 0: the direct presenter owns the top
-    // window only, so when POWCNT routes engine A to the bottom screen these
-    // surfaces would be applied to the wrong window. The direct path rejects
-    // that case as SCREEN_ROUTE for the same reason.
+    // screen == g_hd_screen as well as engine == 0: the surfaces belong to
+    // one presenter window (the top one unless the single-screen layout
+    // follows engine A to the bottom), so when engine A sits on the other
+    // LCD they would be applied to the wrong window. The direct OBJ path
+    // still owns the top window only and rejects that case as SCREEN_ROUTE.
     const bool emit_hd =
-        g_hd_emit_enabled && !g_adaptive_skybox_fill && screen == 0;
+        g_hd_emit_enabled && !g_adaptive_skybox_fill && screen == g_hd_screen;
     if (emit_hd) {
         const size_t needed =
             static_cast<size_t>(output_width) * 192u * 2u;
@@ -3127,6 +3156,12 @@ void nds_gpu2d_invalidate_hd_frame() {
 void nds_gpu2d_set_hd_emit(bool enabled) {
     g_hd_emit_enabled = enabled;
     if (!enabled) g_hd_frame_valid = false;
+}
+
+void nds_gpu2d_set_hd_screen(int screen) {
+    if (g_hd_screen == (screen & 1)) return;
+    g_hd_screen = screen & 1;
+    g_hd_frame_valid = false;
 }
 
 bool nds_gpu2d_hd_frame_peek(NdsGpu2dHdFrame* out) {
