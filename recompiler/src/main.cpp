@@ -1296,6 +1296,9 @@ int main(int argc, char** argv) {
     bool coalesce_fallthroughs = false;
     bool prune_preceding_owned = false;
     bool dispatch_only = false;
+    bool static_scan = false;
+    std::string external_targets_out;
+    std::vector<std::string> extra_seed_paths;
     bool stable_address_shards = false;
     unsigned shards = 1u;
     uint32_t max_function_bytes = 0u;
@@ -1339,6 +1342,12 @@ int main(int argc, char** argv) {
         else if (a == "--prune-preceding-owned")
             prune_preceding_owned = true;
         else if (a == "--dispatch-only") dispatch_only = true;
+        else if (a == "--static-scan") static_scan = true;
+        else if (a == "--external-targets-out") external_targets_out = next();
+        else if (a == "--extra-seeds") extra_seed_paths.push_back(next());
+        else if (a == "--extra-candidates") {
+            extra_seed_paths.push_back(std::string("?") + next());
+        }
         else if (a == "--stable-address-shards") stable_address_shards = true;
         else if (a == "--shards") shards = static_cast<unsigned>(
             std::strtoul(next(), nullptr, 0));
@@ -1409,6 +1418,8 @@ int main(int argc, char** argv) {
 
     FunctionFinder finder(bin.data(), bin.size(), cfg.program.load_address);
     finder.set_authoritative_seeds(cfg.program.authoritative_entry_points);
+    finder.set_static_scan(static_scan ||
+                           std::getenv("NDSRECOMP_STATIC_SCAN") != nullptr);
     // Program entry historically defaulted to ARM. Runtime-materialized
     // firmware may enter in Thumb, in which case an explicit entry_point at
     // the same address is authoritative and must suppress the bogus ARM walk.
@@ -1463,6 +1474,34 @@ int main(int argc, char** argv) {
     }
     for (const auto& ex : cfg.exclude_funcs)
         finder.add_exclude(ex.addr, ex.reason);
+    // --extra-seeds: plain-text "0xADDR arm|thumb [note]" lines, e.g. the
+    // --external-targets-out list of another image (overlay -> main BLs).
+    // Addresses outside this image are ignored.
+    for (std::string path : extra_seed_paths) {
+        // "?path" = --extra-candidates: validated by the static scan.
+        const bool candidate = !path.empty() && path[0] == '?';
+        if (candidate) path.erase(0, 1);
+        FILE* f = std::fopen(path.c_str(), "r");
+        if (!f) { std::fprintf(stderr, "cannot read %s\n", path.c_str()); return 1; }
+        char line[256];
+        std::size_t added = 0;
+        while (std::fgets(line, sizeof line, f)) {
+            unsigned long addr = 0;
+            char mode[16] = {};
+            if (std::sscanf(line, "%lx %15s", &addr, mode) != 2) continue;
+            const uint32_t a32 = static_cast<uint32_t>(addr);
+            if (!finder.readable(a32, 2)) continue;
+            const bool thumb = std::string(mode) == "thumb";
+            char nm[64];
+            std::snprintf(nm, sizeof nm, "ext%c_%08X", thumb ? 't' : 'a', a32);
+            const FunctionSeed fs{a32, thumb ? CpuMode::Thumb : CpuMode::Arm, nm, 0, 0};
+            if (candidate) finder.add_candidate(fs);
+            else           finder.add_seed(fs);
+            ++added;
+        }
+        std::fclose(f);
+        std::printf("[extra-seeds] %s: %zu in-image seeds\n", path.c_str(), added);
+    }
     // Expand each declared jump table into per-target seeds (bit0 = mode
     // for entries_mode=auto), and mark the table bytes as data.
     for (const auto& jt : cfg.jump_tables) {
@@ -1482,6 +1521,18 @@ int main(int argc, char** argv) {
     }
 
     finder.run();
+    if (!external_targets_out.empty()) {
+        std::vector<std::pair<uint64_t, uint32_t>> ext(
+            finder.external_targets().begin(), finder.external_targets().end());
+        std::sort(ext.begin(), ext.end());
+        FILE* f = std::fopen(external_targets_out.c_str(), "w");
+        if (!f) { std::fprintf(stderr, "cannot write %s\n", external_targets_out.c_str()); return 1; }
+        for (const auto& [k, site] : ext) {
+            std::fprintf(f, "0x%08X %s 0x%08X\n", static_cast<uint32_t>(k >> 1),
+                         (k & 1u) ? "thumb" : "arm", site);
+        }
+        std::fclose(f);
+    }
     const auto& st = finder.stats();
     std::printf("\n[finder] functions=%zu (arm=%zu thumb=%zu) "
                 "indirect=%zu undefined=%zu auto_jump_tables=%zu "
@@ -1490,11 +1541,29 @@ int main(int argc, char** argv) {
                 st.indirect_transfer_count, st.undefined_instr_count,
                 st.auto_jump_tables, st.landing_pads_discovered);
     std::printf("[finder] indirect outcomes (non-return): resolved=%zu "
-                "known-unreachable=%zu unknown=%zu stored_ptr_seeds=%zu\n",
+                "known-unreachable=%zu unknown=%zu stored_ptr_seeds=%zu "
+                "carried_state_walks=%zu ptr_arrays=%zu "
+                "ptr_array_targets=%zu\n",
                 st.indirect_resolved_count,
                 st.indirect_known_unreachable_count,
                 st.indirect_unknown_count,
-                st.stored_ptr_seeds);
+                st.stored_ptr_seeds,
+                st.carried_state_walks,
+                st.ptr_arrays,
+                st.ptr_array_targets);
+    std::printf("[finder] branch_ladders=%zu slots=%zu rejected=%zu "
+                "entry_gate_rejects=%zu\n",
+                st.branch_ladders, st.branch_ladder_slots,
+                st.branch_ladders_rejected, st.entry_gate_rejects);
+    if (st.static_scan_rounds != 0) {
+        std::printf("[finder] static_scan rounds=%zu ptr_harvest=%zu "
+                    "(rejected %zu) gap_fill=%zu (rejected %zu) "
+                    "extern=%zu (rejected %zu)\n",
+                    st.static_scan_rounds, st.ptr_harvest_seeds,
+                    st.ptr_harvest_rejects, st.gap_fill_seeds,
+                    st.gap_fill_rejects, st.extern_candidate_seeds,
+                    st.extern_candidate_rejects);
+    }
     // Cluster the proven-but-unreadable targets by 64 KiB region. A
     // cluster is the static signature of code relocated to a base no
     // bank declares (the copy-loop alias class, beads-yjp.35 item 2):
