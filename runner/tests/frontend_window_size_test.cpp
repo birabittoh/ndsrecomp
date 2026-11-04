@@ -79,6 +79,11 @@ int main() {
     nds_present_rect_to_content(r, 256, 192, 100.0f, 540.0f, &cx, &cy);
     check(cx < 0.0f, "inverse left bar is outside");
 
+    const NdsInitialWindowSize single =
+        nds_initial_window_size(256, 256, false, 3, 1.0f, 3840, 2080, true);
+    check(single.top_width == 768 && single.height == 576,
+          "single window is one screen at the requested scale");
+
     if (failures) return 1;
     std::puts("frontend window size checks passed");
     return 0;

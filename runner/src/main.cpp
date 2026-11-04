@@ -724,7 +724,7 @@ int main(int argc, char** argv) {
                 "[--firmware-path firmware.bin] "
                 "[--firmware-state-path mutable-firmware.bin] "
                 "[--config game.toml] "
-                "[--screen-layout stacked|separate] "
+                "[--screen-layout single|stacked|separate] "
                 "[--fullscreen off|borderless|exclusive] "
                 "[--window-mode letterbox|stretch|original] "
                 "[--scaling integer|bilinear] "
@@ -833,7 +833,7 @@ int main(int argc, char** argv) {
                                      &frontend_options.screen_layout)) {
             std::fprintf(stderr,
                          "invalid NDS_SCREEN_LAYOUT "
-                         "(expected stacked or separate)\n");
+                         "(expected single, stacked, or separate)\n");
             return 2;
         }
     }
@@ -1007,7 +1007,7 @@ int main(int argc, char** argv) {
                                  &frontend_options.screen_layout)) {
         std::fprintf(stderr,
                      "invalid --screen-layout "
-                     "(expected stacked or separate)\n");
+                     "(expected single, stacked, or separate)\n");
         return 2;
     }
     if (!cli_window_mode.empty() &&

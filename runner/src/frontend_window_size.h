@@ -8,15 +8,19 @@ struct NdsInitialWindowSize {
     int top_width, bottom_width, height;
 };
 
+// `single` is the one-screen layout: one window, one 192-line screen as wide
+// as the wider of the two. It takes precedence over `separate`.
 inline NdsInitialWindowSize nds_initial_window_size(
     int top_width, int bottom_width, bool separate, int scale,
-    float coordinate_scale, int usable_width, int usable_height) {
+    float coordinate_scale, int usable_width, int usable_height,
+    bool single = false) {
     double factor = std::clamp(scale, 1, 8) *
         (std::isfinite(coordinate_scale) && coordinate_scale > 0
             ? coordinate_scale : 1.0);
-    const int height = separate ? 192 : 384;
-    const int width = separate ? top_width + bottom_width
-                               : std::max(top_width, bottom_width);
+    const int height = separate || single ? 192 : 384;
+    const int width = separate && !single
+                          ? top_width + bottom_width
+                          : std::max(top_width, bottom_width);
     // Fit both windows together, reserving space for borders/taskbar/gap.
     if (usable_width > 96)
         factor = std::min(factor, (usable_width - 96.0) / width);

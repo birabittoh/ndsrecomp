@@ -28,6 +28,9 @@ int main() {
         !require(layout == NdsScreenLayout::Separate) ||
         !require(nds_parse_screen_layout("combined", &layout)) ||
         !require(layout == NdsScreenLayout::Stacked) ||
+        !require(nds_parse_screen_layout("single", &layout)) ||
+        !require(layout == NdsScreenLayout::Single) ||
+        !require(std::string(nds_screen_layout_name(layout)) == "single") ||
         !require(!nds_parse_screen_layout("sideways", &layout)))
         return 1;
 

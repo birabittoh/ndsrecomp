@@ -14,6 +14,10 @@
 enum class NdsScreenLayout : uint8_t {
     Stacked,
     Separate,
+    // One window showing only the DS main screen: whichever LCD engine A is
+    // routed to (POWCNT1 bit 15), debounced. A hotkey shows the other LCD and
+    // holding the virtual stylus peeks at the bottom one.
+    Single,
 };
 
 enum class NdsFullscreenMode : uint8_t {
@@ -325,6 +329,9 @@ struct NdsFrontendOptions {
     uint16_t relative_mouse_fire_mask = 0;
     bool mph_prime_controls = false;
     NdsVirtualStylusOptions virtual_stylus{};
+    // Single-screen layout: key that toggles the shown LCD between the main
+    // screen and the other one ([controls] screen_toggle).
+    std::string screen_toggle_binding = "Grave";
     // Default-off compatibility switch for titles that want relative mouse
     // capture to persist across separate top/bottom presentation windows.
     bool mph_prime_unified_window_focus = false;
