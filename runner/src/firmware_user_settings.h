@@ -37,6 +37,14 @@ bool nds_normalize_touch_calibration(std::vector<uint8_t>& fw);
 // Firmware "start automatically / manually" user setting.
 bool nds_apply_startup_mode(std::vector<uint8_t>& fw, NdsStartupMode mode);
 
+// Firmware language (user settings +0x64 bits 0-2) in both copies, resealing
+// each CRC. Preserve is a byte-exact no-op. A dump carrying iQue/DSi-style
+// extended settings (+0x74 == 1) also gets its extended language (+0x75) and
+// supported-language mask (+0x76) updated, since the console prefers that
+// field, and its own CRC (+0xFE over +0x74..+0xFD) resealed.
+bool nds_apply_firmware_language(std::vector<uint8_t>& fw,
+                                 NdsFirmwareLanguage language);
+
 // Per-instance guest MAC perturbation (Wiimmfi multi-instance identity).
 // Instance 0 is a deliberate total no-op: LLE-faithful, the guest reads the
 // real dump's MAC over SPI unperturbed.

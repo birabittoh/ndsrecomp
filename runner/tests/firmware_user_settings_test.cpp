@@ -207,6 +207,54 @@ void test_patches_compose() {
     }
 }
 
+void test_language() {
+    std::vector<uint8_t> fw = make_firmware();
+    check(nds_apply_startup_mode(fw, NdsStartupMode::Automatic),
+          "startup applies before language");
+    const std::vector<uint8_t> before = fw;
+    check(nds_apply_firmware_language(fw, NdsFirmwareLanguage::Preserve),
+          "preserve language succeeds");
+    check(fw == before, "preserve language is a byte-exact no-op");
+    check(nds_apply_firmware_language(fw, NdsFirmwareLanguage::German),
+          "german applies");
+    for (unsigned copy = 0; copy < 2; ++copy) {
+        const size_t base = user_base(fw, copy);
+        check((read16(fw, base + 0x64u) & 0x7u) == 3u, "language is german");
+        check((read16(fw, base + 0x64u) & (1u << 6u)) != 0u,
+              "startup flag survives the language patch");
+        check((read16(fw, base + 0x64u) & (3u << 4u)) == (3u << 4u),
+              "backlight bits survive the language patch");
+        check(checksum_valid(fw, copy), "language resealed checksum");
+    }
+
+    // iQue/DSi-style extended settings get their own language and CRC.
+    std::vector<uint8_t> ext = make_firmware();
+    for (unsigned copy = 0; copy < 2; ++copy) {
+        const size_t base = user_base(ext, copy);
+        ext[base + 0x74u] = 1u;
+        ext[base + 0x75u] = 1u;
+        ext[base + 0x76u] = 0x02u;
+        ext[base + 0x77u] = 0x00u;
+    }
+    check(nds_apply_firmware_language(ext, NdsFirmwareLanguage::Italian),
+          "italian applies to extended settings");
+    for (unsigned copy = 0; copy < 2; ++copy) {
+        const size_t base = user_base(ext, copy);
+        check(ext[base + 0x75u] == 4u, "extended language is italian");
+        check(read16(ext, base + 0x76u) == (0x02u | (1u << 4u)),
+              "italian added to supported-language mask");
+        check(read16(ext, base + 0xFEu) ==
+                  nds_firmware_crc16(ext.data() + base + 0x74u, 0x8Au,
+                                     0xFFFFu),
+              "extended settings checksum resealed");
+        check(checksum_valid(ext, copy), "extended copy base checksum valid");
+    }
+
+    std::vector<uint8_t> tiny(0x10u, 0u);
+    check(!nds_apply_firmware_language(tiny, NdsFirmwareLanguage::English),
+          "undersized image refused");
+}
+
 }  // namespace
 
 int main() {
@@ -218,6 +266,7 @@ int main() {
     test_malformed_layout();
     test_hoisted_patches();
     test_patches_compose();
+    test_language();
     if (g_failures != 0) {
         std::fprintf(stderr, "firmware_user_settings_test: %d failure(s)\n",
                      g_failures);
