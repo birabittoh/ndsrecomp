@@ -79,6 +79,48 @@ bool indirect_report_enabled() {
     return enabled;
 }
 
+// Does `i` write its decoded `rd` slot? The decoder zero-fills unused
+// slots, so compares, stores, branches etc. carry rd == 0; treating that
+// as a write made the constant tracker forget r0 at every CMP/STR/B.
+bool writes_rd(const armv4t::Instr& i) {
+    using armv4t::IrOp;
+    switch (i.op) {
+        case IrOp::TST: case IrOp::TEQ: case IrOp::CMP: case IrOp::CMN:
+        case IrOp::B: case IrOp::BL: case IrOp::BX: case IrOp::BLX_reg:
+        case IrOp::BLX_imm: case IrOp::BL_prefix: case IrOp::BL_suffix:
+        case IrOp::STR: case IrOp::STRB: case IrOp::STRH: case IrOp::STRD:
+        case IrOp::LDM: case IrOp::STM: case IrOp::PLD: case IrOp::SWI:
+        case IrOp::MCR: case IrOp::CDP: case IrOp::MSR:
+        case IrOp::Undefined:
+            return false;
+        default:
+            return true;
+    }
+}
+
+// Registers an instruction writes besides `rd` (and besides LDM lists,
+// writeback bases and PC), as a bitmask.
+uint16_t extra_written_regs(const armv4t::Instr& i) {
+    using armv4t::IrOp;
+    uint16_t m = 0;
+    switch (i.op) {
+        case IrOp::UMULL: case IrOp::UMLAL: case IrOp::SMULL:
+        case IrOp::SMLAL: case IrOp::SMLALxy:
+            if (i.rn < 16) m |= static_cast<uint16_t>(1u << i.rn);  // RdLo
+            break;
+        case IrOp::LDRD:
+            if (i.rd < 15) m |= static_cast<uint16_t>(1u << (i.rd + 1));
+            break;
+        default:
+            break;
+    }
+    // Calls write LR (THUMB BL writes it in both halves).
+    if (i.is_call || i.op == IrOp::BL_prefix || i.op == IrOp::BL_suffix) {
+        m |= static_cast<uint16_t>(1u << 14);
+    }
+    return m;
+}
+
 }  // namespace
 
 FunctionFinder::FunctionFinder(const uint8_t* rom_bytes,
@@ -249,6 +291,69 @@ void FunctionFinder::discover_one(uint32_t entry_addr, CpuMode entry_mode,
         uint32_t value = 0;
     };
     RegConst reg_const[16];
+    // Registers whose tracked value must NOT be carried to a branch
+    // target: clobbered by a call (AAPCS r0-r3, r12, lr) or last
+    // written by a conditional instruction (the tracker models those as
+    // unconditional, which is wrong on the not-taken path).
+    uint16_t no_carry = 0;
+    constexpr uint16_t kCallClobbered =
+        0x000Fu | (1u << 12) | (1u << 14);
+    // Weaker per-register lane: the static in-image address this register
+    // was last loaded from (see CarriedRegs::load_*). Set by any word LDR
+    // with a known non-PC base, conditional or not; cleared by any other
+    // write and by calls.
+    struct RegLoad {
+        bool     known = false;
+        uint32_t addr  = 0;
+    };
+    RegLoad reg_load[16];
+    {
+        auto it = branch_target_regs_.find(visit_key(entry_addr, entry_mode));
+        if (it != branch_target_regs_.end() &&
+            (it->second.mask | it->second.load_mask) != 0) {
+            for (int r = 0; r < 15; ++r) {
+                if (it->second.mask & (1u << r)) {
+                    reg_const[r] = {true, it->second.value[r]};
+                }
+                if (it->second.load_mask & (1u << r)) {
+                    reg_load[r] = {true, it->second.load_addr[r]};
+                }
+            }
+            ++stats_.carried_state_walks;
+        }
+    }
+    auto carry_state_to = [&](uint32_t target) {
+        CarriedRegs snap;
+        for (int r = 0; r < 15; ++r) {
+            const uint16_t b = static_cast<uint16_t>(1u << r);
+            if (reg_const[r].known && (no_carry & b) == 0) {
+                snap.mask |= b;
+                snap.value[r] = reg_const[r].value;
+            }
+            if (reg_load[r].known) {
+                snap.load_mask |= b;
+                snap.load_addr[r] = reg_load[r].addr;
+            }
+        }
+        const uint64_t k = visit_key(target, entry_mode);
+        if (visited_.count(k) != 0) return;  // already walked; first wins
+        auto [it, inserted] = branch_target_regs_.emplace(k, snap);
+        if (!inserted) {
+            CarriedRegs& cur = it->second;
+            for (int r = 0; r < 15; ++r) {
+                const uint16_t b = static_cast<uint16_t>(1u << r);
+                if ((cur.mask & b) &&
+                    (!(snap.mask & b) || snap.value[r] != cur.value[r])) {
+                    cur.mask = static_cast<uint16_t>(cur.mask & ~b);
+                }
+                if ((cur.load_mask & b) &&
+                    (!(snap.load_mask & b) ||
+                     snap.load_addr[r] != cur.load_addr[r])) {
+                    cur.load_mask = static_cast<uint16_t>(cur.load_mask & ~b);
+                }
+            }
+        }
+    };
 
     // Jump-table address tracking (MC-HP-000). The compiler builds a
     // dispatch like:  LDR Rb,=table ; LSL Ri,Ri,#k ; ADD Ra,Ri,Rb ;
@@ -319,6 +424,9 @@ void FunctionFinder::discover_one(uint32_t entry_addr, CpuMode entry_mode,
         // Exact entry count from the dispatcher's CMP-bound, when present.
         bool     count_known = false;
         uint32_t count       = 0;
+        // Unscaled `ldr Rt,[Rb,Ri]` (index pre-multiplied by 4 in code):
+        // only the base-relative `add pc,Rb,Rt` confirmation may accept it.
+        bool     relative_only = false;
     };
     PendingJt pend;
 
@@ -548,6 +656,37 @@ void FunctionFinder::discover_one(uint32_t entry_addr, CpuMode entry_mode,
         return true;
     };
 
+    // Stricter gate for a FUNCTION ENTRY reached only through a pointer
+    // value (stored code pointer, code-pointer array). Data that decodes
+    // cleanly is overwhelmingly cond=EQ in ARM (image pointers
+    // 0x02xxxxxx, small integers) or a non-AL nibble (ASCII), while a
+    // function entry starts unconditionally (flags are undefined at
+    // entry) and is mostly AL. ARM: the first instruction must be AL (or
+    // the unconditional 0xF space) and >= 3 of the first 6 AL (or all of
+    // them, when fewer than 3 are readable before the image ends).
+    auto looks_like_entry = [&](uint32_t tgt, CpuMode mode) -> bool {
+        if (!looks_like_code(tgt, mode, /*strict=*/true)) return false;
+        if (mode == CpuMode::Thumb) return true;
+        unsigned al = 0, seen = 0;
+        bool first_ok = true;
+        for (uint32_t j = 0; j < 6u; ++j) {
+            const uint32_t a = tgt + 4u * j;
+            if (!can_read_at(a, 4)) break;
+            const uint32_t c = read_u32(a) >> 28;
+            ++seen;
+            if (j == 0 && c < 0xEu) { first_ok = false; break; }
+            if (c >= 0xEu) ++al;
+        }
+        if (!first_ok || al < std::min(3u, seen)) {
+            ++stats_.entry_gate_rejects;
+            if (indirect_report_enabled()) {
+                std::fprintf(stderr, "[entry-gate] reject 0x%08X arm\n", tgt);
+            }
+            return false;
+        }
+        return true;
+    };
+
     // Recognize an abs32 jump table at `base` revealed by an indexed load
     // at `site_pc`. Mirrors the manual [[jump_table]] expansion in
     // main.cpp (mark table bytes as data + seed each entry) but derives
@@ -638,6 +777,39 @@ void FunctionFinder::discover_one(uint32_t entry_addr, CpuMode entry_mode,
             AutoJumpTable{base, stride, count, site_pc, entry_mode,
                           interworking, bounded});
         ++stats_.auto_jump_tables;
+    };
+
+    // Code-pointer array at `base`: control flow just went through a
+    // register loaded from `base`, so the word there is a code pointer,
+    // and arrays of them (static-init tables, ops/callback tables) keep
+    // going. Walk forward while each word passes the strict code gate;
+    // stop at a zero terminator or the first non-code word. Unlike a jump
+    // table the bytes are NOT marked as a data_range: the array can sit
+    // inside a larger mutable struct, and a wrong data_range is a hard
+    // build error, while a wrong extra seed only costs bloat.
+    auto emit_pointer_array = [&](uint32_t base, uint32_t site_pc,
+                                  bool interworking) {
+        if ((base & 3u) != 0 || !ptr_array_seen_.insert(base).second) return;
+        uint32_t n = 0;
+        for (uint32_t pos = base; n < 1024u; pos += 4, ++n) {
+            if (!can_read_at(pos, 4) || addr_in_data_range(pos)) break;
+            const uint32_t raw = read_u32(pos);
+            if (raw == 0) break;
+            const CpuMode tmode = interworking
+                ? ((raw & 1u) ? CpuMode::Thumb : CpuMode::Arm) : entry_mode;
+            const uint32_t tgt = raw & ~uint32_t{1};
+            if (!looks_like_entry(tgt, tmode)) break;
+            char nm[64];
+            std::snprintf(nm, sizeof nm, "parr%c_%08X",
+                          tmode == CpuMode::Thumb ? 't' : 'a', tgt);
+            mode_switch_seeds_.push_back(FunctionSeed{tgt, tmode, nm});
+            ++stats_.ptr_array_targets;
+        }
+        if (n != 0) ++stats_.ptr_arrays;
+        if (jt_report_enabled()) {
+            std::fprintf(stderr, "[parr] base=0x%08X site=0x%08X %s n=%u\n",
+                         base, site_pc, interworking ? "BX" : "MOVpc", n);
+        }
     };
 
     auto eval_dp_imm_pc_write = [&](const armv4t::Instr& i,
@@ -795,6 +967,12 @@ void FunctionFinder::discover_one(uint32_t entry_addr, CpuMode entry_mode,
 
         if (ins.is_undefined) {
             ++stats_.undefined_instr_count;
+            if (indirect_report_enabled()) {
+                std::fprintf(stderr,
+                    "[undefined] pc=0x%08X %s raw=0x%08X fn=0x%08X\n", pc,
+                    entry_mode == CpuMode::Thumb ? "thumb" : "arm",
+                    ins.raw, fn.addr);
+            }
             break;
         }
 
@@ -804,6 +982,28 @@ void FunctionFinder::discover_one(uint32_t entry_addr, CpuMode entry_mode,
             entry_mode == CpuMode::Thumb &&
             (ins.op == armv4t::IrOp::BL_prefix ||
              ins.op == armv4t::IrOp::BL_suffix);
+        // Return pad of a direct-branch call: `add lr,pc,#k; ...; b f`
+        // (DQ9 ov016 0x02196158). LR only becomes known through an explicit
+        // write in this walk (calls clobber it, entry state is unknown), so
+        // an unconditional non-linking B with LR known is a call whose
+        // callee returns to that address; nothing else ever targets it.
+        if (ins.op == armv4t::IrOp::B && ins.cond == armv4t::Cond::AL &&
+            !ins.is_indirect && reg_const[14].known) {
+            const uint32_t pad_raw = reg_const[14].value;
+            const uint32_t pad = pad_raw & ~uint32_t{1};
+            const CpuMode pad_mode = (pad_raw & 1u) ? CpuMode::Thumb
+                                                    : CpuMode::Arm;
+            if (pad != 0 && pad != ins.branch_target &&
+                can_read_at(pad, pad_mode == CpuMode::Thumb ? 2u : 4u) &&
+                !addr_in_data_range(pad) &&
+                looks_like_code(pad, pad_mode, /*strict=*/false)) {
+                char nm[64];
+                std::snprintf(nm, sizeof nm, "lpad%c_%08X",
+                              pad_mode == CpuMode::Thumb ? 't' : 'a', pad);
+                mode_switch_seeds_.push_back(FunctionSeed{pad, pad_mode, nm});
+                ++stats_.landing_pads_discovered;
+            }
+        }
         if (ins.is_branch && !ins.is_indirect &&
             ins.branch_target != 0 && !thumb_bl_half) {
             // BLX (immediate) switches instruction set: an ARM caller
@@ -826,6 +1026,9 @@ void FunctionFinder::discover_one(uint32_t entry_addr, CpuMode entry_mode,
             } else {
                 fn.direct_branch_targets.push_back(ins.branch_target);
                 ++stats_.branch_targets_discovered;
+                // B/Bcc (not a call): the target continues this path, so
+                // it inherits the tracker state as of the branch.
+                if (!ins.is_call) carry_state_to(ins.branch_target);
             }
         }
 
@@ -849,6 +1052,9 @@ void FunctionFinder::discover_one(uint32_t entry_addr, CpuMode entry_mode,
                 uint32_t full = ins.branch_target + lower.swi_imm;
                 full &= blx ? ~uint32_t{3} : ~uint32_t{1};
                 const CpuMode tmode = blx ? CpuMode::Arm : CpuMode::Thumb;
+                if (full != 0 && !can_read_at(full, blx ? 4u : 2u)) {
+                    external_targets_.emplace(visit_key(full, tmode), pc);
+                }
                 if (full != 0 && can_read_at(full, blx ? 4u : 2u)) {
                     if (addr_in_data_range(full)) {
                         record_collision(full, fn.addr, fn.name,
@@ -969,6 +1175,96 @@ void FunctionFinder::discover_one(uint32_t entry_addr, CpuMode entry_mode,
                 }
             }
 
+            // ARM branch-ladder switch: `add{cond} pc, pc, rX, lsl #2`
+            // jumps to slot pc+8+4*rX; each slot is (almost always) a
+            // `b caseK`. Size from the adjacent `cmp rX,#N` guard for
+            // LS/CC; otherwise (guard further upstream, e.g. `subs;
+            // addpl`, `cmp; addge`) walk slots while each is an
+            // unconditional B, requiring >= 2. A computed jump into
+            // straight-line code (unrolled division: `add pc,pc,r2,lsl#2`
+            // into `adcs/sublo` runs) fails that and stays unknown.
+            if (!indirect_resolved && entry_mode == CpuMode::Arm &&
+                ins.op == armv4t::IrOp::ADD && ins.rd == 15 &&
+                ins.rn == 15 &&
+                ins.op2.kind == armv4t::Op2::Kind::Shifted &&
+                !ins.op2.shifted.by_register &&
+                ins.op2.shifted.type == armv4t::ShiftType::LSL &&
+                ins.op2.shifted.imm_or_rs == 2 &&
+                ins.op2.shifted.rm < 15) {
+                const uint32_t slot0 = ins.pc + 8u;
+                uint32_t count = 0;
+                bool bounded = false;
+                if (last_cmp.known && last_cmp.reg == ins.op2.shifted.rm &&
+                    last_cmp.pc + 4u == ins.pc) {
+                    if (ins.cond == armv4t::Cond::LS) {
+                        count = last_cmp.imm + 1u;
+                        bounded = true;
+                    } else if (ins.cond == armv4t::Cond::CC &&
+                               last_cmp.imm > 0) {
+                        count = last_cmp.imm;
+                        bounded = true;
+                    }
+                }
+                auto slot_is_code = [&](uint32_t a, bool need_b) {
+                    if (!can_read_at(a, 4) || addr_in_data_range(a))
+                        return false;
+                    armv4t::Instr s = armv4t::ArmDecoder::decode(
+                        read_u32(a), a);
+                    if (s.is_undefined) return false;
+                    return !need_b || (s.op == armv4t::IrOp::B &&
+                                       s.cond == armv4t::Cond::AL);
+                };
+                uint32_t n = 0;
+                if (bounded) {
+                    if (count <= 1024u) {
+                        while (n < count && slot_is_code(slot0 + 4u * n, false))
+                            ++n;
+                        if (n != count) n = 0;  // a bounded slot isn't code
+                    }
+                } else {
+                    // Unbounded: walk slots that are an unconditional B or
+                    // an unconditional return (`pop {..,pc}` cases that
+                    // just return, e.g. `cmp r0,#63; bgt; cmp r0,#0;
+                    // addge pc,pc,r0,lsl#2` with mixed b/pop slots).
+                    // Needs >= 2 B slots so straight-line computed jumps
+                    // (unrolled division) stay rejected.
+                    uint32_t b_slots = 0;
+                    while (n < 1024u) {
+                        const uint32_t a = slot0 + 4u * n;
+                        if (slot_is_code(a, true)) { ++b_slots; ++n; continue; }
+                        if (!slot_is_code(a, false)) break;
+                        armv4t::Instr s = armv4t::ArmDecoder::decode(read_u32(a), a);
+                        if (!(s.is_return && s.cond == armv4t::Cond::AL)) break;
+                        ++n;
+                    }
+                    // Trailing returns past the last B are the function's
+                    // own epilogue, not slots we can prove; keep them, they
+                    // are code either way.
+                    if (b_slots < 2) n = 0;
+                }
+                const bool first = ladder_seen_sites_.insert(ins.pc).second;
+                if (first && jt_report_enabled()) {
+                    std::fprintf(stderr,
+                        "[ladder] site=0x%08X cond=%X bound=%s want=%u "
+                        "got=%u\n", ins.pc, static_cast<unsigned>(ins.cond),
+                        bounded ? "yes" : "no", count, n);
+                }
+                if (n != 0) {
+                    for (uint32_t k = 0; k < n; ++k) {
+                        enqueue_resolved_target(slot0 + 4u * k, entry_mode,
+                                                "jump_table");
+                    }
+                    indirect_resolved = true;
+                    ind_seeded = true;
+                    if (first) {
+                        ++stats_.branch_ladders;
+                        stats_.branch_ladder_slots += n;
+                    }
+                } else if (first) {
+                    ++stats_.branch_ladders_rejected;
+                }
+            }
+
             // Two cases land here with a tracked register source:
             //   1. BX Rm                  — `ins.rm` is the source
             //   2. MOV PC, Rn (DP-MOV)    — `ins.op2.shifted.rm`
@@ -983,15 +1279,18 @@ void FunctionFinder::discover_one(uint32_t entry_addr, CpuMode entry_mode,
                 // BX and BLX(reg) both interwork from Rm bit0.
                 src_reg = ins.rm;
                 src_is_bx = true;
-            } else if (ins.rd == 15 &&
+            } else if (ins.op == armv4t::IrOp::MOV && ins.rd == 15 &&
                        ins.op2.kind == armv4t::Op2::Kind::Shifted &&
                        !ins.op2.shifted.by_register &&
                        ins.op2.shifted.imm_or_rs == 0 &&
                        ins.op2.shifted.rm < 16) {
-                // DP write to PC with op2 = plain register: this is
-                // either `mov pc, Rn` (computed jump) or some other
-                // DP-PC pattern. If the source register is tracked,
-                // we know the target.
+                // `mov pc, Rn` (computed jump): if the source register is
+                // tracked, we know the target. Only MOV: for `add pc,Rt,Rb`
+                // op2 is just one addend (the base of a relative table),
+                // and taking it as the target seeded table bases as code
+                // and suppressed the call's landing pad (DQ9 ov016).
+                // ADD/SUB with both operands known are resolved above by
+                // eval_dp_reg_pc_write.
                 src_reg = ins.op2.shifted.rm;
             }
             if (src_reg < 16) {
@@ -1023,6 +1322,10 @@ void FunctionFinder::discover_one(uint32_t entry_addr, CpuMode entry_mode,
                         ind_seeded = true;
                     }
                 }
+            }
+            if (src_reg < 15 && reg_load[src_reg].known) {
+                emit_pointer_array(reg_load[src_reg].addr, ins.pc,
+                                   src_is_bx);
             }
             if (ins.op == armv4t::IrOp::BX &&
                 ins.rm != 14 &&
@@ -1121,6 +1424,38 @@ void FunctionFinder::discover_one(uint32_t entry_addr, CpuMode entry_mode,
             }
         }
 
+        // Call into a one-instruction `bx rN` veneer (`_call_via_rN`):
+        // the call goes through rN, so a load-tracked rN reveals a
+        // code-pointer array exactly like a direct `blx rN` would.
+        {
+            uint32_t veneer = 0;
+            CpuMode veneer_mode = entry_mode;
+            if (ins.op == armv4t::IrOp::BL && ins.branch_target != 0) {
+                veneer = ins.branch_target;
+            } else if (entry_mode == CpuMode::Thumb &&
+                       ins.op == armv4t::IrOp::BL_prefix &&
+                       can_read_at(pc + 2, 2)) {
+                armv4t::Instr lo = armv4t::ThumbDecoder::decode(
+                    read_u16(pc + 2), pc + 2);
+                if (lo.op == armv4t::IrOp::BL_suffix) {
+                    const bool blx = lo.branch_exchange;
+                    veneer = (ins.branch_target + lo.swi_imm) &
+                             (blx ? ~uint32_t{3} : ~uint32_t{1});
+                    veneer_mode = blx ? CpuMode::Arm : CpuMode::Thumb;
+                }
+            }
+            const uint32_t vstep = veneer_mode == CpuMode::Thumb ? 2u : 4u;
+            if (veneer != 0 && can_read_at(veneer, vstep)) {
+                armv4t::Instr v = veneer_mode == CpuMode::Thumb
+                    ? armv4t::ThumbDecoder::decode(read_u16(veneer), veneer)
+                    : armv4t::ArmDecoder::decode(read_u32(veneer), veneer);
+                if (v.op == armv4t::IrOp::BX && v.cond == armv4t::Cond::AL &&
+                    v.rm < 14 && reg_load[v.rm].known) {
+                    emit_pointer_array(reg_load[v.rm].addr, ins.pc, true);
+                }
+            }
+        }
+
         // Jump-table confirmation (MC-HP-000). If a candidate from a
         // prior indexed load is pending, check whether THIS instruction
         // uses the loaded register as a control-flow target. That
@@ -1177,7 +1512,77 @@ void FunctionFinder::discover_one(uint32_t entry_addr, CpuMode entry_mode,
                     }
                 }
             }
-            if (confirmed) {
+            // Base-relative offset table: `sub/add Rb,pc,#k;
+            // ldr Rt,[Rb,Ri,lsl#2]; add pc,Rb,Rt` — each word is an offset
+            // from the table base (hand-written dispatchers, e.g. codec
+            // state machines). Mode stays the dispatcher's.
+            bool relative = false;
+            if (ins.op == armv4t::IrOp::ADD && ins.rd == 15 &&
+                po.kind == armv4t::Op2::Kind::Shifted &&
+                !po.shifted.by_register && po.shifted.imm_or_rs == 0 &&
+                po.shifted.rm < 16 && ins.rn < 15) {
+                const uint8_t other = po.shifted.rm == pend.dest ? ins.rn
+                                    : (ins.rn == pend.dest ? po.shifted.rm : 255);
+                if (other < 15 && reg_const[other].known &&
+                    reg_const[other].value == pend.base) {
+                    relative = true;
+                }
+            }
+            if (relative) {
+                confirmed = false;  // not the MOV-pc form matched above
+                ++stats_.jt_confirmations;
+                if (jt_seen_bases_.insert(pend.base).second) {
+                    const uint32_t limit = pend.count_known ? pend.count : 256u;
+                    if (!pend.count_known && !pc_rel_bases_ready_) {
+                        pc_rel_bases_ready_ = true;
+                        for (std::size_t off = 0; off + 4 <= rom_size_; off += 4) {
+                            const uint32_t pc = rom_base_ + static_cast<uint32_t>(off);
+                            const armv4t::Instr d =
+                                armv4t::ArmDecoder::decode(read_u32(pc), pc);
+                            if (d.cond == armv4t::Cond::AL && d.rn == 15 && d.rd < 15 &&
+                                (d.op == armv4t::IrOp::ADD || d.op == armv4t::IrOp::SUB) &&
+                                d.op2.kind == armv4t::Op2::Kind::Imm) {
+                                pc_rel_bases_.insert(d.op == armv4t::IrOp::ADD
+                                    ? pc + 8u + d.op2.imm_value
+                                    : pc + 8u - d.op2.imm_value);
+                            }
+                        }
+                    }
+                    uint32_t n = 0;
+                    std::vector<FunctionSeed> rel_targets;
+                    for (; n < limit; ++n) {
+                        const uint32_t pos = pend.base + 4u * n;
+                        if (!can_read_at(pos, 4) || addr_in_data_range(pos)) break;
+                        // Unbounded walk: stop where another table begins.
+                        if (n > 0 && !pend.count_known && pc_rel_bases_.count(pos)) break;
+                        const uint32_t tgt = (pend.base + read_u32(pos)) &
+                            (entry_mode == CpuMode::Thumb ? ~uint32_t{1} : ~uint32_t{3});
+                        // Stop at the first word that is not an offset to
+                        // code; the table's own bytes are not a target.
+                        if (tgt >= pend.base && tgt < pend.base + 4u * (n + 1)) break;
+                        if (!looks_like_code(tgt, entry_mode, /*strict=*/true)) break;
+                        char nm[64];
+                        std::snprintf(nm, sizeof nm, "reljt_%08X_%02u", pend.base, n);
+                        rel_targets.push_back(FunctionSeed{tgt, entry_mode, nm});
+                    }
+                    if (jt_report_enabled()) {
+                        std::fprintf(stderr, "[jt] base=0x%08X site=0x%08X REL n=%u\n",
+                                     pend.base, ins.pc, n);
+                    }
+                    if (n >= 2 || (pend.count_known && n == pend.count)) {
+                        for (auto& t : rel_targets) {
+                            mode_switch_seeds_.push_back(t);
+                            ++stats_.auto_jump_table_targets;
+                        }
+                        data_ranges_.push_back(DataRange{pend.base, pend.base + 4u * n,
+                                                         "auto rel jump_table"});
+                        auto_jump_tables_.push_back(AutoJumpTable{pend.base, 4, n,
+                            ins.pc, entry_mode, false, pend.count_known});
+                        ++stats_.auto_jump_tables;
+                    }
+                }
+                pend.active = false;
+            } else if (confirmed && !pend.relative_only) {
                 ++stats_.jt_confirmations;
                 emit_jump_table(pend.base, pend.stride, ins.pc, interworking,
                                 pend.count_known ? pend.count : 0u);
@@ -1200,6 +1605,7 @@ void FunctionFinder::discover_one(uint32_t entry_addr, CpuMode entry_mode,
         if (jump_table_detection_enabled() && ins.op == armv4t::IrOp::LDR) {
             uint32_t jt_base = 0;
             bool jt = false;
+            bool unscaled = false;
             bool     count_known = false;
             uint32_t count = 0;
             if (ins.mem.by_register && ins.mem.rn < 16 &&
@@ -1217,6 +1623,22 @@ void FunctionFinder::discover_one(uint32_t entry_addr, CpuMode entry_mode,
                     count_known = true;
                     count = reg_bound[ireg].max_index + 1u;
                 }
+            } else if (ins.mem.by_register && ins.mem.rn < 15 &&
+                       ins.mem.pre_indexed && ins.mem.add &&
+                       ins.mem.reg_offset.rm < 15 &&
+                       ins.mem.reg_offset.rm != ins.mem.rn &&
+                       ins.mem.reg_offset.type == armv4t::ShiftType::LSL &&
+                       !ins.mem.reg_offset.by_register &&
+                       ins.mem.reg_offset.imm_or_rs == 0 &&
+                       reg_const[ins.mem.rn].known &&
+                       addr_in_rom(reg_const[ins.mem.rn].value)) {
+                // `ldr Rt,[Rb,Ri]` with Ri built as 0/4/8/.. (DQ9 ov016
+                // 0x021989CC: `sub r5,pc,#24; ... addne r8,#8; addge r8,#4;
+                // ldr r6,[r5,r8]; add pc,r5,r6`). Accepted only through the
+                // base-relative confirmation below.
+                jt_base = reg_const[ins.mem.rn].value;
+                jt = true;
+                unscaled = true;
             } else if (!ins.mem.by_register && ins.mem.rn < 16 &&
                        reg_table[ins.mem.rn].known &&
                        reg_table[ins.mem.rn].stride == 4) {
@@ -1240,6 +1662,7 @@ void FunctionFinder::discover_one(uint32_t entry_addr, CpuMode entry_mode,
                 pend.dest        = ins.rd;
                 pend.count_known = count_known;
                 pend.count       = count;
+                pend.relative_only = unscaled;
             }
         }
 
@@ -1330,7 +1753,7 @@ void FunctionFinder::discover_one(uint32_t entry_addr, CpuMode entry_mode,
                     can_read_at(ptr, ptr_mode == CpuMode::Thumb ? 2u : 4u) &&
                     !addr_in_data_range(ptr) &&
                     stored_ptr_seen_.insert(visit_key(ptr, ptr_mode)).second &&
-                    looks_like_code(ptr, ptr_mode, /*strict=*/true)) {
+                    looks_like_entry(ptr, ptr_mode)) {
                     char nm[64];
                     // Mode is part of the identity: the same address can
                     // be stored as both an ARM and a THUMB pointer, and
@@ -1403,8 +1826,22 @@ void FunctionFinder::discover_one(uint32_t entry_addr, CpuMode entry_mode,
             reg_sym[ins.block.rn].known = false;
             reg_scaled[ins.block.rn].known = false;
             reg_table[ins.block.rn].known = false;
+            if (ins.block.rn < 15) reg_load[ins.block.rn].known = false;
             invalidate_mem_base(ins.block.rn);
             invalidate_sym_base(ins.block.rn);
+        }
+        if (ins.op == armv4t::IrOp::LDM && ins.block.load) {
+            // Every loaded register is overwritten with memory contents.
+            for (int r = 0; r < 15; ++r) {
+                if ((ins.block.reg_list & (1u << r)) == 0) continue;
+                reg_const[r].known = false;
+                reg_sym[r].known = false;
+                reg_scaled[r].known = false;
+                reg_table[r].known = false;
+                reg_load[r].known = false;
+                invalidate_mem_base(static_cast<uint8_t>(r));
+                invalidate_sym_base(static_cast<uint8_t>(r));
+            }
         }
 
         // Update the narrow constant tracker. Do this AFTER the
@@ -1414,7 +1851,8 @@ void FunctionFinder::discover_one(uint32_t entry_addr, CpuMode entry_mode,
         // MOV Rd, #imm  →  track value
         // ADD Rd, PC, #imm  →  track (pc+8 ARM, pc+4 THUMB) + imm
         // Anything else writing Rd  →  invalidate
-        if (ins.rd < 16) {
+        const bool rd_written = ins.rd < 16 && writes_rd(ins);
+        if (rd_written) {
             if (ins.op == armv4t::IrOp::MOV &&
                 ins.op2.kind == armv4t::Op2::Kind::Imm) {
                 reg_const[ins.rd].known = true;
@@ -1449,14 +1887,16 @@ void FunctionFinder::discover_one(uint32_t entry_addr, CpuMode entry_mode,
                 } else {
                     reg_sym[ins.rd].known = false;
                 }
-            } else if (ins.op == armv4t::IrOp::ADD &&
+            } else if ((ins.op == armv4t::IrOp::ADD ||
+                        ins.op == armv4t::IrOp::SUB) &&
                        ins.rn == 15 &&
                        ins.op2.kind == armv4t::Op2::Kind::Imm) {
                 uint32_t pc_val = ins.pc +
                     (entry_mode == CpuMode::Thumb ? 4u : 8u);
                 if (entry_mode == CpuMode::Thumb) pc_val &= ~uint32_t{3};
                 reg_const[ins.rd].known = true;
-                reg_const[ins.rd].value = pc_val + ins.op2.imm_value;
+                reg_const[ins.rd].value = ins.op == armv4t::IrOp::ADD
+                    ? pc_val + ins.op2.imm_value : pc_val - ins.op2.imm_value;
                 reg_sym[ins.rd].known = false;
             } else if ((ins.op == armv4t::IrOp::ADD ||
                         ins.op == armv4t::IrOp::SUB) &&
@@ -1494,13 +1934,46 @@ void FunctionFinder::discover_one(uint32_t entry_addr, CpuMode entry_mode,
             }
             invalidate_mem_base(ins.rd);
             invalidate_sym_base(ins.rd);
+            if (ins.cond != armv4t::Cond::AL) {
+                no_carry = static_cast<uint16_t>(no_carry | (1u << ins.rd));
+            } else if (reg_const[ins.rd].known) {
+                no_carry = static_cast<uint16_t>(no_carry & ~(1u << ins.rd));
+            }
+            // Load-address lane: a word LDR from a static (non-literal-
+            // pool) in-image address, conditional or not.
+            reg_load[ins.rd].known = false;
+            uint32_t load_ea = 0;
+            if (ins.op == armv4t::IrOp::LDR && !ins.mem.writeback &&
+                !ins.mem.by_register && ins.mem.rn != 15 &&
+                eval_mem_imm_addr(ins, &load_ea) && (load_ea & 3u) == 0 &&
+                can_read_at(load_ea, 4)) {
+                reg_load[ins.rd] = {true, load_ea};
+            }
+        }
+        if (const uint16_t extra = extra_written_regs(ins)) {
+            for (int r = 0; r < 15; ++r) {
+                if ((extra & (1u << r)) == 0) continue;
+                reg_const[r].known = false;
+                reg_sym[r].known = false;
+                reg_scaled[r].known = false;
+                reg_table[r].known = false;
+                reg_load[r].known = false;
+                invalidate_mem_base(static_cast<uint8_t>(r));
+                invalidate_sym_base(static_cast<uint8_t>(r));
+            }
+        }
+        if (ins.is_call || ins.op == armv4t::IrOp::SWI) {
+            no_carry |= kCallClobbered;
+            for (int r = 0; r < 15; ++r) {
+                if (kCallClobbered & (1u << r)) reg_load[r].known = false;
+            }
         }
 
         // Maintain the jump-table address trackers (independent of the
         // reg_const tracker above; consumed by the LDR detection). A
         // write to Rd clears its scaled/table state unless this same
         // instruction re-establishes it.
-        if (ins.rd < 16) {
+        if (rd_written) {
             bool set_scaled = false, set_table = false;
             const armv4t::Op2& o = ins.op2;
             if (ins.op == armv4t::IrOp::MOV &&
@@ -1583,6 +2056,7 @@ void FunctionFinder::discover_one(uint32_t entry_addr, CpuMode entry_mode,
              ins.op == armv4t::IrOp::STRB ||
              ins.op == armv4t::IrOp::STRH) &&
             ins.mem.writeback && ins.mem.rn < 16) {
+            if (ins.mem.rn < 15) reg_load[ins.mem.rn].known = false;
             reg_const[ins.mem.rn].known = false;
             reg_sym[ins.mem.rn].known = false;
             reg_scaled[ins.mem.rn].known = false;
@@ -1648,6 +2122,327 @@ void FunctionFinder::discover_one(uint32_t entry_addr, CpuMode entry_mode,
     functions_.push_back(std::move(fn));
 }
 
+std::vector<FunctionFinder::ScanRegion>
+FunctionFinder::build_scan_regions() const {
+    // Image span minus code_copy sources, split into pieces.
+    std::vector<std::pair<uint32_t, uint32_t>> cuts;  // [lo, hi) source spans
+    for (const auto& cc : code_copies_) {
+        if (!addr_in_rom(cc.source_start)) continue;
+        uint64_t hi = static_cast<uint64_t>(cc.source_start) + cc.size;
+        uint64_t img_hi = static_cast<uint64_t>(rom_base_) + rom_size_;
+        cuts.emplace_back(cc.source_start,
+                          static_cast<uint32_t>(std::min(hi, img_hi)));
+    }
+    std::sort(cuts.begin(), cuts.end());
+    std::vector<ScanRegion> out;
+    uint64_t cur = rom_base_;
+    const uint64_t img_end = static_cast<uint64_t>(rom_base_) + rom_size_;
+    for (const auto& [lo, hi] : cuts) {
+        if (lo > cur) {
+            out.push_back(ScanRegion{static_cast<uint32_t>(cur),
+                                     static_cast<uint32_t>(lo - cur), {}});
+        }
+        cur = std::max<uint64_t>(cur, hi);
+    }
+    if (cur < img_end) {
+        out.push_back(ScanRegion{static_cast<uint32_t>(cur),
+                                 static_cast<uint32_t>(img_end - cur), {}});
+    }
+    for (const auto& cc : code_copies_) {
+        uint32_t src = 0;
+        if (!map_addr_to_source(cc.runtime_start, &src)) continue;
+        out.push_back(ScanRegion{cc.runtime_start, cc.size, {}});
+    }
+    for (auto& r : out) r.cover.assign(r.size, 0);
+    // Mark every walked body. end_addr is the linear walk end here.
+    for (const auto& fn : functions_) {
+        const uint8_t bit = fn.mode == CpuMode::Thumb ? 2u : 1u;
+        for (auto& r : out) {
+            if (fn.addr < r.start || fn.addr - r.start >= r.size) continue;
+            uint64_t end = std::min<uint64_t>(
+                std::max(fn.end_addr, fn.addr + 1u),
+                static_cast<uint64_t>(r.start) + r.size);
+            for (uint64_t a = fn.addr; a < end; ++a) r.cover[a - r.start] |= bit;
+            break;
+        }
+    }
+    return out;
+}
+
+bool FunctionFinder::validate_candidate(
+        uint32_t addr, CpuMode mode,
+        const std::vector<ScanRegion>& regions, bool strict) const {
+    auto cover_at = [&](uint32_t a, bool* inside) -> uint8_t {
+        for (const auto& r : regions) {
+            if (a >= r.start && a - r.start < r.size) {
+                *inside = true;
+                return r.cover[a - r.start];
+            }
+        }
+        *inside = false;
+        return 0;
+    };
+    static const uint32_t trace_addr = [] {
+        const char* e = std::getenv("NDSRECOMP_SCAN_TRACE");
+        return e ? static_cast<uint32_t>(std::strtoul(e, nullptr, 0)) : 0u;
+    }();
+    const bool trace = trace_addr != 0 && trace_addr == addr;
+#define REJECT(why) do { if (trace) std::fprintf(stderr, \
+        "[scan-trace] 0x%08X %s reject at 0x%08X: %s\n", addr, \
+        mode == CpuMode::Thumb ? "thumb" : "arm", pc, why); return false; } while (0)
+    const bool thumb = mode == CpuMode::Thumb;
+    const uint32_t step = thumb ? 2u : 4u;
+    uint32_t pc = addr;
+    if (addr & (step - 1u)) REJECT("align");
+    const uint8_t other_bit = thumb ? 1u : 2u;
+    constexpr uint32_t kMaxWalk = 384;
+    unsigned zero_run = 0;
+    unsigned non_al = 0;
+    bool flags_set = false;
+    for (uint32_t n = 0; n < kMaxWalk; ++n) {
+        bool inside = false;
+        const uint8_t cov = cover_at(pc, &inside);
+        if (!inside || !can_read_at(pc, step)) REJECT("outside");
+        if (cov & other_bit) REJECT("mode-conflict");           // mode conflict
+        if (n > 0 && (cov & (thumb ? 2u : 1u))) return true;  // joins known code
+        if (addr_in_data_range(pc)) REJECT("data-range");
+        armv4t::Instr ins = thumb
+            ? armv4t::ThumbDecoder::decode(read_u16(pc), pc)
+            : armv4t::ArmDecoder::decode(read_u32(pc), pc);
+        if (ins.is_undefined) REJECT("undefined");
+        const uint32_t raw = thumb ? read_u16(pc) : read_u32(pc);
+        if (raw == 0) {
+            // ARM `andeq r0,r0,r0` / THUMB `movs r0,r0`: zero fill.
+            if (!thumb || ++zero_run >= 2) REJECT("zero");
+        } else {
+            zero_run = 0;
+        }
+        // Flags are undefined at a function entry, so a conditional
+        // instruction before anything set them is data, not code. Real
+        // conditional runs (`cmp; ldrne; cmpne; strhne...`) pass this;
+        // random data words carry random condition nibbles and fail it.
+        const bool conditional = ins.cond != armv4t::Cond::AL &&
+                                 (thumb || (raw >> 28) != 0xFu);
+        if (conditional && !flags_set) REJECT("cond-before-flags");
+        if (!thumb) {
+            const uint32_t c = raw >> 28;
+            if (n == 0 && c < 0xEu) REJECT("first-not-AL");
+            // A long all-conditional run with flags set is still code
+            // (`cmp; ldrshne; cmpne; strhne x6; bxne`); only a wholly
+            // conditional window is suspicious.
+            if (c < 0xEu) ++non_al; else non_al = 0;
+            if (non_al > 24) REJECT("non-AL");
+        }
+        if (ins.set_flags || ins.op == armv4t::IrOp::CMP ||
+            ins.op == armv4t::IrOp::CMN || ins.op == armv4t::IrOp::TST ||
+            ins.op == armv4t::IrOp::TEQ) {
+            flags_set = true;
+        }
+        if (thumb && ins.op == armv4t::IrOp::BL_suffix) REJECT("orphan-bl");
+        uint32_t target = 0;
+        bool have_target = false;
+        if (thumb && ins.op == armv4t::IrOp::BL_prefix) {
+            if (!can_read_at(pc + 2, 2)) REJECT("bl-end");
+            armv4t::Instr lo = armv4t::ThumbDecoder::decode(read_u16(pc + 2), pc + 2);
+            if (lo.op != armv4t::IrOp::BL_suffix) REJECT("bl-prefix-alone");
+            target = (ins.branch_target + lo.swi_imm) &
+                     (lo.branch_exchange ? ~uint32_t{3} : ~uint32_t{1});
+            have_target = true;
+            pc += 2;  // consume the suffix too
+        } else if (ins.is_branch && !ins.is_indirect && ins.branch_target != 0) {
+            target = ins.branch_target & ~uint32_t{1};
+            have_target = true;
+        }
+        if (have_target) {
+            if (addr_in_data_range(target)) REJECT("target-data");
+            if (!can_read_at(target, 2)) {
+                // Cross-image control flow is normal (overlay -> main,
+                // main -> ITCM); accept a target outside this image only
+                // inside a DS code window (ITCM, main RAM, ARM7 WRAM).
+                const bool ds_code =
+                    (target >= 0x01FF8000u && target < 0x02400000u) ||
+                    (target >= 0x027E0000u && target < 0x02800000u) ||
+                    (target >= 0x037F8000u && target < 0x03810000u);
+                if (!ds_code) REJECT("target-outside");
+            }
+        }
+        pc += step;
+        // strict (terminator-sweep candidates, which have no pointer or
+        // prologue evidence): the linear path must end in a real return or
+        // a tail branch to an already-walked entry; joining known code
+        // above also counts.
+        if (ins.is_return && ins.cond == armv4t::Cond::AL) return true;
+        if (ins.is_return) continue;
+        if (ins.is_indirect && ins.cond == armv4t::Cond::AL && !ins.is_call) {
+            if (strict) { REJECT("strict-indirect"); }
+            return true;
+        }
+        if (ins.is_branch && !ins.is_indirect && !ins.is_call &&
+            ins.cond == armv4t::Cond::AL && !(thumb && ins.op == armv4t::IrOp::BL_prefix)) {
+            if (!strict) return true;
+            if (visited_.count(visit_key(target, mode)) == 0) { REJECT("strict-tail"); }
+            return true;
+        }
+    }
+    // kMaxWalk decoded instructions with every check above passing is a
+    // long straight-line body, not data.
+    if (strict) REJECT("no-terminator");
+    return true;
+#undef REJECT
+}
+
+std::vector<FunctionSeed> FunctionFinder::static_scan_candidates() {
+    std::vector<ScanRegion> regions = build_scan_regions();
+    std::vector<FunctionSeed> out;
+    std::unordered_set<uint64_t> picked;
+    auto in_exec_region = [&](uint32_t a) {
+        for (const auto& r : regions)
+            if (a >= r.start && a - r.start < r.size) return true;
+        return false;
+    };
+    std::unordered_set<uint64_t> rejected_now;
+    auto consider = [&](uint32_t tgt, CpuMode m, const char* tag,
+                        std::size_t* seeds, std::size_t* rejects,
+                        bool strict = false) {
+        const uint64_t k = visit_key(tgt, m);
+        if (visited_.count(k) || picked.count(k) || rejected_now.count(k)) return;
+        if (!validate_candidate(tgt, m, regions, strict)) {
+            rejected_now.insert(k);
+            ++*rejects;
+            return;
+        }
+        picked.insert(k);
+        char nm[64];
+        std::snprintf(nm, sizeof nm, "%s%c_%08X", tag,
+                      m == CpuMode::Thumb ? 't' : 'a', tgt);
+        out.push_back(FunctionSeed{tgt, m, nm});
+        ++*seeds;
+    };
+    for (const auto& c : pending_candidates_) {
+        if (!in_exec_region(c.addr)) continue;
+        consider(c.addr, c.mode, "ext", &stats_.extern_candidate_seeds,
+                 &stats_.extern_candidate_rejects);
+    }
+    pending_candidates_.clear();
+    // GapFill (terminator sweep): code after a walked body that ended at
+    // an unconditional terminator is usually the next function (leaf
+    // functions sit back to back after `bx lr`), possibly behind a literal
+    // pool. Try each following uncovered slot in the body's mode, skipping
+    // up to kPoolSkip pool words, and take the first that validates.
+    {
+        auto cover_of = [&](uint32_t a, bool* in) -> uint8_t {
+            for (const auto& r : regions)
+                if (a >= r.start && a - r.start < r.size) {
+                    *in = true;
+                    return r.cover[a - r.start];
+                }
+            *in = false;
+            return 0;
+        };
+        constexpr uint32_t kPoolSkip = 64;  // words
+        for (const auto& fn : functions_) {
+            const bool thumb = fn.mode == CpuMode::Thumb;
+            const uint32_t step = thumb ? 2u : 4u;
+            if (fn.end_addr < fn.addr + step) continue;
+            const uint32_t last = fn.end_addr - step;
+            if (!can_read_at(last, step)) continue;
+            armv4t::Instr li = thumb
+                ? armv4t::ThumbDecoder::decode(read_u16(last), last)
+                : armv4t::ArmDecoder::decode(read_u32(last), last);
+            if (li.is_undefined) continue;
+            const bool term = li.is_return ||
+                (li.is_indirect && !li.is_call && li.cond == armv4t::Cond::AL) ||
+                (li.is_branch && !li.is_call && !li.is_indirect &&
+                 li.cond == armv4t::Cond::AL);
+            if (!term) continue;
+            uint32_t a = fn.end_addr;
+            for (uint32_t n = 0; n < kPoolSkip * (thumb ? 2u : 1u); ++n, a += step) {
+                bool in = false;
+                if (cover_of(a, &in) != 0 || !in) break;
+                if (addr_in_data_range(a)) break;
+                const uint64_t k = visit_key(a, fn.mode);
+                if (visited_.count(k) || picked.count(k)) break;
+                if (thumb && (a & 3u)) continue;
+                if (validate_candidate(a, fn.mode, regions, /*strict=*/true)) {
+                    picked.insert(k);
+                    char nm[64];
+                    std::snprintf(nm, sizeof nm, "gapt%c_%08X",
+                                  thumb ? 't' : 'a', a);
+                    out.push_back(FunctionSeed{a, fn.mode, nm});
+                    ++stats_.gap_fill_seeds;
+                    break;
+                }
+            }
+        }
+    }
+    for (const auto& r : regions) {
+        // PointerHarvest: aligned words outside any walked body.
+        for (uint32_t off = (4u - (r.start & 3u)) & 3u; off + 4 <= r.size; off += 4) {
+            if (r.cover[off] | r.cover[off + 2]) continue;
+            const uint32_t a = r.start + off;
+            if (addr_in_data_range(a)) continue;
+            const uint32_t w = read_u32(a);
+            if (w < 0x100u) continue;
+            const CpuMode m = (w & 1u) ? CpuMode::Thumb : CpuMode::Arm;
+            const uint32_t t = w & ~uint32_t{1};
+            if (m == CpuMode::Arm && (t & 3u)) continue;
+            if (!in_exec_region(t)) continue;
+            consider(t, m, "ptr", &stats_.ptr_harvest_seeds,
+                     &stats_.ptr_harvest_rejects);
+        }
+        // GapFill: function prologues in uncovered bytes.
+        for (uint32_t off = (2u - (r.start & 1u)) & 1u; off + 2 <= r.size; off += 2) {
+            if (r.cover[off]) continue;
+            const uint32_t a = r.start + off;
+            if (addr_in_data_range(a)) continue;
+            if ((a & 3u) == 0 && off + 4 <= r.size && !r.cover[off + 2]) {
+                const uint32_t w = read_u32(a);
+                // stmdb sp!, {..., lr}, or its one-register form
+                // `str lr,[sp,#-4]!` (table-called wrappers in DQ9 ov016).
+                if ((w & 0xFFFF4000u) == 0xE92D4000u || w == 0xE52DE004u) {
+                    consider(a, CpuMode::Arm, "gap", &stats_.gap_fill_seeds,
+                             &stats_.gap_fill_rejects);
+                    continue;
+                }
+            }
+            const uint16_t h = read_u16(a);
+            // push {..., lr}. Only at 4-aligned addresses: the upper half of
+            // every ARM word sits at 2 mod 4, and ARM `ldrlt rX,[sp,..]`
+            // (0xB59Dxxxx) puts a perfect THUMB push there. The compilers
+            // here word-align THUMB functions (~95% of observed entries);
+            // the rest are reached by direct calls. Strict validation: a
+            // prologue followed by a branch to nowhere known is not trusted.
+            if ((a & 3u) == 0 && (h & 0xFF00u) == 0xB500u) {
+                consider(a, CpuMode::Thumb, "gap", &stats_.gap_fill_seeds,
+                         &stats_.gap_fill_rejects, /*strict=*/true);
+            }
+        }
+    }
+    // ARM before THUMB. The upper half of every ARM word is a plausible
+    // THUMB instruction stream, so a THUMB candidate is only judged once
+    // the ARM bodies around it exist and the mode-conflict check can see
+    // them. Defer harvested/gap THUMB candidates while any ARM candidate is
+    // pending; direct-call (ext) candidates carry real evidence and stay.
+    bool any_arm = false;
+    for (const auto& c : out)
+        if (c.mode == CpuMode::Arm) { any_arm = true; break; }
+    if (any_arm) {
+        std::vector<FunctionSeed> kept;
+        for (auto& c : out) {
+            if (c.mode == CpuMode::Thumb && c.name.rfind("ext", 0) != 0) {
+                ++deferred_thumb_;
+                // Re-found (and re-counted) in a later round.
+                if (c.name.rfind("ptr", 0) == 0) --stats_.ptr_harvest_seeds;
+                else                             --stats_.gap_fill_seeds;
+                continue;
+            }
+            kept.push_back(std::move(c));
+        }
+        out.swap(kept);
+    }
+    return out;
+}
+
 void FunctionFinder::run(std::size_t max_functions) {
     // Validate seeds against data_ranges before any walking. A seed
     // landing inside a data_range is a collision (the TOML author
@@ -1703,6 +2498,7 @@ void FunctionFinder::run(std::size_t max_functions) {
     }
 
     std::size_t pos = 0;
+    for (unsigned scan_round = 0;; ++scan_round) {
     while (pos < worklist.size() &&
            (functions_.size() < max_functions || required_remaining > 0)) {
         // Safety net: discovery must converge (worklist drains toward
@@ -1744,11 +2540,29 @@ void FunctionFinder::run(std::size_t max_functions) {
 
         std::size_t before = functions_.size();
         discover_one(s.addr, s.mode, s.name, s.source_addr, s.exact_size);
-        if (functions_.size() == before) continue;
+        if (functions_.size() == before) {
+            uint32_t src = 0;
+            if (s.source_addr == 0 && s.addr != 0 &&
+                !map_addr_to_source(s.addr, &src)) {
+                external_targets_.emplace(s_key, 0);
+            }
+            continue;
+        }
 
         // The function we just added is at the end of functions_.
         const Function& fn = functions_.back();
         std::vector<QueuedSeed> discovered_seeds;
+        static const bool prov = std::getenv("NDSRECOMP_PROVENANCE") != nullptr;
+        if (prov) {
+            for (uint32_t t : fn.direct_branch_targets)
+                std::fprintf(stderr, "[prov] %08X%c <- %08X%c\n", t,
+                             fn.mode == CpuMode::Thumb ? 't' : 'a', fn.addr,
+                             fn.mode == CpuMode::Thumb ? 't' : 'a');
+            for (const auto& ms : mode_switch_seeds_)
+                std::fprintf(stderr, "[prov] %08X%c <- %08X%c\n", ms.addr,
+                             ms.mode == CpuMode::Thumb ? 't' : 'a', fn.addr,
+                             fn.mode == CpuMode::Thumb ? 't' : 'a');
+        }
 
         // Each direct branch target becomes a new seed at the SAME
         // mode (control flow within a function doesn't switch
@@ -1795,6 +2609,23 @@ void FunctionFinder::run(std::size_t max_functions) {
             origin_mask[this_key] |= 2u;
         }
     }
+    // Static scan fixed point: harvest new candidates from the bytes the
+    // walk has not claimed, walk them, repeat. Candidates are required
+    // (they bypass max_functions) because they are validated entries.
+    if (!static_scan_ || authoritative_seeds_ || scan_round >= 32) break;
+    std::vector<FunctionSeed> cands = static_scan_candidates();
+    std::size_t added = 0;
+    for (auto& c : cands) {
+        uint64_t k = visit_key(c.addr, c.mode);
+        origin_mask[k] |= 2u;
+        if (!enqueued.insert(k).second) continue;
+        worklist.push_back(QueuedSeed{c, true});
+        ++required_remaining;
+        ++added;
+    }
+    ++stats_.static_scan_rounds;
+    if (added == 0) break;
+    }  // static-scan rounds
 
     // Apply exclude_func filter — remove functions whose entry
     // address was declared in [[exclude_func]].

@@ -52,6 +52,28 @@ target_include_directories(nds_recompile PRIVATE
 ndsrecomp_link_tomlpp(nds_recompile)
 target_link_libraries(nds_recompile PRIVATE nds_armv4t)
 
+# Pins cross-block register-constant carrying in the function finder (the
+# crt0 `ldr r1,=main; tst; bne; b; sub sp; bx r1` shape) and its soundness
+# rules for conditional writes and call-clobbered registers.
+add_executable(finder_carry_state_test
+    tests/finder_carry_state_test.cpp
+    finder/function_finder.cpp)
+target_include_directories(finder_carry_state_test PRIVATE
+    finder ${NDS_ARM_RECOMP_INCLUDE_DIRS})
+target_link_libraries(finder_carry_state_test PRIVATE nds_armv4t)
+add_test(NAME finder_carry_state COMMAND finder_carry_state_test)
+
+# Pins the whole-image static scan (PointerHarvest, GapFill, validated
+# cross-image candidates) and the return-slot ladder / base-relative jump
+# table idioms, including the precision rejects found on DQ9.
+add_executable(finder_static_scan_test
+    tests/finder_static_scan_test.cpp
+    finder/function_finder.cpp)
+target_include_directories(finder_static_scan_test PRIVATE
+    finder ${NDS_ARM_RECOMP_INCLUDE_DIRS})
+target_link_libraries(finder_static_scan_test PRIVATE nds_armv4t)
+add_test(NAME finder_static_scan COMMAND finder_static_scan_test)
+
 # Pins the interior-entry fail-closed contract: every generated body's resume
 # switch must keep its `default: runtime_dispatch_bad_entry(...); return;` arm.
 # Content-validated overlay banks rely on it — losing the arm would turn an
