@@ -219,7 +219,9 @@ independent:
 sha1 = "40-lowercase-hex-digits"
 
 [display]
-screen_layout = "stacked"          # stacked | separate
+screen_layout = "stacked"          # single | stacked | separate
+window_mode = "letterbox"          # letterbox | stretch | original (1:1)
+scaling = "integer"                # integer (pixel-perfect) | bilinear
 adaptive_widescreen = "none"       # none | top | bottom | both
 adaptive_capability = "top"        # exact-ROM capability; same choices
 adaptive_width = 448               # even width from 256 through 448
@@ -261,6 +263,26 @@ overrides are
 `NDS_SCREEN_LAYOUT` / `NDS_ADAPTIVE_WIDESCREEN` and the
 `--screen-layout` / `--adaptive-widescreen` CLI flags. Precedence is TOML,
 then environment, then CLI.
+
+`screen_layout = "single"` opens one window showing only the DS main screen:
+the LCD engine A is routed to (POWCNT1 bit 15), followed after the routing
+has held for 4 frames (both-blank fade frames do not count) and logged as
+`[display] main screen -> top|bottom`. The `[controls] screen_toggle` key
+(default `Grave`, the backtick) shows the other LCD until the main screen
+next changes. While engine A is on the top LCD, holding the virtual stylus
+key shows the bottom LCD for as long as it is held. Mouse clicks are touches
+only while the bottom LCD is shown. With internal resolution above 1x, the
+HD 3D compose follows engine A to whichever LCD it is on.
+
+`window_mode` places the image in each window: `letterbox` is the largest
+aspect-correct fit, `stretch` fills the window, and `original` is a strict
+1:1 image in physical pixels, centred. `scaling = "integer"` keeps whole-pixel
+multiples with nearest filtering (in `stretch`, independent X and Y factors;
+never below 1x); `bilinear` filters linearly to the exact rect. With the GL
+presenter, bilinear resamples the composed frame at its own sample density,
+so HD 3D keeps its detail. Both are in the runtime menu (Esc) and have
+`NDS_WINDOW_MODE` / `NDS_SCALING` and `--window-mode` / `--scaling`
+overrides.
 
 `startup_mode = "automatic"` sets the retail firmware's Automatic-mode flag
 in the runner's private in-memory firmware image. With a Slot-1 cartridge
