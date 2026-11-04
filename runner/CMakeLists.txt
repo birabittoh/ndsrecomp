@@ -1209,6 +1209,11 @@ ndsrecomp_link_tomlpp(frontend_config_test)
   target_include_directories(frontend_window_size_test PRIVATE src)
   add_test(NAME frontend_window_size_test COMMAND frontend_window_size_test)
 
+  add_executable(frontend_screen_route_test
+      tests/frontend_screen_route_test.cpp)
+  target_include_directories(frontend_screen_route_test PRIVATE src)
+  add_test(NAME frontend_screen_route_test COMMAND frontend_screen_route_test)
+
   add_executable(wfc_provider_test
       tests/wfc_provider_test.cpp
       src/net/wfc_provider.cpp)
