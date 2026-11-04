@@ -151,10 +151,16 @@ extern "C" const unsigned g_dispatch_fw_arm7_pictochat_room_a_len;
 namespace {
 
 std::vector<uint8_t> read_file(const std::string& p) {
-    std::ifstream f(p, std::ios::binary);
+    // One bulk read: the per-char istreambuf_iterator path cost ~0.6 s on a
+    // 256 MiB cartridge at every launch.
+    std::ifstream f(p, std::ios::binary | std::ios::ate);
     if (!f) return {};
-    return std::vector<uint8_t>((std::istreambuf_iterator<char>(f)),
-                                std::istreambuf_iterator<char>());
+    const std::streamoff size = f.tellg();
+    if (size <= 0) return {};
+    std::vector<uint8_t> data(static_cast<size_t>(size));
+    f.seekg(0);
+    if (!f.read(reinterpret_cast<char*>(data.data()), size)) return {};
+    return data;
 }
 
 bool verify(const std::vector<uint8_t>& data, const char* want,
