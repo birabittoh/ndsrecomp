@@ -73,6 +73,13 @@ void nds_gpu2d_finish_frame();
 // StartScanline order.
 void nds_gpu2d_vblank();
 const uint32_t* nds_gpu2d_framebuffer(int screen);
+// Engine A's routing for the frame nds_gpu2d_framebuffer() exposes, as the
+// scanlines latched it (POWCNT1 bit 15 of the last line), never the live
+// register: 0 when engine A ("main") drew the top LCD, 1 for the bottom.
+int nds_gpu2d_presented_main_screen();
+// True when neither LCD showed an image in that frame (each engine powered
+// off, force-blanked, or in display mode 0) -- a fade or transition frame.
+bool nds_gpu2d_presented_both_blank();
 // Host-only adaptive presentation surface. Returns the native framebuffer
 // with width=256 when no enhanced surface is active for this physical LCD.
 const uint32_t* nds_gpu2d_adaptive_framebuffer(int screen, uint16_t* width);
@@ -149,6 +156,10 @@ struct NdsGpu2dHdFrame {
 // Enabled only while internal resolution > 1. Emission costs an extra pair of
 // stores per pixel in the adaptive loop, so it stays off at 1x.
 void nds_gpu2d_set_hd_emit(bool enabled);
+// The physical LCD whose window consumes the HD surfaces (default 0, the
+// top). Surfaces are emitted only when engine A is routed to this LCD, so a
+// presenter never applies them to the wrong window.
+void nds_gpu2d_set_hd_screen(int screen);
 // Valid only after nds_gpu2d_adaptive_framebuffer() has run for this frame,
 // which is where the surfaces are filled.
 bool nds_gpu2d_hd_frame(NdsGpu2dHdFrame* out);

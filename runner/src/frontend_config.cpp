@@ -98,9 +98,12 @@ bool nds_parse_screen_layout(const std::string& value,
                              NdsScreenLayout* out) {
     if (!out) return false;
     const std::string normalized = lower_ascii(value);
-    if (normalized == "stacked" || normalized == "combined" ||
-        normalized == "single") {
+    if (normalized == "stacked" || normalized == "combined") {
         *out = NdsScreenLayout::Stacked;
+        return true;
+    }
+    if (normalized == "single" || normalized == "main") {
+        *out = NdsScreenLayout::Single;
         return true;
     }
     if (normalized == "separate" || normalized == "two-window" ||
@@ -563,7 +566,11 @@ bool nds_parse_local_wireless_base_port(const std::string& value,
 }
 
 const char* nds_screen_layout_name(NdsScreenLayout value) {
-    return value == NdsScreenLayout::Separate ? "separate" : "stacked";
+    switch (value) {
+        case NdsScreenLayout::Separate: return "separate";
+        case NdsScreenLayout::Single: return "single";
+        default: return "stacked";
+    }
 }
 
 const char* nds_window_mode_name(NdsWindowMode value) {
@@ -720,7 +727,8 @@ bool nds_load_frontend_config(const std::string& path,
                                          &options->screen_layout)) {
                 if (error) {
                     *error =
-                        "display.screen_layout must be stacked or separate";
+                        "display.screen_layout must be single, stacked, or "
+                        "separate";
                 }
                 return false;
             }
@@ -1034,6 +1042,14 @@ bool nds_load_frontend_config(const std::string& path,
     }
 
     if (const toml::table* controls = root["controls"].as_table()) {
+        if (const auto value =
+                (*controls)["screen_toggle"].value<std::string>()) {
+            if (!nds_set_virtual_stylus_binding(
+                    &options->screen_toggle_binding, *value)) {
+                if (error) *error = "controls.screen_toggle is too long";
+                return false;
+            }
+        }
         if (const toml::table* virtual_stylus =
                 (*controls)["virtual_stylus"].as_table()) {
             if (const auto value =
