@@ -92,6 +92,9 @@ struct NdsDispatchTiming {
     // populations end up in the record (this one here, the other in
     // dispatch_delta), so neither number is ambiguous.
     uint64_t cache_events[NDS_DISPATCH_CACHE_PATH_COUNT] = {};
+    // Dispatcher slow lookups by the class of the dispatch that made them
+    // (exact counts, not sampled).
+    uint64_t class_slow[NDS_DISPATCH_CLASS_COUNT] = {};
 };
 
 // One slot per CPU (0 = ARM9, 1 = ARM7), indexed by g_nds_active, matching
@@ -205,6 +208,8 @@ class NdsDispatchRegion {
     }
 
     ~NdsDispatchRegion() { close(); }
+
+    NdsDispatchClass cls() const { return cls_; }
 
     NdsDispatchRegion(const NdsDispatchRegion&) = delete;
     NdsDispatchRegion& operator=(const NdsDispatchRegion&) = delete;

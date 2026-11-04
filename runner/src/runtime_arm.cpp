@@ -34,6 +34,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <unordered_map>
 #include <unordered_set>
 #include <vector>
 #if !defined(NDEBUG)
@@ -86,6 +87,13 @@ std::string nds_dispatch_stats_json() {
             ",\"cache_hit_absent\":" + std::to_string(s.cache_hit_absent) +
             ",\"cache_slow_lookup\":" +
                 std::to_string(s.cache_slow_lookup) +
+            ",\"cache_slow_empty\":" + std::to_string(s.cache_slow_empty) +
+            ",\"cache_slow_collide\":" +
+                std::to_string(s.cache_slow_collide) +
+            ",\"cache_slow_epoch\":" + std::to_string(s.cache_slow_epoch) +
+            ",\"cache_slow_gen\":" + std::to_string(s.cache_slow_gen) +
+            ",\"cache_slow_gen_refresh\":" +
+                std::to_string(s.cache_slow_gen_refresh) +
             ",\"crs_push\":" + std::to_string(s.crs_push) +
             ",\"crs_hit\":" + std::to_string(s.crs_hit) +
             ",\"crs_miss\":" + std::to_string(s.crs_miss) +
@@ -299,6 +307,11 @@ static_assert(sizeof(CachedStaticLookup) == 128u);
 std::array<std::array<CachedStaticLookup, kDispatchCacheSize>, 2>
     g_dispatch_cache{};
 
+inline uint32_t dispatch_cache_index(uint32_t pc, bool thumb) {
+    return ((pc >> 1u) ^ (pc >> 13u) ^ uint32_t{thumb}) &
+        (kDispatchCacheSize - 1u);
+}
+
 void clear_dispatch_cache_cpu(unsigned cpu) {
     CachedStaticLookup empty{};
     for (CachedStaticLookup& slot : g_dispatch_cache[cpu & 1u])
@@ -508,12 +521,66 @@ bool cache_rejected_candidate_chain(const CpuCtx& c, uint32_t pc, bool thumb,
     return slot.page_count != 0u;
 }
 
+// ── Slow-lookup reason report (NDS_SLOW_LOOKUP_REPORT=1) ───────────────
+// Host-only diagnostic: classifies why a dispatch missed g_dispatch_cache and
+// whether the slow path could re-cache it, per guest PC, and prints the top
+// offenders at exit. Off unless the env var is set; one predicted branch.
+enum SlowReason : uint8_t { kSlowEmpty, kSlowCollide, kSlowEpoch, kSlowGen, kSlowReasonCount };
+struct SlowLookupDiag {
+    bool enabled = false;
+    struct Row { uint64_t n[kSlowReasonCount]{}; uint64_t uncached = 0; };
+    std::unordered_map<uint64_t, Row> rows;
+    std::unordered_map<uint32_t, uint64_t> gen_pages;
+    SlowLookupDiag() {
+        const char* v = std::getenv("NDS_SLOW_LOOKUP_REPORT");
+        enabled = v && *v && *v != '0';
+        if (enabled) std::atexit([] { report(); });
+    }
+    static void report();
+};
+// Heap-allocated and never destroyed: the atexit report registered from the
+// constructor would otherwise run after a static instance's destructor.
+SlowLookupDiag& g_slow_diag = *new SlowLookupDiag();
+void SlowLookupDiag::report() {
+    auto& d = g_slow_diag;
+    static const char* names[] = {"empty", "collide", "epoch", "gen"};
+    uint64_t tot[kSlowReasonCount]{}, unc = 0;
+    std::vector<std::pair<uint64_t, uint64_t>> order;
+    for (auto& [k, r] : d.rows) {
+        uint64_t sum = r.uncached;
+        for (int i = 0; i < kSlowReasonCount; ++i) { tot[i] += r.n[i]; sum += r.n[i]; }
+        unc += r.uncached;
+        order.push_back({sum, k});
+    }
+    std::sort(order.rbegin(), order.rend());
+    std::fprintf(stderr, "[slow-lookup] totals empty=%llu collide=%llu epoch=%llu gen=%llu uncached_results=%llu distinct_pcs=%zu\n",
+        (unsigned long long)tot[0], (unsigned long long)tot[1], (unsigned long long)tot[2],
+        (unsigned long long)tot[3], (unsigned long long)unc, d.rows.size());
+    for (size_t i = 0; i < order.size() && i < 40; ++i) {
+        const uint64_t k = order[i].second; const auto& r = d.rows[k];
+        std::fprintf(stderr, "[slow-lookup] cpu%u pc=%08X%s", unsigned(k >> 40), unsigned(k >> 1) & 0xFFFFFFFFu, (k & 1u) ? "T" : "A");
+        for (int j = 0; j < kSlowReasonCount; ++j) std::fprintf(stderr, " %s=%llu", names[j], (unsigned long long)r.n[j]);
+        std::fprintf(stderr, " uncached=%llu\n", (unsigned long long)r.uncached);
+    }
+    std::vector<std::pair<uint64_t, uint32_t>> pages;
+    for (auto& [pg, n] : d.gen_pages) pages.push_back({n, pg});
+    std::sort(pages.rbegin(), pages.rend());
+    for (size_t i = 0; i < pages.size() && i < 20; ++i)
+        std::fprintf(stderr, "[slow-lookup] gen-invalidating page %08X x%llu\n", pages[i].second, (unsigned long long)pages[i].first);
+}
+struct SlowLookupScope {
+    CachedStaticLookup* slot = nullptr; uint64_t key = 0;
+    ~SlowLookupScope() {
+        if (!slot) return;
+        if (!(slot->occupied && slot->pc == uint32_t(key >> 1) && slot->fn))
+            ++g_slow_diag.rows[key].uncached;
+    }
+};
+
 const CachedStaticLookup* lookup_static_cached_impl(const CpuCtx& c,
                                                     uint32_t pc, bool thumb) {
     auto& cache = g_dispatch_cache[g_nds_active];
-    CachedStaticLookup& slot =
-        cache[((pc >> 1u) ^ (pc >> 13u) ^ uint32_t{thumb}) &
-              (kDispatchCacheSize - 1u)];
+    CachedStaticLookup& slot = cache[dispatch_cache_index(pc, thumb)];
     if (slot.occupied && slot.dispatch_epoch == c.dispatch_epoch &&
         slot.pc == pc && slot.thumb == uint8_t{thumb} &&
         cached_lookup_live(slot)) {
@@ -526,7 +593,16 @@ const CachedStaticLookup* lookup_static_cached_impl(const CpuCtx& c,
         ++stats.cache_hit_absent;
         return nullptr;
     }
-    ++g_nds_dispatch_stats[g_nds_active].cache_slow_lookup;
+    {
+        NdsDispatchStats& stats = g_nds_dispatch_stats[g_nds_active];
+        ++stats.cache_slow_lookup;
+        if (!slot.occupied) ++stats.cache_slow_empty;
+        else if (slot.pc != pc || slot.thumb != uint8_t{thumb})
+            ++stats.cache_slow_collide;
+        else if (slot.dispatch_epoch != c.dispatch_epoch)
+            ++stats.cache_slow_epoch;
+        else ++stats.cache_slow_gen;
+    }
 #if !defined(NDS_MPH_SUBMIT_HLE) && !defined(NDS_MPH_MATH_HLE) && \
     !defined(NDS_MKDS_HLE)
     // Generation-only miss: same key, same epoch, a cached native hit, but a
@@ -548,11 +624,12 @@ const CachedStaticLookup* lookup_static_cached_impl(const CpuCtx& c,
     if (slot.occupied && slot.dispatch_epoch == c.dispatch_epoch &&
         slot.pc == pc && slot.thumb == uint8_t{thumb} && slot.fn &&
         slot.entry && slot.index_pos != UINT32_MAX &&
-        !live_overlay_enabled()) {
+        !g_slow_diag.enabled && !live_overlay_enabled()) {
         const NdsDispatchLookupResult again = nds_dispatch_lookup_run(
             c.dispatch_index, slot.index_pos, pc, thumb,
             dispatch_validation_live, nullptr);
         if (again.selected == slot.entry) {
+            ++g_nds_dispatch_stats[g_nds_active].cache_slow_gen_refresh;
             for (uint32_t i = 0; i < slot.page_count; ++i) {
                 slot.generation[i] = slot.generation_ptr[i]
                     ? *slot.generation_ptr[i]
@@ -562,6 +639,23 @@ const CachedStaticLookup* lookup_static_cached_impl(const CpuCtx& c,
         }
     }
 #endif
+    SlowLookupScope slow_scope;
+    if (g_slow_diag.enabled) [[unlikely]] {
+        SlowReason why = !slot.occupied ? kSlowEmpty
+            : (slot.pc != pc || slot.thumb != uint8_t{thumb}) ? kSlowCollide
+            : slot.dispatch_epoch != c.dispatch_epoch ? kSlowEpoch : kSlowGen;
+        const uint64_t key = (uint64_t{unsigned(g_nds_active)} << 40) |
+            (uint64_t{pc} << 1) | uint64_t{thumb};
+        ++g_slow_diag.rows[key].n[why];
+        if (why == kSlowGen) {
+            for (uint32_t i = 0; i < slot.page_count; ++i) {
+                const uint32_t live = slot.generation_ptr[i] ? *slot.generation_ptr[i]
+                    : bus_exec_page_generation(slot.page_addr[i]);
+                if (live != slot.generation[i]) ++g_slow_diag.gen_pages[slot.page_addr[i]];
+            }
+        }
+        slow_scope.slot = &slot; slow_scope.key = key;
+    }
 
     uint32_t candidate_count = 0u;
     const DispatchEntry* inactive_candidate = nullptr;
@@ -1829,6 +1923,9 @@ void runtime_dispatch_impl(uint32_t target_pc, NdsLinkSlot* linked) {
                            ? NDS_DISPATCH_CACHE_HIT_ABSENT
                            : NDS_DISPATCH_CACHE_SLOW);
             ++g_nds_dispatch_timing[g_nds_active].cache_events[cache_path];
+            if (cache_path == NDS_DISPATCH_CACHE_SLOW)
+                ++g_nds_dispatch_timing[g_nds_active]
+                      .class_slow[cost_region.cls()];
             cache_region.close_as(cache_path);
             // Refill the offered slot from the authoritative resolution.
             // Only when the slot's own target is the PC actually resolved

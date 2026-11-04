@@ -384,7 +384,10 @@ void write_dispatch_delta(const NdsDispatchStats& now,
         "\"literal_branch\":%llu,\"literal_call\":%llu,"
         "\"literal_fallthrough\":%llu,\"exception_dispatch\":%llu,"
         "\"cache_hit\":%llu,\"cache_hit_absent\":%llu,"
-        "\"cache_slow_lookup\":%llu,\"crs_push\":%llu,"
+        "\"cache_slow_lookup\":%llu,\"cache_slow_empty\":%llu,"
+        "\"cache_slow_collide\":%llu,\"cache_slow_epoch\":%llu,"
+        "\"cache_slow_gen\":%llu,\"cache_slow_gen_refresh\":%llu,"
+        "\"crs_push\":%llu,"
         "\"crs_hit\":%llu,\"crs_miss\":%llu,\"crs_scan_iters\":%llu}",
         (unsigned long long)sub_u64(now.resume_dispatch, before.resume_dispatch),
         (unsigned long long)sub_u64(now.dispatch_total, before.dispatch_total),
@@ -403,6 +406,15 @@ void write_dispatch_delta(const NdsDispatchStats& now,
                                     before.cache_hit_absent),
         (unsigned long long)sub_u64(now.cache_slow_lookup,
                                     before.cache_slow_lookup),
+        (unsigned long long)sub_u64(now.cache_slow_empty,
+                                    before.cache_slow_empty),
+        (unsigned long long)sub_u64(now.cache_slow_collide,
+                                    before.cache_slow_collide),
+        (unsigned long long)sub_u64(now.cache_slow_epoch,
+                                    before.cache_slow_epoch),
+        (unsigned long long)sub_u64(now.cache_slow_gen, before.cache_slow_gen),
+        (unsigned long long)sub_u64(now.cache_slow_gen_refresh,
+                                    before.cache_slow_gen_refresh),
         (unsigned long long)sub_u64(now.crs_push, before.crs_push),
         (unsigned long long)sub_u64(now.crs_hit, before.crs_hit),
         (unsigned long long)sub_u64(now.crs_miss, before.crs_miss),
@@ -426,7 +438,8 @@ void write_timing_delta(const NdsDispatchTiming& now,
     for (int i = 0; i < NDS_DISPATCH_CLASS_COUNT; ++i) {
         if (i) std::fputc(',', g_perf);
         std::fprintf(g_perf,
-                     "\"%s\":{\"ns\":%llu,\"samples\":%llu,\"events\":%llu}",
+                     "\"%s\":{\"ns\":%llu,\"samples\":%llu,\"events\":%llu,"
+                     "\"slow\":%llu}",
                      nds_dispatch_class_name(
                          static_cast<NdsDispatchClass>(i)),
                      (unsigned long long)sub_u64(now.class_ns[i],
@@ -434,7 +447,9 @@ void write_timing_delta(const NdsDispatchTiming& now,
                      (unsigned long long)sub_u64(now.class_samples[i],
                                                  before.class_samples[i]),
                      (unsigned long long)sub_u64(now.class_events[i],
-                                                 before.class_events[i]));
+                                                 before.class_events[i]),
+                     (unsigned long long)sub_u64(now.class_slow[i],
+                                                 before.class_slow[i]));
     }
     // Nested inside the class regions above -- a breakdown of where the
     // dispatch prologue spends its time, NOT an addend to class ns.

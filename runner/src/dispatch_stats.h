@@ -43,6 +43,15 @@ struct NdsDispatchStats {
     uint64_t cache_hit = 0;
     uint64_t cache_hit_absent = 0;
     uint64_t cache_slow_lookup = 0;
+    // Why each cache_slow_lookup missed the slot: empty, another key in the
+    // slot, dispatch_epoch moved, or a backing-page generation moved. gen_
+    // refresh is the subset of gen misses the cached-position revalidation
+    // settled without a fresh search.
+    uint64_t cache_slow_empty = 0;
+    uint64_t cache_slow_collide = 0;
+    uint64_t cache_slow_epoch = 0;
+    uint64_t cache_slow_gen = 0;
+    uint64_t cache_slow_gen_refresh = 0;
     uint64_t crs_push = 0;
     uint64_t crs_hit = 0;
     uint64_t crs_miss = 0;
