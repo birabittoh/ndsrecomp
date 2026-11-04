@@ -37,6 +37,22 @@ int main() {
         !require(!nds_parse_screen_layout("sideways", &layout)))
         return 1;
 
+    NdsWindowMode window_mode = NdsWindowMode::Letterbox;
+    NdsScalingFilter scaling = NdsScalingFilter::Integer;
+    if (!require(nds_parse_window_mode("Stretch", &window_mode)) ||
+        !require(window_mode == NdsWindowMode::Stretch) ||
+        !require(nds_parse_window_mode("1:1", &window_mode)) ||
+        !require(window_mode == NdsWindowMode::Original) ||
+        !require(nds_parse_window_mode("letterbox", &window_mode)) ||
+        !require(window_mode == NdsWindowMode::Letterbox) ||
+        !require(!nds_parse_window_mode("zoom", &window_mode)) ||
+        !require(nds_parse_scaling_filter("bilinear", &scaling)) ||
+        !require(scaling == NdsScalingFilter::Bilinear) ||
+        !require(nds_parse_scaling_filter("pixel-perfect", &scaling)) ||
+        !require(scaling == NdsScalingFilter::Integer) ||
+        !require(!nds_parse_scaling_filter("nearest", &scaling)))
+        return 40;
+
     NdsFullscreenMode fullscreen = NdsFullscreenMode::Off;
     if (!require(nds_parse_fullscreen_mode("off", &fullscreen)) ||
         !require(fullscreen == NdsFullscreenMode::Off) ||
@@ -470,6 +486,31 @@ int main() {
         !require(nds_load_runtime_quality_setting(&restarted)) ||
         !require(restarted.perf_governor_mode == NdsPerfGovernorMode::Auto))
         return 157;
+    {
+        std::ofstream file(path);
+        file << "[display]\n"
+                "window_mode = \"original\"\n"
+                "scaling = \"bilinear\"\n";
+    }
+    options = {};
+    if (!require(nds_load_frontend_config(path.string(), &options, &error)) ||
+        !require(options.window_mode == NdsWindowMode::Original) ||
+        !require(options.scaling == NdsScalingFilter::Bilinear))
+        return 41;
+
+    {
+        std::ofstream file(path);
+        file << "[display]\n"
+                "scaling = \"smooth\"\n";
+    }
+    options = {};
+    if (!require(
+            !nds_load_frontend_config(path.string(), &options, &error)))
+        return 42;
+    options = {};
+    if (!require(options.window_mode == NdsWindowMode::Letterbox) ||
+        !require(options.scaling == NdsScalingFilter::Integer))
+        return 43;
     std::filesystem::remove(path);
     return 0;
 }

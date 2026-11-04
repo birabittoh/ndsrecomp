@@ -4,6 +4,7 @@
 #include <cstdint>
 #include <vector>
 #include "../gpu2d.h"
+#include "../frontend_window_size.h"
 
 struct SDL_Window;
 struct NdsGpu2dDirectFrame;
@@ -37,6 +38,10 @@ bool nds_compute_host_has_visible_context();
 // ordinary presentation, capture hardware or performance measurements.
 bool nds_compute_host_read_presented(std::vector<uint32_t>& pixels,
                                       unsigned& width, unsigned& height);
+// Presentation geometry for the visible GL window, from [display]
+// window_mode / scaling. Takes effect on the next present.
+void nds_compute_host_set_present_mode(NdsWindowMode mode,
+                                       NdsScalingFilter scaling);
 bool nds_compute_host_present_top(const unsigned int* fallback_pixels,
                                   unsigned short fallback_width,
                                   const NdsGpu2dDirectFrame* direct_frame,

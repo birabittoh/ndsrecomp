@@ -340,4 +340,19 @@ void main()
 }
 )GLSL";
 
+// Bilinear final pass: the composed frame, rendered offscreen at its own
+// density, resampled linearly into the presentation rect. The offscreen image
+// was drawn with the same flipped-uv vertex shader, so its GL row 0 holds the
+// bottom DS row; flip back here.
+inline constexpr const char* kBlitFragment = R"GLSL(
+#version 430 core
+layout(binding = 7) uniform sampler2D source;
+in vec2 uv;
+out vec4 outColor;
+void main()
+{
+    outColor = texture(source, vec2(uv.x, 1.0 - uv.y));
+}
+)GLSL";
+
 }
