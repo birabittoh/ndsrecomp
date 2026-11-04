@@ -95,6 +95,35 @@ bool nds_apply_startup_mode(std::vector<uint8_t>& fw, NdsStartupMode mode) {
     return true;
 }
 
+bool nds_apply_firmware_language(std::vector<uint8_t>& fw,
+                                 NdsFirmwareLanguage language) {
+    if (language == NdsFirmwareLanguage::Preserve) return true;
+    const unsigned value = static_cast<unsigned>(language);
+    if (value > 6u) return false;
+    size_t user = 0;
+    if (!user_settings_base(fw, &user)) return false;
+    for (unsigned copy = 0; copy < 2; ++copy) {
+        const size_t base = user + size_t{copy} * 0x100u;
+        const uint16_t flags = get16(fw, base + 0x64u);
+        put16(fw, base + 0x64u,
+              static_cast<uint16_t>((flags & ~0x7u) | value));
+        put16(fw, base + kChecksumOffset,
+              nds_firmware_crc16(fw.data() + base, kChecksumLength, 0xFFFFu));
+        // GBATek "Extended Settings": +0x74 version (1), +0x75 language,
+        // +0x76 supported-language bitmask, +0xFE CRC16 over 0x74..0xFD.
+        if (fw[base + 0x74u] == 1u) {
+            fw[base + 0x75u] = static_cast<uint8_t>(value);
+            put16(fw, base + 0x76u,
+                  static_cast<uint16_t>(get16(fw, base + 0x76u) |
+                                        (1u << value)));
+            put16(fw, base + 0xFEu,
+                  nds_firmware_crc16(fw.data() + base + 0x74u, 0x8Au,
+                                     0xFFFFu));
+        }
+    }
+    return true;
+}
+
 // Wiimmfi (beads-yjp.1.11): two ndsrecomp instances booted from the SAME
 // firmware dump present the SAME console MAC, so Wiimmfi identity and DS
 // friend codes -- both derived from it -- collide: two such clients look

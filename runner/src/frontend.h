@@ -30,6 +30,21 @@ enum class NdsStartupMode : uint8_t {
     Automatic,
 };
 
+// Firmware user-settings language (user settings +0x64 bits 0-2). Preserve
+// leaves the dump's (or generated image's) language alone; every other value
+// is the firmware's own encoding and overrides the runner's private in-memory
+// copy, which games read to pick their text language.
+enum class NdsFirmwareLanguage : uint8_t {
+    Japanese = 0,
+    English = 1,
+    French = 2,
+    German = 3,
+    Italian = 4,
+    Spanish = 5,
+    Chinese = 6,
+    Preserve = 0xFF,
+};
+
 // Which boot path establishes the pre-game machine state. Lle executes the
 // real BIOS + firmware boot (the default and the oracle-diffed source of
 // truth). Direct is the opt-in melonDS SetupDirectBoot equivalent: the
@@ -233,6 +248,11 @@ struct NdsFrontendOptions {
     // "ndsrecomp". Sources, lowest to highest precedence: game.toml
     // [system] player_name, NDS_PLAYER_NAME, --player-name.
     std::string player_name;
+    // Firmware language (user settings +0x64 bits 0-2), applied to the
+    // in-memory image alongside player_name. Preserve (the default) is a
+    // no-op. Sources, lowest to highest precedence: game.toml [system]
+    // language, NDS_LANGUAGE, --language.
+    NdsFirmwareLanguage firmware_language = NdsFirmwareLanguage::Preserve;
     uint8_t adaptive_screens = NDS_ADAPTIVE_NONE;
     // Title-owned capability mask. A requested screen must be present here;
     // unsupported adaptive output fails closed instead of stretching pixels.
@@ -349,6 +369,10 @@ bool nds_apply_fullscreen_overrides(
 bool nds_parse_startup_mode(const std::string& value,
                             NdsStartupMode* out);
 bool nds_parse_boot_mode(const std::string& value, NdsBootMode* out);
+// preserve, or a language name / ISO 639-1 code: japanese|ja, english|en,
+// french|fr, german|de, italian|it, spanish|es, chinese|zh.
+bool nds_parse_firmware_language(const std::string& value,
+                                 NdsFirmwareLanguage* out);
 // 0..255 (fits the byte-wise MAC perturbation in main.cpp's
 // apply_instance_mac(), which wraps mod-256 exactly like melonDS's own u8
 // arithmetic -- see that function's comment for why a wider range would
@@ -385,6 +409,7 @@ const char* nds_screen_layout_name(NdsScreenLayout value);
 const char* nds_fullscreen_mode_name(NdsFullscreenMode value);
 const char* nds_startup_mode_name(NdsStartupMode value);
 const char* nds_boot_mode_name(NdsBootMode value);
+const char* nds_firmware_language_name(NdsFirmwareLanguage value);
 const char* nds_adaptive_screens_name(uint8_t value);
 const char* nds_frame_interpolation_name(NdsFrameInterpolation value);
 

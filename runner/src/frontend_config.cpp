@@ -399,6 +399,46 @@ bool nds_parse_boot_mode(const std::string& value, NdsBootMode* out) {
     return false;
 }
 
+bool nds_parse_firmware_language(const std::string& value,
+                                 NdsFirmwareLanguage* out) {
+    if (!out) return false;
+    const std::string normalized = lower_ascii(value);
+    static const struct {
+        const char* name;
+        const char* code;
+        NdsFirmwareLanguage language;
+    } kLanguages[] = {
+        {"preserve", "firmware", NdsFirmwareLanguage::Preserve},
+        {"japanese", "ja", NdsFirmwareLanguage::Japanese},
+        {"english", "en", NdsFirmwareLanguage::English},
+        {"french", "fr", NdsFirmwareLanguage::French},
+        {"german", "de", NdsFirmwareLanguage::German},
+        {"italian", "it", NdsFirmwareLanguage::Italian},
+        {"spanish", "es", NdsFirmwareLanguage::Spanish},
+        {"chinese", "zh", NdsFirmwareLanguage::Chinese},
+    };
+    for (const auto& entry : kLanguages) {
+        if (normalized == entry.name || normalized == entry.code) {
+            *out = entry.language;
+            return true;
+        }
+    }
+    return false;
+}
+
+const char* nds_firmware_language_name(NdsFirmwareLanguage value) {
+    switch (value) {
+        case NdsFirmwareLanguage::Japanese: return "japanese";
+        case NdsFirmwareLanguage::English: return "english";
+        case NdsFirmwareLanguage::French: return "french";
+        case NdsFirmwareLanguage::German: return "german";
+        case NdsFirmwareLanguage::Italian: return "italian";
+        case NdsFirmwareLanguage::Spanish: return "spanish";
+        case NdsFirmwareLanguage::Chinese: return "chinese";
+        default: return "preserve";
+    }
+}
+
 bool nds_parse_instance_index(const std::string& value, uint32_t* out) {
     if (!out || value.empty()) return false;
     char* end = nullptr;
@@ -526,6 +566,17 @@ bool nds_load_frontend_config(const std::string& path,
         // error message can name the value that actually won.
         if (const auto value = (*system)["player_name"].value<std::string>()) {
             options->player_name = *value;
+        }
+        if (const auto value = (*system)["language"].value<std::string>()) {
+            if (!nds_parse_firmware_language(*value,
+                                             &options->firmware_language)) {
+                if (error) {
+                    *error =
+                        "system.language must be preserve, japanese, english, "
+                        "french, german, italian, spanish, or chinese";
+                }
+                return false;
+            }
         }
         if (const auto value = (*system)["instance_index"].value<int64_t>()) {
             if (!nds_parse_instance_index(std::to_string(*value),

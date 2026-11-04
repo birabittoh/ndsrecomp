@@ -433,6 +433,7 @@ int main(int argc, char** argv) {
     std::string cli_boot_mode;
     std::string cli_identity_mac;
     std::string cli_player_name;
+    std::string cli_language;
     bool cli_generated_firmware = false;
     bool cli_freebios = false;
     std::string cli_instance_index;
@@ -639,6 +640,8 @@ int main(int argc, char** argv) {
             cli_identity_mac = argv[++i];
         } else if (a == "--player-name" && i + 1 < argc) {
             cli_player_name = argv[++i];
+        } else if (a == "--language" && i + 1 < argc) {
+            cli_language = argv[++i];
         } else if (a == "--instance-index" && i + 1 < argc) {
             cli_instance_index = argv[++i];
         } else if (a == "--net-ring-dump") {
@@ -749,6 +752,8 @@ int main(int argc, char** argv) {
                 "[--boot lle|direct] "
                 "[--generated-firmware] [--identity-mac AA:BB:CC:DD:EE:FF] "
                 "[--player-name NAME] "
+                "[--language preserve|japanese|english|french|german|"
+                "italian|spanish|chinese] "
                 "[--freebios] "
                 "[--instance-index 0..255] "
                 "[--discover-static-misses] [--rtc-host] "
@@ -937,6 +942,25 @@ int main(int argc, char** argv) {
             return 2;
         }
         frontend_options.freebios = enabled;
+    }
+    if (const char* value = std::getenv("NDS_LANGUAGE")) {
+        if (!nds_parse_firmware_language(
+                value, &frontend_options.firmware_language)) {
+            std::fprintf(stderr,
+                         "invalid NDS_LANGUAGE (expected preserve, japanese, "
+                         "english, french, german, italian, spanish, or "
+                         "chinese)\n");
+            return 2;
+        }
+    }
+    if (!cli_language.empty() &&
+        !nds_parse_firmware_language(cli_language,
+                                     &frontend_options.firmware_language)) {
+        std::fprintf(stderr,
+                     "invalid --language (expected preserve, japanese, "
+                     "english, french, german, italian, spanish, or "
+                     "chinese)\n");
+        return 2;
     }
     if (const char* value = std::getenv("NDS_PLAYER_NAME")) {
         frontend_options.player_name = value;
@@ -2090,6 +2114,18 @@ int main(int argc, char** argv) {
             "[firmware] player name: \"%s\" written to both user-settings "
             "copies (in-memory only; the dump on disk is untouched)\n",
             frontend_options.player_name.c_str());
+    }
+    if (!nds_apply_firmware_language(fw, frontend_options.firmware_language)) {
+        std::fprintf(stderr,
+            "refusing to start: cannot apply firmware language (malformed "
+            "firmware user-settings layout)\n");
+        return 1;
+    }
+    if (frontend_options.firmware_language != NdsFirmwareLanguage::Preserve) {
+        std::fprintf(stderr,
+            "[firmware] language: %s written to both user-settings copies "
+            "(in-memory only; the dump on disk is untouched)\n",
+            nds_firmware_language_name(frontend_options.firmware_language));
     }
     if (!nds_apply_instance_mac(fw, frontend_options.instance_index)) {
         std::fprintf(stderr,
