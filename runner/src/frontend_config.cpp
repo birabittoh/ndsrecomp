@@ -43,6 +43,41 @@ bool nds_parse_screen_layout(const std::string& value,
     return false;
 }
 
+bool nds_parse_window_mode(const std::string& value, NdsWindowMode* out) {
+    if (!out) return false;
+    const std::string normalized = lower_ascii(value);
+    if (normalized == "letterbox" || normalized == "fit") {
+        *out = NdsWindowMode::Letterbox;
+        return true;
+    }
+    if (normalized == "stretch") {
+        *out = NdsWindowMode::Stretch;
+        return true;
+    }
+    if (normalized == "original" || normalized == "1:1" ||
+        normalized == "native") {
+        *out = NdsWindowMode::Original;
+        return true;
+    }
+    return false;
+}
+
+bool nds_parse_scaling_filter(const std::string& value,
+                              NdsScalingFilter* out) {
+    if (!out) return false;
+    const std::string normalized = lower_ascii(value);
+    if (normalized == "integer" || normalized == "pixel-perfect" ||
+        normalized == "pixel_perfect") {
+        *out = NdsScalingFilter::Integer;
+        return true;
+    }
+    if (normalized == "bilinear" || normalized == "linear") {
+        *out = NdsScalingFilter::Bilinear;
+        return true;
+    }
+    return false;
+}
+
 bool nds_parse_fullscreen_mode(const std::string& value,
                                NdsFullscreenMode* out) {
     if (!out) return false;
@@ -463,6 +498,18 @@ const char* nds_screen_layout_name(NdsScreenLayout value) {
     return value == NdsScreenLayout::Separate ? "separate" : "stacked";
 }
 
+const char* nds_window_mode_name(NdsWindowMode value) {
+    switch (value) {
+        case NdsWindowMode::Stretch: return "stretch";
+        case NdsWindowMode::Original: return "original";
+        default: return "letterbox";
+    }
+}
+
+const char* nds_scaling_filter_name(NdsScalingFilter value) {
+    return value == NdsScalingFilter::Bilinear ? "bilinear" : "integer";
+}
+
 const char* nds_frame_interpolation_name(NdsFrameInterpolation value) {
     return value == NdsFrameInterpolation::Blend ? "blend" : "off";
 }
@@ -606,6 +653,25 @@ bool nds_load_frontend_config(const std::string& path,
                 if (error) {
                     *error =
                         "display.screen_layout must be stacked or separate";
+                }
+                return false;
+            }
+        }
+        if (const auto value =
+                (*display)["window_mode"].value<std::string>()) {
+            if (!nds_parse_window_mode(*value, &options->window_mode)) {
+                if (error) {
+                    *error =
+                        "display.window_mode must be letterbox, stretch, or "
+                        "original";
+                }
+                return false;
+            }
+        }
+        if (const auto value = (*display)["scaling"].value<std::string>()) {
+            if (!nds_parse_scaling_filter(*value, &options->scaling)) {
+                if (error) {
+                    *error = "display.scaling must be integer or bilinear";
                 }
                 return false;
             }

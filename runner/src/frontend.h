@@ -4,6 +4,7 @@
 #include <string>
 
 #include "cartridge_config.h"
+#include "frontend_window_size.h"
 #include "perf_governor.h"
 #include "../../launcher/nds_input_bindings.h"
 
@@ -212,6 +213,12 @@ struct NdsFrontendOptions {
     std::string game_name;
     NdsScreenLayout screen_layout = NdsScreenLayout::Stacked;
     NdsFullscreenMode fullscreen = NdsFullscreenMode::Off;
+    // Host presentation geometry ([display] window_mode / scaling). The
+    // defaults reproduce the historical SDL path: an aspect-correct,
+    // pixel-perfect integer fit. Both are live-adjustable from the runtime
+    // menu and never touch guest-visible bytes.
+    NdsWindowMode window_mode = NdsWindowMode::Letterbox;
+    NdsScalingFilter scaling = NdsScalingFilter::Integer;
     // Zero preserves the standalone runner's historical 2x sizing. Title
     // launchers can request 1..8x with display-DPI-aware desktop fitting.
     uint8_t window_scale = 0;
@@ -356,6 +363,11 @@ bool nds_parse_screen_layout(const std::string& value,
                              NdsScreenLayout* out);
 bool nds_parse_fullscreen_mode(const std::string& value,
                                NdsFullscreenMode* out);
+// letterbox | stretch | original (aliases: fit, 1:1, native).
+bool nds_parse_window_mode(const std::string& value, NdsWindowMode* out);
+// integer | bilinear (aliases: pixel-perfect, linear).
+bool nds_parse_scaling_filter(const std::string& value,
+                              NdsScalingFilter* out);
 enum class NdsFullscreenOverrideError : uint8_t {
     None,
     Environment,
@@ -407,6 +419,8 @@ bool nds_parse_local_wireless_base_port(const std::string& value,
                                         uint16_t* out);
 const char* nds_screen_layout_name(NdsScreenLayout value);
 const char* nds_fullscreen_mode_name(NdsFullscreenMode value);
+const char* nds_window_mode_name(NdsWindowMode value);
+const char* nds_scaling_filter_name(NdsScalingFilter value);
 const char* nds_startup_mode_name(NdsStartupMode value);
 const char* nds_boot_mode_name(NdsBootMode value);
 const char* nds_firmware_language_name(NdsFirmwareLanguage value);

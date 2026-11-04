@@ -406,6 +406,8 @@ int main(int argc, char** argv) {
     std::string config_path = "game.toml";
     std::string cli_screen_layout;
     std::string cli_fullscreen;
+    std::string cli_window_mode;
+    std::string cli_scaling;
     std::string cli_adaptive_screens;
     std::string cli_widescreen_width;
     std::string cli_supersampling;
@@ -563,6 +565,10 @@ int main(int argc, char** argv) {
             if (pad) frontend_options.custom_gamepad_bindings = true;
         } else if (a == "--fullscreen" && i + 1 < argc) {
             cli_fullscreen = argv[++i];
+        } else if (a == "--window-mode" && i + 1 < argc) {
+            cli_window_mode = argv[++i];
+        } else if (a == "--scaling" && i + 1 < argc) {
+            cli_scaling = argv[++i];
         } else if (a == "--adaptive-widescreen" && i + 1 < argc) {
             cli_adaptive_screens = argv[++i];
         } else if (a == "--widescreen-width" && i + 1 < argc) {
@@ -720,6 +726,8 @@ int main(int argc, char** argv) {
                 "[--config game.toml] "
                 "[--screen-layout stacked|separate] "
                 "[--fullscreen off|borderless|exclusive] "
+                "[--window-mode letterbox|stretch|original] "
+                "[--scaling integer|bilinear] "
                 "[--adaptive-widescreen none|top|bottom|both] "
                 "[--widescreen-width even:256..448] "
                 "[--supersampling 1|2|3|4] "
@@ -826,6 +834,21 @@ int main(int argc, char** argv) {
             std::fprintf(stderr,
                          "invalid NDS_SCREEN_LAYOUT "
                          "(expected stacked or separate)\n");
+            return 2;
+        }
+    }
+    if (const char* value = std::getenv("NDS_WINDOW_MODE")) {
+        if (!nds_parse_window_mode(value, &frontend_options.window_mode)) {
+            std::fprintf(stderr,
+                         "invalid NDS_WINDOW_MODE "
+                         "(expected letterbox, stretch, or original)\n");
+            return 2;
+        }
+    }
+    if (const char* value = std::getenv("NDS_SCALING")) {
+        if (!nds_parse_scaling_filter(value, &frontend_options.scaling)) {
+            std::fprintf(stderr,
+                         "invalid NDS_SCALING (expected integer or bilinear)\n");
             return 2;
         }
     }
@@ -985,6 +1008,20 @@ int main(int argc, char** argv) {
         std::fprintf(stderr,
                      "invalid --screen-layout "
                      "(expected stacked or separate)\n");
+        return 2;
+    }
+    if (!cli_window_mode.empty() &&
+        !nds_parse_window_mode(cli_window_mode,
+                               &frontend_options.window_mode)) {
+        std::fprintf(stderr,
+                     "invalid --window-mode "
+                     "(expected letterbox, stretch, or original)\n");
+        return 2;
+    }
+    if (!cli_scaling.empty() &&
+        !nds_parse_scaling_filter(cli_scaling, &frontend_options.scaling)) {
+        std::fprintf(stderr,
+                     "invalid --scaling (expected integer or bilinear)\n");
         return 2;
     }
     if (!cli_adaptive_screens.empty() &&
