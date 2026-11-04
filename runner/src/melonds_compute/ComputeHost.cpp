@@ -47,6 +47,10 @@ GLuint g_compose_fbo = 0;
 GLuint g_compose_texture = 0;
 int g_compose_width = 0;
 int g_compose_height = 0;
+GLuint g_overlay_texture = 0;
+int g_overlay_texture_width = 0;
+const uint32_t* g_overlay_pixels = nullptr;
+unsigned g_overlay_width = 0;
 
 // GL identity, captured once the context is current. Fixed buffers rather
 // than std::string: this is read from the diagnostics sampler, and the
@@ -184,6 +188,7 @@ bool start_presenter()
     if (!g_blit_program) return false;
     glGenFramebuffers(1, &g_compose_fbo);
     glGenTextures(1, &g_compose_texture);
+    glGenTextures(1, &g_overlay_texture);
     glGenVertexArrays(1, &g_present_vao);
     glGenTextures(2, g_fallback_texture);
     glGenTextures(2, g_object_texture);
@@ -198,6 +203,9 @@ void stop_presenter()
     if (g_compose_fbo) glDeleteFramebuffers(1, &g_compose_fbo);
     if (g_compose_texture) glDeleteTextures(1, &g_compose_texture);
     if (g_blit_program) glDeleteProgram(g_blit_program);
+    if (g_overlay_texture) glDeleteTextures(1, &g_overlay_texture);
+    g_overlay_texture = 0;
+    g_overlay_texture_width = 0;
     g_compose_fbo = 0;
     g_compose_texture = 0;
     g_blit_program = 0;
@@ -439,6 +447,12 @@ bool nds_compute_host_read_presented(std::vector<uint32_t>& pixels,
     return true;
 }
 
+void nds_compute_host_set_overlay(const uint32_t* argb, unsigned width)
+{
+    g_overlay_pixels = width > 0 && width <= 448 ? argb : nullptr;
+    g_overlay_width = g_overlay_pixels ? width : 0;
+}
+
 void nds_compute_host_set_present_mode(NdsWindowMode mode,
                                        NdsScalingFilter scaling)
 {
@@ -617,7 +631,37 @@ bool nds_compute_host_present_top(const unsigned int* fallback_pixels,
         glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER,
                         minify ? GL_LINEAR_MIPMAP_LINEAR : GL_LINEAR);
         glUseProgram(g_blit_program);
+        glUniform1ui(0, 0u);
         glDrawArrays(GL_TRIANGLES, 0, 3);
+    }
+    if (g_overlay_pixels) {
+        glBindFramebuffer(GL_FRAMEBUFFER, 0);
+        glViewport(rect.x, viewport_y, rect.w, rect.h);
+        glActiveTexture(GL_TEXTURE7);
+        glBindTexture(GL_TEXTURE_2D, g_overlay_texture);
+        const int overlay_width = static_cast<int>(g_overlay_width);
+        if (g_overlay_texture_width != overlay_width) {
+            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S,
+                            GL_CLAMP_TO_EDGE);
+            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T,
+                            GL_CLAMP_TO_EDGE);
+            glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, overlay_width, 192, 0,
+                         GL_BGRA, GL_UNSIGNED_BYTE, nullptr);
+            g_overlay_texture_width = overlay_width;
+        }
+        glPixelStorei(GL_UNPACK_ALIGNMENT, 4);
+        glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, overlay_width, 192, GL_BGRA,
+                        GL_UNSIGNED_BYTE, g_overlay_pixels);
+        const GLint filter = g_scaling == NdsScalingFilter::Bilinear
+            ? GL_LINEAR : GL_NEAREST;
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, filter);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, filter);
+        glEnable(GL_BLEND);
+        glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+        glUseProgram(g_blit_program);
+        glUniform1ui(0, 1u);
+        glDrawArrays(GL_TRIANGLES, 0, 3);
+        glDisable(GL_BLEND);
     }
     ticks->draw += SDL_GetPerformanceCounter() - start;
 

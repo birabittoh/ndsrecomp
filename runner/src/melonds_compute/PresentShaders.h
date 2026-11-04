@@ -340,18 +340,21 @@ void main()
 }
 )GLSL";
 
-// Bilinear final pass: the composed frame, rendered offscreen at its own
-// density, resampled linearly into the presentation rect. The offscreen image
-// was drawn with the same flipped-uv vertex shader, so its GL row 0 holds the
-// bottom DS row; flip back here.
+// Final resample pass into the presentation rect. Bilinear presents the
+// composed frame, rendered offscreen at its own density; that image was drawn
+// with the same flipped-uv vertex shader, so its GL row 0 holds the bottom DS
+// row and it is flipped back (sourceTopDown = 0). The frontend overlay is
+// uploaded top row first (sourceTopDown = 1) and alpha-blended.
 inline constexpr const char* kBlitFragment = R"GLSL(
 #version 430 core
 layout(binding = 7) uniform sampler2D source;
+layout(location = 0) uniform uint sourceTopDown;
 in vec2 uv;
 out vec4 outColor;
 void main()
 {
-    outColor = texture(source, vec2(uv.x, 1.0 - uv.y));
+    outColor = texture(source,
+        vec2(uv.x, sourceTopDown != 0u ? uv.y : 1.0 - uv.y));
 }
 )GLSL";
 
