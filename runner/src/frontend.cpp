@@ -1184,6 +1184,8 @@ uint64_t framebuffer_rgb_fnv(int screen) {
 
 constexpr const char* kRuntimeMouseSensitivityKey =
     "input.mouse_sensitivity";
+constexpr const char* kRuntimeWindowModeKey = "display.window_mode";
+constexpr const char* kRuntimeScalingKey = "display.scaling";
 constexpr const char* kRuntimeResumeKey = "system.resume";
 constexpr const char* kRuntimeQuitKey = "system.quit";
 
@@ -1193,7 +1195,11 @@ struct RuntimeMenuState {
     bool close_requested = false;
 };
 
-bool save_runtime_mouse_sensitivity(const std::string& path, uint16_t value) {
+// Rewrites (or appends) each key=value pair in the launcher-owned settings
+// file, keeping every other line as it was.
+bool save_runtime_settings(
+        const std::string& path,
+        const std::vector<std::pair<std::string, std::string>>& values) {
     if (path.empty()) return false;
     std::filesystem::path settings(path);
     std::error_code error;
@@ -1203,7 +1209,7 @@ bool save_runtime_mouse_sensitivity(const std::string& path, uint16_t value) {
     }
 
     std::vector<std::string> lines;
-    bool found = false;
+    std::vector<bool> found(values.size(), false);
     bool saw_version = false;
     {
         std::ifstream in(settings);
@@ -1213,9 +1219,10 @@ bool save_runtime_mouse_sensitivity(const std::string& path, uint16_t value) {
             if (equals != std::string::npos) {
                 const std::string key = line.substr(0, equals);
                 if (key == "settings_version") saw_version = true;
-                if (key == "mouse_sensitivity") {
-                    line = "mouse_sensitivity=" + std::to_string(value);
-                    found = true;
+                for (size_t i = 0; i < values.size(); ++i) {
+                    if (key != values[i].first) continue;
+                    line = values[i].first + "=" + values[i].second;
+                    found[i] = true;
                 }
             }
             lines.push_back(line);
@@ -1223,8 +1230,10 @@ bool save_runtime_mouse_sensitivity(const std::string& path, uint16_t value) {
     }
     if (!saw_version)
         lines.insert(lines.begin(), "settings_version=12");
-    if (!found)
-        lines.push_back("mouse_sensitivity=" + std::to_string(value));
+    for (size_t i = 0; i < values.size(); ++i) {
+        if (!found[i])
+            lines.push_back(values[i].first + "=" + values[i].second);
+    }
 
     std::ofstream out(settings, std::ios::trunc);
     if (!out) return false;
@@ -1241,6 +1250,14 @@ int runtime_menu_get_value(void* context, const RecompRuntimeUiItem* item,
         *value_out = state->options->relative_mouse_sensitivity;
         return 1;
     }
+    if (std::strcmp(item->key, kRuntimeWindowModeKey) == 0) {
+        *value_out = static_cast<int>(state->options->window_mode);
+        return 1;
+    }
+    if (std::strcmp(item->key, kRuntimeScalingKey) == 0) {
+        *value_out = static_cast<int>(state->options->scaling);
+        return 1;
+    }
     return 0;
 }
 
@@ -1253,6 +1270,22 @@ int runtime_menu_set_value(void* context, const RecompRuntimeUiItem* item,
         state->options->relative_mouse_sensitivity =
             static_cast<uint16_t>(value);
         std::fprintf(stderr, "[sdl] mouse sensitivity set to %d%%\n", value);
+        return 1;
+    }
+    if (std::strcmp(item->key, kRuntimeWindowModeKey) == 0) {
+        if (value < 0 || value > static_cast<int>(NdsWindowMode::Original))
+            return 0;
+        state->options->window_mode = static_cast<NdsWindowMode>(value);
+        std::fprintf(stderr, "[display] window mode -> %s\n",
+                     nds_window_mode_name(state->options->window_mode));
+        return 1;
+    }
+    if (std::strcmp(item->key, kRuntimeScalingKey) == 0) {
+        if (value < 0 || value > static_cast<int>(NdsScalingFilter::Bilinear))
+            return 0;
+        state->options->scaling = static_cast<NdsScalingFilter>(value);
+        std::fprintf(stderr, "[display] scaling -> %s\n",
+                     nds_scaling_filter_name(state->options->scaling));
         return 1;
     }
     return 0;
@@ -1283,11 +1316,14 @@ int runtime_menu_is_enabled(void* context, const RecompRuntimeUiItem* item) {
 void runtime_menu_save(void* context) {
     auto* state = static_cast<RuntimeMenuState*>(context);
     if (!state || !state->options) return;
-    if (save_runtime_mouse_sensitivity(
-            state->options->runtime_settings_path,
-            state->options->relative_mouse_sensitivity)) {
-        std::fprintf(stderr,
-                     "[sdl] saved mouse sensitivity to runtime settings\n");
+    const NdsFrontendOptions& options = *state->options;
+    if (save_runtime_settings(
+            options.runtime_settings_path,
+            {{"mouse_sensitivity",
+              std::to_string(options.relative_mouse_sensitivity)},
+             {"window_mode", nds_window_mode_name(options.window_mode)},
+             {"scaling", nds_scaling_filter_name(options.scaling)}})) {
+        std::fprintf(stderr, "[sdl] saved runtime settings\n");
     }
 }
 
@@ -2633,7 +2669,17 @@ int nds_run_interactive_frontend(const NdsFrontendOptions& initial_options) {
     nds_set_touch(0, 0, false);
     bool running = true;
     RuntimeMenuState runtime_menu_state{&options, &running, false};
+    static const char* const window_mode_choices[] = {
+        "Letterbox", "Stretch", "Original (1:1)"};
+    static const char* const scaling_choices[] = {
+        "Integer (pixel-perfect)", "Bilinear"};
     static const RecompRuntimeUiItem runtime_menu_items[] = {
+        {kRuntimeWindowModeKey, "Display", "Window mode",
+         "Letterbox keeps 4:3, stretch fills the window, original is 1:1.",
+         RECOMP_RUNTIME_UI_CHOICE, 0, 2, 1, window_mode_choices, 3, nullptr},
+        {kRuntimeScalingKey, "Display", "Scaling",
+         "Integer keeps whole-pixel multiples; bilinear smooths to any size.",
+         RECOMP_RUNTIME_UI_CHOICE, 0, 1, 1, scaling_choices, 2, nullptr},
         {kRuntimeMouseSensitivityKey, "Input", "Mouse sensitivity",
          "Prime Controls relative aim speed.",
          RECOMP_RUNTIME_UI_INT, 10, 400, 1, nullptr, 0, nullptr},
