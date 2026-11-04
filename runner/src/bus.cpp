@@ -770,10 +770,12 @@ bool bus_range_has_write_provenance(uint32_t addr, uint32_t size) {
         uint32_t written_offset = 0u;
         std::vector<uint8_t>* written =
             live ? written_for_ptr(live, &written_offset) : nullptr;
+        // "Every flag byte nonzero" == "no zero byte in the span". memchr is
+        // SIMD in libc; the per-byte std::all_of this replaces was the top
+        // host hotspot (up to 40% of the ARM9 thread) while DQ9 streams
+        // overlay data and re-validates large static candidate ranges.
         if (!written || written_offset + chunk > written->size() ||
-            !std::all_of(written->begin() + written_offset,
-                         written->begin() + written_offset + chunk,
-                         [](uint8_t value) { return value != 0u; }))
+            std::memchr(written->data() + written_offset, 0, chunk) != nullptr)
             return false;
         offset += chunk;
     }
