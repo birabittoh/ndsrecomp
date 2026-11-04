@@ -161,17 +161,30 @@ inline void nds_dispatch_index_add(
     index.swap(merged);
 }
 
-inline NdsDispatchLookupResult nds_dispatch_lookup_index(
+// Position of the first row keyed (pc, thumb), or index.size() when none.
+// Stable until the index is mutated, and every mutation bumps the owning
+// CPU's dispatch_epoch, so callers may cache it against that epoch.
+inline std::size_t nds_dispatch_index_run_start(
         const std::vector<const NdsDispatchEntry*>& index,
+        uint32_t pc, bool thumb) {
+    const uint64_t wanted = (uint64_t{pc} << 1u) | uint64_t{thumb};
+    return static_cast<std::size_t>(std::lower_bound(
+        index.begin(), index.end(), wanted,
+        [](const NdsDispatchEntry* entry, uint64_t value) {
+            return nds_dispatch_entry_key(entry) < value;
+        }) - index.begin());
+}
+
+// The selection rule proper, walking the run that starts at `start`.
+// nds_dispatch_lookup_index() is exactly lower_bound + this.
+inline NdsDispatchLookupResult nds_dispatch_lookup_run(
+        const std::vector<const NdsDispatchEntry*>& index, std::size_t start,
         uint32_t pc, bool thumb,
         NdsDispatchValidationFn validation_live, void* user) {
     NdsDispatchLookupResult result{};
     const uint64_t wanted = (uint64_t{pc} << 1u) | uint64_t{thumb};
-    auto it = std::lower_bound(
-        index.begin(), index.end(), wanted,
-        [](const NdsDispatchEntry* entry, uint64_t value) {
-            return nds_dispatch_entry_key(entry) < value;
-        });
+    auto it = index.begin() + static_cast<std::ptrdiff_t>(
+        std::min(start, index.size()));
     uint32_t best_rank = 0u;
     for (; it != index.end() && nds_dispatch_entry_key(*it) == wanted; ++it) {
         const NdsDispatchEntry* entry = *it;
@@ -188,6 +201,15 @@ inline NdsDispatchLookupResult nds_dispatch_lookup_index(
         }
     }
     return result;
+}
+
+inline NdsDispatchLookupResult nds_dispatch_lookup_index(
+        const std::vector<const NdsDispatchEntry*>& index,
+        uint32_t pc, bool thumb,
+        NdsDispatchValidationFn validation_live, void* user) {
+    return nds_dispatch_lookup_run(
+        index, nds_dispatch_index_run_start(index, pc, thumb),
+        pc, thumb, validation_live, user);
 }
 
 // ---- Tier-3 coverage filing rule (beads-yjp.56 / beads-yjp.62) ------------

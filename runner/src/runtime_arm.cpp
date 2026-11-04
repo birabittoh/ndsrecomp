@@ -269,18 +269,31 @@ void append_json_string(std::string& out, const char* text) {
 #endif
 
 constexpr uint32_t kDispatchCacheSize = 65536u;
+// Field order is a host-cache layout, not an ABI: everything the hit test
+// reads (key, epoch, flags, fn, serial, generations and the first three
+// generation pointers) sits in the first 64-byte line. The table is 16 MiB,
+// larger than a laptop L3, and the former order split the hit test across
+// both lines of the slot (pc at +0, occupied at +0x62): two misses per
+// dispatch. The second line holds what only the slow path and rare 4-page
+// candidates need.
 struct alignas(64) CachedStaticLookup {
     uint32_t pc = 0u;
-    uint32_t page_addr[4]{};
-    uint32_t generation[4]{};
-    const uint32_t* generation_ptr[4]{};
-    void (*fn)(void) = nullptr;
-    const NdsStaticValidation* validation = nullptr;
-    uint32_t live_bank_serial = 0u;
     uint32_t dispatch_epoch = 0u;
     uint8_t page_count = 0u;
     uint8_t thumb = 0u;
     uint8_t occupied = 0u;
+    uint32_t live_bank_serial = 0u;
+    void (*fn)(void) = nullptr;
+    uint32_t generation[4]{};
+    const uint32_t* generation_ptr[4]{};
+    uint32_t page_addr[4]{};
+    const NdsStaticValidation* validation = nullptr;
+    // The dispatch row selected when this slot was filled, and where its
+    // (pc, thumb) run starts in dispatch_index. Both are valid exactly while
+    // dispatch_epoch matches. Lets a generation-only miss re-run the exact
+    // selection without a fresh binary search (see lookup_static_cached_impl).
+    const DispatchEntry* entry = nullptr;
+    uint32_t index_pos = UINT32_MAX;
 };
 static_assert(sizeof(CachedStaticLookup) == 128u);
 std::array<std::array<CachedStaticLookup, kDispatchCacheSize>, 2>
@@ -514,6 +527,41 @@ const CachedStaticLookup* lookup_static_cached_impl(const CpuCtx& c,
         return nullptr;
     }
     ++g_nds_dispatch_stats[g_nds_active].cache_slow_lookup;
+#if !defined(NDS_MPH_SUBMIT_HLE) && !defined(NDS_MPH_MATH_HLE) && \
+    !defined(NDS_MKDS_HLE)
+    // Generation-only miss: same key, same epoch, a cached native hit, but a
+    // store somewhere in one of its 4 KiB pages bumped that page's
+    // generation. In one title this is overlay code sharing a page with hot data
+    // (ov033 .text + its .bss + ov032's buffer tail at 0x022A2xxx), which
+    // made ~90 percent of all slow lookups.
+    //
+    // Re-run the SAME selection rule (nds_dispatch_lookup_run, the body of
+    // nds_dispatch_lookup_index) over the cached run position, i.e. every
+    // candidate is re-validated for provenance and live bytes exactly as
+    // before. If it picks the same row, the full slow path below would
+    // rebuild this slot field-for-field identically except for fresh
+    // generations: hit-path pages come from cache_validation_pages(hit->
+    // validation) in a fixed order, and the only other effect,
+    // live_overlay_note_lookup, is a no-op while live overlay is disabled.
+    // Title HLE builds layer extra resolution on top, so they keep the
+    // reference path. Any other outcome falls through to it unchanged.
+    if (slot.occupied && slot.dispatch_epoch == c.dispatch_epoch &&
+        slot.pc == pc && slot.thumb == uint8_t{thumb} && slot.fn &&
+        slot.entry && slot.index_pos != UINT32_MAX &&
+        !live_overlay_enabled()) {
+        const NdsDispatchLookupResult again = nds_dispatch_lookup_run(
+            c.dispatch_index, slot.index_pos, pc, thumb,
+            dispatch_validation_live, nullptr);
+        if (again.selected == slot.entry) {
+            for (uint32_t i = 0; i < slot.page_count; ++i) {
+                slot.generation[i] = slot.generation_ptr[i]
+                    ? *slot.generation_ptr[i]
+                    : bus_exec_page_generation(slot.page_addr[i]);
+            }
+            return &slot;
+        }
+    }
+#endif
 
     uint32_t candidate_count = 0u;
     const DispatchEntry* inactive_candidate = nullptr;
@@ -541,6 +589,13 @@ const CachedStaticLookup* lookup_static_cached_impl(const CpuCtx& c,
     slot.dispatch_epoch = c.dispatch_epoch;
     const DispatchEntry* const candidate = hit ? hit : inactive_candidate;
     slot.fn = hit ? hit->fn : nullptr;
+    if (hit && hit->validation) {
+        slot.entry = hit;
+        const std::size_t run =
+            nds_dispatch_index_run_start(c.dispatch_index, pc, thumb);
+        slot.index_pos = run < UINT32_MAX ? static_cast<uint32_t>(run)
+                                          : UINT32_MAX;
+    }
     slot.validation = candidate ? candidate->validation : nullptr;
     slot.live_bank_serial = hit
         ? live_overlay_candidate_serial(g_nds_active, hit)
