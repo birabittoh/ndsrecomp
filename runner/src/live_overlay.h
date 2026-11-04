@@ -26,6 +26,8 @@ void live_overlay_register_cached_banks();
 // branch rate. They are opt-in and sampled; ordinary live sharding keeps the
 // compact Tier-3/root coverage path without touching the diagnostic ring.
 void live_overlay_set_transfer_trace(bool enabled);
+// Configured on (live_overlay_configure). When false every note_* hook is a no-op.
+bool live_overlay_enabled();
 void live_overlay_note_tier3(int cpu, uint32_t pc);
 // Tier-3 ENTRY hook -- once per tier3_run(), NOT once per interpreted
 // instruction (beads-yjp.62). Entering the interpreter at `pc` is the proof

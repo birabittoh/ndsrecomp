@@ -3342,3 +3342,5 @@ std::string live_overlay_diagnostics_json(uint32_t max_entries) {
     out << "]}";
     return out.str();
 }
+
+bool live_overlay_enabled() { return g_live.enabled; }
