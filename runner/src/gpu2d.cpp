@@ -1863,6 +1863,12 @@ struct Pool {
     std::mutex m;
     std::condition_variable work_cv;
     std::condition_variable done_cv;
+    // Workers parked in work_cv.wait_for. Guarded by m: a worker increments
+    // it under the same lock it re-checks the predicate with, and submit
+    // publishes head under that lock, so a submit that reads 0 here is
+    // ordered before any later sleeper's predicate check (which then sees
+    // the new head). Lets submit skip the futex wake while workers are busy.
+    int sleepers = 0;
     std::vector<std::thread> threads;
     std::vector<std::unique_ptr<LineScratch>> scratch;
 };
@@ -1911,11 +1917,14 @@ void worker_main(Pool* pool, LineScratch* sc) {
             std::unique_lock<std::mutex> lock(pool->m);
             if (pool->stop.load(std::memory_order_acquire)) return;
             if (pool->claim.load(std::memory_order_acquire) >=
-                pool->head.load(std::memory_order_acquire))
+                pool->head.load(std::memory_order_acquire)) {
                 // Bounded so that no future publish/notify ordering mistake
                 // can wedge a worker asleep with work queued; the predicate is
                 // re-checked on every wakeup.
+                ++pool->sleepers;
                 pool->work_cv.wait_for(lock, std::chrono::milliseconds(2));
+                --pool->sleepers;
+            }
         }
         if (!have) continue;
         render_line_job(pool->jobs[index % kJobSlots], *sc);
@@ -2090,15 +2099,19 @@ void submit_line(int y) {
     // Publish under the mutex: a worker that has already evaluated its
     // predicate and is between that check and its wait would otherwise miss
     // the notification and sleep with work queued.
+    bool wake = false;
     {
         std::lock_guard<std::mutex> lock(pool->m);
         pool->head.store(head + 1, std::memory_order_release);
+        wake = pool->sleepers > 0;
     }
     nds_gpu2d_jobs_outstanding.store(1u, std::memory_order_relaxed);
     if (job.cap)
         nds_gpu2d_staged_captures.store(1u, std::memory_order_relaxed);
     ++g_threaded_lines;
-    pool->work_cv.notify_one();
+    // A futex wake per scanline cost ~3% of the emu thread in DQ9 while the
+    // workers were already running; only wake when one is actually parked.
+    if (wake) pool->work_cv.notify_one();
 }
 
 // Defined with the adaptive-compositor band pool further down (it needs
