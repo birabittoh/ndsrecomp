@@ -5,6 +5,7 @@
 // slots). The vendored translation units are unmodified melonDS 1.0rc.
 
 #include "gpu3d.h"
+#include "frontend_window_size.h"
 #include "host_profile.h"
 #include "cpu_render_handoff.h"
 
@@ -148,11 +149,11 @@ bool validate_gpu3d_device(const melonDS::GPU3D& gpu,
     return true;
 }
 
-// Internal-resolution (HD) multiplier for the accelerated renderer. 4x of a
-// 448-wide adaptive raster is 1792x768; the compute renderer's tile and span
-// buffers grow with it, so this is deliberately capped well below what the
-// shader constants would otherwise permit.
-constexpr uint8_t kMaxInternalScale = 4u;
+// Internal-resolution (HD) multiplier for the accelerated renderer. The
+// compute renderer's tile and span buffers grow with its square; 16x (upstream
+// melonDS's own cap, a 4096x3072 raster at native width) peaked at ~510 MiB on
+// a GTX 1060 and 12x (4K) at ~290 MiB, so the cap is 16.
+constexpr uint8_t kMaxInternalScale = kNdsMaxInternalScale;
 uint8_t g_internal_scale = 1u;
 #if defined(NDS_HAVE_COMPUTE_RENDERER)
 bool g_display_readback_latency = false;

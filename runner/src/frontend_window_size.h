@@ -4,6 +4,10 @@
 #include <cmath>
 #include <cstdint>
 
+// Largest internal-resolution (3D sample) multiplier the accelerated renderer
+// is allowed to build. gpu3d enforces it; the frontend clamps auto scale to it.
+constexpr uint8_t kNdsMaxInternalScale = 16u;
+
 struct NdsInitialWindowSize {
     int top_width, bottom_width, height;
 };
@@ -119,4 +123,54 @@ inline void nds_present_rect_to_content(const NdsPresentRect& rect,
     }
     if (cx) *cx = (px - rect.x) * static_cast<float>(content_w) / rect.w;
     if (cy) *cy = (py - rect.y) * static_cast<float>(content_h) / rect.h;
+}
+
+// The 3D internal-resolution multiplier that renders at `percent` of the
+// presented rect's pixel density (resolution_scale). `rect_h` is the rect's
+// height in drawable pixels and `content_h` the content's (192), so the
+// letterbox bars never count. The compute renderer only takes whole
+// multipliers:
+// - bilinear rounds up (100% is never softer than the screen) and lets the
+//   presenter resample the remainder;
+// - integer keeps 3D texels on whole screen pixels: the rect is k*content_h
+//   tall, so at or below 100% the result is the largest divisor of k not
+//   above the target, and above 100% the smallest multiple of k at or above
+//   it (falling back to the largest multiple, then divisor, of k that fits
+//   max_scale).
+// The result is always in [1, max_scale].
+inline uint8_t nds_auto_internal_scale(int rect_h, int content_h,
+                                       NdsScalingFilter scaling, int percent,
+                                       int max_scale) {
+    max_scale = std::max(max_scale, 1);
+    if (rect_h <= 0 || content_h <= 0 || percent <= 0) return 1u;
+    int n = 1;
+    if (scaling == NdsScalingFilter::Integer) {
+        const int k = std::max(1, rect_h / content_h);
+        if (percent <= 100) {
+            for (int d = k; d >= 1; --d) {
+                if (k % d == 0 && d * 100 <= k * percent && d <= max_scale) {
+                    n = d;
+                    break;
+                }
+            }
+        } else {
+            const int want = (percent + 99) / 100;  // multiples of k
+            int m = std::min(want, max_scale / k);
+            if (m >= 1) {
+                n = m * k;
+            } else {
+                for (int d = std::min(k, max_scale); d >= 1; --d) {
+                    if (k % d == 0) {
+                        n = d;
+                        break;
+                    }
+                }
+            }
+        }
+    } else {
+        const long long num = static_cast<long long>(rect_h) * percent;
+        const long long den = static_cast<long long>(content_h) * 100;
+        n = static_cast<int>((num + den - 1) / den);
+    }
+    return static_cast<uint8_t>(std::clamp(n, 1, max_scale));
 }
