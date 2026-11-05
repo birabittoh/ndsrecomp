@@ -42,6 +42,11 @@ struct NdsPerfGovernorConfig {
     // is never taken as evidence the full mode is sustainable.
     uint32_t flap_engage_limit = 2;
     uint32_t flap_window_frames = 3600;
+    // Stage 2 (internal scale 1x) only helps when the frame is waiting on
+    // the GPU. With this above zero, the 1->2 step also needs the over-budget
+    // streak's mean gpu_wait_ms to reach it; a CPU-bound streak stays at
+    // stage 1. Zero keeps the unconditional escalation.
+    double min_stage2_gpu_wait_ms = 0.0;
 };
 
 struct NdsPerfGovernorSample {
@@ -50,6 +55,9 @@ struct NdsPerfGovernorSample {
     double budget_ms = 1000.0 / 60.0;
     uint64_t underruns_delta = 0;
     double compute_map_ms = 0.0;
+    // Host time this frame spent blocked on the GPU: the 3D readback wait
+    // plus the buffer swap.
+    double gpu_wait_ms = 0.0;
     // True only when drain_ms is a real headroom signal: an audio device
     // exists, playback has started (so the drain actually paces), and turbo is
     // not bypassing the drain. When false the drain clause is NEUTRAL - it
@@ -64,6 +72,8 @@ struct NdsPerfGovernorState {
     uint8_t stage = 0;
     uint32_t over_frames = 0;
     uint32_t under_frames = 0;
+    // Sum of gpu_wait_ms over the current over-budget streak.
+    double over_gpu_wait_ms = 0.0;
     // Flap guard bookkeeping (see NdsPerfGovernorConfig).
     uint32_t stage2_engagements = 0;
     uint32_t frames_since_stage2_engage = 0;

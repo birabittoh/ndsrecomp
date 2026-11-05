@@ -2696,8 +2696,14 @@ int nds_run_interactive_frontend(const NdsFrontendOptions& initial_options) {
     bool auto_scale_enabled = true;
     uint8_t auto_scale_candidate = 0u;
     uint64_t auto_scale_since = 0u;
+    // Stage 2 drops 3D to 1x, which only relieves a GPU-bound frame; a
+    // CPU-bound title (DQ9 runs ~13 ms of ARM per frame) would otherwise be
+    // pinned at 1x by load the multiplier does not cause.
+    NdsPerfGovernorConfig perf_governor_config{};
+    perf_governor_config.min_stage2_gpu_wait_ms = 1.0;
     nds_perf_governor_init(&perf_governor,
-                           options.perf_governor_mode);
+                           options.perf_governor_mode,
+                           perf_governor_config);
     // Governor off is byte-identical to the pre-governor frontend: the scale,
     // the HD emit flag and the readback latency were all already established
     // above from the options, so there is nothing to apply and no new way to
@@ -4816,6 +4822,10 @@ int nds_run_interactive_frontend(const NdsFrontendOptions& initial_options) {
                 : 0u;
         governor_sample.compute_map_ms =
             static_cast<double>(frame_compute_map_ns) / 1000000.0;
+        governor_sample.gpu_wait_ms =
+            governor_sample.compute_map_ms +
+            static_cast<double>(presentation_ticks.swap) * 1000.0 /
+                static_cast<double>(frequency);
         // The drain is only a headroom signal when it is actually the pacing
         // sleep this frame: no device, pre-playback and turbo frames all read
         // ~0 for reasons that have nothing to do with load.

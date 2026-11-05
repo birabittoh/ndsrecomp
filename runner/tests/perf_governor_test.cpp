@@ -500,6 +500,27 @@ void test_transition_ring() {
 
 }  // namespace
 
+// ---- Stage 2 needs GPU wait when configured ----
+
+void test_stage2_needs_gpu_wait() {
+    NdsPerfGovernorConfig cfg = small_config();
+    cfg.min_stage2_gpu_wait_ms = 1.0;
+    NdsPerfGovernorState state{};
+    nds_perf_governor_init(&state, NdsPerfGovernorMode::Auto, cfg);
+    // A CPU-bound streak (no GPU wait) reaches stage 1 and stays there.
+    feed(state, over_emu(), 2);
+    CHECK(nds_perf_governor_update(&state, over_emu()));
+    CHECK(state.stage == 1);
+    feed(state, over_emu(), 12);
+    CHECK(state.stage == 1);
+    // A GPU-bound streak escalates.
+    NdsPerfGovernorSample gpu = over_emu();
+    gpu.gpu_wait_ms = 3.0;
+    feed(state, gpu, 2);
+    CHECK(nds_perf_governor_update(&state, gpu));
+    CHECK(state.stage == 2);
+}
+
 int main() {
     test_ladder();
     test_streak_is_broken_by_one_frame();
@@ -514,6 +535,7 @@ int main() {
     test_off_mode_from_engaged_stage();
     test_mode_parsing();
     test_transition_ring();
+    test_stage2_needs_gpu_wait();
     if (g_failures)
         std::fprintf(stderr, "perf_governor_test: %d failure(s)\n",
                      g_failures);

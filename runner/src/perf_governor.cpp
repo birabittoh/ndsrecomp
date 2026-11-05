@@ -136,6 +136,9 @@ bool nds_perf_governor_update(NdsPerfGovernorState* state,
         drain_recovered;
 
     if (over_budget) {
+        if (state->over_frames == 0u) state->over_gpu_wait_ms = 0.0;
+        if (state->over_frames < cfg.engage_frames)
+            state->over_gpu_wait_ms += sample.gpu_wait_ms;
         state->over_frames = std::min<uint32_t>(
             state->over_frames + 1u, cfg.engage_frames);
         state->under_frames = 0;
@@ -150,6 +153,15 @@ bool nds_perf_governor_update(NdsPerfGovernorState* state,
         state->under_frames = 0;
     }
 
+    if (over_budget && state->over_frames >= cfg.engage_frames &&
+        state->stage == 1u && cfg.min_stage2_gpu_wait_ms > 0.0 &&
+        state->over_gpu_wait_ms / state->over_frames <
+            cfg.min_stage2_gpu_wait_ms) {
+        // CPU-bound: dropping the 3D multiplier would cost detail and buy
+        // nothing. Hold stage 1 and start a fresh streak.
+        state->over_frames = 0;
+        return false;
+    }
     if (over_budget && state->over_frames >= cfg.engage_frames &&
         state->stage < 2u) {
         ++state->stage;
