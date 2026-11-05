@@ -285,6 +285,22 @@ so HD 3D keeps its detail. Both are in the runtime menu (Esc) and have
 `NDS_WINDOW_MODE` / `NDS_SCALING` and `--window-mode` / `--scaling`
 overrides.
 
+`resolution_scale` (a percentage) renders 3D relative to the presented rect
+instead of at a fixed multiplier: `100` matches the screen (the 3D raster is
+at least as tall as the rect, e.g. 6x for a 1080-line letterbox), lower is
+coarser down to native 1x, and higher supersamples (box-resolved under
+`scaling = "integer"`, mip-filtered under `bilinear`). Under integer scaling
+the multiplier is a divisor or multiple of the integer factor, so 3D texels
+land on whole screen pixels. It follows window resizes, fullscreen and
+window-mode changes, applied 250 ms after the size settles and only when the
+whole multiplier changes (each change rebuilds the 3D renderer). Only 3D
+gains density; the 2D layers stay native and are upscaled. It needs the
+OpenGL compute renderer with the `separate` or `single` layout, is in the
+runtime menu, and has `NDS_RESOLUTION_SCALE` / `--resolution-scale`
+overrides. `internal_resolution` (1..16) instead pins the multiplier; the two
+are exclusive within one source, and the later source (TOML < env < CLI)
+wins. The performance governor still drops 3D to 1x under load.
+
 `startup_mode = "automatic"` sets the retail firmware's Automatic-mode flag
 in the runner's private in-memory firmware image. With a Slot-1 cartridge
 inserted, the real BIOS/firmware/card path then launches it without navigating
