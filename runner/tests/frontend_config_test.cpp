@@ -47,7 +47,10 @@ int main() {
         !require(scaling == NdsScalingFilter::Bilinear) ||
         !require(nds_parse_scaling_filter("pixel-perfect", &scaling)) ||
         !require(scaling == NdsScalingFilter::Integer) ||
-        !require(!nds_parse_scaling_filter("nearest", &scaling)))
+        !require(nds_parse_scaling_filter("Nearest-Neighbor", &scaling)) ||
+        !require(scaling == NdsScalingFilter::Nearest) ||
+        !require(std::string(nds_scaling_filter_name(scaling)) == "nearest") ||
+        !require(!nds_parse_scaling_filter("smooth", &scaling)))
         return 40;
 
     NdsFullscreenMode fullscreen = NdsFullscreenMode::Off;

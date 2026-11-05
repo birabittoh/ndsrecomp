@@ -730,7 +730,7 @@ int main(int argc, char** argv) {
                 "[--screen-layout single|stacked|separate] "
                 "[--fullscreen off|borderless|exclusive] "
                 "[--window-mode letterbox|stretch|original] "
-                "[--scaling integer|bilinear] "
+                "[--scaling integer|bilinear|nearest] "
                 "[--adaptive-widescreen none|top|bottom|both] "
                 "[--widescreen-width even:256..448] "
                 "[--supersampling 1|2|3|4] "
@@ -851,7 +851,7 @@ int main(int argc, char** argv) {
     if (const char* value = std::getenv("NDS_SCALING")) {
         if (!nds_parse_scaling_filter(value, &frontend_options.scaling)) {
             std::fprintf(stderr,
-                         "invalid NDS_SCALING (expected integer or bilinear)\n");
+                         "invalid NDS_SCALING (expected integer, bilinear, or nearest)\n");
             return 2;
         }
     }
@@ -1045,7 +1045,7 @@ int main(int argc, char** argv) {
     if (!cli_scaling.empty() &&
         !nds_parse_scaling_filter(cli_scaling, &frontend_options.scaling)) {
         std::fprintf(stderr,
-                     "invalid --scaling (expected integer or bilinear)\n");
+                     "invalid --scaling (expected integer, bilinear, or nearest)\n");
         return 2;
     }
     if (!cli_adaptive_screens.empty() &&

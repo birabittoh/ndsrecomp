@@ -559,8 +559,13 @@ bool nds_compute_host_present_top(const unsigned int* fallback_pixels,
     const int compose_height = 192 * density;
     const bool supersampled =
         compose_width > rect.w || compose_height > rect.h;
+    // Nearest composes straight into its exact rect too (point sampling is
+    // what it asks for), box resolving only a raster at least twice as dense,
+    // i.e. resolution_scale supersampling rather than the round-up remainder.
     const bool box_resolve =
-        g_scaling == NdsScalingFilter::Integer && supersampled;
+        (g_scaling == NdsScalingFilter::Integer && supersampled) ||
+        (g_scaling == NdsScalingFilter::Nearest &&
+         compose_width >= 2 * rect.w && compose_height >= 2 * rect.h);
     const bool offscreen =
         (box_resolve || (g_scaling == NdsScalingFilter::Bilinear &&
                          (compose_width != rect.w ||

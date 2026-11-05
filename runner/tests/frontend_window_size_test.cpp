@@ -118,6 +118,11 @@ int main() {
           "integer 10x at 200% falls back to 10x");
     check(nds_auto_internal_scale(192, 192, S::Integer, 200, 16) == 2,
           "integer 1x at 200% -> 2x");
+    check(rect_is(nds_present_rect(M::Letterbox, S::Nearest, 1920, 1080, 256,
+                                   192), 240, 0, 1440, 1080),
+          "letterbox nearest is the exact fit");
+    check(nds_auto_internal_scale(1080, 192, S::Nearest, 100, 16) == 6,
+          "1080p nearest 100% rounds up like bilinear");
     check(nds_auto_internal_scale(0, 192, S::Bilinear, 100, 16) == 1,
           "degenerate rect -> 1x");
 

@@ -221,7 +221,7 @@ sha1 = "40-lowercase-hex-digits"
 [display]
 screen_layout = "stacked"          # single | stacked | separate
 window_mode = "letterbox"          # letterbox | stretch | original (1:1)
-scaling = "integer"                # integer (pixel-perfect) | bilinear
+scaling = "integer"                # integer (pixel-perfect) | bilinear | nearest
 adaptive_widescreen = "none"       # none | top | bottom | both
 adaptive_capability = "top"        # exact-ROM capability; same choices
 adaptive_width = 448               # even width from 256 through 448
@@ -279,7 +279,9 @@ HD 3D compose follows engine A to whichever LCD it is on.
 aspect-correct fit, `stretch` fills the window, and `original` is a strict
 1:1 image in physical pixels, centred. `scaling = "integer"` keeps whole-pixel
 multiples with nearest filtering (in `stretch`, independent X and Y factors;
-never below 1x); `bilinear` filters linearly to the exact rect. With the GL
+never below 1x); `bilinear` filters linearly to the exact rect, and `nearest`
+point-samples into that same rect (pixelated at any size, with uneven pixel
+widths when the factor is not whole). With the GL
 presenter, bilinear resamples the composed frame at its own sample density,
 so HD 3D keeps its detail. Both are in the runtime menu (Esc) and have
 `NDS_WINDOW_MODE` / `NDS_SCALING` and `--window-mode` / `--scaling`
