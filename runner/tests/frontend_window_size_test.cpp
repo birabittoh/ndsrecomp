@@ -84,6 +84,43 @@ int main() {
     check(single.top_width == 768 && single.height == 576,
           "single window is one screen at the requested scale");
 
+    // Auto internal scale (resolution_scale), bilinear: round up.
+    check(nds_auto_internal_scale(1080, 192, S::Bilinear, 100, 16) == 6,
+          "1080p bilinear 100% -> 6x");
+    check(nds_auto_internal_scale(384, 192, S::Bilinear, 100, 16) == 2,
+          "exact 2x bilinear 100% -> 2x");
+    check(nds_auto_internal_scale(2160, 192, S::Bilinear, 100, 16) == 12,
+          "4K bilinear 100% -> 12x");
+    check(nds_auto_internal_scale(1080, 192, S::Bilinear, 50, 16) == 3,
+          "1080p bilinear 50% -> 3x");
+    check(nds_auto_internal_scale(1080, 192, S::Bilinear, 10, 16) == 1,
+          "low percent floors at 1x");
+    check(nds_auto_internal_scale(1080, 192, S::Bilinear, 200, 16) == 12,
+          "1080p bilinear 200% supersamples");
+    check(nds_auto_internal_scale(2160, 192, S::Bilinear, 200, 16) == 16,
+          "clamped to the maximum");
+    check(nds_auto_internal_scale(192, 192, S::Bilinear, 100, 16) == 1,
+          "original 1:1 at 100% -> 1x");
+    check(nds_auto_internal_scale(192, 192, S::Bilinear, 200, 16) == 2,
+          "original 1:1 at 200% supersamples");
+    // Integer: divisors of k at or below 100%, multiples above.
+    check(nds_auto_internal_scale(960, 192, S::Integer, 100, 16) == 5,
+          "integer 5x at 100% -> 5x");
+    check(nds_auto_internal_scale(1152, 192, S::Integer, 50, 16) == 3,
+          "integer 6x at 50% -> 3x");
+    check(nds_auto_internal_scale(1152, 192, S::Integer, 75, 16) == 3,
+          "integer 6x at 75% -> largest divisor under 4.5 -> 3x");
+    check(nds_auto_internal_scale(960, 192, S::Integer, 50, 16) == 1,
+          "integer 5x at 50% -> 1x (5 is prime)");
+    check(nds_auto_internal_scale(768, 192, S::Integer, 150, 16) == 8,
+          "integer 4x at 150% -> 8x");
+    check(nds_auto_internal_scale(1920, 192, S::Integer, 200, 16) == 10,
+          "integer 10x at 200% falls back to 10x");
+    check(nds_auto_internal_scale(192, 192, S::Integer, 200, 16) == 2,
+          "integer 1x at 200% -> 2x");
+    check(nds_auto_internal_scale(0, 192, S::Bilinear, 100, 16) == 1,
+          "degenerate rect -> 1x");
+
     if (failures) return 1;
     std::puts("frontend window size checks passed");
     return 0;
