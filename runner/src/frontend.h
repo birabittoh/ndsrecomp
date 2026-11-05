@@ -299,13 +299,19 @@ struct NdsFrontendOptions {
     // paths retain the reconstruction filter.
     uint8_t supersampling = 1;  // 1x..4x presentation reconstruction
     uint8_t antialiasing = 0;   // 0/2/4/8 samples per output pixel
-    // Internal-resolution (HD) 3D scaling, 1x..4x. This is pre-composition:
+    // Internal-resolution (HD) 3D scaling, 1x..16x. This is pre-composition:
     // it raises the 3D engine's sample
     // density. It still alters no guest-visible bytes, because every
     // faithful consumer reads the native surface the same render pass
     // point-samples out of the scaled raster. Requires the accelerated
     // renderer; ignored by the software floor.
     uint8_t internal_resolution = 1;
+    // Automatic 3D scale, as a percentage of the presented rect's own pixel
+    // density: 100 renders 3D at the screen's resolution, less is coarser,
+    // more supersamples. 0 = off (internal_resolution is used as is). The
+    // last source (TOML < env < CLI) that names either option wins: setting
+    // internal_resolution clears this and pins the multiplier.
+    uint16_t resolution_scale = 0;
     // Texture upscaling factor, 1 (off), 2, or 4. Filters each decoded DS
     // texture once on a cache miss; independent of internal_resolution, but
     // only worth enabling alongside it.
@@ -402,6 +408,8 @@ bool nds_parse_widescreen_width(const std::string& value, uint16_t* out);
 bool nds_parse_supersampling(const std::string& value, uint8_t* out);
 bool nds_parse_antialiasing(const std::string& value, uint8_t* out);
 bool nds_parse_internal_resolution(const std::string& value, uint8_t* out);
+// 10..1000 (percent).
+bool nds_parse_resolution_scale(const std::string& value, uint16_t* out);
 bool nds_parse_texture_upscale(const std::string& value, uint8_t* out);
 bool nds_parse_frame_interpolation(const std::string& value,
                                    NdsFrameInterpolation* out);

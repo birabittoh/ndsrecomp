@@ -443,6 +443,45 @@ int main() {
     if (!require(options.window_mode == NdsWindowMode::Letterbox) ||
         !require(options.scaling == NdsScalingFilter::Integer))
         return 43;
+
+    uint16_t resolution_scale = 0;
+    uint8_t internal_resolution = 1;
+    if (!require(nds_parse_resolution_scale("100", &resolution_scale)) ||
+        !require(resolution_scale == 100) ||
+        !require(nds_parse_resolution_scale("150%", &resolution_scale)) ||
+        !require(resolution_scale == 150) ||
+        !require(!nds_parse_resolution_scale("5", &resolution_scale)) ||
+        !require(!nds_parse_resolution_scale("%", &resolution_scale)) ||
+        !require(!nds_parse_resolution_scale("1001", &resolution_scale)) ||
+        !require(nds_parse_internal_resolution("16", &internal_resolution)) ||
+        !require(internal_resolution == 16) ||
+        !require(!nds_parse_internal_resolution("17", &internal_resolution)))
+        return 44;
+
+    {
+        std::ofstream file(path);
+        file << "[display]\n"
+                "resolution_scale = 75\n";
+    }
+    options = {};
+    if (!require(nds_load_frontend_config(path.string(), &options, &error)) ||
+        !require(options.resolution_scale == 75) ||
+        !require(options.internal_resolution == 1))
+        return 45;
+
+    {
+        std::ofstream file(path);
+        file << "[display]\n"
+                "resolution_scale = 100\n"
+                "internal_resolution = 2\n";
+    }
+    options = {};
+    if (!require(
+            !nds_load_frontend_config(path.string(), &options, &error)))
+        return 46;
+    options = {};
+    if (!require(options.resolution_scale == 0))
+        return 47;
     std::filesystem::remove(path);
     return 0;
 }

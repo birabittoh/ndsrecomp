@@ -412,6 +412,7 @@ int main(int argc, char** argv) {
     std::string cli_widescreen_width;
     std::string cli_supersampling;
     std::string cli_internal_resolution;
+    std::string cli_resolution_scale;
     std::string cli_texture_upscale;
     std::string cli_antialiasing;
     std::string cli_frame_interpolation;
@@ -577,6 +578,8 @@ int main(int argc, char** argv) {
             cli_supersampling = argv[++i];
         } else if (a == "--internal-resolution" && i + 1 < argc) {
             cli_internal_resolution = argv[++i];
+        } else if (a == "--resolution-scale" && i + 1 < argc) {
+            cli_resolution_scale = argv[++i];
         } else if (a == "--texture-upscale" && i + 1 < argc) {
             cli_texture_upscale = argv[++i];
         } else if (a == "--antialiasing" && i + 1 < argc) {
@@ -731,7 +734,7 @@ int main(int argc, char** argv) {
                 "[--adaptive-widescreen none|top|bottom|both] "
                 "[--widescreen-width even:256..448] "
                 "[--supersampling 1|2|3|4] "
-                "[--internal-resolution 1|2|3|4] "
+                "[--internal-resolution 1..16] [--resolution-scale PERCENT] "
                 "[--window-scale 1..8] "
                 "[--keyboard-bindings <12 comma-separated SDL scancodes>] "
                 "[--gamepad-bindings <12 comma-separated encoded controls>] "
@@ -894,13 +897,34 @@ int main(int argc, char** argv) {
             return 2;
         }
     }
-    if (const char* value = std::getenv("NDS_INTERNAL_RESOLUTION")) {
-        if (!nds_parse_internal_resolution(
-                value, &frontend_options.internal_resolution)) {
+    {
+        const char* internal = std::getenv("NDS_INTERNAL_RESOLUTION");
+        const char* scale = std::getenv("NDS_RESOLUTION_SCALE");
+        if (internal && *internal && scale && *scale) {
             std::fprintf(stderr,
-                         "invalid NDS_INTERNAL_RESOLUTION "
-                         "(expected 1..4)\n");
+                         "NDS_INTERNAL_RESOLUTION and NDS_RESOLUTION_SCALE "
+                         "are exclusive\n");
             return 2;
+        }
+        if (internal && *internal) {
+            if (!nds_parse_internal_resolution(
+                    internal, &frontend_options.internal_resolution)) {
+                std::fprintf(stderr,
+                             "invalid NDS_INTERNAL_RESOLUTION "
+                             "(expected 1..16)\n");
+                return 2;
+            }
+            frontend_options.resolution_scale = 0;
+        }
+        if (scale && *scale) {
+            if (!nds_parse_resolution_scale(
+                    scale, &frontend_options.resolution_scale)) {
+                std::fprintf(stderr,
+                             "invalid NDS_RESOLUTION_SCALE "
+                             "(expected 10..1000)\n");
+                return 2;
+            }
+            frontend_options.internal_resolution = 1;
         }
     }
     if (const char* value = std::getenv("NDS_ANTIALIASING")) {
@@ -1057,13 +1081,31 @@ int main(int argc, char** argv) {
                      "(expected 1, 2, or 4)\n");
         return 2;
     }
-    if (!cli_internal_resolution.empty() &&
-        !nds_parse_internal_resolution(
-            cli_internal_resolution,
-            &frontend_options.internal_resolution)) {
+    if (!cli_internal_resolution.empty() && !cli_resolution_scale.empty()) {
         std::fprintf(stderr,
-                     "invalid --internal-resolution (expected 1..4)\n");
+                     "--internal-resolution and --resolution-scale are "
+                     "exclusive\n");
         return 2;
+    }
+    if (!cli_internal_resolution.empty()) {
+        if (!nds_parse_internal_resolution(
+                cli_internal_resolution,
+                &frontend_options.internal_resolution)) {
+            std::fprintf(stderr,
+                         "invalid --internal-resolution (expected 1..16)\n");
+            return 2;
+        }
+        frontend_options.resolution_scale = 0;
+    }
+    if (!cli_resolution_scale.empty()) {
+        if (!nds_parse_resolution_scale(
+                cli_resolution_scale,
+                &frontend_options.resolution_scale)) {
+            std::fprintf(stderr,
+                         "invalid --resolution-scale (expected 10..1000)\n");
+            return 2;
+        }
+        frontend_options.internal_resolution = 1;
     }
     if (!cli_antialiasing.empty() &&
         !nds_parse_antialiasing(cli_antialiasing,

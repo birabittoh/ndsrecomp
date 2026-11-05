@@ -167,8 +167,20 @@ bool nds_parse_internal_resolution(const std::string& value, uint8_t* out) {
     if (!out || value.empty()) return false;
     char* end = nullptr;
     const long parsed = std::strtol(value.c_str(), &end, 10);
-    if (!end || *end != '\0' || parsed < 1 || parsed > 4) return false;
+    if (!end || *end != '\0' || parsed < 1 || parsed > kNdsMaxInternalScale) return false;
     *out = static_cast<uint8_t>(parsed);
+    return true;
+}
+
+bool nds_parse_resolution_scale(const std::string& value, uint16_t* out) {
+    if (!out || value.empty()) return false;
+    std::string digits = value;
+    if (digits.back() == '%') digits.pop_back();
+    if (digits.empty()) return false;
+    char* end = nullptr;
+    const long parsed = std::strtol(digits.c_str(), &end, 10);
+    if (!end || *end != '\0' || parsed < 10 || parsed > 1000) return false;
+    *out = static_cast<uint16_t>(parsed);
     return true;
 }
 
@@ -815,15 +827,38 @@ bool nds_load_frontend_config(const std::string& path,
                 return false;
             }
         }
-        if (const auto value =
-                (*display)["internal_resolution"].value<int64_t>()) {
+        const auto internal_resolution =
+            (*display)["internal_resolution"].value<int64_t>();
+        const auto resolution_scale =
+            (*display)["resolution_scale"].value<int64_t>();
+        if (internal_resolution && resolution_scale) {
+            if (error) {
+                *error = "display.internal_resolution and "
+                         "display.resolution_scale are exclusive";
+            }
+            return false;
+        }
+        if (internal_resolution) {
             if (!nds_parse_internal_resolution(
-                    std::to_string(*value), &options->internal_resolution)) {
+                    std::to_string(*internal_resolution),
+                    &options->internal_resolution)) {
                 if (error) {
-                    *error = "display.internal_resolution must be 1..4";
+                    *error = "display.internal_resolution must be 1..16";
                 }
                 return false;
             }
+            options->resolution_scale = 0;
+        }
+        if (resolution_scale) {
+            if (!nds_parse_resolution_scale(
+                    std::to_string(*resolution_scale),
+                    &options->resolution_scale)) {
+                if (error) {
+                    *error = "display.resolution_scale must be 10..1000";
+                }
+                return false;
+            }
+            options->internal_resolution = 1;
         }
     }
 
