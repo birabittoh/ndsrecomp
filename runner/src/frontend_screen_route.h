@@ -43,11 +43,12 @@ inline bool nds_main_screen_update(NdsMainScreenDebounce& d, int routed,
     return true;
 }
 
-// The LCD the single window shows. Holding the virtual stylus while engine A
-// is on top peeks at the bottom LCD, bypassing the debounce both ways; the
-// toggle hotkey shows the other LCD until the main screen next changes.
+// The LCD the single window shows. Holding the virtual stylus peeks at the
+// other LCD (the bottom one while engine A is on top, the top one while it is
+// on the bottom), bypassing the debounce both ways; the toggle hotkey shows
+// the other LCD until the main screen next changes.
 inline int nds_single_shown_screen(int main, bool toggled,
                                    bool stylus_peek) {
-    if (stylus_peek && main == 0) return 1;
+    if (stylus_peek) return main ^ 1;
     return toggled ? (main ^ 1) : main;
 }

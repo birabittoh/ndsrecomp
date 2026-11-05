@@ -56,8 +56,9 @@ int main() {
     check(nds_single_shown_screen(1, true, false) == 0, "toggle from bottom");
     check(nds_single_shown_screen(0, false, true) == 1, "peek bottom");
     check(nds_single_shown_screen(0, true, true) == 1, "peek wins over toggle");
-    check(nds_single_shown_screen(1, false, true) == 1,
-          "no peek change when main is bottom");
+    check(nds_single_shown_screen(1, false, true) == 0, "peek top");
+    check(nds_single_shown_screen(1, true, true) == 0,
+          "peek top wins over toggle");
 
     if (failures) return 1;
     std::puts("frontend screen route checks passed");

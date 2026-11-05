@@ -4284,9 +4284,13 @@ int nds_run_interactive_frontend(const NdsFrontendOptions& initial_options) {
             relative_delta_y = 0;
         }
         if (generic_virtual_stylus) {
+            // A single-screen peek at the top LCD hides the touchscreen, so
+            // taps do not reach it.
+            const bool stylus_on_touchscreen =
+                !presentation.single || presentation.shown_screen == 1;
             nds_set_touch(static_cast<uint16_t>(std::lround(mph_virtual_x)),
                           static_cast<uint16_t>(std::lround(mph_virtual_y)),
-                          virtual_stylus_tap_held);
+                          virtual_stylus_tap_held && stylus_on_touchscreen);
         } else if (mph_prime_is_active) {
             if (mph_touch_sequence.active()) {
                 mph_touch_sequence.tick();

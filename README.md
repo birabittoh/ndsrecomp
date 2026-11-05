@@ -269,8 +269,9 @@ the LCD engine A is routed to (POWCNT1 bit 15), followed after the routing
 has held for 4 frames (both-blank fade frames do not count) and logged as
 `[display] main screen -> top|bottom`. The `[controls] screen_toggle` key
 (default `Grave`, the backtick) shows the other LCD until the main screen
-next changes. While engine A is on the top LCD, holding the virtual stylus
-key shows the bottom LCD for as long as it is held. Mouse clicks are touches
+next changes. Holding the virtual stylus key shows the other LCD for as long
+as it is held: the bottom one while engine A is on top, the top one while
+engine A is on the bottom. Mouse clicks and virtual stylus taps are touches
 only while the bottom LCD is shown. With internal resolution above 1x, the
 HD 3D compose follows engine A to whichever LCD it is on.
 
