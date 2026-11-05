@@ -46,6 +46,7 @@ enum class NdsWindowMode : uint8_t {
 enum class NdsScalingFilter : uint8_t {
     Integer,   // pixel-perfect: nearest, whole-multiple factors only
     Bilinear,  // linear filtering to the exact rect
+    Nearest,   // nearest filtering to the exact rect: pixelated, uneven
 };
 
 struct NdsPresentRect {
@@ -130,8 +131,8 @@ inline void nds_present_rect_to_content(const NdsPresentRect& rect,
 // height in drawable pixels and `content_h` the content's (192), so the
 // letterbox bars never count. The compute renderer only takes whole
 // multipliers:
-// - bilinear rounds up (100% is never softer than the screen) and lets the
-//   presenter resample the remainder;
+// - bilinear and nearest round up (100% is never softer than the screen) and
+//   let the presenter resample the remainder;
 // - integer keeps 3D texels on whole screen pixels: the rect is k*content_h
 //   tall, so at or below 100% the result is the largest divisor of k not
 //   above the target, and above 100% the smallest multiple of k at or above

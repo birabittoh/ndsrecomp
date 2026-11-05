@@ -146,6 +146,12 @@ bool nds_parse_scaling_filter(const std::string& value,
         *out = NdsScalingFilter::Bilinear;
         return true;
     }
+    if (normalized == "nearest" || normalized == "nearest-neighbor" ||
+        normalized == "nearest_neighbor" || normalized == "nearest-neighbour" ||
+        normalized == "nearest_neighbour" || normalized == "point") {
+        *out = NdsScalingFilter::Nearest;
+        return true;
+    }
     return false;
 }
 
@@ -594,7 +600,12 @@ const char* nds_window_mode_name(NdsWindowMode value) {
 }
 
 const char* nds_scaling_filter_name(NdsScalingFilter value) {
-    return value == NdsScalingFilter::Bilinear ? "bilinear" : "integer";
+    switch (value) {
+        case NdsScalingFilter::Bilinear: return "bilinear";
+        case NdsScalingFilter::Nearest: return "nearest";
+        case NdsScalingFilter::Integer:
+        default: return "integer";
+    }
 }
 
 const char* nds_frame_interpolation_name(NdsFrameInterpolation value) {
@@ -759,7 +770,7 @@ bool nds_load_frontend_config(const std::string& path,
         if (const auto value = (*display)["scaling"].value<std::string>()) {
             if (!nds_parse_scaling_filter(*value, &options->scaling)) {
                 if (error) {
-                    *error = "display.scaling must be integer or bilinear";
+                    *error = "display.scaling must be integer, bilinear, or nearest";
                 }
                 return false;
             }

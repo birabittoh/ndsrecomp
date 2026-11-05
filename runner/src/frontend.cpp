@@ -1326,7 +1326,7 @@ int runtime_menu_set_value(void* context, const RecompRuntimeUiItem* item,
         return 1;
     }
     if (std::strcmp(item->key, kRuntimeScalingKey) == 0) {
-        if (value < 0 || value > static_cast<int>(NdsScalingFilter::Bilinear))
+        if (value < 0 || value > static_cast<int>(NdsScalingFilter::Nearest))
             return 0;
         state->options->scaling = static_cast<NdsScalingFilter>(value);
         std::fprintf(stderr, "[display] scaling -> %s\n",
@@ -2941,7 +2941,7 @@ int nds_run_interactive_frontend(const NdsFrontendOptions& initial_options) {
     static const char* const window_mode_choices[] = {
         "Letterbox", "Stretch", "Original (1:1)"};
     static const char* const scaling_choices[] = {
-        "Integer (pixel-perfect)", "Bilinear"};
+        "Integer (pixel-perfect)", "Bilinear", "Nearest neighbor"};
     static const char* const resolution_scale_choices[] = {
         "Off (fixed)", "25%", "50%", "75%", "100%", "150%", "200%"};
     static const RecompRuntimeUiItem runtime_menu_items[] = {
@@ -2949,8 +2949,9 @@ int nds_run_interactive_frontend(const NdsFrontendOptions& initial_options) {
          "Letterbox keeps 4:3, stretch fills the window, original is 1:1.",
          RECOMP_RUNTIME_UI_CHOICE, 0, 2, 1, window_mode_choices, 3, nullptr},
         {kRuntimeScalingKey, "Display", "Scaling",
-         "Integer keeps whole-pixel multiples; bilinear smooths to any size.",
-         RECOMP_RUNTIME_UI_CHOICE, 0, 1, 1, scaling_choices, 2, nullptr},
+         "Integer keeps whole-pixel multiples; bilinear smooths to any size; "
+         "nearest stays pixelated at any size.",
+         RECOMP_RUNTIME_UI_CHOICE, 0, 2, 1, scaling_choices, 3, nullptr},
         {kRuntimeResolutionScaleKey, "Display", "Resolution scale",
          "3D detail relative to the window: 100% matches the screen, "
          "less is coarser, more supersamples.",
