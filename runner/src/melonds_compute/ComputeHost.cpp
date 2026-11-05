@@ -547,16 +547,24 @@ bool nds_compute_host_present_top(const unsigned int* fallback_pixels,
     g_last_rect = rect;
     // GL's viewport origin is bottom-left.
     const int viewport_y = drawable_height - rect.y - rect.h;
-    // Integer scaling composes straight into the rect: nearest at a whole
-    // factor is exact. Bilinear composes offscreen at the frame's own sample
+    // Integer scaling composes straight into the rect while the 3D raster
+    // is no denser than it: nearest at a whole factor is exact. A denser
+    // raster (resolution_scale above 100%) composes offscreen and is box
+    // resolved. Bilinear composes offscreen at the frame's own sample
     // density (the 3D raster's when it is denser than native, so HD detail
     // survives) and resamples that linearly. When the offscreen image would
     // be exactly the rect's size the resample is the identity, so skip it.
     const int density = (hd_active || direct_frame) ? int(scale) : 1;
     const int compose_width = width * density;
     const int compose_height = 192 * density;
-    const bool offscreen = g_scaling == NdsScalingFilter::Bilinear &&
-        (compose_width != rect.w || compose_height != rect.h) &&
+    const bool supersampled =
+        compose_width > rect.w || compose_height > rect.h;
+    const bool box_resolve =
+        g_scaling == NdsScalingFilter::Integer && supersampled;
+    const bool offscreen =
+        (box_resolve || (g_scaling == NdsScalingFilter::Bilinear &&
+                         (compose_width != rect.w ||
+                          compose_height != rect.h))) &&
         ensure_compose_target(compose_width, compose_height);
     glClearColor(0.f, 0.f, 0.f, 1.f);
     glBindFramebuffer(GL_FRAMEBUFFER, 0);
@@ -624,14 +632,16 @@ bool nds_compute_host_present_top(const unsigned int* fallback_pixels,
         glActiveTexture(GL_TEXTURE7);
         glBindTexture(GL_TEXTURE_2D, g_compose_texture);
         // Shrinking (a dense HD raster into a smaller rect) goes through the
-        // mip chain so it averages instead of skipping samples.
-        const bool minify =
-            compose_width > rect.w || compose_height > rect.h;
-        if (minify) glGenerateMipmap(GL_TEXTURE_2D);
+        // mip chain so it averages instead of skipping samples; integer
+        // scaling box-resolves the base level instead.
+        const bool mipmapped = supersampled && !box_resolve;
+        if (mipmapped) glGenerateMipmap(GL_TEXTURE_2D);
         glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER,
-                        minify ? GL_LINEAR_MIPMAP_LINEAR : GL_LINEAR);
+                        mipmapped ? GL_LINEAR_MIPMAP_LINEAR : GL_LINEAR);
         glUseProgram(g_blit_program);
         glUniform1ui(0, 0u);
+        glUniform1ui(1, box_resolve ? 1u : 0u);
+        glUniform2i(2, rect.w, rect.h);
         glDrawArrays(GL_TRIANGLES, 0, 3);
     }
     if (g_overlay_pixels) {
@@ -660,6 +670,7 @@ bool nds_compute_host_present_top(const unsigned int* fallback_pixels,
         glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
         glUseProgram(g_blit_program);
         glUniform1ui(0, 1u);
+        glUniform1ui(1, 0u);
         glDrawArrays(GL_TRIANGLES, 0, 3);
         glDisable(GL_BLEND);
     }

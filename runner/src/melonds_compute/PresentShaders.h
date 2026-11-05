@@ -345,16 +345,35 @@ void main()
 // with the same flipped-uv vertex shader, so its GL row 0 holds the bottom DS
 // row and it is flipped back (sourceTopDown = 0). The frontend overlay is
 // uploaded top row first (sourceTopDown = 1) and alpha-blended.
+// boxResolve averages every source texel whose centre falls inside the output
+// pixel's footprint: the supersample resolve for integer scaling, where the 3D
+// raster is a whole multiple of the rect and the mean is an exact box filter.
 inline constexpr const char* kBlitFragment = R"GLSL(
 #version 430 core
 layout(binding = 7) uniform sampler2D source;
 layout(location = 0) uniform uint sourceTopDown;
+layout(location = 1) uniform uint boxResolve;
+layout(location = 2) uniform ivec2 rectSize;
 in vec2 uv;
 out vec4 outColor;
 void main()
 {
-    outColor = texture(source,
-        vec2(uv.x, sourceTopDown != 0u ? uv.y : 1.0 - uv.y));
+    vec2 st = vec2(uv.x, sourceTopDown != 0u ? uv.y : 1.0 - uv.y);
+    if (boxResolve == 0u) {
+        outColor = texture(source, st);
+        return;
+    }
+    ivec2 srcSize = textureSize(source, 0);
+    vec2 ratio = vec2(srcSize) / vec2(rectSize);
+    vec2 p = floor(st * vec2(rectSize));
+    ivec2 lo = ivec2(ceil(p * ratio - 0.5));
+    ivec2 hi = max(ivec2(ceil((p + 1.0) * ratio - 0.5)), lo + 1);
+    hi = min(min(hi, lo + 16), srcSize);
+    vec4 sum = vec4(0.0);
+    for (int y = lo.y; y < hi.y; ++y)
+        for (int x = lo.x; x < hi.x; ++x)
+            sum += texelFetch(source, ivec2(x, y), 0);
+    outColor = sum / float((hi.x - lo.x) * (hi.y - lo.y));
 }
 )GLSL";
 
