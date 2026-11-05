@@ -1192,6 +1192,10 @@ constexpr const char* kRuntimeMouseSensitivityKey =
     "input.mouse_sensitivity";
 constexpr const char* kRuntimeWindowModeKey = "display.window_mode";
 constexpr const char* kRuntimeScalingKey = "display.scaling";
+constexpr const char* kRuntimeResolutionScaleKey = "display.resolution_scale";
+// Menu steps for resolution_scale; 0 is "off" (the fixed multiplier). TOML
+// and the CLI take any percentage, which the menu shows as the nearest step.
+constexpr int kResolutionScaleChoiceValues[] = {0, 25, 50, 75, 100, 150, 200};
 constexpr const char* kRuntimeResumeKey = "system.resume";
 constexpr const char* kRuntimeQuitKey = "system.quit";
 
@@ -1199,6 +1203,8 @@ struct RuntimeMenuState {
     NdsFrontendOptions* options = nullptr;
     bool* running = nullptr;
     bool close_requested = false;
+    // Resolution scale needs the GL presenter on the compute renderer.
+    bool resolution_scale_available = false;
 };
 
 // Rewrites (or appends) each key=value pair in the launcher-owned settings
@@ -1260,6 +1266,19 @@ int runtime_menu_get_value(void* context, const RecompRuntimeUiItem* item,
         *value_out = static_cast<int>(state->options->window_mode);
         return 1;
     }
+    if (std::strcmp(item->key, kRuntimeResolutionScaleKey) == 0) {
+        const int current = state->options->resolution_scale;
+        int best = 0;
+        if (current > 0) {
+            best = kResolutionScaleChoiceValues[1];
+            for (const int v : kResolutionScaleChoiceValues) {
+                if (v > 0 && std::abs(v - current) < std::abs(best - current))
+                    best = v;
+            }
+        }
+        *value_out = best;
+        return 1;
+    }
     if (std::strcmp(item->key, kRuntimeScalingKey) == 0) {
         *value_out = static_cast<int>(state->options->scaling);
         return 1;
@@ -1284,6 +1303,19 @@ int runtime_menu_set_value(void* context, const RecompRuntimeUiItem* item,
         state->options->window_mode = static_cast<NdsWindowMode>(value);
         std::fprintf(stderr, "[display] window mode -> %s\n",
                      nds_window_mode_name(state->options->window_mode));
+        return 1;
+    }
+    if (std::strcmp(item->key, kRuntimeResolutionScaleKey) == 0) {
+        if (value < 0 || value > 1000) return 0;
+        state->options->resolution_scale = static_cast<uint16_t>(value);
+        if (value == 0)
+            std::fprintf(stderr,
+                         "[display] resolution scale -> off (fixed %ux)\n",
+                         static_cast<unsigned>(
+                             state->options->internal_resolution));
+        else
+            std::fprintf(stderr, "[display] resolution scale -> %d%%\n",
+                         value);
         return 1;
     }
     if (std::strcmp(item->key, kRuntimeScalingKey) == 0) {
@@ -1316,6 +1348,8 @@ int runtime_menu_is_enabled(void* context, const RecompRuntimeUiItem* item) {
     if (!state || !state->options || !item) return 0;
     if (std::strcmp(item->key, kRuntimeMouseSensitivityKey) == 0)
         return state->options->relative_mouse_touch ? 1 : 0;
+    if (std::strcmp(item->key, kRuntimeResolutionScaleKey) == 0)
+        return state->resolution_scale_available ? 1 : 0;
     return 1;
 }
 
@@ -1328,7 +1362,9 @@ void runtime_menu_save(void* context) {
             {{"mouse_sensitivity",
               std::to_string(options.relative_mouse_sensitivity)},
              {"window_mode", nds_window_mode_name(options.window_mode)},
-             {"scaling", nds_scaling_filter_name(options.scaling)}})) {
+             {"scaling", nds_scaling_filter_name(options.scaling)},
+             {"resolution_scale",
+              std::to_string(options.resolution_scale)}})) {
         std::fprintf(stderr, "[sdl] saved runtime settings\n");
     }
 }
@@ -1625,6 +1661,27 @@ NdsPresentRect window_present_rect(const FrontendPresentation& presentation,
     window_content_size(presentation, screen, &content_w, &content_h);
     return nds_present_rect(presentation.window_mode, presentation.scaling,
                             drawable_w, drawable_h, content_w, content_h);
+}
+
+// The 3D multiplier the options ask for: with resolution_scale, that percent
+// of the GL window's presented rect (window_mode/scaling from the options, so
+// a menu change counts at once); otherwise the fixed internal_resolution.
+uint8_t requested_internal_scale_for(const FrontendPresentation& presentation,
+                                     const NdsFrontendOptions& options,
+                                     NdsPresentRect* rect_out = nullptr) {
+    if (options.resolution_scale == 0u || !presentation.windows[0])
+        return options.internal_resolution;
+    int drawable_w = 0, drawable_h = 0;
+    window_drawable_size(presentation, 0, &drawable_w, &drawable_h);
+    int content_w = 0, content_h = 0;
+    window_content_size(presentation, 0, &content_w, &content_h);
+    const NdsPresentRect rect = nds_present_rect(
+        options.window_mode, options.scaling, drawable_w, drawable_h,
+        content_w, content_h);
+    if (rect_out) *rect_out = rect;
+    return nds_auto_internal_scale(rect.h, content_h, options.scaling,
+                                   options.resolution_scale,
+                                   kNdsMaxInternalScale);
 }
 
 // A DS-space sub-rect of a window's content, mapped into drawable pixels.
@@ -1927,9 +1984,12 @@ bool create_presentation(const NdsFrontendOptions& options,
     const bool direct_enabled =
         !direct_selection || !*direct_selection ||
         std::strcmp(direct_selection, "1") == 0;
+    // resolution_scale asks for the GL presenter up front, whatever the
+    // startup multiplier: auto scale can move between 1x and HD at runtime,
+    // and the presenter runs at 1x too, so a change never recreates windows.
     const bool direct_top_requested =
         (options.adaptive_screens & NDS_ADAPTIVE_TOP) != 0u ||
-        options.internal_resolution > 1u;
+        options.internal_resolution > 1u || options.resolution_scale > 0u;
     presentation.gl_top = (presentation.separate || presentation.single) &&
         allow_gl_top &&
         direct_top_requested &&
@@ -2153,11 +2213,11 @@ struct PresentationTicks {
 // as the currently installed stage left them, so the caller can report the
 // stage that is actually running.
 bool apply_performance_governor_stage(
-        const NdsFrontendOptions& options,
         FrontendPresentation& presentation,
-        uint8_t stage) {
-    const uint8_t target_scale =
-        stage >= 2u ? 1u : options.internal_resolution;
+        uint8_t stage, uint8_t requested_scale) {
+    // The governor caps the requested multiplier (fixed or auto); it never
+    // raises it.
+    const uint8_t target_scale = stage >= 2u ? 1u : requested_scale;
     if (!nds_gpu3d_set_runtime_internal_scale(target_scale)) {
         std::fprintf(stderr,
                      "[governor] could not apply internal scale %u\n",
@@ -2549,10 +2609,32 @@ int nds_run_interactive_frontend(const NdsFrontendOptions& initial_options) {
     // the same native surface every faithful consumer reads, so a run without
     // the GPU presenter is a valid way to prove that invariance holds. Only
     // the visible benefit needs gl_top, so that is what the notice says.
+    // The multiplier the user asked for (fixed, or resolution_scale of the
+    // presented rect). The perf governor caps it; the auto-scale controller
+    // in the frame loop moves it as the window changes.
+    const bool resolution_scale_live =
+        options.resolution_scale > 0u && presentation.gl_top;
+    if (options.resolution_scale > 0u && !presentation.gl_top) {
+        std::fprintf(stderr,
+            "[display] resolution_scale ignored: needs the OpenGL compute "
+            "renderer and the separate or single layout\n");
+    }
+    uint8_t requested_internal_scale = options.internal_resolution;
+    if (resolution_scale_live) {
+        NdsPresentRect rect{};
+        requested_internal_scale =
+            requested_internal_scale_for(presentation, options, &rect);
+        std::fprintf(stderr,
+                     "[display] resolution scale %u%%: internal %ux "
+                     "(presented %dx%d)\n",
+                     static_cast<unsigned>(options.resolution_scale),
+                     static_cast<unsigned>(requested_internal_scale),
+                     rect.w, rect.h);
+    }
     const uint8_t initial_internal_resolution =
         options.perf_governor_mode == NdsPerfGovernorMode::ForceStage2
             ? 1u
-            : options.internal_resolution;
+            : requested_internal_scale;
     if (!nds_gpu3d_set_internal_scale(initial_internal_resolution)) {
         std::fprintf(stderr,
                      "[sdl] internal resolution %ux is unavailable\n",
@@ -2599,7 +2681,8 @@ int nds_run_interactive_frontend(const NdsFrontendOptions& initial_options) {
         nds_compute_host_has_visible_context());
     const char* window_direct = std::getenv("NDS_COMPUTE_WINDOW_DIRECT");
     nds_gpu2d_set_direct_windows(window_direct &&
-        std::strcmp(window_direct, "1") == 0 && options.internal_resolution == 1u);
+        std::strcmp(window_direct, "1") == 0 && options.internal_resolution == 1u &&
+        options.resolution_scale == 0u);
 #else
     if (nds_gpu3d_renderer_policy() == NdsGpu3dRendererPolicy::Auto) {
         std::fprintf(stderr,
@@ -2609,6 +2692,10 @@ int nds_run_interactive_frontend(const NdsFrontendOptions& initial_options) {
 #endif
 
     NdsPerfGovernorState perf_governor{};
+    // Auto-scale controller state (see the frame loop's join point).
+    bool auto_scale_enabled = true;
+    uint8_t auto_scale_candidate = 0u;
+    uint64_t auto_scale_since = 0u;
     nds_perf_governor_init(&perf_governor,
                            options.perf_governor_mode);
     // Governor off is byte-identical to the pre-governor frontend: the scale,
@@ -2617,7 +2704,7 @@ int nds_run_interactive_frontend(const NdsFrontendOptions& initial_options) {
     // fail at startup.
     if (options.perf_governor_mode != NdsPerfGovernorMode::Off &&
         !apply_performance_governor_stage(
-            options, presentation, perf_governor.stage)) {
+            presentation, perf_governor.stage, requested_internal_scale)) {
         destroy_presentation(presentation);
         SDL_Quit();
         return 1;
@@ -2823,10 +2910,16 @@ int nds_run_interactive_frontend(const NdsFrontendOptions& initial_options) {
     nds_set_touch(0, 0, false);
     bool running = true;
     RuntimeMenuState runtime_menu_state{&options, &running, false};
+#if defined(NDS_HAVE_COMPUTE_RENDERER)
+    runtime_menu_state.resolution_scale_available =
+        presentation.gl_top && nds_compute_host_active();
+#endif
     static const char* const window_mode_choices[] = {
         "Letterbox", "Stretch", "Original (1:1)"};
     static const char* const scaling_choices[] = {
         "Integer (pixel-perfect)", "Bilinear"};
+    static const char* const resolution_scale_choices[] = {
+        "Off (fixed)", "25%", "50%", "75%", "100%", "150%", "200%"};
     static const RecompRuntimeUiItem runtime_menu_items[] = {
         {kRuntimeWindowModeKey, "Display", "Window mode",
          "Letterbox keeps 4:3, stretch fills the window, original is 1:1.",
@@ -2834,6 +2927,11 @@ int nds_run_interactive_frontend(const NdsFrontendOptions& initial_options) {
         {kRuntimeScalingKey, "Display", "Scaling",
          "Integer keeps whole-pixel multiples; bilinear smooths to any size.",
          RECOMP_RUNTIME_UI_CHOICE, 0, 1, 1, scaling_choices, 2, nullptr},
+        {kRuntimeResolutionScaleKey, "Display", "Resolution scale",
+         "3D detail relative to the window: 100% matches the screen, "
+         "less is coarser, more supersamples.",
+         RECOMP_RUNTIME_UI_CHOICE, 0, 200, 1, resolution_scale_choices, 7,
+         kResolutionScaleChoiceValues},
         {kRuntimeMouseSensitivityKey, "Input", "Mouse sensitivity",
          "Prime Controls relative aim speed.",
          RECOMP_RUNTIME_UI_INT, 10, 400, 1, nullptr, 0, nullptr},
@@ -3667,8 +3765,8 @@ int nds_run_interactive_frontend(const NdsFrontendOptions& initial_options) {
                             options.perf_governor_mode !=
                                 NdsPerfGovernorMode::Off &&
                             !apply_performance_governor_stage(
-                                options, presentation,
-                                perf_governor.stage)) {
+                                presentation, perf_governor.stage,
+                                requested_internal_scale)) {
                             nds_perf_governor_mark_apply_failed(
                                 &perf_governor);
                             nds_perf_governor_record_transition(
@@ -4724,12 +4822,66 @@ int nds_run_interactive_frontend(const NdsFrontendOptions& initial_options) {
         governor_sample.headroom_valid =
             static_cast<bool>(audio) && audio_started && !turbo_active;
         governor_last_underruns = current_underruns;
+#if defined(NDS_HAVE_COMPUTE_RENDERER)
+        // Auto scale. Runs here, with the producer joined, like the governor:
+        // a renderer rebuild must not land between a frame's capture and its
+        // present. The target must hold for 250 ms (a drag-resize sends many
+        // sizes) before the costly rebuild, which happens only on an integer
+        // multiplier change.
+        if (runtime_menu_state.resolution_scale_available &&
+            auto_scale_enabled && !perf_governor.apply_failed) {
+            NdsPresentRect rect{};
+            const uint8_t target =
+                requested_internal_scale_for(presentation, options, &rect);
+            const uint64_t now = SDL_GetPerformanceCounter();
+            if (target == requested_internal_scale) {
+                auto_scale_candidate = 0u;
+            } else if (target != auto_scale_candidate) {
+                auto_scale_candidate = target;
+                auto_scale_since = now;
+            } else if (now - auto_scale_since >= frequency / 4u) {
+                auto_scale_candidate = 0u;
+                const uint8_t effective =
+                    perf_governor.stage >= 2u ? 1u : target;
+                if (nds_gpu3d_set_runtime_internal_scale(effective)) {
+                    nds_gpu2d_set_hd_emit(effective > 1u &&
+                                          presentation.gl_top);
+                    std::fprintf(stderr,
+                                 "[display] internal %ux -> %ux "
+                                 "(presented %dx%d, resolution scale "
+                                 "%u%%%s) frame %llu\n",
+                                 static_cast<unsigned>(
+                                     requested_internal_scale),
+                                 static_cast<unsigned>(target), rect.w,
+                                 rect.h,
+                                 static_cast<unsigned>(
+                                     options.resolution_scale),
+                                 effective != target
+                                     ? ", governor holds 1x" : "",
+                                 static_cast<unsigned long long>(
+                                     shown_frames));
+                    requested_internal_scale = target;
+                    blend_cache.valid = false;
+                } else {
+                    // Same terminal rule as the governor: a failing rebuild
+                    // is not retried every frame.
+                    auto_scale_enabled = false;
+                    std::fprintf(stderr,
+                                 "[display] internal %ux could not be "
+                                 "applied; auto scale disabled at %ux\n",
+                                 static_cast<unsigned>(target),
+                                 static_cast<unsigned>(
+                                     nds_gpu3d_internal_scale()));
+                }
+            }
+        }
+#endif
         const uint8_t governor_stage_before = perf_governor.stage;
         if (nds_perf_governor_update(&perf_governor, governor_sample)) {
             const uint8_t requested_stage = perf_governor.stage;
             NdsPerfGovernorReason reason = perf_governor.last_reason;
             bool applied = apply_performance_governor_stage(
-                options, presentation, requested_stage);
+                presentation, requested_stage, requested_internal_scale);
             if (!applied) {
                 // Nothing was mutated by the failed apply, so the previously
                 // installed stage is still the live one. Report that stage and
