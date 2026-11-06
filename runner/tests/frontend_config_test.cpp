@@ -3,6 +3,7 @@
 #include <cstdlib>
 #include <filesystem>
 #include <fstream>
+#include <iterator>
 #include <string>
 
 namespace {
@@ -22,7 +23,67 @@ bool set_fullscreen_environment(const char* value) {
 
 }  // namespace
 
+static bool settings_file_test() {
+    const std::filesystem::path path =
+        std::filesystem::temp_directory_path() / "nds_settings_file_test.toml";
+    {
+        std::ofstream out(path);
+        out << "# top comment\n[paths]\nrom = \"\"   # keep me\n\n"
+               "[display]\nscaling = \"nearest\"   # nearest | bilinear\n"
+               "internal_resolution = 4\n# resolution_scale = 50\n\n"
+               "[audio]\nvolume = 100\n";
+    }
+    std::string error;
+    if (!nds_update_settings_file(
+            path.string(),
+            {{"paths", "rom", nds_toml_string("C:\\roms\\my \"game\".nds")},
+             {"display", "scaling", nds_toml_string("bilinear")},
+             {"display", "internal_resolution", "", true},
+             {"display", "resolution_scale", "150"},
+             {"audio", "mute", "true"},
+             {"controls", "gamepad_layout", nds_toml_string("labels")}},
+            &error))
+        return false;
+    std::ifstream in(path);
+    const std::string text((std::istreambuf_iterator<char>(in)),
+                           std::istreambuf_iterator<char>());
+    NdsFrontendOptions options{};
+    options.resolution_scale = 100;
+    const bool loaded =
+        nds_load_settings_file(path.string(), &options, &error);
+    bool ok =
+        loaded && text.find("# top comment") != std::string::npos &&
+        text.find("   # keep me") != std::string::npos &&
+        text.find("scaling = \"bilinear\"   # nearest | bilinear") !=
+            std::string::npos &&
+        text.find("# resolution_scale = 50") != std::string::npos &&
+        text.find("internal_resolution") == std::string::npos &&
+        options.paths.rom == "C:\\roms\\my \"game\".nds" &&
+        options.scaling == NdsScalingFilter::Bilinear &&
+        options.resolution_scale == 150 && options.audio_muted &&
+        options.audio_volume == 100 && !options.gamepad_positional;
+
+    // The menu's "Off (fixed)", layered over a title default.
+    ok = ok && nds_update_settings_file(
+                   path.string(), {{"display", "resolution_scale", "0"}},
+                   &error);
+    ok = ok && nds_load_settings_file(path.string(), &options, &error) &&
+         options.resolution_scale == 0;
+
+    // Title-owned sections stay out of a player's hands.
+    {
+        std::ofstream out(path);
+        out << "[game]\nsha1 = \"bad\"\n[cartridge]\nsave_size = 3\n";
+    }
+    options.expected_rom_sha1 = "kept";
+    ok = ok && nds_load_settings_file(path.string(), &options, &error) &&
+         options.expected_rom_sha1 == "kept";
+    std::filesystem::remove(path);
+    return ok;
+}
+
 int main() {
+    if (!settings_file_test()) return 1;
     NdsScreenLayout layout = NdsScreenLayout::Stacked;
     if (!require(nds_parse_screen_layout("separate", &layout)) ||
         !require(layout == NdsScreenLayout::Separate) ||

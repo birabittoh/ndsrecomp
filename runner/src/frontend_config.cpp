@@ -4,6 +4,9 @@
 #include <cctype>
 #include <exception>
 #include <cstdlib>
+#include <filesystem>
+#include <fstream>
+#include <sstream>
 
 #include "toml.hpp"
 
@@ -595,6 +598,10 @@ const char* nds_adaptive_screens_name(uint8_t value) {
     }
 }
 
+static bool apply_frontend_config(toml::table& root,
+                                  NdsFrontendOptions* options,
+                                  std::string* error);
+
 bool nds_load_frontend_config(const std::string& path,
                               NdsFrontendOptions* options,
                               std::string* error) {
@@ -609,10 +616,193 @@ bool nds_load_frontend_config(const std::string& path,
         if (error) *error = e.what();
         return false;
     }
+    return apply_frontend_config(root, options, error);
+}
 
+bool nds_load_frontend_config_text(const std::string& text,
+                                   NdsFrontendOptions* options,
+                                   std::string* error) {
+    if (!options) return false;
+    toml::table root;
+    try {
+        root = toml::parse(text);
+    } catch (const toml::parse_error& e) {
+        if (error) *error = e.description();
+        return false;
+    }
+    return apply_frontend_config(root, options, error);
+}
+
+bool nds_load_settings_file(const std::string& path,
+                            NdsFrontendOptions* options,
+                            std::string* error) {
+    if (!options) return false;
+    toml::table root;
+    try {
+        root = toml::parse_file(path);
+    } catch (const toml::parse_error& e) {
+        if (error) {
+            std::ostringstream message;
+            message << "line " << e.source().begin.line << ": "
+                    << e.description();
+            *error = message.str();
+        }
+        return false;
+    } catch (const std::exception& e) {
+        if (error) *error = e.what();
+        return false;
+    }
+    root.erase("game");
+    root.erase("cartridge");
+    if (const toml::table* paths = root["paths"].as_table()) {
+        options->paths.rom = (*paths)["rom"].value_or(std::string());
+        options->paths.bios = (*paths)["bios"].value_or(std::string());
+        options->paths.save = (*paths)["save"].value_or(std::string());
+    }
+    return apply_frontend_config(root, options, error);
+}
+
+std::string nds_toml_string(const std::string& value) {
+    std::string out = "\"";
+    for (const char c : value) {
+        if (c == '\\' || c == '"') out.push_back('\\');
+        out.push_back(c);
+    }
+    out.push_back('"');
+    return out;
+}
+
+namespace {
+
+std::string trim_ascii(const std::string& value) {
+    const size_t first = value.find_first_not_of(" \t\r");
+    if (first == std::string::npos) return {};
+    return value.substr(first, value.find_last_not_of(" \t\r") - first + 1u);
+}
+
+// "[name]" on a line of its own, optionally followed by a comment.
+bool settings_section_header(const std::string& line, std::string* name) {
+    const std::string text = trim_ascii(line);
+    if (text.size() < 3u || text[0] != '[' || text[1] == '[') return false;
+    const size_t close = text.find(']');
+    if (close == std::string::npos) return false;
+    *name = trim_ascii(text.substr(1u, close - 1u));
+    return true;
+}
+
+// Replace the value of a `key = value  # comment` line, comment included.
+std::string with_settings_value(const std::string& line, size_t equals,
+                                const std::string& value) {
+    size_t begin = line.find_first_not_of(" \t", equals + 1u);
+    if (begin == std::string::npos) begin = line.size();
+    size_t end = begin;
+    if (begin < line.size() && (line[begin] == '"' || line[begin] == '\'')) {
+        const char quote = line[begin];
+        end = begin + 1u;
+        while (end < line.size() && line[end] != quote)
+            end += line[end] == '\\' && quote == '"' ? 2u : 1u;
+        end = std::min(end + 1u, line.size());
+    } else {
+        while (end < line.size() && line[end] != '#' && line[end] != ' ' &&
+               line[end] != '\t' && line[end] != '\r')
+            ++end;
+    }
+    return line.substr(0, equals) + "= " + value + line.substr(end);
+}
+
+}  // namespace
+
+bool nds_update_settings_file(const std::string& path,
+                              const std::vector<NdsSettingUpdate>& updates,
+                              std::string* error) {
+    std::vector<std::string> lines;
+    {
+        std::ifstream in(path);
+        std::string line;
+        while (std::getline(in, line)) lines.push_back(line);
+    }
+
+    std::vector<bool> done(updates.size(), false);
+    std::string section;
+    std::vector<std::string> edited;
+    edited.reserve(lines.size());
+    for (const std::string& line : lines) {
+        if (settings_section_header(line, &section)) {
+            edited.push_back(line);
+            continue;
+        }
+        const size_t equals = line.find('=');
+        const size_t comment = line.find('#');
+        bool removed = false;
+        std::string out = line;
+        if (equals != std::string::npos &&
+            (comment == std::string::npos || comment > equals)) {
+            const std::string key = trim_ascii(line.substr(0, equals));
+            for (size_t i = 0; i < updates.size(); ++i) {
+                if (updates[i].section != section || updates[i].key != key)
+                    continue;
+                done[i] = true;
+                if (updates[i].remove)
+                    removed = true;
+                else
+                    out = with_settings_value(line, equals, updates[i].value);
+            }
+        }
+        if (!removed) edited.push_back(out);
+    }
+
+    for (size_t i = 0; i < updates.size(); ++i) {
+        if (done[i] || updates[i].remove) continue;
+        const std::string entry = updates[i].key + " = " + updates[i].value;
+        // After the last non-blank line of the section, if it exists.
+        std::string current;
+        size_t insert = edited.size() + 1u;
+        for (size_t line = 0; line < edited.size(); ++line) {
+            if (settings_section_header(edited[line], &current)) {
+                if (current == updates[i].section) insert = line + 1u;
+            } else if (current == updates[i].section &&
+                       !trim_ascii(edited[line]).empty()) {
+                insert = line + 1u;
+            }
+        }
+        if (insert > edited.size()) {
+            if (!edited.empty() && !trim_ascii(edited.back()).empty())
+                edited.push_back("");
+            edited.push_back("[" + updates[i].section + "]");
+            edited.push_back(entry);
+        } else {
+            edited.insert(edited.begin() + static_cast<std::ptrdiff_t>(insert),
+                          entry);
+        }
+    }
+
+    const std::string temporary = path + ".tmp";
+    {
+        std::ofstream out(temporary, std::ios::trunc);
+        for (const std::string& line : edited) out << line << '\n';
+        out.flush();
+        if (!out) {
+            if (error) *error = "cannot write " + temporary;
+            return false;
+        }
+    }
+    std::error_code rename_error;
+    std::filesystem::rename(temporary, path, rename_error);
+    if (rename_error) {
+        if (error) *error = rename_error.message();
+        return false;
+    }
+    return true;
+}
+
+static bool apply_frontend_config(toml::table& root,
+                                  NdsFrontendOptions* options,
+                                  std::string* error) {
     if (const toml::table* game = root["game"].as_table()) {
         if (const auto value = (*game)["name"].value<std::string>())
             options->game_name = *value;
+        if (const auto value = (*game)["app_name"].value<std::string>())
+            options->app_name = *value;
         if (const auto value = (*game)["sha1"].value<std::string>()) {
             const bool invalid_length = value->size() != 40u;
             const bool invalid_character = std::any_of(
@@ -688,7 +878,21 @@ bool nds_load_frontend_config(const std::string& path,
         }
     }
 
+    if (const toml::table* audio = root["audio"].as_table()) {
+        if (const auto value = (*audio)["volume"].value<int64_t>()) {
+            if (*value < 0 || *value > 100) {
+                if (error) *error = "audio.volume must be 0..100";
+                return false;
+            }
+            options->audio_volume = static_cast<uint8_t>(*value);
+        }
+        if (const auto value = (*audio)["mute"].value<bool>())
+            options->audio_muted = *value;
+    }
+
     if (const toml::table* display = root["display"].as_table()) {
+        if (const auto value = (*display)["discrete_gpu"].value<bool>())
+            options->discrete_gpu = *value;
         if (const auto value = (*display)["fullscreen"].value<std::string>()) {
             if (!nds_parse_fullscreen_mode(*value, &options->fullscreen)) {
                 if (error) {
@@ -864,7 +1068,10 @@ bool nds_load_frontend_config(const std::string& path,
             (*display)["internal_resolution"].value<int64_t>();
         const auto resolution_scale =
             (*display)["resolution_scale"].value<int64_t>();
-        if (internal_resolution && resolution_scale) {
+        // resolution_scale = 0 is the runtime menu's "Off (fixed)": it keeps
+        // whatever multiplier internal_resolution gives.
+        const bool scale_off = resolution_scale && *resolution_scale == 0;
+        if (internal_resolution && resolution_scale && !scale_off) {
             if (error) {
                 *error = "display.internal_resolution and "
                          "display.resolution_scale are exclusive";
@@ -882,12 +1089,14 @@ bool nds_load_frontend_config(const std::string& path,
             }
             options->resolution_scale = 0;
         }
-        if (resolution_scale) {
+        if (scale_off) {
+            options->resolution_scale = 0;
+        } else if (resolution_scale) {
             if (!nds_parse_resolution_scale(
                     std::to_string(*resolution_scale),
                     &options->resolution_scale)) {
                 if (error) {
-                    *error = "display.resolution_scale must be 10..1000";
+                    *error = "display.resolution_scale must be 0 or 10..1000";
                 }
                 return false;
             }
@@ -1055,6 +1264,14 @@ bool nds_load_frontend_config(const std::string& path,
                     *error = "controls.gamepad_layout must be labels or "
                              "positional";
                 }
+                return false;
+            }
+        }
+        if (const auto value = (*controls)["mouse_sensitivity"].value<int64_t>()) {
+            if (!nds_parse_mouse_sensitivity(
+                    std::to_string(*value),
+                    &options->relative_mouse_sensitivity)) {
+                if (error) *error = "controls.mouse_sensitivity must be 10..400";
                 return false;
             }
         }

@@ -2,6 +2,8 @@
 
 #include <cstdint>
 #include <string>
+#include <utility>
+#include <vector>
 
 #include "cartridge_config.h"
 #include "frontend_window_size.h"
@@ -209,12 +211,26 @@ struct NdsVirtualStylusOptions {
     uint16_t pad_sensitivity = 100; // 10%..400%
 };
 
+// [paths] from the player's settings.toml. Empty means "use the default".
+// Relative paths are relative to the data directory.
+struct NdsSettingsPaths {
+    std::string rom;
+    std::string bios;
+    std::string save;
+};
+
 struct NdsFrontendOptions {
     // Optional exact cartridge identity from [game]. When present, every
     // title-owned setting in this config is rejected for any other ROM.
     std::string expected_rom_sha1;
     // Display name from [game].name (runtime settings menu title).
     std::string game_name;
+    // [game].app_name: the per-title data directory's name (player_launch.h).
+    std::string app_name;
+    NdsSettingsPaths paths{};
+    // [display] discrete_gpu: on hybrid-graphics laptops, run on the discrete
+    // GPU. Consumed by the player launch only.
+    bool discrete_gpu = true;
     NdsScreenLayout screen_layout = NdsScreenLayout::Stacked;
     NdsFullscreenMode fullscreen = NdsFullscreenMode::Off;
     // Host presentation geometry ([display] window_mode / scaling). The
@@ -373,6 +389,9 @@ struct NdsFrontendOptions {
     // Optional launcher-owned settings file. Runtime-only menu changes update
     // the existing key/value file when the launcher passes this path.
     std::string runtime_settings_path;
+    // The player's settings.toml. When set, every runtime menu change is
+    // written back to it (nds_update_settings_file).
+    std::string settings_path;
 };
 
 // Parse [display] settings from a game TOML. Missing [display] is valid.
@@ -380,6 +399,35 @@ struct NdsFrontendOptions {
 bool nds_load_frontend_config(const std::string& path,
                               NdsFrontendOptions* options,
                               std::string* error);
+// Same, from TOML text already in memory (the title config embedded in the
+// executable).
+bool nds_load_frontend_config_text(const std::string& text,
+                                   NdsFrontendOptions* options,
+                                   std::string* error);
+// Layer the player's settings.toml over `options`. Title-owned sections
+// ([game], [cartridge]) are ignored here; [paths] is only read here.
+bool nds_load_settings_file(const std::string& path,
+                            NdsFrontendOptions* options,
+                            std::string* error);
+// One key of a settings file. `value` is TOML source text (quote strings with
+// nds_toml_string); `remove` deletes the key instead.
+struct NdsSettingUpdate {
+    NdsSettingUpdate(std::string section_name, std::string key_name,
+                     std::string toml_value, bool remove_key = false)
+        : section(std::move(section_name)), key(std::move(key_name)),
+          value(std::move(toml_value)), remove(remove_key) {}
+    std::string section;
+    std::string key;
+    std::string value;
+    bool remove;
+};
+// Edit keys in place, keeping comments, ordering and every other line. Keys
+// not in the file are added to their section, created if needed. The file is
+// replaced atomically.
+bool nds_update_settings_file(const std::string& path,
+                              const std::vector<NdsSettingUpdate>& updates,
+                              std::string* error);
+std::string nds_toml_string(const std::string& value);
 bool nds_parse_screen_layout(const std::string& value,
                              NdsScreenLayout* out);
 bool nds_parse_fullscreen_mode(const std::string& value,
