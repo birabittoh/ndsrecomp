@@ -56,6 +56,9 @@ option(NDS_NATIVE_CONTROL
     "Experiment: native pure status/multiply and stateless ARM9 cache operations" OFF)
 option(NDS_TIER3_CANONICAL_STATE
     "Share canonical registers/banks with faithful execution" ON)
+option(NDS_INTERPRETER
+    "Link the Tier-3 interpreter; OFF makes code with no live bank a fatal error"
+    ON)
 set(NDS_MKDS_PERFORMANCE_BANK_DIR "" CACHE PATH
     "Generated mkds_perf_arm9 and mkds_perf_arm9_itcm banks")
 set(NDS_ARM9_DYNARMIC_ROOT "" CACHE PATH "Optional pinned Dynarmic source for experimental ARM9 native execution")
@@ -186,6 +189,12 @@ if(NDS_MKDS_CARD_PIO_IMPLEMENTATION STREQUAL "HLE")
 endif()
 if(NDS_TIER3_CANONICAL_STATE)
     string(APPEND NDS_BUILD_VARIANT "-canonical-tier3-v1")
+endif()
+if(NDS_INTERPRETER)
+    set(NDS_TIER3_SOURCE src/tier3.cpp)
+else()
+    set(NDS_TIER3_SOURCE src/tier3_absent.cpp)
+    string(APPEND NDS_BUILD_VARIANT "-no-interpreter-v1")
 endif()
 foreach(_experiment NDS_CAPTURE_VIEW_REUSE NDS_LEAN_DIAGNOSTICS)
     if(${_experiment})
@@ -720,7 +729,7 @@ add_executable(nds_runner
     src/gpu2d.cpp
     src/gpu3d.cpp
     src/title_patches.cpp
-    src/tier3.cpp
+    ${NDS_TIER3_SOURCE}
     src/coverage_manifest.cpp
     src/diagnostics.cpp
     src/dispatch_timing.cpp
