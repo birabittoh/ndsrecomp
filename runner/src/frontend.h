@@ -312,6 +312,9 @@ struct NdsFrontendOptions {
     // last source (TOML < env < CLI) that names either option wins: setting
     // internal_resolution clears this and pins the multiplier.
     uint16_t resolution_scale = 0;
+    // Single-screen layout: the other LCD beside the main one, as a percent
+    // of its size. 0 shows only the main screen.
+    uint8_t second_screen_size = 0;
     // Texture upscaling factor, 1 (off), 2, or 4. Filters each decoded DS
     // texture once on a cache miss; independent of internal_resolution, but
     // only worth enabling alongside it.
@@ -412,6 +415,8 @@ bool nds_parse_antialiasing(const std::string& value, uint8_t* out);
 bool nds_parse_internal_resolution(const std::string& value, uint8_t* out);
 // 10..1000 (percent).
 bool nds_parse_resolution_scale(const std::string& value, uint16_t* out);
+// 0..60 (percent).
+bool nds_parse_second_screen_size(const std::string& value, uint8_t* out);
 bool nds_parse_texture_upscale(const std::string& value, uint8_t* out);
 bool nds_parse_frame_interpolation(const std::string& value,
                                    NdsFrameInterpolation* out);

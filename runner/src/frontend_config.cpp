@@ -178,6 +178,15 @@ bool nds_parse_internal_resolution(const std::string& value, uint8_t* out) {
     return true;
 }
 
+bool nds_parse_second_screen_size(const std::string& value, uint8_t* out) {
+    if (!out || value.empty()) return false;
+    char* end = nullptr;
+    const long parsed = std::strtol(value.c_str(), &end, 10);
+    if (!end || *end != '\0' || parsed < 0 || parsed > 60) return false;
+    *out = static_cast<uint8_t>(parsed);
+    return true;
+}
+
 bool nds_parse_resolution_scale(const std::string& value, uint16_t* out) {
     if (!out || value.empty()) return false;
     std::string digits = value;
@@ -870,6 +879,16 @@ bool nds_load_frontend_config(const std::string& path,
                 return false;
             }
             options->internal_resolution = 1;
+        }
+        if (const auto value =
+                (*display)["second_screen_size"].value<int64_t>()) {
+            if (!nds_parse_second_screen_size(
+                    std::to_string(*value), &options->second_screen_size)) {
+                if (error) {
+                    *error = "display.second_screen_size must be 0..60";
+                }
+                return false;
+            }
         }
     }
 

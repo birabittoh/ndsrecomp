@@ -1220,6 +1220,7 @@ constexpr const char* kRuntimeResolutionScaleKey = "display.resolution_scale";
 // Menu steps for resolution_scale; 0 is "off" (the fixed multiplier). TOML
 // and the CLI take any percentage, which the menu shows as the nearest step.
 constexpr int kResolutionScaleChoiceValues[] = {0, 25, 50, 75, 100, 150, 200};
+constexpr const char* kRuntimeSecondScreenKey = "display.second_screen_size";
 constexpr const char* kRuntimeVolumeKey = "audio.volume";
 constexpr const char* kRuntimeMuteKey = "audio.mute";
 constexpr const char* kRuntimeResumeKey = "system.resume";
@@ -1311,6 +1312,10 @@ int runtime_menu_get_value(void* context, const RecompRuntimeUiItem* item,
         *value_out = static_cast<int>(state->options->scaling);
         return 1;
     }
+    if (std::strcmp(item->key, kRuntimeSecondScreenKey) == 0) {
+        *value_out = state->options->second_screen_size;
+        return 1;
+    }
     if (std::strcmp(item->key, kRuntimeVolumeKey) == 0) {
         *value_out = state->options->audio_volume;
         return 1;
@@ -1362,6 +1367,12 @@ int runtime_menu_set_value(void* context, const RecompRuntimeUiItem* item,
                      nds_scaling_filter_name(state->options->scaling));
         return 1;
     }
+    if (std::strcmp(item->key, kRuntimeSecondScreenKey) == 0) {
+        if (value < 0 || value > 60) return 0;
+        state->options->second_screen_size = static_cast<uint8_t>(value);
+        std::fprintf(stderr, "[display] second screen size -> %d%%\n", value);
+        return 1;
+    }
     if (std::strcmp(item->key, kRuntimeVolumeKey) == 0 ||
         std::strcmp(item->key, kRuntimeMuteKey) == 0) {
         if (!state->audio || !state->audio_queue) return 0;
@@ -1400,6 +1411,9 @@ int runtime_menu_is_enabled(void* context, const RecompRuntimeUiItem* item) {
         return state->options->relative_mouse_touch ? 1 : 0;
     if (std::strcmp(item->key, kRuntimeResolutionScaleKey) == 0)
         return state->resolution_scale_available ? 1 : 0;
+    if (std::strcmp(item->key, kRuntimeSecondScreenKey) == 0)
+        return state->options->screen_layout == NdsScreenLayout::Single
+            ? 1 : 0;
     if (std::strcmp(item->key, kRuntimeVolumeKey) == 0)
         return state->audio && *state->audio &&
                !state->options->audio_muted ? 1 : 0;
@@ -1420,6 +1434,8 @@ void runtime_menu_save(void* context) {
              {"scaling", nds_scaling_filter_name(options.scaling)},
              {"resolution_scale",
               std::to_string(options.resolution_scale)},
+             {"second_screen_size",
+              std::to_string(options.second_screen_size)},
              {"audio_volume", std::to_string(options.audio_volume)},
              {"audio_muted", options.audio_muted ? "1" : "0"}})) {
         std::fprintf(stderr, "[sdl] saved runtime settings\n");
@@ -1511,6 +1527,8 @@ struct FrontendPresentation {
     // shows the physical LCD `shown_screen`. With gl_top it is the GL window.
     bool single = false;
     int shown_screen = 0;
+    // The other LCD's size beside it, percent; 0 hides it.
+    int inset_percent = 0;
     bool gl_top = false;
     SDL_Window* windows[2]{};
     SDL_Renderer* renderers[2]{};
@@ -1716,6 +1734,11 @@ NdsPresentRect window_present_rect(const FrontendPresentation& presentation,
                                    int drawable_h) {
     int content_w = 0, content_h = 0;
     window_content_size(presentation, screen, &content_w, &content_h);
+    if (presentation.single)
+        return nds_single_layout(presentation.window_mode,
+                                 presentation.scaling, drawable_w, drawable_h,
+                                 content_w, content_h,
+                                 presentation.inset_percent).main;
     return nds_present_rect(presentation.window_mode, presentation.scaling,
                             drawable_w, drawable_h, content_w, content_h);
 }
@@ -1732,9 +1755,10 @@ uint8_t requested_internal_scale_for(const FrontendPresentation& presentation,
     window_drawable_size(presentation, 0, &drawable_w, &drawable_h);
     int content_w = 0, content_h = 0;
     window_content_size(presentation, 0, &content_w, &content_h);
-    const NdsPresentRect rect = nds_present_rect(
+    const NdsPresentRect rect = nds_single_layout(
         options.window_mode, options.scaling, drawable_w, drawable_h,
-        content_w, content_h);
+        content_w, content_h,
+        presentation.single ? options.second_screen_size : 0).main;
     if (rect_out) *rect_out = rect;
     return nds_auto_internal_scale(rect.h, content_h, options.scaling,
                                    options.resolution_scale,
@@ -1809,8 +1833,17 @@ void convert_mouse_event_to_logical_coordinates(
         const float py = static_cast<float>(y) * drawable_h / window_h;
         int content_w = 0, content_h = 0;
         window_content_size(presentation, screen, &content_w, &content_h);
-        const NdsPresentRect rect = window_present_rect(
+        NdsPresentRect rect = window_present_rect(
             presentation, screen, drawable_w, drawable_h);
+        // With the top LCD shown, the touchscreen is the inset. Either way
+        // the result is bottom-LCD coordinates.
+        if (presentation.single && presentation.shown_screen == 0 &&
+            presentation.inset_percent > 0) {
+            rect = nds_single_layout(presentation.window_mode,
+                                     presentation.scaling, drawable_w,
+                                     drawable_h, content_w, content_h,
+                                     presentation.inset_percent).inset;
+        }
         float cx = 0.0f, cy = 0.0f;
         nds_present_rect_to_content(rect, content_w, content_h, px, py,
                                     &cx, &cy);
@@ -2056,6 +2089,8 @@ bool create_presentation(const NdsFrontendOptions& options,
     presentation.antialiasing = options.antialiasing;
     presentation.window_mode = options.window_mode;
     presentation.scaling = options.scaling;
+    presentation.inset_percent =
+        presentation.single ? options.second_screen_size : 0;
     const int aa_scale = presentation.gl_top ? 1 : options.antialiasing >= 8 ? 4 :
                          options.antialiasing >= 4 ? 3 :
                          options.antialiasing >= 2 ? 2 : 1;
@@ -2088,7 +2123,8 @@ bool create_presentation(const NdsFrontendOptions& options,
                               : "ndsrecomp firmware preview",
         SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED,
         (presentation.separate ? presentation.screen_widths[0]
-                               : presentation.canvas_width) * kWindowScale,
+                               : presentation.canvas_width) * kWindowScale *
+            (100 + presentation.inset_percent) / 100,
         first_height,
         top_window_flags);
     if (!presentation.windows[0]) {
@@ -2117,7 +2153,8 @@ bool create_presentation(const NdsFrontendOptions& options,
             usable.w, usable.h, presentation.single);
         SDL_SetWindowSize(presentation.windows[0],
             presentation.separate ? initial_size.top_width
-                : std::max(initial_size.top_width, initial_size.bottom_width),
+                : std::max(initial_size.top_width, initial_size.bottom_width) *
+                      (100 + presentation.inset_percent) / 100,
             initial_size.height);
         SDL_SetWindowPosition(presentation.windows[0],
             SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED);
@@ -2378,8 +2415,9 @@ void draw_separate_screen(FrontendPresentation& presentation, int screen,
     draw_savestate_notice(target, savestate_notice);
 }
 
-// Single-screen layout: present only presentation.shown_screen, with the
-// runtime menu, virtual stylus (bottom LCD only) and savestate notice on it.
+// Single-screen layout: present presentation.shown_screen, with the other LCD
+// as an optional inset beside it, and the runtime menu, virtual stylus (bottom
+// LCD only) and savestate notice on the shown screen.
 // The GL window has no SDL renderer, so there the stylus and notice go
 // through the presenter's overlay layer, and an open runtime menu (drawn into
 // the CPU pixels) makes that frame present the CPU composite instead of HD.
@@ -2397,6 +2435,8 @@ PresentationTicks present_single_screen(FrontendPresentation& presentation,
     const int shown = presentation.shown_screen & 1;
     const uint32_t* pixels = shown ? bottom_pixels : top_pixels;
     const int width = shown ? bottom_width : top_width;
+    const uint32_t* other_pixels = shown ? top_pixels : bottom_pixels;
+    const int other_width = shown ? top_width : bottom_width;
     const bool stylus = virtual_stylus_visible && shown == 1;
     const bool menu_open = runtime_ui && recomp_runtime_ui_is_open(runtime_ui);
     pixels = runtime_menu_overlay(runtime_ui, pixels, width, kScreenHeight);
@@ -2430,11 +2470,15 @@ PresentationTicks present_single_screen(FrontendPresentation& presentation,
             nds_frontend_latency::enabled.load(std::memory_order_relaxed);
         nds_compute_host_set_present_mode(presentation.window_mode,
                                           presentation.scaling);
+        nds_compute_host_set_inset(other_pixels,
+                                   static_cast<unsigned>(other_width),
+                                   presentation.inset_percent);
         const bool ok = nds_compute_host_present_top(
             pixels, static_cast<uint16_t>(width),
             direct ? &direct_frame : nullptr, &gl_ticks,
             presentation.antialiasing);
         nds_compute_host_set_overlay(nullptr, 0);
+        nds_compute_host_set_inset(nullptr, 0, 0);
         if (!ok) {
             std::fprintf(stderr, "[gpu3d] single-screen presentation failed\n");
             ticks.ok = false;
@@ -2451,6 +2495,9 @@ PresentationTicks present_single_screen(FrontendPresentation& presentation,
     uint64_t start = SDL_GetPerformanceCounter();
     SDL_UpdateTexture(presentation.textures[shown], nullptr, pixels,
                       width * sizeof(uint32_t));
+    if (presentation.inset_percent > 0)
+        SDL_UpdateTexture(presentation.textures[shown ^ 1], nullptr,
+                          other_pixels, other_width * sizeof(uint32_t));
     ticks.upload += SDL_GetPerformanceCounter() - start;
     SDL_Renderer* renderer = presentation.renderers[0];
     start = SDL_GetPerformanceCounter();
@@ -2458,10 +2505,17 @@ PresentationTicks present_single_screen(FrontendPresentation& presentation,
     SDL_RenderClear(renderer);
     int drawable_w = 0, drawable_h = 0;
     window_drawable_size(presentation, 0, &drawable_w, &drawable_h);
-    const NdsPresentRect rect =
-        window_present_rect(presentation, 0, drawable_w, drawable_h);
+    const NdsSingleLayout layout = nds_single_layout(
+        presentation.window_mode, presentation.scaling, drawable_w, drawable_h,
+        width, kScreenHeight, presentation.inset_percent);
+    const NdsPresentRect& rect = layout.main;
     const SDL_Rect screen_rect{rect.x, rect.y, rect.w, rect.h};
     render_screen(presentation, shown, screen_rect);
+    if (layout.inset.w > 0 && layout.inset.h > 0) {
+        const SDL_Rect inset_rect{layout.inset.x, layout.inset.y,
+                                  layout.inset.w, layout.inset.h};
+        render_screen(presentation, shown ^ 1, inset_rect);
+    }
     const DsTarget target = sdl_ds_target(renderer, screen_rect, width);
     if (stylus)
         draw_virtual_stylus(target, virtual_stylus_x, virtual_stylus_y);
@@ -3002,6 +3056,10 @@ int nds_run_interactive_frontend(const NdsFrontendOptions& initial_options) {
          "less is coarser, more supersamples.",
          RECOMP_RUNTIME_UI_CHOICE, 0, 200, 1, resolution_scale_choices, 7,
          kResolutionScaleChoiceValues},
+        {kRuntimeSecondScreenKey, "Display", "Second screen size",
+         "The other screen beside the main one, as a percent of its size. "
+         "0 hides it.",
+         RECOMP_RUNTIME_UI_INT, 0, 60, 5, nullptr, 0, nullptr},
         {kRuntimeVolumeKey, "Audio", "Volume",
          "Host output level in percent; the game keeps running at full mix.",
          RECOMP_RUNTIME_UI_INT, 0, 100, 5, nullptr, 0, nullptr},
@@ -4100,7 +4158,8 @@ int nds_run_interactive_frontend(const NdsFrontendOptions& initial_options) {
                   relative_mouse.captured()) &&
                 (presentation.separate || presentation.single
                     ? (!presentation.single ||
-                       presentation.shown_screen == 1) &&
+                       presentation.shown_screen == 1 ||
+                       presentation.inset_percent > 0) &&
                           event.button.x >= bottom_content_left &&
                           event.button.x < bottom_content_left + kScreenWidth
                     : stacked_left_route ==
@@ -4713,6 +4772,8 @@ int nds_run_interactive_frontend(const NdsFrontendOptions& initial_options) {
                        blend_cache.previous[1].size());
             presentation.window_mode = options.window_mode;
             presentation.scaling = options.scaling;
+            presentation.inset_percent =
+                presentation.single ? options.second_screen_size : 0;
             const PresentationTicks synthetic_ticks = present_screens(
                 presentation, blend_cache.blended[0].data(), top_width,
                 blend_cache.blended[1].data(), bottom_width,
@@ -4739,6 +4800,8 @@ int nds_run_interactive_frontend(const NdsFrontendOptions& initial_options) {
         }
         presentation.window_mode = options.window_mode;
         presentation.scaling = options.scaling;
+        presentation.inset_percent =
+            presentation.single ? options.second_screen_size : 0;
         const PresentationTicks presentation_ticks = present_screens(
             presentation, top_pixels, top_width,
             bottom_pixels, bottom_width,

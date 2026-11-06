@@ -83,6 +83,13 @@ int main() {
     bool toggle = false;
     uint16_t mouse_value = 0;
     uint16_t local_wireless_port = 0;
+    uint8_t second_screen_size = 0;
+    if (!require(nds_parse_second_screen_size("25", &second_screen_size)) ||
+        !require(second_screen_size == 25) ||
+        !require(nds_parse_second_screen_size("0", &second_screen_size)) ||
+        !require(!nds_parse_second_screen_size("61", &second_screen_size)) ||
+        !require(!nds_parse_second_screen_size("-1", &second_screen_size)))
+        return 1;
     if (!require(nds_parse_on_off("on", &toggle)) || !require(toggle) ||
         !require(nds_parse_on_off("false", &toggle)) || require(toggle) ||
         !require(!nds_parse_on_off("maybe", &toggle)) ||

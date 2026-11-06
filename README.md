@@ -304,6 +304,13 @@ are exclusive within one source, and the later source (TOML < env < CLI)
 wins. The performance governor drops 3D to 1x when frames wait on the GPU, and
 restores it once that wait falls again.
 
+`second_screen_size` (0..60, default 0) shows the other LCD in the `single`
+layout, to the right of the main screen and bottom-aligned, as a percent of its
+size. The pair is fitted as one image, so `window_mode` and `scaling` apply to
+it and the main screen is never covered. Clicking the inset touches the bottom
+LCD when that is the screen it shows. It is also in the runtime menu (Esc),
+along with the audio volume and mute.
+
 `startup_mode = "automatic"` sets the retail firmware's Automatic-mode flag
 in the runner's private in-memory firmware image. With a Slot-1 cartridge
 inserted, the real BIOS/firmware/card path then launches it without navigating

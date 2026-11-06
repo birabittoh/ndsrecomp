@@ -126,6 +126,37 @@ int main() {
     check(nds_auto_internal_scale(0, 192, S::Bilinear, 100, 16) == 1,
           "degenerate rect -> 1x");
 
+    {
+        const auto off = nds_single_layout(M::Letterbox, S::Nearest, 1920,
+                                           1080, 256, 192, 0);
+        check(rect_is(off.main, 240, 0, 1440, 1080) && off.inset.w == 0,
+              "no inset: the plain rect");
+        // The inset fills the bar: the main screen keeps its full height.
+        const auto wide = nds_single_layout(M::Letterbox, S::Nearest, 1920,
+                                            1080, 256, 192, 25);
+        check(rect_is(wide.main, 60, 0, 1440, 1080),
+              "16:9 inset leaves the main screen full height");
+        check(rect_is(wide.inset, 1500, 810, 360, 270),
+              "inset right of main, bottom-aligned, keeps 4:3");
+        // 4:3 has no bars to spend, so the pair shrinks to fit.
+        const auto square = nds_single_layout(M::Letterbox, S::Nearest, 640,
+                                              480, 256, 192, 25);
+        check(rect_is(square.main, 0, 48, 512, 384),
+              "4:3 window fits the pair");
+        check(rect_is(square.inset, 512, 336, 128, 96),
+              "4:3 inset at a quarter size");
+        // Integer keeps the main screen on whole multiples.
+        const auto integer = nds_single_layout(M::Letterbox, S::Integer, 1920,
+                                               1080, 256, 192, 25);
+        check(integer.main.w == 256 * 5 && integer.main.h == 192 * 5,
+              "integer main stays a whole multiple");
+        const auto original = nds_single_layout(M::Original, S::Nearest, 1000,
+                                                800, 256, 192, 50);
+        check(original.main.w == 256 && original.main.h == 192 &&
+                  original.inset.w == 128 && original.inset.h == 96,
+              "original stays 1:1");
+    }
+
     if (failures) return 1;
     std::puts("frontend window size checks passed");
     return 0;
