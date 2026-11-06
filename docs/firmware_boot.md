@@ -1,7 +1,7 @@
 # Firmware boot — Phase 0 ground truth
 
 Source: `bios/firmware.bin`, sha-1 `ae22de59…` (matches known-good).
-Decoded by `tools/fw_inspect.py`.
+Decoded by `tools/fw_inspect.py`; `tools/fw_extract.py` decodes the parts.
 
 ## Header (verified offsets, melonDS FirmwareHeader)
 
@@ -14,8 +14,8 @@ Decoded by `tools/fw_inspect.py`.
 | 0x08 identifier | `"MACP"` |
 | 0x0C ARM9 boot ROM addr | `0x0030` |
 | 0x0E ARM9 boot RAM addr | `0x6100` |
-| 0x10 ARM7 boot RAM addr | `0x0034` |
-| 0x12 ARM7 boot ROM addr | `0x0008` |
+| 0x10 ARM7 boot ROM addr | `0x0034` |
+| 0x12 ARM7 boot RAM addr | `0x0008` |
 | 0x14 shift amounts | `0x0C71` |
 | 0x24 user settings offset | `0x0DB3` → flash `0x6D98` |
 | 0x36 MAC | device-specific value (redacted; Nintendo OUI verified) |
@@ -32,22 +32,31 @@ s_a9ram = (shift >> 3) & 7   # = 6
 s_a7rom = (shift >> 6) & 7   # = 1
 s_a7ram = (shift >> 9) & 7   # = 6
 ARM9 ROM = header[0x0C] << (2 + s_a9rom)              # 0x0030<<3 = flash 0x180
-ARM7 ROM = header[0x12] << (2 + s_a7rom)              # 0x0008<<3 = flash 0x40
+ARM7 ROM = header[0x10] << (2 + s_a7rom)              # 0x0034<<3 = flash 0x1A0
 ARM9 RAM = 0x02800000 - (header[0x0E] << (2+s_a9ram)) # 0x02800000-0x610000 = 0x021F0000
-ARM7 RAM = 0x03810000 - (header[0x10] << (2+s_a7ram)) # 0x03810000-0x3400   = 0x0380CC00
+ARM7 RAM = 0x03810000 - (header[0x12] << (2+s_a7ram)) # 0x03810000-0x0800   = 0x0380F800
 ```
 
 Both destinations land in valid regions (ARM9 → main RAM, ARM7 → ARM7
 WRAM), confirming the formula. The streams at those ROM offsets are
-**compressed/encrypted** (a bit-flag + back-reference scheme the ARM7
-BIOS decodes). We do **not** decompress offline: the recompiled ARM7
-BIOS does it at runtime (LLE). Offline decompression is only needed to
-promote the menu to recompiled banks (Phase 3), not to boot.
+**compressed/encrypted**: LZSS behind a Blowfish layer keyed from the ARM7
+BIOS's KEY1 table, which the recompiled ARM7 BIOS decodes at runtime (LLE).
+`tools/fw_extract.py` does the same decode offline, which is what lets a
+title build banks for this code. It checks the result against the header's
+boot CRC.
+
+A dump checked this way (sha-1 `1cf9e67c…`) turned out to be **FlashMe**, not
+retail boot code: its ARM9 part at `0x021F0000` is 12 bytes, `ldr r0,[pc]; bx r0`
+around a jump target, spinning until the ARM7 writes a real entry into that
+word, and its ARM7 part is a 272 byte loader. FlashMe marks itself with
+`flash[0x17C] != 0xFF`, keeps the original header at `0x3F680` (`0x3FC80` for
+its first version), and stores the real parts as plain LZSS at the addresses it
+names. `tools/fw_extract.py` handles both layouts.
 
 | part | flash offset | RAM destination |
 |---|---|---|
 | ARM9 boot | `0x000180` | `0x021F0000` (main RAM) |
-| ARM7 boot | `0x000040` | `0x0380CC00` (ARM7 WRAM) |
+| ARM7 boot | `0x0001A0` | `0x0380F800` (ARM7 WRAM) |
 | ARM9 GUI/menu | `0x0183B0` | (loaded by ARM9 boot) |
 | ARM7 wifi | `0x00F5B0` | (loaded by ARM7 boot) |
 | user settings | `0x006D98` | — |
