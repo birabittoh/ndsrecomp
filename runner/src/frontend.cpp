@@ -1231,6 +1231,7 @@ constexpr const char* kRuntimeResolutionScaleKey = "display.resolution_scale";
 // and the CLI take any percentage, which the menu shows as the nearest step.
 constexpr int kResolutionScaleChoiceValues[] = {0, 25, 50, 75, 100, 150, 200};
 constexpr const char* kRuntimeSecondScreenKey = "display.second_screen_size";
+constexpr const char* kRuntimeShowFpsKey = "display.show_fps";
 constexpr const char* kRuntimeVolumeKey = "audio.volume";
 constexpr const char* kRuntimeMuteKey = "audio.mute";
 constexpr const char* kRuntimeResumeKey = "system.resume";
@@ -1330,6 +1331,10 @@ int runtime_menu_get_value(void* context, const RecompRuntimeUiItem* item,
         *value_out = state->options->second_screen_size;
         return 1;
     }
+    if (std::strcmp(item->key, kRuntimeShowFpsKey) == 0) {
+        *value_out = state->options->show_fps ? 1 : 0;
+        return 1;
+    }
     if (std::strcmp(item->key, kRuntimeVolumeKey) == 0) {
         *value_out = state->options->audio_volume;
         return 1;
@@ -1392,6 +1397,11 @@ int runtime_menu_set_value(void* context, const RecompRuntimeUiItem* item,
         if (value < 0 || value > 60) return 0;
         state->options->second_screen_size = static_cast<uint8_t>(value);
         std::fprintf(stderr, "[display] second screen size -> %d%%\n", value);
+        return 1;
+    }
+    if (std::strcmp(item->key, kRuntimeShowFpsKey) == 0) {
+        if (value < 0 || value > 1) return 0;
+        state->options->show_fps = value != 0;
         return 1;
     }
     if (std::strcmp(item->key, kRuntimeVolumeKey) == 0 ||
@@ -1477,6 +1487,7 @@ void runtime_menu_save(void* context) {
          std::to_string(options.resolution_scale)},
         {"display", "second_screen_size",
          std::to_string(options.second_screen_size)},
+        {"display", "show_fps", options.show_fps ? "true" : "false"},
         {"audio", "volume", std::to_string(options.audio_volume)},
         {"audio", "mute", options.audio_muted ? "true" : "false"},
         {"controls", "gamepad_layout",
@@ -2059,6 +2070,16 @@ struct DsTarget {
     }
 };
 
+void draw_notice_glyph(const DsTarget& target, int x, int y, char ch) {
+    const char* glyph = notice_glyph(ch);
+    for (int gy = 0; gy < 7; ++gy) {
+        for (int gx = 0; gx < 5; ++gx) {
+            if (glyph[gy * 5 + gx] == '1')
+                target.fill(x + gx, y + gy, 1, 1);
+        }
+    }
+}
+
 void draw_savestate_notice(DsTarget target, const char* text) {
     if ((!target.renderer && !target.pixels) || !text || !*text) return;
     constexpr int kColumns = 40;
@@ -2081,16 +2102,21 @@ void draw_savestate_notice(DsTarget target, const char* text) {
             if (*p == '\n') continue;
             if (row >= kRows) break;
         }
-        const char* glyph = notice_glyph(*p);
-        for (int gy = 0; gy < 7; ++gy) {
-            for (int gx = 0; gx < 5; ++gx) {
-                if (glyph[gy * 5 + gx] != '1') continue;
-                target.fill(background.x + 3 + column * kGlyphWidth + gx,
-                            background.y + 2 + row * kGlyphHeight + gy, 1, 1);
-            }
-        }
+        draw_notice_glyph(target, background.x + 3 + column * kGlyphWidth,
+                          background.y + 2 + row * kGlyphHeight, *p);
         ++column;
     }
+}
+
+void draw_fps_counter(DsTarget target, const char* text) {
+    if ((!target.renderer && !target.pixels) || !text || !*text) return;
+    constexpr int kGlyphWidth = 6;
+    const int columns = static_cast<int>(std::strlen(text));
+    target.set_color(10, 10, 10);
+    target.fill(2, 2, columns * kGlyphWidth + 3, 11);
+    target.set_color(255, 255, 255);
+    for (int column = 0; column < columns; ++column)
+        draw_notice_glyph(target, 4 + column * kGlyphWidth, 4, text[column]);
 }
 
 // The stylus lives in the 256x192 touch space spread over the screen's rect.
@@ -2450,7 +2476,8 @@ struct OwnedPresentationFrame {
 void draw_separate_screen(FrontendPresentation& presentation, int screen,
                           bool virtual_stylus_visible, float virtual_stylus_x,
                           float virtual_stylus_y,
-                          const char* savestate_notice) {
+                          const char* savestate_notice,
+                          const char* fps_counter) {
     SDL_Renderer* renderer = presentation.renderers[screen];
     SDL_SetRenderDrawColor(renderer, 20, 20, 20, 255);
     SDL_RenderClear(renderer);
@@ -2465,6 +2492,7 @@ void draw_separate_screen(FrontendPresentation& presentation, int screen,
     if (virtual_stylus_visible)
         draw_virtual_stylus(target, virtual_stylus_x, virtual_stylus_y);
     draw_savestate_notice(target, savestate_notice);
+    draw_fps_counter(target, fps_counter);
 }
 
 // Single-screen layout: present presentation.shown_screen, with the other LCD
@@ -2482,7 +2510,8 @@ PresentationTicks present_single_screen(FrontendPresentation& presentation,
                                         bool virtual_stylus_visible,
                                         float virtual_stylus_x,
                                         float virtual_stylus_y,
-                                        const char* savestate_notice) {
+                                        const char* savestate_notice,
+                                        const char* fps_counter) {
     PresentationTicks ticks{};
     const int shown = presentation.shown_screen & 1;
     const uint32_t* pixels = shown ? bottom_pixels : top_pixels;
@@ -2501,7 +2530,8 @@ PresentationTicks present_single_screen(FrontendPresentation& presentation,
         if (menu_open) nds_gpu2d_invalidate_hd_frame();
         static std::vector<uint32_t> overlay;
         const bool want_overlay =
-            stylus || (savestate_notice && *savestate_notice);
+            stylus || (savestate_notice && *savestate_notice) ||
+            (fps_counter && *fps_counter);
         if (want_overlay) {
             overlay.assign(size_t(width) * kScreenHeight, 0u);
             DsTarget target{};
@@ -2514,6 +2544,7 @@ PresentationTicks present_single_screen(FrontendPresentation& presentation,
                 draw_virtual_stylus(target, virtual_stylus_x,
                                     virtual_stylus_y);
             draw_savestate_notice(target, savestate_notice);
+            draw_fps_counter(target, fps_counter);
         }
         nds_compute_host_set_overlay(want_overlay ? overlay.data() : nullptr,
                                      static_cast<unsigned>(width));
@@ -2572,6 +2603,7 @@ PresentationTicks present_single_screen(FrontendPresentation& presentation,
     if (stylus)
         draw_virtual_stylus(target, virtual_stylus_x, virtual_stylus_y);
     draw_savestate_notice(target, savestate_notice);
+    draw_fps_counter(target, fps_counter);
     ticks.draw += SDL_GetPerformanceCounter() - start;
     start = SDL_GetPerformanceCounter();
     SDL_RenderPresent(renderer);
@@ -2588,7 +2620,8 @@ PresentationTicks present_screens(FrontendPresentation& presentation,
                                   bool virtual_stylus_visible,
                                   float virtual_stylus_x,
                                   float virtual_stylus_y,
-                                  const char* savestate_notice
+                                  const char* savestate_notice,
+                                  const char* fps_counter
 #if defined(NDS_HAVE_COMPUTE_RENDERER)
                                   ,const NdsComputePresentationFrame* owned = nullptr
 #endif
@@ -2598,7 +2631,7 @@ PresentationTicks present_screens(FrontendPresentation& presentation,
         return present_single_screen(
             presentation, top_pixels, top_width, bottom_pixels, bottom_width,
             runtime_ui, virtual_stylus_visible, virtual_stylus_x,
-            virtual_stylus_y, savestate_notice);
+            virtual_stylus_y, savestate_notice, fps_counter);
     if (presentation.gl_top) {
 #if defined(NDS_HAVE_COMPUTE_RENDERER)
         NdsGpu2dDirectFrame direct_frame{};
@@ -2636,7 +2669,7 @@ PresentationTicks present_screens(FrontendPresentation& presentation,
         start = SDL_GetPerformanceCounter();
         draw_separate_screen(presentation, 1, virtual_stylus_visible,
                              virtual_stylus_x, virtual_stylus_y,
-                             savestate_notice);
+                             savestate_notice, fps_counter);
         ticks.draw += SDL_GetPerformanceCounter() - start;
         start = SDL_GetPerformanceCounter();
         SDL_RenderPresent(renderer);
@@ -2678,6 +2711,7 @@ PresentationTicks present_screens(FrontendPresentation& presentation,
         if (virtual_stylus_visible)
             draw_virtual_stylus(target, virtual_stylus_x, virtual_stylus_y);
         draw_savestate_notice(target, savestate_notice);
+        draw_fps_counter(target, fps_counter);
         ticks.draw += SDL_GetPerformanceCounter() - start;
         start = SDL_GetPerformanceCounter();
         SDL_RenderPresent(renderer);
@@ -2691,7 +2725,8 @@ PresentationTicks present_screens(FrontendPresentation& presentation,
         draw_separate_screen(presentation, screen,
                              screen == 1 && virtual_stylus_visible,
                              virtual_stylus_x, virtual_stylus_y,
-                             screen == 1 ? savestate_notice : nullptr);
+                             screen == 1 ? savestate_notice : nullptr,
+                             screen == 1 ? fps_counter : nullptr);
         ticks.draw += SDL_GetPerformanceCounter() - start;
         start = SDL_GetPerformanceCounter();
         SDL_RenderPresent(renderer);
@@ -3116,6 +3151,10 @@ int nds_run_interactive_frontend(const NdsFrontendOptions& initial_options) {
          "The other screen beside the main one, as a percent of its size. "
          "0 hides it.",
          RECOMP_RUNTIME_UI_INT, 0, 60, 5, nullptr, 0, nullptr},
+        {kRuntimeShowFpsKey, "Display", "Show FPS",
+         "New 3D images per second in the corner of the screen, updated "
+         "once a second. Reads 0 when nothing 3D is moving.",
+         RECOMP_RUNTIME_UI_BOOL, 0, 1, 1, nullptr, 0, nullptr},
         {kRuntimeVolumeKey, "Audio", "Volume",
          "Host output level in percent; the game keeps running at full mix.",
          RECOMP_RUNTIME_UI_INT, 0, 100, 5, nullptr, 0, nullptr},
@@ -3455,6 +3494,8 @@ int nds_run_interactive_frontend(const NdsFrontendOptions& initial_options) {
     FrameBlendCache blend_cache{};
     uint64_t fps_frames = 0;
     uint64_t fps_start = SDL_GetPerformanceCounter();
+    uint64_t fps_images = 0;
+    std::string fps_counter;  // empty until the first second has passed
     const uint64_t frequency = SDL_GetPerformanceFrequency();
     const uint64_t soak_frames = environment_u64("NDS_FRONTEND_MAX_FRAMES");
     const bool print_stats = std::getenv("NDS_FRONTEND_STATS") != nullptr;
@@ -4857,7 +4898,8 @@ int nds_run_interactive_frontend(const NdsFrontendOptions& initial_options) {
                 runtime_ui,
                 mph_prime_virtual_stylus || generic_virtual_stylus,
                 mph_virtual_x, mph_virtual_y,
-                savestate_notice.empty() ? nullptr : savestate_notice.c_str());
+                savestate_notice.empty() ? nullptr : savestate_notice.c_str(),
+                options.show_fps ? fps_counter.c_str() : nullptr);
             if (!synthetic_ticks.ok) {
                 compute_failed = true;
                 running = false;
@@ -4885,7 +4927,8 @@ int nds_run_interactive_frontend(const NdsFrontendOptions& initial_options) {
             runtime_ui,
             mph_prime_virtual_stylus || generic_virtual_stylus,
             mph_virtual_x, mph_virtual_y,
-            savestate_notice.empty() ? nullptr : savestate_notice.c_str()
+            savestate_notice.empty() ? nullptr : savestate_notice.c_str(),
+            options.show_fps ? fps_counter.c_str() : nullptr
 #if defined(NDS_HAVE_COMPUTE_RENDERER)
             ,cpu_handoff ? &presented->gl : nullptr
 #endif
@@ -5185,6 +5228,18 @@ int nds_run_interactive_frontend(const NdsFrontendOptions& initial_options) {
             const double fps = static_cast<double>(fps_frames) / seconds;
             const std::string fps_text =
                 std::to_string(fps).substr(0, 4) + " FPS";
+            NdsGpu3dProfile gpu3d_profile{};
+            nds_gpu3d_profile(&gpu3d_profile);
+            // Loading a savestate resets the profile.
+            const uint64_t images = gpu3d_profile.gx_new_images;
+            const uint64_t new_images =
+                images >= fps_images ? images - fps_images : 0;
+            char fps_counter_text[24];
+            std::snprintf(fps_counter_text, sizeof(fps_counter_text),
+                          "3D %.1f FPS",
+                          static_cast<double>(new_images) / seconds);
+            fps_counter = fps_counter_text;
+            fps_images = images;
             const std::string governor_text =
                 perf_governor.apply_failed
                     ? " - Gov disabled (apply failed, S" +

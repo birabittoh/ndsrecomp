@@ -349,6 +349,12 @@ to the second screen too, up to the main screen's size. Clicking the inset
 touches the bottom LCD when that is the screen it shows. It is also in the
 runtime menu (Esc), along with the audio volume and mute.
 
+`show_fps` (default false) draws the 3D frame rate in the top-left of the
+screen, updated once a second: how many new 3D images the game finished, not
+how many frames were presented, so a game drawing 3D at 30 reads 30 on a 60 Hz
+DS screen, and a still or 2D scene reads 0. It is also in the runtime menu,
+under Display. With two screens showing, the counter is on the bottom one.
+
 `startup_mode = "automatic"` sets the retail firmware's Automatic-mode flag
 in the runner's private in-memory firmware image. With a Slot-1 cartridge
 inserted, the real BIOS/firmware/card path then launches it without navigating

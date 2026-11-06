@@ -1112,6 +1112,8 @@ static bool apply_frontend_config(toml::table& root,
                 return false;
             }
         }
+        if (const auto value = (*display)["show_fps"].value<bool>())
+            options->show_fps = *value;
     }
 
     if (const toml::table* cartridge = root["cartridge"].as_table()) {
