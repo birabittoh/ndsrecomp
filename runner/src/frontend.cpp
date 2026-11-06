@@ -1314,6 +1314,8 @@ int runtime_menu_get_value(void* context, const RecompRuntimeUiItem* item,
         return 1;
     }
     if (std::strcmp(item->key, kRuntimeResolutionScaleKey) == 0) {
+        // 0 is "Original" (the fixed multiplier); a percent reads as the
+        // nearest percent choice.
         const int current = state->options->resolution_scale;
         int best = 0;
         if (current > 0) {
@@ -1375,11 +1377,11 @@ int runtime_menu_set_value(void* context, const RecompRuntimeUiItem* item,
         return 1;
     }
     if (std::strcmp(item->key, kRuntimeResolutionScaleKey) == 0) {
-        if (value < 0 || value > 1000) return 0;
+        if (value != 0 && (value < 10 || value > 1000)) return 0;
         state->options->resolution_scale = static_cast<uint16_t>(value);
         if (value == 0)
             std::fprintf(stderr,
-                         "[display] resolution scale -> off (fixed %ux)\n",
+                         "[display] resolution scale -> original (fixed %ux)\n",
                          static_cast<unsigned>(
                              state->options->internal_resolution));
         else
@@ -1472,6 +1474,33 @@ void runtime_menu_save(void* context) {
              {"audio_muted", options.audio_muted ? "1" : "0"}})) {
         std::fprintf(stderr, "[sdl] saved runtime settings\n");
     }
+    if (options.settings_path.empty()) return;
+    const auto quoted = [](const char* name) {
+        return nds_toml_string(name);
+    };
+    std::vector<NdsSettingUpdate> updates = {
+        {"display", "window_mode",
+         quoted(nds_window_mode_name(options.window_mode))},
+        {"display", "scaling", quoted(nds_scaling_filter_name(options.scaling))},
+        {"display", "resolution_scale",
+         std::to_string(options.resolution_scale)},
+        {"display", "second_screen_size",
+         std::to_string(options.second_screen_size)},
+        {"audio", "volume", std::to_string(options.audio_volume)},
+        {"audio", "mute", options.audio_muted ? "true" : "false"},
+        {"controls", "gamepad_layout",
+         quoted(options.gamepad_positional ? "positional" : "labels")},
+    };
+    // The two are exclusive in TOML unless the scale is off.
+    if (options.resolution_scale != 0)
+        updates.push_back({"display", "internal_resolution", "", true});
+    if (options.relative_mouse_touch)
+        updates.push_back({"controls", "mouse_sensitivity",
+                           std::to_string(options.relative_mouse_sensitivity)});
+    std::string error;
+    if (!nds_update_settings_file(options.settings_path, updates, &error))
+        std::fprintf(stderr, "[settings] could not save %s: %s\n",
+                     options.settings_path.c_str(), error.c_str());
 }
 
 bool runtime_menu_key_input(SDL_Scancode scancode,
@@ -2958,6 +2987,8 @@ int nds_run_interactive_frontend(const NdsFrontendOptions& initial_options) {
     else
         std::fprintf(stderr, "[sdl] audio driver: %s, output muted: %s\n",
             SDL_GetCurrentAudioDriver(), audio_queue.output_muted ? "yes" : "no");
+    apply_audio_output_level(audio, audio_queue, options.audio_volume,
+                             options.audio_muted);
 
     std::fprintf(stderr,
         "[sdl] controls: gamepad=Player 1 | bottom mouse=touch | "
@@ -3092,7 +3123,7 @@ int nds_run_interactive_frontend(const NdsFrontendOptions& initial_options) {
     static const char* const scaling_choices[] = {
         "Integer (pixel-perfect)", "Bilinear", "Nearest neighbor"};
     static const char* const resolution_scale_choices[] = {
-        "Off (fixed)", "25%", "50%", "75%", "100%", "150%", "200%"};
+        "Original", "25%", "50%", "75%", "100%", "150%", "200%"};
     static const char* const gamepad_layout_choices[] = {
         "By label", "By position"};
     static const RecompRuntimeUiItem runtime_menu_items[] = {
