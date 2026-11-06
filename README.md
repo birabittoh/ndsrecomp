@@ -207,6 +207,19 @@ Dispatch tables are discovered at configure time, classified by `_arm9_` or
 the configured SHA-1. Live-byte validation remains the boundary for mutable
 or overlay code.
 
+`NDS_BOOTSTRAP_FIRMWARE=ON` leaves the framework's captured firmware banks out,
+so the firmware's boot code needs banks of its own. `tools/fw_extract.py` decodes
+it from the dump and the ARM7 BIOS, retail or FlashMe, and lists the code it
+relocates, which a title's bank build can use directly.
+
+### Building without the interpreter
+
+`-DNDS_INTERPRETER=OFF` links `runner/src/tier3_absent.cpp` in place of Tier 3, so
+the binary contains no interpreter at all. Code with no live bank then stops
+both CPUs with `[no-interpreter] no live bank for pc=...` and the usual dispatch
+miss report, instead of quietly running slower. Use it once a title's banks cover
+everything it runs: an unrecompiled path is a fatal error here, not a slowdown.
+
 ### No-argument launch
 
 Configure the runner with `-DNDS_TITLE_CONFIG=/path/to/game.toml` to embed the
