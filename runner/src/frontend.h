@@ -336,6 +336,9 @@ struct NdsFrontendOptions {
     uint8_t second_screen_size = 0;
     // On-screen frame rate, in the top-left of the shown screen.
     bool show_fps = false;
+    // Blends 3D images for games drawing below the DS frame rate, at the cost
+    // of showing 3D one DS frame later. See gpu3d_interp.h.
+    bool smooth_3d = false;
     // Texture upscaling factor, 1 (off), 2, or 4. Filters each decoded DS
     // texture once on a cache miss; independent of internal_resolution, but
     // only worth enabling alongside it.

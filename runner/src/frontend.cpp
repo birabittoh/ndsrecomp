@@ -1232,6 +1232,7 @@ constexpr const char* kRuntimeResolutionScaleKey = "display.resolution_scale";
 constexpr int kResolutionScaleChoiceValues[] = {0, 25, 50, 75, 100, 150, 200};
 constexpr const char* kRuntimeSecondScreenKey = "display.second_screen_size";
 constexpr const char* kRuntimeShowFpsKey = "display.show_fps";
+constexpr const char* kRuntimeSmooth3dKey = "display.smooth_3d";
 constexpr const char* kRuntimeVolumeKey = "audio.volume";
 constexpr const char* kRuntimeMuteKey = "audio.mute";
 constexpr const char* kRuntimeResumeKey = "system.resume";
@@ -1335,6 +1336,10 @@ int runtime_menu_get_value(void* context, const RecompRuntimeUiItem* item,
         *value_out = state->options->show_fps ? 1 : 0;
         return 1;
     }
+    if (std::strcmp(item->key, kRuntimeSmooth3dKey) == 0) {
+        *value_out = state->options->smooth_3d ? 1 : 0;
+        return 1;
+    }
     if (std::strcmp(item->key, kRuntimeVolumeKey) == 0) {
         *value_out = state->options->audio_volume;
         return 1;
@@ -1402,6 +1407,11 @@ int runtime_menu_set_value(void* context, const RecompRuntimeUiItem* item,
     if (std::strcmp(item->key, kRuntimeShowFpsKey) == 0) {
         if (value < 0 || value > 1) return 0;
         state->options->show_fps = value != 0;
+        return 1;
+    }
+    if (std::strcmp(item->key, kRuntimeSmooth3dKey) == 0) {
+        if (value < 0 || value > 1) return 0;
+        state->options->smooth_3d = value != 0;
         return 1;
     }
     if (std::strcmp(item->key, kRuntimeVolumeKey) == 0 ||
@@ -1488,6 +1498,7 @@ void runtime_menu_save(void* context) {
         {"display", "second_screen_size",
          std::to_string(options.second_screen_size)},
         {"display", "show_fps", options.show_fps ? "true" : "false"},
+        {"display", "smooth_3d", options.smooth_3d ? "true" : "false"},
         {"audio", "volume", std::to_string(options.audio_volume)},
         {"audio", "mute", options.audio_muted ? "true" : "false"},
         {"controls", "gamepad_layout",
@@ -3154,6 +3165,10 @@ int nds_run_interactive_frontend(const NdsFrontendOptions& initial_options) {
         {kRuntimeShowFpsKey, "Display", "Show FPS",
          "New 3D images per second in the corner of the screen, updated "
          "once a second. Reads 0 when nothing 3D is moving.",
+         RECOMP_RUNTIME_UI_BOOL, 0, 1, 1, nullptr, 0, nullptr},
+        {kRuntimeSmooth3dKey, "Display", "Smooth 3D (experimental)",
+         "Blends in-between 3D images for games that draw below 60. Shows 3D "
+         "one frame later; may glitch.",
          RECOMP_RUNTIME_UI_BOOL, 0, 1, 1, nullptr, 0, nullptr},
         {kRuntimeVolumeKey, "Audio", "Volume",
          "Host output level in percent; the game keeps running at full mix.",
@@ -4917,6 +4932,7 @@ int nds_run_interactive_frontend(const NdsFrontendOptions& initial_options) {
             // extra present.
             SDL_PumpEvents();
         }
+        nds_gpu3d_set_interpolation(options.smooth_3d);
         presentation.window_mode = options.window_mode;
         presentation.scaling = options.scaling;
         presentation.inset_percent =
@@ -5231,7 +5247,8 @@ int nds_run_interactive_frontend(const NdsFrontendOptions& initial_options) {
             NdsGpu3dProfile gpu3d_profile{};
             nds_gpu3d_profile(&gpu3d_profile);
             // Loading a savestate resets the profile.
-            const uint64_t images = gpu3d_profile.gx_new_images;
+            const uint64_t images = gpu3d_profile.gx_new_images +
+                                    gpu3d_profile.gx_interp_images;
             const uint64_t new_images =
                 images >= fps_images ? images - fps_images : 0;
             char fps_counter_text[24];

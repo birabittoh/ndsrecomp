@@ -219,6 +219,7 @@ int main() {
                 "screen_layout = \"separate\"\n"
                 "fullscreen = \"borderless\"\n"
                 "show_fps = true\n"
+                "smooth_3d = true\n"
                 "adaptive_widescreen = \"top\"\n"
                 "adaptive_capability = \"top\"\n"
                 "adaptive_width = 448\n"
@@ -260,6 +261,7 @@ int main() {
         !require(options.screen_layout == NdsScreenLayout::Separate) ||
         !require(options.fullscreen == NdsFullscreenMode::Borderless) ||
         !require(options.show_fps) ||
+        !require(options.smooth_3d) ||
         !require(options.startup_mode == NdsStartupMode::Automatic) ||
         !require(options.adaptive_screens == NDS_ADAPTIVE_TOP) ||
         !require(options.adaptive_supported == NDS_ADAPTIVE_TOP) ||

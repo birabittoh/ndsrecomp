@@ -355,6 +355,14 @@ how many frames were presented, so a game drawing 3D at 30 reads 30 on a 60 Hz
 DS screen, and a still or 2D scene reads 0. It is also in the runtime menu,
 under Display. With two screens showing, the counter is on the bottom one.
 
+`smooth_3d` (default false, experimental) is for games that draw 3D below the
+DS frame rate. A game at 30 holds each image for two DS frames, so the second
+one is filled with an image halfway between the last two, built by pairing
+their polygons. 3D is shown one DS frame later for it, and the guest never sees
+the blended images. It is also in the runtime menu, so it can be compared live;
+`show_fps` counts the blended images too. Pairs that are too different, such as
+a scene cut, show the real image instead.
+
 `startup_mode = "automatic"` sets the retail firmware's Automatic-mode flag
 in the runner's private in-memory firmware image. With a Slot-1 cartridge
 inserted, the real BIOS/firmware/card path then launches it without navigating

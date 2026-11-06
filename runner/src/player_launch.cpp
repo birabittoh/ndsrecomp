@@ -151,6 +151,8 @@ bool write_default_settings(const fs::path& path,
         << static_cast<unsigned>(options.second_screen_size) << "\n"
         << "show_fps = " << (options.show_fps ? "true" : "false")
         << "   # 3D frame rate in the corner of the screen\n"
+        << "smooth_3d = " << (options.smooth_3d ? "true" : "false")
+        << "   # blend 3D frames (experimental)\n"
         << "# Hybrid-graphics laptops: run on the discrete GPU.\n"
         << "discrete_gpu = " << (options.discrete_gpu ? "true" : "false")
         << "\n"

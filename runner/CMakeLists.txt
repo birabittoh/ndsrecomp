@@ -728,6 +728,7 @@ add_executable(nds_runner
     src/vram.cpp
     src/gpu2d.cpp
     src/gpu3d.cpp
+    src/gpu3d_interp.cpp
     src/title_patches.cpp
     ${NDS_TIER3_SOURCE}
     src/coverage_manifest.cpp
@@ -1295,6 +1296,11 @@ ndsrecomp_link_tomlpp(frontend_config_test)
   target_include_directories(gx_command_batch_test PRIVATE vendor/melonds)
   add_test(NAME gx_command_batch_test COMMAND gx_command_batch_test)
 
+  add_executable(gpu3d_interp_test tests/gpu3d_interp_test.cpp
+      src/gpu3d_interp.cpp)
+  target_include_directories(gpu3d_interp_test PRIVATE src vendor/melonds)
+  add_test(NAME gpu3d_interp_test COMMAND gpu3d_interp_test)
+
   if(NDS_BUILD_NATIVE_GL_TESTS AND NDS_ENABLE_COMPUTE_RENDERER AND NDS_SDL_BACKEND STREQUAL "SDL3")
     add_executable(native_gl_test tests/native_gl_test.cpp
         src/melonds_compute/CaptureReference.cpp src/melonds_compute/GPU_OpenGL.cpp
@@ -1486,6 +1492,7 @@ ndsrecomp_link_tomlpp(frontend_config_test)
       src/vram.cpp
       src/gpu2d.cpp
       src/gpu3d.cpp
+      src/gpu3d_interp.cpp
       src/dispatch_timing.cpp
       src/emu_profile.cpp
       # The worker threads in these units register themselves with the

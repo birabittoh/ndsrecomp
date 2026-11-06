@@ -5,6 +5,7 @@
 // slots). The vendored translation units are unmodified melonDS 1.0rc.
 
 #include "gpu3d.h"
+#include "gpu3d_interp.h"
 #include "frontend_window_size.h"
 #include "host_profile.h"
 #include "cpu_render_handoff.h"
@@ -1039,6 +1040,7 @@ bool gpu3d_savestate_export(NdsGpu3dSaveState* out, std::string* error) {
     // its pointer-rich geometry graph. The compute path has no CPU worker but
     // can have an asynchronous readback; finish it before taking the device
     // snapshot so no host command references state being replaced.
+    nds_gx_interp_show_real(g_nds.GPU.GPU3D);
 #if defined(NDS_HAVE_COMPUTE_RENDERER)
     if (g_compute_readback_pending) compute_finish_readback();
     if (g_nds.GPU.GPU3D.IsRendererAccelerated()) glFinish();
@@ -1109,6 +1111,7 @@ bool gpu3d_savestate_validate(const NdsGpu3dSaveState& in,
 bool gpu3d_savestate_import(const NdsGpu3dSaveState& in,
                             std::string* error) {
     if (!gpu3d_savestate_validate(in, error)) return false;
+    nds_gx_interp_reset();
 #if defined(NDS_USE_NATIVE_GL)
     g_capture_reference.Reset();
 #endif
@@ -1369,6 +1372,8 @@ void nds_gpu3d_vcount144() {
     ++g_gpu3d_profile.vcount144_calls;
 }
 
+static bool g_gx_interpolation = false;
+
 // NDS_GX_TRACE=<file> records each new 3D image in submission order, the
 // input for developing frame interpolation offline. Layout, little-endian:
 // "GXIM", u32 vblank, vertices, polygons, then per vertex s32 position[4],
@@ -1430,8 +1435,13 @@ static void trace_3d_image(const melonDS::GPU3D& g3, uint64_t vblank) {
     std::fflush(file);
 }
 
+struct Gx3dFrame {
+    bool swap = false;
+    bool new_image = false;
+};
+
 // Before GPU3D::VBlank, which consumes FlushRequest and flips the vertex RAM.
-static void count_3d_frame() {
+static Gx3dFrame count_3d_frame() {
     static uint64_t last_hash = 0;
     static uint16_t last_lcd = 0;
     const auto& g3 = g_nds.GPU.GPU3D;
@@ -1441,7 +1451,7 @@ static void count_3d_frame() {
     if (lcd != last_lcd) ++g_gpu3d_profile.gx_lcd_flips;
     last_lcd = lcd;
     if (!g3.GeometryEnabled || !g3.RenderingEnabled || !g3.FlushRequest)
-        return;
+        return {};
     ++g_gpu3d_profile.gx_swaps;
     g_gpu3d_profile.gx_swap_polygons += g3.NumPolygons;
     uint64_t hash = g3.NumPolygons;
@@ -1450,16 +1460,30 @@ static void count_3d_frame() {
             hash = (hash ^ static_cast<uint32_t>(position)) *
                    1099511628211ull;
     }
-    if (hash != last_hash) {
+    const bool new_image = hash != last_hash;
+    if (new_image) {
         ++g_gpu3d_profile.gx_new_images;
         trace_3d_image(g3, g_gpu3d_profile.gx_vblanks);
     }
     last_hash = hash;
+    return {true, new_image};
+}
+
+void nds_gpu3d_set_interpolation(bool enabled) {
+    g_gx_interpolation = enabled;
 }
 
 void nds_gpu3d_vblank() {
-    count_3d_frame();
-    g_nds.GPU.GPU3D.VBlank();
+    const Gx3dFrame frame = count_3d_frame();
+    auto& g3 = g_nds.GPU.GPU3D;
+    g3.VBlank();
+    NdsGxInterpStats stats{};
+    nds_gx_interp_after_vblank(
+        g3, g_gx_interpolation && g3.IsRendererAccelerated(), frame.swap,
+        frame.new_image, &stats);
+    g_gpu3d_profile.gx_interp_images += stats.images;
+    g_gpu3d_profile.gx_interp_polygons += stats.polygons;
+    g_gpu3d_profile.gx_interp_blended += stats.blended;
 }
 
 void nds_gpu3d_vcount215() {
