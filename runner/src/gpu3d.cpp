@@ -1368,7 +1368,31 @@ void nds_gpu3d_vcount144() {
     ++g_gpu3d_profile.vcount144_calls;
 }
 
+// Before GPU3D::VBlank, which consumes FlushRequest and flips the vertex RAM.
+static void count_3d_frame() {
+    static uint64_t last_hash = 0;
+    static uint16_t last_lcd = 0;
+    const auto& g3 = g_nds.GPU.GPU3D;
+    ++g_gpu3d_profile.gx_vblanks;
+    const uint16_t lcd = nds_powercontrol9() & 0x8000u;
+    if (lcd != last_lcd) ++g_gpu3d_profile.gx_lcd_flips;
+    last_lcd = lcd;
+    if (!g3.GeometryEnabled || !g3.RenderingEnabled || !g3.FlushRequest)
+        return;
+    ++g_gpu3d_profile.gx_swaps;
+    g_gpu3d_profile.gx_swap_polygons += g3.NumPolygons;
+    uint64_t hash = g3.NumPolygons;
+    for (uint32_t i = 0; i < g3.NumVertices; ++i) {
+        for (const int32_t position : g3.CurVertexRAM[i].Position)
+            hash = (hash ^ static_cast<uint32_t>(position)) *
+                   1099511628211ull;
+    }
+    if (hash != last_hash) ++g_gpu3d_profile.gx_new_images;
+    last_hash = hash;
+}
+
 void nds_gpu3d_vblank() {
+    count_3d_frame();
     g_nds.GPU.GPU3D.VBlank();
 }
 

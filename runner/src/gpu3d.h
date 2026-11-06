@@ -93,6 +93,16 @@ struct NdsGpu3dProfile {
     // critical path, so the governor has to be able to read it in every build.
     uint64_t compute_readback_ns;
     uint64_t compute_readback_calls;
+    // ALWAYS-ON: how often the game really finishes a 3D image, which the
+    // frame rate does not show. A swap is a SWAP_BUFFERS that took effect at
+    // VBlank; a new image is a swap whose vertices differ from the last one.
+    // LCD flips count POWCNT1 bit 15 changes between VBlanks: a game drawing
+    // 3D on both screens alternates them, halving each screen's rate.
+    uint64_t gx_vblanks;
+    uint64_t gx_swaps;
+    uint64_t gx_new_images;
+    uint64_t gx_swap_polygons;
+    uint64_t gx_lcd_flips;
 };
 void nds_gpu3d_profile(NdsGpu3dProfile* out);
 // Host-only immutable capture-copy counters; unavailable paths return zeros.

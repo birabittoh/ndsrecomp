@@ -796,6 +796,8 @@ void nds_diagnostics_maybe_write_performance_sample(
         "\"governor\":{\"stage\":%u,\"over_frames\":%u,"
         "\"under_frames\":%u,\"held\":%s,\"apply_failed\":%s,"
         "\"transitions\":%llu,\"compute_readback_ms\":%.3f},"
+        "\"gx\":{\"vblanks\":%llu,\"swaps\":%llu,\"new_images\":%llu,"
+        "\"swap_polygons\":%llu,\"lcd_flips\":%llu},"
         "\"cycles\":{\"arm9\":%llu,\"arm7\":%llu},"
         "\"tier3_delta\":{\"arm9\":{\"entries\":%llu,"
         "\"instructions\":%llu,\"clean_ram_rejects\":%llu},"
@@ -833,6 +835,15 @@ void nds_diagnostics_maybe_write_performance_sample(
                                   g_prev_gpu3d.compute_readback_ns)) /
                           1000000.0 / static_cast<double>(frame_delta)
                     : 0.0,
+        (unsigned long long)sub_u64(gpu3d.gx_vblanks,
+                                    g_prev_gpu3d.gx_vblanks),
+        (unsigned long long)sub_u64(gpu3d.gx_swaps, g_prev_gpu3d.gx_swaps),
+        (unsigned long long)sub_u64(gpu3d.gx_new_images,
+                                    g_prev_gpu3d.gx_new_images),
+        (unsigned long long)sub_u64(gpu3d.gx_swap_polygons,
+                                    g_prev_gpu3d.gx_swap_polygons),
+        (unsigned long long)sub_u64(gpu3d.gx_lcd_flips,
+                                    g_prev_gpu3d.gx_lcd_flips),
         (unsigned long long)sched_state.cycles[0],
         (unsigned long long)sched_state.cycles[1],
         (unsigned long long)sub_u64(tier3.entries[0],
