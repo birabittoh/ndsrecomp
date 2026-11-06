@@ -521,7 +521,69 @@ void test_stage2_needs_gpu_wait() {
     CHECK(state.stage == 2);
 }
 
+// ---- Stage 2 is left on GPU wait when configured ----
+
+// Escalates a fresh Auto governor to stage 2 on a GPU-bound streak.
+void reach_stage2(NdsPerfGovernorState& state) {
+    NdsPerfGovernorSample gpu = over_emu();
+    gpu.gpu_wait_ms = 6.0;
+    for (int i = 0; i < 100 && state.stage < 2; ++i)
+        nds_perf_governor_update(&state, gpu);
+    CHECK(state.stage == 2);
+}
+
+void test_stage2_restores_on_low_gpu_wait() {
+    NdsPerfGovernorConfig cfg = small_config();
+    cfg.min_stage2_gpu_wait_ms = 4.0;
+    NdsPerfGovernorState state{};
+    nds_perf_governor_init(&state, NdsPerfGovernorMode::Auto, cfg);
+    reach_stage2(state);
+    // Over the frame budget on every frame, as a CPU-bound title is, with
+    // the GPU idle: the frame-budget predicate could never restore this.
+    NdsPerfGovernorSample cpu = over_emu();
+    cpu.gpu_wait_ms = 0.4;
+    feed(state, cpu, cfg.restore_frames - 1u);
+    CHECK(state.stage == 2);
+    CHECK(nds_perf_governor_update(&state, cpu));
+    CHECK(state.stage == 1);
+    CHECK(state.last_reason == NdsPerfGovernorReason::Recovered);
+}
+
+void test_stage2_stays_while_gpu_waits() {
+    NdsPerfGovernorConfig cfg = small_config();
+    cfg.min_stage2_gpu_wait_ms = 4.0;
+    NdsPerfGovernorState state{};
+    nds_perf_governor_init(&state, NdsPerfGovernorMode::Auto, cfg);
+    reach_stage2(state);
+    NdsPerfGovernorSample gpu = neutral();
+    gpu.gpu_wait_ms = 6.0;
+    feed(state, gpu, cfg.restore_frames * 4u);
+    CHECK(state.stage == 2);
+}
+
+void test_stage2_hold_expires() {
+    NdsPerfGovernorConfig cfg = small_config();
+    cfg.min_stage2_gpu_wait_ms = 4.0;
+    cfg.flap_hold_frames = 20;
+    NdsPerfGovernorState state{};
+    nds_perf_governor_init(&state, NdsPerfGovernorMode::Auto, cfg);
+    reach_stage2(state);
+    state.stage2_held = true;
+    NdsPerfGovernorSample idle = neutral();
+    idle.gpu_wait_ms = 0.4;
+    feed(state, idle, cfg.flap_hold_frames - 1u);
+    CHECK(state.stage2_held);
+    CHECK(state.stage == 2);
+    for (uint32_t i = 0; i < cfg.restore_frames + 1u && state.stage == 2; ++i)
+        nds_perf_governor_update(&state, idle);
+    CHECK(!state.stage2_held);
+    CHECK(state.stage == 1);
+}
+
 int main() {
+    test_stage2_restores_on_low_gpu_wait();
+    test_stage2_stays_while_gpu_waits();
+    test_stage2_hold_expires();
     test_ladder();
     test_streak_is_broken_by_one_frame();
     test_dead_zone();

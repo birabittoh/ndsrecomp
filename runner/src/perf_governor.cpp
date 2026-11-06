@@ -170,10 +170,42 @@ bool nds_perf_governor_update(NdsPerfGovernorState* state,
         if (state->stage == 2u) {
             ++state->stage2_engagements;
             state->frames_since_stage2_engage = 0;
+            state->stage2_held_frames = 0;
+            state->stage2_window_frames = 0;
+            state->stage2_window_gpu_wait_ms = 0.0;
             if (state->stage2_engagements >= cfg.flap_engage_limit)
                 state->stage2_held = true;
         }
         return true;
+    }
+    if (state->stage == 2u && state->stage2_held &&
+        cfg.flap_hold_frames != 0u &&
+        ++state->stage2_held_frames >= cfg.flap_hold_frames) {
+        // A hold is a backoff, not a verdict: a heavy scene must not cost
+        // the multiplier for the rest of the session.
+        state->stage2_held = false;
+        state->stage2_held_frames = 0;
+        state->stage2_engagements = 0;
+    }
+    if (state->stage == 2u && cfg.min_stage2_gpu_wait_ms > 0.0) {
+        // The frame-budget predicate cannot see this: a CPU-bound title
+        // misses it with the GPU idle, and it needs an unbroken streak where
+        // this takes the window's mean.
+        state->stage2_window_gpu_wait_ms += sample.gpu_wait_ms;
+        if (++state->stage2_window_frames >= cfg.restore_frames) {
+            const double mean = state->stage2_window_gpu_wait_ms /
+                                state->stage2_window_frames;
+            state->stage2_window_frames = 0;
+            state->stage2_window_gpu_wait_ms = 0.0;
+            if (mean < cfg.min_stage2_gpu_wait_ms && !state->stage2_held) {
+                --state->stage;
+                state->over_frames = 0;
+                state->under_frames = 0;
+                state->last_reason = NdsPerfGovernorReason::Recovered;
+                return true;
+            }
+        }
+        return false;
     }
     if (recovered && state->under_frames >= cfg.restore_frames &&
         state->stage > 0u) {

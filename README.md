@@ -301,7 +301,8 @@ OpenGL compute renderer with the `separate` or `single` layout, is in the
 runtime menu, and has `NDS_RESOLUTION_SCALE` / `--resolution-scale`
 overrides. `internal_resolution` (1..16) instead pins the multiplier; the two
 are exclusive within one source, and the later source (TOML < env < CLI)
-wins. The performance governor still drops 3D to 1x under load.
+wins. The performance governor drops 3D to 1x when frames wait on the GPU, and
+restores it once that wait falls again.
 
 `startup_mode = "automatic"` sets the retail firmware's Automatic-mode flag
 in the runner's private in-memory firmware image. With a Slot-1 cartridge

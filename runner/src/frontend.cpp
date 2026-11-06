@@ -2700,7 +2700,11 @@ int nds_run_interactive_frontend(const NdsFrontendOptions& initial_options) {
     // CPU-bound title (DQ9 runs ~13 ms of ARM per frame) would otherwise be
     // pinned at 1x by load the multiplier does not cause.
     NdsPerfGovernorConfig perf_governor_config{};
-    perf_governor_config.min_stage2_gpu_wait_ms = 1.0;
+    // 4 ms is about the headroom such a frame has left. Boot reads 1-4 ms
+    // with no real GPU load, and DQ9 plays at ~0.4 ms even with HD frames.
+    perf_governor_config.min_stage2_gpu_wait_ms = 4.0;
+    // Five minutes at 60 fps, then a flapping machine gets another try.
+    perf_governor_config.flap_hold_frames = 18000;
     nds_perf_governor_init(&perf_governor,
                            options.perf_governor_mode,
                            perf_governor_config);

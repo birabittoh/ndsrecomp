@@ -42,10 +42,16 @@ struct NdsPerfGovernorConfig {
     // is never taken as evidence the full mode is sustainable.
     uint32_t flap_engage_limit = 2;
     uint32_t flap_window_frames = 3600;
+    // Frames a stage-2 hold lasts before the guard retires and restoring is
+    // allowed again. Zero holds for the rest of the session.
+    uint32_t flap_hold_frames = 0;
     // Stage 2 (internal scale 1x) only helps when the frame is waiting on
     // the GPU. With this above zero, the 1->2 step also needs the over-budget
     // streak's mean gpu_wait_ms to reach it; a CPU-bound streak stays at
-    // stage 1. Zero keeps the unconditional escalation.
+    // stage 1. Stage 2 is then left the same way: a restore_frames window
+    // whose mean gpu_wait_ms is below it restores, however slow the CPU side
+    // runs, because the multiplier does not change CPU time. Zero keeps the
+    // unconditional escalation and the frame-budget restore.
     double min_stage2_gpu_wait_ms = 0.0;
 };
 
@@ -78,6 +84,10 @@ struct NdsPerfGovernorState {
     uint32_t stage2_engagements = 0;
     uint32_t frames_since_stage2_engage = 0;
     bool stage2_held = false;
+    uint32_t stage2_held_frames = 0;
+    // The current restore window at stage 2 (min_stage2_gpu_wait_ms only).
+    uint32_t stage2_window_frames = 0;
+    double stage2_window_gpu_wait_ms = 0.0;
     // Terminal state: a stage could not be applied to the renderer, so the
     // governor stops deciding anything rather than retrying a failing rebuild
     // every engage_frames forever.
