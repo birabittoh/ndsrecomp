@@ -330,6 +330,8 @@ struct NdsFrontendOptions {
     // stylus.
     bool tab_turbo = false;
     uint16_t relative_mouse_sensitivity = 100;  // 10%..400%
+    uint8_t audio_volume = 100;  // 0..100, host output only
+    bool audio_muted = false;
     bool relative_mouse_invert_y = false;
     // Active-high frontend pressed-bit mask (same layout as key_bit()).
     uint16_t relative_mouse_fire_mask = 0;

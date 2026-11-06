@@ -736,6 +736,8 @@ struct AudioQueue {
     // Host output only. Consumption, guest mixing and pacing remain active.
     bool output_muted = false;
 #if !defined(NDS_HAVE_SDL3)
+    // Read by the audio callback; SDL3 applies it as the stream gain instead.
+    std::atomic<float> gain{1.0f};
     std::array<int16_t, kAudioCapacityFrames * 2> samples{};
     uint32_t read = 0;
     uint32_t write = 0;
@@ -798,8 +800,13 @@ void SDLCALL audio_callback(void* userdata, Uint8* stream, int len) {
                     (take - first) * kAudioFrameBytes);
     queue->read = (queue->read + take) % kAudioCapacityFrames;
     queue->count -= take;
-    if (queue->output_muted)
+    if (queue->output_muted) {
         std::memset(stream, 0, static_cast<size_t>(len));
+    } else if (const float gain = queue->gain.load(std::memory_order_relaxed);
+               gain < 1.0f) {
+        for (uint32_t i = 0; i < take * 2u; ++i)
+            output[i] = static_cast<int16_t>(output[i] * gain);
+    }
     if (take < requested && queue->started.load(std::memory_order_relaxed)) {
         queue->underruns.fetch_add(1, std::memory_order_relaxed);
         nds_frontend_latency::shortage(
@@ -1157,6 +1164,23 @@ NdsAudioDevice open_audio_device(AudioQueue& queue,
 #endif
 }
 
+// Sets the host output level. Guest mixing, queue consumption and audio pacing
+// carry on untouched, so muting never changes timing. NDS_FRONTEND_AUDIO_MUTE
+// (output_muted) always wins.
+void apply_audio_output_level(const NdsAudioDevice& device, AudioQueue& queue,
+                              uint8_t volume, bool muted) {
+    if (!device) return;
+    const float gain = muted || queue.output_muted
+        ? 0.0f : static_cast<float>(volume) / 100.0f;
+#if defined(NDS_HAVE_SDL3)
+    if (!SDL_SetAudioStreamGain(device.stream, gain))
+        std::fprintf(stderr, "[sdl] cannot set audio volume: %s\n",
+                     SDL_GetError());
+#else
+    queue.gain.store(gain, std::memory_order_relaxed);
+#endif
+}
+
 void discard_spu_output() {
     std::array<int16_t, 2048> samples{};
     while (nds_spu_read_output(samples.data(), 1024) != 0) {}
@@ -1196,6 +1220,8 @@ constexpr const char* kRuntimeResolutionScaleKey = "display.resolution_scale";
 // Menu steps for resolution_scale; 0 is "off" (the fixed multiplier). TOML
 // and the CLI take any percentage, which the menu shows as the nearest step.
 constexpr int kResolutionScaleChoiceValues[] = {0, 25, 50, 75, 100, 150, 200};
+constexpr const char* kRuntimeVolumeKey = "audio.volume";
+constexpr const char* kRuntimeMuteKey = "audio.mute";
 constexpr const char* kRuntimeResumeKey = "system.resume";
 constexpr const char* kRuntimeQuitKey = "system.quit";
 
@@ -1205,6 +1231,8 @@ struct RuntimeMenuState {
     bool close_requested = false;
     // Resolution scale needs the GL presenter on the compute renderer.
     bool resolution_scale_available = false;
+    const NdsAudioDevice* audio = nullptr;
+    AudioQueue* audio_queue = nullptr;
 };
 
 // Rewrites (or appends) each key=value pair in the launcher-owned settings
@@ -1283,6 +1311,14 @@ int runtime_menu_get_value(void* context, const RecompRuntimeUiItem* item,
         *value_out = static_cast<int>(state->options->scaling);
         return 1;
     }
+    if (std::strcmp(item->key, kRuntimeVolumeKey) == 0) {
+        *value_out = state->options->audio_volume;
+        return 1;
+    }
+    if (std::strcmp(item->key, kRuntimeMuteKey) == 0) {
+        *value_out = state->options->audio_muted ? 1 : 0;
+        return 1;
+    }
     return 0;
 }
 
@@ -1326,6 +1362,20 @@ int runtime_menu_set_value(void* context, const RecompRuntimeUiItem* item,
                      nds_scaling_filter_name(state->options->scaling));
         return 1;
     }
+    if (std::strcmp(item->key, kRuntimeVolumeKey) == 0 ||
+        std::strcmp(item->key, kRuntimeMuteKey) == 0) {
+        if (!state->audio || !state->audio_queue) return 0;
+        if (std::strcmp(item->key, kRuntimeVolumeKey) == 0) {
+            if (value < 0 || value > 100) return 0;
+            state->options->audio_volume = static_cast<uint8_t>(value);
+        } else {
+            state->options->audio_muted = value != 0;
+        }
+        apply_audio_output_level(*state->audio, *state->audio_queue,
+                                 state->options->audio_volume,
+                                 state->options->audio_muted);
+        return 1;
+    }
     return 0;
 }
 
@@ -1350,6 +1400,11 @@ int runtime_menu_is_enabled(void* context, const RecompRuntimeUiItem* item) {
         return state->options->relative_mouse_touch ? 1 : 0;
     if (std::strcmp(item->key, kRuntimeResolutionScaleKey) == 0)
         return state->resolution_scale_available ? 1 : 0;
+    if (std::strcmp(item->key, kRuntimeVolumeKey) == 0)
+        return state->audio && *state->audio &&
+               !state->options->audio_muted ? 1 : 0;
+    if (std::strcmp(item->key, kRuntimeMuteKey) == 0)
+        return state->audio && *state->audio ? 1 : 0;
     return 1;
 }
 
@@ -1364,7 +1419,9 @@ void runtime_menu_save(void* context) {
              {"window_mode", nds_window_mode_name(options.window_mode)},
              {"scaling", nds_scaling_filter_name(options.scaling)},
              {"resolution_scale",
-              std::to_string(options.resolution_scale)}})) {
+              std::to_string(options.resolution_scale)},
+             {"audio_volume", std::to_string(options.audio_volume)},
+             {"audio_muted", options.audio_muted ? "1" : "0"}})) {
         std::fprintf(stderr, "[sdl] saved runtime settings\n");
     }
 }
@@ -2920,6 +2977,8 @@ int nds_run_interactive_frontend(const NdsFrontendOptions& initial_options) {
     nds_set_touch(0, 0, false);
     bool running = true;
     RuntimeMenuState runtime_menu_state{&options, &running, false};
+    runtime_menu_state.audio = &audio;
+    runtime_menu_state.audio_queue = &audio_queue;
 #if defined(NDS_HAVE_COMPUTE_RENDERER)
     runtime_menu_state.resolution_scale_available =
         presentation.gl_top && nds_compute_host_active();
@@ -2943,6 +3002,12 @@ int nds_run_interactive_frontend(const NdsFrontendOptions& initial_options) {
          "less is coarser, more supersamples.",
          RECOMP_RUNTIME_UI_CHOICE, 0, 200, 1, resolution_scale_choices, 7,
          kResolutionScaleChoiceValues},
+        {kRuntimeVolumeKey, "Audio", "Volume",
+         "Host output level in percent; the game keeps running at full mix.",
+         RECOMP_RUNTIME_UI_INT, 0, 100, 5, nullptr, 0, nullptr},
+        {kRuntimeMuteKey, "Audio", "Mute",
+         "Silence all audio output.",
+         RECOMP_RUNTIME_UI_BOOL, 0, 1, 1, nullptr, 0, nullptr},
         {kRuntimeMouseSensitivityKey, "Input", "Mouse sensitivity",
          "Prime Controls relative aim speed.",
          RECOMP_RUNTIME_UI_INT, 10, 400, 1, nullptr, 0, nullptr},
