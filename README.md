@@ -313,6 +313,14 @@ restores it once that wait falls again. `[display] performance_governor`
 (`auto`, the default, `off`, `stage1` or `stage2`) sets its mode;
 `NDS_PERFORMANCE_GOVERNOR` and `--performance-governor` override it.
 
+`[controls] gamepad_layout` picks how the pad's face buttons reach the DS:
+`labels` (the default) matches names, so a pad's A is DS A; `positional`
+matches the diamond instead, so the bottom button is DS B and the right one
+DS A, which is what Xbox-style pads need to feel like a DS. An explicit
+`--gamepad-bindings` wins over it and greys out the runtime menu's Input >
+Gamepad layout row, which otherwise switches it live. The menu keeps its own
+accept/back buttons either way.
+
 `second_screen_size` (0..60, default 0) shows the other LCD in the `single`
 layout, to the right of the main screen and bottom-aligned, as a percent of its
 size. In a portrait window (taller than wide) it goes just below the main

@@ -28,6 +28,10 @@ int main() {
     keys[5] = keys[4];
     require(nds_binding_mask(keys, 6) == 3, "shared physical key presses both assigned buttons");
     require(nds_binding_mask(kNdsDefaultPad, 1) == 1, "default gamepad south is A");
+    require(nds_binding_mask(kNdsPositionalPad, 1) == 2, "positional south is DS B");
+    require(nds_binding_mask(kNdsPositionalPad, 2) == 1, "positional east is DS A");
+    require(nds_binding_mask(kNdsPositionalPad, 3) == 1u << 11, "positional west is DS Y");
+    require(nds_binding_mask(kNdsPositionalPad, 4) == 1u << 10, "positional north is DS X");
     require(nds_parse_bindings("12,13,14,15,111,2,3,4,109,11,7,5", true, &loaded),
             "signed gamepad axes supported");
     require(!nds_parse_bindings("12,13,14,15,112,2,3,4,10,11,7,5", true, &loaded),
