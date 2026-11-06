@@ -111,11 +111,14 @@ inline NdsPresentRect nds_present_rect(NdsWindowMode mode,
 }
 
 // The single-screen layout's two rects. With inset_percent above zero the
-// other LCD sits to the right of the main one, bottom-aligned, at that percent
-// of its size. The pair is laid out as one wider image through
-// nds_present_rect, so window_mode and scaling apply to it unchanged, the main
-// screen is never covered, and a widescreen window spends its bars on the
-// inset before shrinking the main screen. inset is empty at zero.
+// other LCD is shown at that percent of its size: to the right of the main one
+// and bottom-aligned, or, in a portrait drawable (taller than wide), just below
+// it and centred. The pair is laid out as one image through nds_present_rect,
+// so window_mode and scaling apply to it unchanged, the main screen is never
+// covered, and the window spends its bars on the inset before shrinking the
+// main screen. inset_percent is therefore a minimum: in Letterbox, space left
+// over along that axis goes to the inset too, up to the main screen's size,
+// and the pair is re-centred. inset is empty at zero.
 struct NdsSingleLayout {
     NdsPresentRect main, inset;
 };
@@ -132,6 +135,31 @@ inline NdsSingleLayout nds_single_layout(NdsWindowMode mode,
                                        content_w, content_h);
         return layout;
     }
+    if (drawable_h > drawable_w) {
+        const int total_h = content_h + content_h * inset_percent / 100;
+        const NdsPresentRect all = nds_present_rect(
+            mode, scaling, drawable_w, drawable_h, content_w, total_h);
+        layout.main = all;
+        layout.main.h = static_cast<int>(
+            static_cast<long long>(all.h) * content_h / total_h);
+        layout.inset.h = all.h - layout.main.h;
+        layout.inset.w = all.w * inset_percent / 100;
+        layout.inset.x = all.x + (all.w - layout.inset.w) / 2;
+        layout.inset.y = all.y + layout.main.h;
+        const int room = drawable_h - layout.main.h;
+        if (mode == NdsWindowMode::Letterbox && room > layout.inset.h) {
+            layout.inset.h = std::min(room, layout.main.h);
+            layout.inset.w = static_cast<int>(
+                static_cast<long long>(layout.inset.h) * content_w /
+                content_h);
+            layout.main.y =
+                (drawable_h - layout.main.h - layout.inset.h) / 2;
+            layout.inset.x =
+                layout.main.x + (layout.main.w - layout.inset.w) / 2;
+            layout.inset.y = layout.main.y + layout.main.h;
+        }
+        return layout;
+    }
     const int total_w = content_w + inset_content_w;
     const NdsPresentRect all = nds_present_rect(
         mode, scaling, drawable_w, drawable_h, total_w, content_h);
@@ -142,6 +170,15 @@ inline NdsSingleLayout nds_single_layout(NdsWindowMode mode,
     layout.inset.h = all.h * inset_percent / 100;
     layout.inset.x = all.x + layout.main.w;
     layout.inset.y = all.y + all.h - layout.inset.h;
+    const int room = drawable_w - layout.main.w;
+    if (mode == NdsWindowMode::Letterbox && room > layout.inset.w) {
+        layout.inset.w = std::min(room, layout.main.w);
+        layout.inset.h = static_cast<int>(
+            static_cast<long long>(layout.inset.w) * content_h / content_w);
+        layout.main.x = (drawable_w - layout.main.w - layout.inset.w) / 2;
+        layout.inset.x = layout.main.x + layout.main.w;
+        layout.inset.y = layout.main.y + layout.main.h - layout.inset.h;
+    }
     return layout;
 }
 

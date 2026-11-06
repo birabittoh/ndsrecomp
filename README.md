@@ -328,10 +328,13 @@ button lands, the game sees the first one, so it gets a brief DS Select.
 
 `second_screen_size` (0..60, default 0) shows the other LCD in the `single`
 layout, to the right of the main screen and bottom-aligned, as a percent of its
-size. The pair is fitted as one image, so `window_mode` and `scaling` apply to
-it and the main screen is never covered. Clicking the inset touches the bottom
-LCD when that is the screen it shows. It is also in the runtime menu (Esc),
-along with the audio volume and mute.
+size. In a portrait window (taller than wide) it goes just below the main
+screen, centred. The pair is fitted as one image, so `window_mode` and
+`scaling` apply to it and the main screen is never covered. The percent is a
+minimum: with `window_mode = "letterbox"`, space the main screen can't use goes
+to the second screen too, up to the main screen's size. Clicking the inset
+touches the bottom LCD when that is the screen it shows. It is also in the
+runtime menu (Esc), along with the audio volume and mute.
 
 `startup_mode = "automatic"` sets the retail firmware's Automatic-mode flag
 in the runner's private in-memory firmware image. With a Slot-1 cartridge

@@ -131,13 +131,26 @@ int main() {
                                            1080, 256, 192, 0);
         check(rect_is(off.main, 240, 0, 1440, 1080) && off.inset.w == 0,
               "no inset: the plain rect");
-        // The inset fills the bar: the main screen keeps its full height.
+        // The inset takes the whole bar: the main screen keeps its full
+        // height and nothing is left empty.
         const auto wide = nds_single_layout(M::Letterbox, S::Nearest, 1920,
                                             1080, 256, 192, 25);
-        check(rect_is(wide.main, 60, 0, 1440, 1080),
+        check(rect_is(wide.main, 0, 0, 1440, 1080),
               "16:9 inset leaves the main screen full height");
-        check(rect_is(wide.inset, 1500, 810, 360, 270),
-              "inset right of main, bottom-aligned, keeps 4:3");
+        check(rect_is(wide.inset, 1440, 720, 480, 360),
+              "inset grows into the bar, bottom-aligned, keeps 4:3");
+        // The percent is a floor: a bigger one still shrinks the main screen.
+        const auto floor = nds_single_layout(M::Letterbox, S::Nearest, 1920,
+                                             1080, 256, 192, 60);
+        check(rect_is(floor.main, 0, 89, 1201, 901) &&
+                  rect_is(floor.inset, 1201, 450, 719, 540),
+              "inset never drops below the requested percent");
+        // Never larger than the main screen, however wide the window.
+        const auto ultra = nds_single_layout(M::Letterbox, S::Nearest, 4000,
+                                             1080, 256, 192, 25);
+        check(rect_is(ultra.main, 560, 0, 1440, 1080) &&
+                  rect_is(ultra.inset, 2000, 0, 1440, 1080),
+              "inset growth stops at the main screen's size");
         // 4:3 has no bars to spend, so the pair shrinks to fit.
         const auto square = nds_single_layout(M::Letterbox, S::Nearest, 640,
                                               480, 256, 192, 25);
@@ -155,6 +168,45 @@ int main() {
         check(original.main.w == 256 && original.main.h == 192 &&
                   original.inset.w == 128 && original.inset.h == 96,
               "original stays 1:1");
+        // A portrait window moves the inset below the main screen, centred.
+        const auto tall = nds_single_layout(M::Letterbox, S::Nearest, 480,
+                                            640, 256, 192, 25);
+        check(rect_is(tall.main, 0, 0, 480, 360),
+              "portrait main keeps the full width, at the top");
+        check(rect_is(tall.inset, 53, 360, 373, 280),
+              "portrait inset fills the rest, centred, keeps 4:3");
+        const auto tower = nds_single_layout(M::Letterbox, S::Nearest, 480,
+                                             1000, 256, 192, 25);
+        check(rect_is(tower.main, 0, 140, 480, 360) &&
+                  rect_is(tower.inset, 0, 500, 480, 360),
+              "portrait inset growth stops at the main screen's size");
+        const auto tall_off = nds_single_layout(M::Letterbox, S::Nearest, 480,
+                                                640, 256, 192, 0);
+        check(rect_is(tall_off.main, 0, 140, 480, 360) &&
+                  tall_off.inset.w == 0,
+              "portrait with no inset: the plain rect");
+        const auto tall_integer = nds_single_layout(
+            M::Letterbox, S::Integer, 1080, 1920, 256, 192, 25);
+        check(tall_integer.main.w == 256 * 4 &&
+                  tall_integer.main.h == 192 * 4,
+              "portrait integer main stays a whole multiple");
+        const auto tall_original = nds_single_layout(
+            M::Original, S::Nearest, 800, 1000, 256, 192, 50);
+        check(tall_original.main.w == 256 && tall_original.main.h == 192 &&
+                  tall_original.inset.w == 128 &&
+                  tall_original.inset.h == 96 &&
+                  tall_original.inset.y ==
+                      tall_original.main.y + tall_original.main.h,
+              "portrait original stays 1:1");
+        const auto tall_stretch = nds_single_layout(
+            M::Stretch, S::Nearest, 480, 640, 256, 192, 25);
+        check(tall_stretch.inset.w == 120,
+              "stretch keeps the requested percent");
+        // A square window is not portrait.
+        const auto even = nds_single_layout(M::Letterbox, S::Nearest, 640,
+                                            640, 256, 192, 25);
+        check(even.inset.x == even.main.x + even.main.w,
+              "square window keeps the inset beside main");
     }
 
     if (failures) return 1;
