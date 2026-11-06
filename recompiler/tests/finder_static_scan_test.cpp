@@ -368,6 +368,102 @@ void external_targets_and_candidates() {
     delete on;
 }
 
+void thumb_halfword_switch() {
+    // The ADS/RVCT inline switch, entered from ARM through a THUMB leaf:
+    // `cmp r4,#2; bhi default`, the seven fixed halfwords, then three
+    // offsets of (case - table) | 1. Only the table reaches the cases.
+    Image img = base_image();
+    const uint32_t fn = kBase + 0x100;
+    img.put(kBase + 0x1000, fn | 1u);
+    const uint16_t code[] = {
+        0x2C02,  // cmp r4,#2
+        0xD80B,  // bhi default
+        0x1920,  // adds r0,r4,r4
+        0x4478,  // add r0,pc
+        0x8900,  // ldrh r0,[r0,#8]
+        0x0400,  // lsls r0,r0,#16
+        0x1400,  // asrs r0,r0,#16
+        0x4478,  // add r0,pc
+        0x4700,  // bx r0
+    };
+    uint32_t at = fn;
+    for (uint16_t h : code) { img.put16(at, h); at += 2; }
+    const uint32_t table = at;
+    const uint32_t cases = table + 6u;
+    const uint32_t targets[3] = {cases, cases + 4u, cases + 8u};
+    for (uint32_t i = 0; i < 3; ++i)
+        img.put16(table + 2u * i,
+                  static_cast<uint16_t>((targets[i] - table) | 1u));
+    for (uint32_t i = 0; i < 3; ++i) {
+        img.put16(targets[i], 0x2001);      // movs r0,#1
+        img.put16(targets[i] + 2, 0x4770);  // bx lr
+    }
+    FunctionFinder* on = run(img, true);
+    auto covered = [&](uint32_t pc) {
+        for (const auto& f : on->functions())
+            if (f.mode == CpuMode::Thumb && pc >= f.addr && pc < f.end_addr)
+                return true;
+        return false;
+    };
+    expect("thumb_halfword_switch: table recognised",
+           !on->auto_jump_tables().empty() &&
+           on->auto_jump_tables()[0].count == 3u);
+    expect("thumb_halfword_switch: last case reached", covered(targets[2]));
+    expect("thumb_halfword_switch: middle case reached", covered(targets[1]));
+    delete on;
+}
+
+void thumb_halfword_switch_backward_case() {
+    // A guarded table may name a case before itself, and a bounded walk must
+    // not stop there: the entries after it are still cases.
+    Image img = base_image();
+    const uint32_t fn = kBase + 0x100;
+    img.put(kBase + 0x1000, fn | 1u);
+    const uint32_t before = fn;
+    img.put16(before, 0x2001);      // movs r0,#1
+    img.put16(before + 2, 0x4770);  // bx lr
+    const uint16_t code[] = {
+        0x2C01,  // cmp r4,#1
+        0xD80A,  // bhi default
+        0x1920, 0x4478, 0x8900, 0x0400, 0x1400, 0x4478, 0x4700,
+    };
+    const uint32_t entry = fn + 4u;
+    uint32_t at = entry;
+    for (uint16_t h : code) { img.put16(at, h); at += 2; }
+    const uint32_t table = at;
+    const uint32_t after = table + 4u;
+    img.put16(table, static_cast<uint16_t>((before - table) | 1u));
+    img.put16(table + 2u, static_cast<uint16_t>((after - table) | 1u));
+    img.put16(after, 0x2002);      // movs r0,#2
+    img.put16(after + 2, 0x4770);  // bx lr
+    img.put(kBase + 0x1004, entry | 1u);
+    FunctionFinder* on = run(img, true);
+    bool found = false;
+    for (const auto& t : on->auto_jump_tables())
+        found |= t.base == table && t.count == 2u;
+    expect("thumb_halfword_switch: backward case keeps the whole table", found);
+    delete on;
+}
+
+void thumb_halfword_switch_rejects_lookalike() {
+    // Same tail with a register other than the index scale: not the idiom.
+    Image img = base_image();
+    const uint32_t fn = kBase + 0x100;
+    img.put(kBase + 0x1000, fn | 1u);
+    const uint16_t code[] = {
+        0x0080,  // lsls r0,r0,#2 (not adds rX,rI,rI)
+        0x4478, 0x8900, 0x0400, 0x1400, 0x4478, 0x4700,
+    };
+    uint32_t at = fn;
+    for (uint16_t h : code) { img.put16(at, h); at += 2; }
+    img.put16(at, 0x0005);
+    img.put16(at + 2, 0x0009);
+    FunctionFinder* on = run(img, true);
+    expect("thumb_halfword_switch: lookalike left alone",
+           on->auto_jump_tables().empty());
+    delete on;
+}
+
 }  // namespace
 
 int main() {
@@ -384,6 +480,9 @@ int main() {
     gap_str_lr_prologue();
     relative_jt_unscaled_index();
     external_targets_and_candidates();
+    thumb_halfword_switch();
+    thumb_halfword_switch_backward_case();
+    thumb_halfword_switch_rejects_lookalike();
     std::printf("%s (%d failure%s)\n", g_fail ? "FAILED" : "OK", g_fail,
                 g_fail == 1 ? "" : "s");
     return g_fail ? 1 : 0;

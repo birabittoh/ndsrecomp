@@ -779,6 +779,78 @@ void FunctionFinder::discover_one(uint32_t entry_addr, CpuMode entry_mode,
         ++stats_.auto_jump_tables;
     };
 
+    // THUMB halfword switch, as ADS/RVCT inline it: the offsets sit right
+    // after the BX, and each one is (case - table) | 1.
+    //     adds rX,rI,rI
+    //     add  rX,pc
+    //     ldrh rX,[rX,#8]
+    //     lsls rX,rX,#16
+    //     asrs rX,rX,#16
+    //     add  rX,pc
+    //     bx   rX
+    // All seven halfwords are fixed, so they are matched exactly rather than
+    // inferred through the tracker. The case count comes from the guard on
+    // rI (`cmp rI,#N` then `bhi default`, or `bls over; b default`). Without
+    // a guard the walk stops at the lowest case after the table, which is
+    // where the compiler starts placing them.
+    auto thumb_halfword_switch = [&](const armv4t::Instr& bx,
+                                     std::vector<uint32_t>& targets) -> bool {
+        const uint32_t x = bx.rm;
+        const uint32_t scale_pc = bx.pc - 12u;
+        if (x >= 8u || bx.pc < 12u || !can_read_at(scale_pc, 14u))
+            return false;
+        const uint32_t add_pc = 0x4478u | x;
+        const uint32_t xx = (x << 3u) | x;
+        if (read_u16(bx.pc - 2u) != add_pc ||
+            read_u16(bx.pc - 4u) != (0x1400u | xx) ||
+            read_u16(bx.pc - 6u) != (0x0400u | xx) ||
+            read_u16(bx.pc - 8u) != (0x8900u | xx) ||
+            read_u16(bx.pc - 10u) != add_pc)
+            return false;
+        const uint32_t scale = read_u16(scale_pc);
+        const uint32_t index = (scale >> 3u) & 7u;
+        if ((scale & 0xFE00u) != 0x1800u || (scale & 7u) != x ||
+            ((scale >> 6u) & 7u) != index)
+            return false;
+
+        auto cmp_count = [&](uint32_t at) -> uint32_t {
+            if (!can_read_at(at, 2u)) return 0u;
+            const uint32_t cmp = read_u16(at);
+            return (cmp & 0xFF00u) == (0x2800u | (index << 8u))
+                ? (cmp & 0xFFu) + 1u : 0u;
+        };
+        uint32_t count = 0u;
+        if (can_read_at(scale_pc - 4u, 4u)) {
+            const uint32_t before = read_u16(scale_pc - 2u);
+            if ((before & 0xFF00u) == 0xD800u) {
+                count = cmp_count(scale_pc - 4u);
+            } else if ((before & 0xF800u) == 0xE000u &&
+                       (read_u16(scale_pc - 4u) & 0xFF00u) == 0xD900u) {
+                count = cmp_count(scale_pc - 6u);
+            }
+        }
+
+        const uint32_t table = bx.pc + 2u;
+        uint32_t lowest = 0xFFFFFFFFu;
+        const uint32_t limit = count ? count : 256u;
+        for (uint32_t k = 0; k < limit; ++k) {
+            const uint32_t at = table + 2u * k;
+            if ((!count && at >= lowest) || !can_read_at(at, 2u) ||
+                addr_in_data_range(at))
+                break;
+            const auto offset = static_cast<int16_t>(read_u16(at));
+            const uint32_t raw = table + static_cast<uint32_t>(
+                static_cast<int32_t>(offset));
+            if (!(raw & 1u) || !looks_like_code(raw & ~uint32_t{1},
+                                                CpuMode::Thumb, count == 0u))
+                break;
+            targets.push_back(raw & ~uint32_t{1});
+            // A case may also sit before the table, which bounds nothing.
+            if (raw > table) lowest = std::min(lowest, raw & ~uint32_t{1});
+        }
+        return count ? targets.size() == count : targets.size() >= 2u;
+    };
+
     // Code-pointer array at `base`: control flow just went through a
     // register loaded from `base`, so the word there is a code pointer,
     // and arrays of them (static-init tables, ops/callback tables) keep
@@ -1262,6 +1334,28 @@ void FunctionFinder::discover_one(uint32_t entry_addr, CpuMode entry_mode,
                     }
                 } else if (first) {
                     ++stats_.branch_ladders_rejected;
+                }
+            }
+
+            if (!indirect_resolved && entry_mode == CpuMode::Thumb &&
+                ins.op == armv4t::IrOp::BX) {
+                std::vector<uint32_t> cases;
+                if (thumb_halfword_switch(ins, cases)) {
+                    const auto count = static_cast<uint32_t>(cases.size());
+                    const uint32_t table = ins.pc + 2u;
+                    if (ladder_seen_sites_.insert(ins.pc).second) {
+                        data_ranges_.push_back(DataRange{
+                            table, table + 2u * count, "auto jump_table"});
+                        auto_jump_tables_.push_back(AutoJumpTable{
+                            table, 2u, count, ins.pc, entry_mode, true, true});
+                        ++stats_.auto_jump_tables;
+                        stats_.auto_jump_table_targets += count;
+                    }
+                    for (const uint32_t target : cases)
+                        enqueue_resolved_target(target, entry_mode,
+                                                "jump_table");
+                    indirect_resolved = true;
+                    ind_seeded = true;
                 }
             }
 
