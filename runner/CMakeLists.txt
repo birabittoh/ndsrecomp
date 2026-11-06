@@ -736,6 +736,7 @@ add_executable(nds_runner
     src/scheduler.cpp
     src/debug_server.cpp
     src/frontend_config.cpp
+    src/player_launch.cpp
     src/relative_mouse_touch.cpp
     "${NDS_RECOMP_UI_ROOT}/src/common/recomp_runtime_ui.c"
     src/frontend.cpp
@@ -959,6 +960,24 @@ if(NDS_ENABLE_PCAP_BACKEND)
     target_sources(nds_runner PRIVATE vendor/melonds/net/Net_PCap.cpp)
     target_compile_definitions(nds_runner PRIVATE NDS_ENABLE_PCAP_BACKEND=1)
 endif()
+# A title's game.toml, embedded so the executable runs with no arguments and
+# from any directory (player_launch.h). Unset, a no-argument run stays a plain
+# batch run.
+set(NDS_TITLE_CONFIG "" CACHE FILEPATH
+    "game.toml to embed for the no-argument player launch")
+set(_nds_title_config_bytes "")
+if(NDS_TITLE_CONFIG)
+    set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS
+        "${NDS_TITLE_CONFIG}")
+    file(READ "${NDS_TITLE_CONFIG}" _nds_title_config_hex HEX)
+    string(REGEX REPLACE "(..)" "0x\\1," _nds_title_config_bytes
+        "${_nds_title_config_hex}")
+endif()
+file(CONFIGURE OUTPUT "${CMAKE_CURRENT_BINARY_DIR}/generated/nds_title_config.inc"
+    CONTENT "${_nds_title_config_bytes}0x00\n" @ONLY)
+set_property(SOURCE src/player_launch.cpp APPEND PROPERTY COMPILE_DEFINITIONS
+    "NDS_SOURCE_BIOS_DIR=\"${CMAKE_CURRENT_SOURCE_DIR}/../bios\"")
+
 # beads-yjp.28: stamped into the coverage manifest so an ingested playthrough
 # can be tied to the build whose static coverage it was measured against.
 # beads-yjp.44: re-read at BUILD time, not configure time. The old

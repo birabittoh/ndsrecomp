@@ -207,6 +207,18 @@ Dispatch tables are discovered at configure time, classified by `_arm9_` or
 the configured SHA-1. Live-byte validation remains the boundary for mutable
 or overlay code.
 
+### No-argument launch
+
+Configure the runner with `-DNDS_TITLE_CONFIG=/path/to/game.toml` to embed the
+title's config, and set `[game] app_name`. Starting that executable with no
+arguments (or only a `.nds` path) then asks for the ROM once and plays, with
+`settings.toml`, saves, savestates and logs in one per-title folder:
+`~/.local/share/<app_name>`, `Documents\<app_name>` on Windows,
+`~/Library/Application Support/<app_name>` on macOS, or the executable's own
+folder if `portable.txt` sits next to it. The runtime menu writes its changes
+to `settings.toml`, keeping comments. Any other command line ignores that file.
+See `runner/src/player_launch.h`.
+
 ### Interactive display configuration
 
 The interactive runner reads an optional `game.toml` in its working directory,

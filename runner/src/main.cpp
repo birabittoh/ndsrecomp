@@ -64,6 +64,7 @@
 #include "title_banks.h"
 #include "execution_model.h"
 #include "coverage_manifest.h"
+#include "player_launch.h"
 #include "title_patches.h"
 #if defined(NDS_HAVE_COMPUTE_RENDERER)
 #include "melonds_compute/ComputeHost.h"
@@ -501,7 +502,24 @@ int main(int argc, char** argv) {
     NdsFrontendOptions frontend_options{};
     uint16_t port = 19842;
     int positional = 0;
-    for (int i = 1; i < argc; ++i) {
+    // No arguments on a title build: find everything and just play.
+    const bool player_mode = nds_player_requested(argc, argv);
+    if (player_mode) {
+        NdsPlayerLaunch launch;
+        if (!nds_player_prepare(argc, argv, &frontend_options, &launch))
+            return launch.exit_code;
+        interactive = true;
+        dir = launch.bios_dir;
+        rom_path = launch.rom;
+        cli_firmware_path = launch.firmware;
+        cli_save_path = launch.save;
+        cli_savestate_dir = launch.savestate_dir;
+        cli_diagnostics_dir = launch.log_dir;
+    }
+    const auto startup_failure = [&](const std::string& message) {
+        if (player_mode) nds_player_error(message);
+    };
+    for (int i = 1; i < argc && !player_mode; ++i) {
         std::string a = argv[i];
         if (a == "--serve") {
             serve = true;
@@ -807,7 +825,8 @@ int main(int argc, char** argv) {
         return 2;
     }
 
-    if (config_explicit || std::filesystem::exists(config_path)) {
+    if (!player_mode &&
+        (config_explicit || std::filesystem::exists(config_path))) {
         std::string config_error;
         if (!nds_load_frontend_config(config_path, &frontend_options,
                                       &config_error)) {
@@ -1826,6 +1845,7 @@ int main(int argc, char** argv) {
         std::fprintf(stderr,
             "refusing to start: --firmware-path %s has %zu bytes, expected 262144\n",
             cli_firmware_path.c_str(), fw.size());
+        startup_failure(cli_firmware_path + " is not a 256 KiB firmware dump.");
         return 1;
     } else {
         std::fprintf(stderr,
@@ -1833,7 +1853,12 @@ int main(int argc, char** argv) {
             cli_firmware_path.c_str(),
             gba::sha1(fw.data(), fw.size()).hex().c_str());
     }
-    if (!ok) { std::fprintf(stderr, "refusing to start: dump verification failed\n"); return 1; }
+    if (!ok) {
+        std::fprintf(stderr, "refusing to start: dump verification failed\n");
+        startup_failure("The BIOS or firmware dumps in " + dir +
+                        " failed verification.");
+        return 1;
+    }
     if (!cli_firmware_state_path.empty()) {
         std::string state_error;
         const NdsFirmwareStateLoadResult state_result =
@@ -1853,6 +1878,7 @@ int main(int argc, char** argv) {
     if (!rom_path.empty()) {
         if (rom.size() < 0x200u) {
             std::fprintf(stderr, "refusing to start: cartridge image is missing or truncated\n");
+            startup_failure(rom_path + " is missing or truncated.");
             return 1;
         }
         rom_sha1 = gba::sha1(rom.data(), rom.size()).hex();
@@ -1865,6 +1891,8 @@ int main(int argc, char** argv) {
                          "%s, got %s\n",
                          frontend_options.expected_rom_sha1.c_str(),
                          rom_sha1.c_str());
+            startup_failure(rom_path + " is not the ROM this build runs. "
+                            "Clear rom in settings.toml to pick another.");
             return 1;
         }
     }
