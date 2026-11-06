@@ -187,6 +187,19 @@ bool nds_parse_second_screen_size(const std::string& value, uint8_t* out) {
     return true;
 }
 
+bool nds_parse_gamepad_layout(const std::string& value, bool* positional) {
+    if (!positional) return false;
+    const std::string normalized = lower_ascii(value);
+    if (normalized == "labels") {
+        *positional = false;
+    } else if (normalized == "positional") {
+        *positional = true;
+    } else {
+        return false;
+    }
+    return true;
+}
+
 bool nds_parse_resolution_scale(const std::string& value, uint16_t* out) {
     if (!out || value.empty()) return false;
     std::string digits = value;
@@ -1031,6 +1044,17 @@ bool nds_load_frontend_config(const std::string& path,
             if (!nds_set_virtual_stylus_binding(
                     &options->screen_toggle_binding, *value)) {
                 if (error) *error = "controls.screen_toggle is too long";
+                return false;
+            }
+        }
+        if (const auto value =
+                (*controls)["gamepad_layout"].value<std::string>()) {
+            if (!nds_parse_gamepad_layout(*value,
+                                          &options->gamepad_positional)) {
+                if (error) {
+                    *error = "controls.gamepad_layout must be labels or "
+                             "positional";
+                }
                 return false;
             }
         }

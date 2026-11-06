@@ -229,6 +229,9 @@ struct NdsFrontendOptions {
     NdsButtonBindings keyboard_bindings = kNdsDefaultKeys;
     NdsButtonBindings gamepad_bindings = kNdsDefaultPad;
     bool custom_gamepad_bindings = false;
+    // Face buttons by position (kNdsPositionalPad) rather than by label.
+    // Live-adjustable from the runtime menu; custom bindings take priority.
+    bool gamepad_positional = false;
     NdsStartupMode startup_mode = NdsStartupMode::Preserve;
     NdsBootMode boot_mode = NdsBootMode::Lle;
     // Opt-in synthesized firmware image (no firmware dump). Forces direct
@@ -417,6 +420,7 @@ bool nds_parse_internal_resolution(const std::string& value, uint8_t* out);
 bool nds_parse_resolution_scale(const std::string& value, uint16_t* out);
 // 0..60 (percent).
 bool nds_parse_second_screen_size(const std::string& value, uint8_t* out);
+bool nds_parse_gamepad_layout(const std::string& value, bool* positional);
 bool nds_parse_texture_upscale(const std::string& value, uint8_t* out);
 bool nds_parse_frame_interpolation(const std::string& value,
                                    NdsFrameInterpolation* out);

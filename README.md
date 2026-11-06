@@ -304,6 +304,14 @@ are exclusive within one source, and the later source (TOML < env < CLI)
 wins. The performance governor drops 3D to 1x when frames wait on the GPU, and
 restores it once that wait falls again.
 
+`[controls] gamepad_layout` picks how the pad's face buttons reach the DS:
+`labels` (the default) matches names, so a pad's A is DS A; `positional`
+matches the diamond instead, so the bottom button is DS B and the right one
+DS A, which is what Xbox-style pads need to feel like a DS. An explicit
+`--gamepad-bindings` wins over it and greys out the runtime menu's Input >
+Gamepad layout row, which otherwise switches it live. The menu keeps its own
+accept/back buttons either way.
+
 `second_screen_size` (0..60, default 0) shows the other LCD in the `single`
 layout, to the right of the main screen and bottom-aligned, as a percent of its
 size. The pair is fitted as one image, so `window_mode` and `scaling` apply to

@@ -492,6 +492,34 @@ int main() {
     options = {};
     if (!require(options.resolution_scale == 0))
         return 47;
+
+    {
+        std::ofstream file(path);
+        file << "[controls]\n"
+                "gamepad_layout = \"positional\"\n";
+    }
+    options = {};
+    if (!require(nds_load_frontend_config(path.string(), &options, &error)) ||
+        !require(options.gamepad_positional) ||
+        !require(!options.custom_gamepad_bindings))
+        return 48;
+    {
+        std::ofstream file(path);
+        file << "[controls]\n"
+                "gamepad_layout = \"labels\"\n";
+    }
+    options = {};
+    if (!require(nds_load_frontend_config(path.string(), &options, &error)) ||
+        !require(!options.gamepad_positional))
+        return 50;
+    {
+        std::ofstream file(path);
+        file << "[controls]\n"
+                "gamepad_layout = \"diagonal\"\n";
+    }
+    options = {};
+    if (!require(!nds_load_frontend_config(path.string(), &options, &error)))
+        return 51;
     std::filesystem::remove(path);
     return 0;
 }

@@ -952,6 +952,15 @@ uint16_t controller_bit(SDL_GameControllerButton button) {
     }
 }
 
+uint16_t gamepad_button_mask(const NdsFrontendOptions& options,
+                             SDL_GameControllerButton button) {
+    if (options.custom_gamepad_bindings)
+        return nds_binding_mask(options.gamepad_bindings, button + 1);
+    if (options.gamepad_positional)
+        return nds_binding_mask(kNdsPositionalPad, button + 1);
+    return controller_bit(button);
+}
+
 SDL_GameController* open_first_controller() {
 #if defined(NDS_HAVE_SDL3)
     int count = 0;
@@ -1214,6 +1223,7 @@ uint64_t framebuffer_rgb_fnv(int screen) {
 
 constexpr const char* kRuntimeMouseSensitivityKey =
     "input.mouse_sensitivity";
+constexpr const char* kRuntimeGamepadLayoutKey = "input.gamepad_layout";
 constexpr const char* kRuntimeWindowModeKey = "display.window_mode";
 constexpr const char* kRuntimeScalingKey = "display.scaling";
 constexpr const char* kRuntimeResolutionScaleKey = "display.resolution_scale";
@@ -1291,6 +1301,10 @@ int runtime_menu_get_value(void* context, const RecompRuntimeUiItem* item,
         *value_out = state->options->relative_mouse_sensitivity;
         return 1;
     }
+    if (std::strcmp(item->key, kRuntimeGamepadLayoutKey) == 0) {
+        *value_out = state->options->gamepad_positional ? 1 : 0;
+        return 1;
+    }
     if (std::strcmp(item->key, kRuntimeWindowModeKey) == 0) {
         *value_out = static_cast<int>(state->options->window_mode);
         return 1;
@@ -1336,6 +1350,13 @@ int runtime_menu_set_value(void* context, const RecompRuntimeUiItem* item,
         state->options->relative_mouse_sensitivity =
             static_cast<uint16_t>(value);
         std::fprintf(stderr, "[sdl] mouse sensitivity set to %d%%\n", value);
+        return 1;
+    }
+    if (std::strcmp(item->key, kRuntimeGamepadLayoutKey) == 0) {
+        if (value < 0 || value > 1) return 0;
+        state->options->gamepad_positional = value != 0;
+        std::fprintf(stderr, "[sdl] gamepad layout -> %s\n",
+                     value ? "positional" : "labels");
         return 1;
     }
     if (std::strcmp(item->key, kRuntimeWindowModeKey) == 0) {
@@ -1409,6 +1430,8 @@ int runtime_menu_is_enabled(void* context, const RecompRuntimeUiItem* item) {
     if (!state || !state->options || !item) return 0;
     if (std::strcmp(item->key, kRuntimeMouseSensitivityKey) == 0)
         return state->options->relative_mouse_touch ? 1 : 0;
+    if (std::strcmp(item->key, kRuntimeGamepadLayoutKey) == 0)
+        return state->options->custom_gamepad_bindings ? 0 : 1;
     if (std::strcmp(item->key, kRuntimeResolutionScaleKey) == 0)
         return state->resolution_scale_available ? 1 : 0;
     if (std::strcmp(item->key, kRuntimeSecondScreenKey) == 0)
@@ -1430,6 +1453,8 @@ void runtime_menu_save(void* context) {
             options.runtime_settings_path,
             {{"mouse_sensitivity",
               std::to_string(options.relative_mouse_sensitivity)},
+             {"gamepad_layout",
+              options.gamepad_positional ? "positional" : "labels"},
              {"window_mode", nds_window_mode_name(options.window_mode)},
              {"scaling", nds_scaling_filter_name(options.scaling)},
              {"resolution_scale",
@@ -3043,6 +3068,8 @@ int nds_run_interactive_frontend(const NdsFrontendOptions& initial_options) {
         "Integer (pixel-perfect)", "Bilinear", "Nearest neighbor"};
     static const char* const resolution_scale_choices[] = {
         "Off (fixed)", "25%", "50%", "75%", "100%", "150%", "200%"};
+    static const char* const gamepad_layout_choices[] = {
+        "By label", "By position"};
     static const RecompRuntimeUiItem runtime_menu_items[] = {
         {kRuntimeWindowModeKey, "Display", "Window mode",
          "Letterbox keeps 4:3, stretch fills the window, original is 1:1.",
@@ -3066,6 +3093,11 @@ int nds_run_interactive_frontend(const NdsFrontendOptions& initial_options) {
         {kRuntimeMuteKey, "Audio", "Mute",
          "Silence all audio output.",
          RECOMP_RUNTIME_UI_BOOL, 0, 1, 1, nullptr, 0, nullptr},
+        {kRuntimeGamepadLayoutKey, "Input", "Gamepad layout",
+         "By label, pad A is DS A. By position, the pad's right button is "
+         "DS A, as on a DS.",
+         RECOMP_RUNTIME_UI_CHOICE, 0, 1, 1, gamepad_layout_choices, 2,
+         nullptr},
         {kRuntimeMouseSensitivityKey, "Input", "Mouse sensitivity",
          "Prime Controls relative aim speed.",
          RECOMP_RUNTIME_UI_INT, 10, 400, 1, nullptr, 0, nullptr},
@@ -4028,9 +4060,8 @@ int nds_run_interactive_frontend(const NdsFrontendOptions& initial_options) {
                 } else if (process_mph_prime_pad(MphPadInputKind::Button, button,
                                           true)) {
                     // Consumed by Prime Controls.
-                } else if (const uint16_t bit = options.custom_gamepad_bindings
-                        ? nds_binding_mask(options.gamepad_bindings, button + 1)
-                        : controller_bit(button)) {
+                } else if (const uint16_t bit =
+                        gamepad_button_mask(options, button)) {
                     controller_pressed |= bit;
                     publish_keys();
                 }
@@ -4044,9 +4075,8 @@ int nds_run_interactive_frontend(const NdsFrontendOptions& initial_options) {
                 } else if (process_mph_prime_pad(MphPadInputKind::Button, button,
                                           false)) {
                     // Consumed by Prime Controls.
-                } else if (const uint16_t bit = options.custom_gamepad_bindings
-                        ? nds_binding_mask(options.gamepad_bindings, button + 1)
-                        : controller_bit(button)) {
+                } else if (const uint16_t bit =
+                        gamepad_button_mask(options, button)) {
                     controller_pressed &= static_cast<uint16_t>(~bit);
                     publish_keys();
                 }
