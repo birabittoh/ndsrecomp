@@ -10,6 +10,7 @@
 #include "cpu_render_handoff.h"
 
 #include <atomic>
+#include <cerrno>
 #include <chrono>
 #include <condition_variable>
 #include <cstdarg>
@@ -1368,11 +1369,73 @@ void nds_gpu3d_vcount144() {
     ++g_gpu3d_profile.vcount144_calls;
 }
 
+// NDS_GX_TRACE=<file> records each new 3D image in submission order, the
+// input for developing frame interpolation offline. Layout, little-endian:
+// "GXIM", u32 vblank, vertices, polygons, then per vertex s32 position[4],
+// s16 texcoords[2], s32 final_position[2], s32 final_color[3], u32 clipped,
+// and per polygon u32 attr, tex_param, tex_palette, vertex count, flags
+// (1 translucent, 2 shadow mask, 4 shadow, 8 perspective, 16 facing view),
+// u16 vertex indices[10].
+static FILE* gx_trace_file() {
+    static FILE* file = [] {
+        const char* path = std::getenv("NDS_GX_TRACE");
+        if (!path || !*path) return static_cast<FILE*>(nullptr);
+        FILE* opened = std::fopen(path, "wb");
+        if (opened) std::fprintf(stderr, "[gx] tracing to %s\n", path);
+        else std::fprintf(stderr, "[gx] cannot trace to %s: %s\n", path,
+                          std::strerror(errno));
+        return opened;
+    }();
+    return file;
+}
+
+static void trace_3d_image(const melonDS::GPU3D& g3, uint64_t vblank) {
+    constexpr uint32_t kMaxImages = 1800;
+    FILE* const file = gx_trace_file();
+    static uint32_t images = 0;
+    if (!file || images >= kMaxImages) return;
+    if (++images == kMaxImages) std::fprintf(stderr, "[gx] trace full\n");
+    const auto put = [file](const auto& value) {
+        std::fwrite(&value, sizeof(value), 1, file);
+    };
+    std::fwrite("GXIM", 4, 1, file);
+    put(static_cast<uint32_t>(vblank));
+    put(static_cast<uint32_t>(g3.NumVertices));
+    put(static_cast<uint32_t>(g3.NumPolygons));
+    for (uint32_t i = 0; i < g3.NumVertices; ++i) {
+        const auto& v = g3.CurVertexRAM[i];
+        put(v.Position);
+        put(v.TexCoords);
+        put(v.FinalPosition);
+        put(v.FinalColor);
+        put(static_cast<uint32_t>(v.Clipped));
+    }
+    for (uint32_t i = 0; i < g3.NumPolygons; ++i) {
+        const auto& poly = g3.CurPolygonRAM[i];
+        put(poly.Attr);
+        put(poly.TexParam);
+        put(poly.TexPalette);
+        put(poly.NumVertices);
+        put(static_cast<uint32_t>((poly.Translucent ? 1 : 0) |
+                                  (poly.IsShadowMask ? 2 : 0) |
+                                  (poly.IsShadow ? 4 : 0) |
+                                  (poly.PerspectiveProjection ? 8 : 0) |
+                                  (poly.FacingView ? 16 : 0)));
+        uint16_t indices[10] = {};
+        for (uint32_t v = 0; v < poly.NumVertices && v < 10; ++v)
+            indices[v] = static_cast<uint16_t>(
+                poly.Vertices[v] - g3.CurVertexRAM);
+        put(indices);
+    }
+    std::fflush(file);
+}
+
 // Before GPU3D::VBlank, which consumes FlushRequest and flips the vertex RAM.
 static void count_3d_frame() {
     static uint64_t last_hash = 0;
     static uint16_t last_lcd = 0;
     const auto& g3 = g_nds.GPU.GPU3D;
+    gx_trace_file();  // reports a bad path at boot, not after a play session
     ++g_gpu3d_profile.gx_vblanks;
     const uint16_t lcd = nds_powercontrol9() & 0x8000u;
     if (lcd != last_lcd) ++g_gpu3d_profile.gx_lcd_flips;
@@ -1387,7 +1450,10 @@ static void count_3d_frame() {
             hash = (hash ^ static_cast<uint32_t>(position)) *
                    1099511628211ull;
     }
-    if (hash != last_hash) ++g_gpu3d_profile.gx_new_images;
+    if (hash != last_hash) {
+        ++g_gpu3d_profile.gx_new_images;
+        trace_3d_image(g3, g_gpu3d_profile.gx_vblanks);
+    }
     last_hash = hash;
 }
 
