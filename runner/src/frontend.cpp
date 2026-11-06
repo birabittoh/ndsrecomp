@@ -3168,6 +3168,9 @@ int nds_run_interactive_frontend(const NdsFrontendOptions& initial_options) {
     bool mph_pad_trigger_right_held = false;
     uint64_t mph_pad_aim_writes = 0;
     bool runtime_stick_held = false;
+    // Back + Start opens the menu; Start alone belongs to the game.
+    bool pad_back_held = false;
+    bool pad_start_held = false;
     RecompRuntimeUiInput runtime_stick_input =
         RECOMP_RUNTIME_UI_INPUT_DOWN;
     uint32_t runtime_stick_frames = 0;
@@ -4022,6 +4025,8 @@ int nds_run_interactive_frontend(const NdsFrontendOptions& initial_options) {
             }
             if (event.type == SDL_CONTROLLERDEVICEREMOVED &&
                 controller && sdl_controller_device_id(event) == controller_id) {
+                pad_back_held = false;
+                pad_start_held = false;
                 SDL_GameControllerClose(controller);
                 controller = nullptr;
                 controller_id = -1;
@@ -4038,11 +4043,22 @@ int nds_run_interactive_frontend(const NdsFrontendOptions& initial_options) {
                 const bool was_open = runtime_menu_open();
                 const auto button = static_cast<SDL_GameControllerButton>(
                     sdl_controller_button(event));
-                if (runtime_menu_controller_input(button, &menu_input) &&
-                    runtime_ui &&
-                    recomp_runtime_ui_handle_input(
-                        runtime_ui, menu_input,
-                        event.type == SDL_CONTROLLERBUTTONDOWN, false)) {
+                const bool down = event.type == SDL_CONTROLLERBUTTONDOWN;
+                if (button == SDL_CONTROLLER_BUTTON_BACK)
+                    pad_back_held = down;
+                if (button == SDL_CONTROLLER_BUTTON_START)
+                    pad_start_held = down;
+                if (!was_open) {
+                    if (down && pad_back_held && pad_start_held && runtime_ui &&
+                        recomp_runtime_ui_handle_input(
+                            runtime_ui, RECOMP_RUNTIME_UI_INPUT_TOGGLE, 1, 0)) {
+                        finish_runtime_menu_input(was_open);
+                        continue;
+                    }
+                } else if (runtime_menu_controller_input(button, &menu_input) &&
+                           runtime_ui &&
+                           recomp_runtime_ui_handle_input(
+                               runtime_ui, menu_input, down, false)) {
                     finish_runtime_menu_input(was_open);
                     continue;
                 }

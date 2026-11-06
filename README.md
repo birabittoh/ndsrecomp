@@ -310,7 +310,9 @@ matches the diamond instead, so the bottom button is DS B and the right one
 DS A, which is what Xbox-style pads need to feel like a DS. An explicit
 `--gamepad-bindings` wins over it and greys out the runtime menu's Input >
 Gamepad layout row, which otherwise switches it live. The menu keeps its own
-accept/back buttons either way.
+accept/back buttons either way. On a pad, Back + Start opens that menu (Esc
+on the keyboard); Start alone is DS Start. Press Back first: until the second
+button lands, the game sees the first one, so it gets a brief DS Select.
 
 `second_screen_size` (0..60, default 0) shows the other LCD in the `single`
 layout, to the right of the main screen and bottom-aligned, as a percent of its
