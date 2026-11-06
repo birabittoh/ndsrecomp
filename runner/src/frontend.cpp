@@ -1465,6 +1465,33 @@ void runtime_menu_save(void* context) {
              {"audio_muted", options.audio_muted ? "1" : "0"}})) {
         std::fprintf(stderr, "[sdl] saved runtime settings\n");
     }
+    if (options.settings_path.empty()) return;
+    const auto quoted = [](const char* name) {
+        return nds_toml_string(name);
+    };
+    std::vector<NdsSettingUpdate> updates = {
+        {"display", "window_mode",
+         quoted(nds_window_mode_name(options.window_mode))},
+        {"display", "scaling", quoted(nds_scaling_filter_name(options.scaling))},
+        {"display", "resolution_scale",
+         std::to_string(options.resolution_scale)},
+        {"display", "second_screen_size",
+         std::to_string(options.second_screen_size)},
+        {"audio", "volume", std::to_string(options.audio_volume)},
+        {"audio", "mute", options.audio_muted ? "true" : "false"},
+        {"controls", "gamepad_layout",
+         quoted(options.gamepad_positional ? "positional" : "labels")},
+    };
+    // The two are exclusive in TOML unless the scale is off.
+    if (options.resolution_scale != 0)
+        updates.push_back({"display", "internal_resolution", "", true});
+    if (options.relative_mouse_touch)
+        updates.push_back({"controls", "mouse_sensitivity",
+                           std::to_string(options.relative_mouse_sensitivity)});
+    std::string error;
+    if (!nds_update_settings_file(options.settings_path, updates, &error))
+        std::fprintf(stderr, "[settings] could not save %s: %s\n",
+                     options.settings_path.c_str(), error.c_str());
 }
 
 bool runtime_menu_key_input(SDL_Scancode scancode,
@@ -2933,6 +2960,8 @@ int nds_run_interactive_frontend(const NdsFrontendOptions& initial_options) {
     else
         std::fprintf(stderr, "[sdl] audio driver: %s, output muted: %s\n",
             SDL_GetCurrentAudioDriver(), audio_queue.output_muted ? "yes" : "no");
+    apply_audio_output_level(audio, audio_queue, options.audio_volume,
+                             options.audio_muted);
 
     std::fprintf(stderr,
         "[sdl] controls: gamepad=Player 1 | bottom mouse=touch | "
