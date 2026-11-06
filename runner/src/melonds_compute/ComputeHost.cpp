@@ -51,6 +51,11 @@ GLuint g_overlay_texture = 0;
 int g_overlay_texture_width = 0;
 const uint32_t* g_overlay_pixels = nullptr;
 unsigned g_overlay_width = 0;
+GLuint g_inset_texture = 0;
+int g_inset_texture_width = 0;
+const uint32_t* g_inset_pixels = nullptr;
+unsigned g_inset_width = 0;
+int g_inset_percent = 0;
 
 // GL identity, captured once the context is current. Fixed buffers rather
 // than std::string: this is read from the diagnostics sampler, and the
@@ -189,6 +194,7 @@ bool start_presenter()
     glGenFramebuffers(1, &g_compose_fbo);
     glGenTextures(1, &g_compose_texture);
     glGenTextures(1, &g_overlay_texture);
+    glGenTextures(1, &g_inset_texture);
     glGenVertexArrays(1, &g_present_vao);
     glGenTextures(2, g_fallback_texture);
     glGenTextures(2, g_object_texture);
@@ -206,6 +212,9 @@ void stop_presenter()
     if (g_overlay_texture) glDeleteTextures(1, &g_overlay_texture);
     g_overlay_texture = 0;
     g_overlay_texture_width = 0;
+    if (g_inset_texture) glDeleteTextures(1, &g_inset_texture);
+    g_inset_texture = 0;
+    g_inset_texture_width = 0;
     g_compose_fbo = 0;
     g_compose_texture = 0;
     g_blit_program = 0;
@@ -453,6 +462,15 @@ void nds_compute_host_set_overlay(const uint32_t* argb, unsigned width)
     g_overlay_width = g_overlay_pixels ? width : 0;
 }
 
+void nds_compute_host_set_inset(const uint32_t* argb, unsigned width,
+                                int percent)
+{
+    const bool shown = argb && percent > 0 && width > 0 && width <= 448;
+    g_inset_pixels = shown ? argb : nullptr;
+    g_inset_width = shown ? width : 0;
+    g_inset_percent = shown ? percent : 0;
+}
+
 void nds_compute_host_set_present_mode(NdsWindowMode mode,
                                        NdsScalingFilter scaling)
 {
@@ -541,9 +559,10 @@ bool nds_compute_host_present_top(const unsigned int* fallback_pixels,
     int drawable_width = 0;
     int drawable_height = 0;
     sdl_get_drawable_size(g_window, &drawable_width, &drawable_height);
-    const NdsPresentRect rect = nds_present_rect(
+    const NdsSingleLayout layout = nds_single_layout(
         g_window_mode, g_scaling, drawable_width, drawable_height, width,
-        192);
+        192, g_inset_percent);
+    const NdsPresentRect rect = layout.main;
     g_last_rect = rect;
     // GL's viewport origin is bottom-left.
     const int viewport_y = drawable_height - rect.y - rect.h;
@@ -648,6 +667,40 @@ bool nds_compute_host_present_top(const unsigned int* fallback_pixels,
         glUniform1ui(1, box_resolve ? 1u : 0u);
         glUniform2i(2, rect.w, rect.h);
         glDrawArrays(GL_TRIANGLES, 0, 3);
+    }
+    if (g_inset_pixels && layout.inset.w > 0 && layout.inset.h > 0) {
+        const NdsPresentRect& inset = layout.inset;
+        glBindFramebuffer(GL_FRAMEBUFFER, 0);
+        glViewport(inset.x, drawable_height - inset.y - inset.h, inset.w,
+                   inset.h);
+        glActiveTexture(GL_TEXTURE7);
+        glBindTexture(GL_TEXTURE_2D, g_inset_texture);
+        const int inset_width = static_cast<int>(g_inset_width);
+        if (g_inset_texture_width != inset_width) {
+            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S,
+                            GL_CLAMP_TO_EDGE);
+            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T,
+                            GL_CLAMP_TO_EDGE);
+            glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, inset_width, 192, 0,
+                         GL_BGRA, GL_UNSIGNED_BYTE, nullptr);
+            g_inset_texture_width = inset_width;
+        }
+        glPixelStorei(GL_UNPACK_ALIGNMENT, 4);
+        glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, inset_width, 192, GL_BGRA,
+                        GL_UNSIGNED_BYTE, g_inset_pixels);
+        // Point sampling a shrunk inset drops whole rows of text.
+        const GLint filter = g_scaling == NdsScalingFilter::Bilinear ||
+                                     inset.w < inset_width
+            ? GL_LINEAR : GL_NEAREST;
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, filter);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, filter);
+        glUseProgram(g_blit_program);
+        glUniform1ui(0, 1u);
+        glUniform1ui(1, 0u);
+        // The source's alpha byte is not meaningful: keep the window opaque.
+        glColorMask(GL_TRUE, GL_TRUE, GL_TRUE, GL_FALSE);
+        glDrawArrays(GL_TRIANGLES, 0, 3);
+        glColorMask(GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE);
     }
     if (g_overlay_pixels) {
         glBindFramebuffer(GL_FRAMEBUFFER, 0);

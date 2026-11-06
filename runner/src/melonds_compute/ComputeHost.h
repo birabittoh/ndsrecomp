@@ -47,6 +47,11 @@ void nds_compute_host_set_present_mode(NdsWindowMode mode,
 // the same rect. The pointer is read during that present only; pass nullptr
 // to clear.
 void nds_compute_host_set_overlay(const uint32_t* argb, unsigned width);
+// Optional second LCD for the next present, in the nds_single_layout() inset:
+// `width` x 192 ARGB at `percent` of the main screen, which moves left to make
+// room. The pointer is read during that present only; pass nullptr to clear.
+void nds_compute_host_set_inset(const uint32_t* argb, unsigned width,
+                                int percent);
 bool nds_compute_host_present_top(const unsigned int* fallback_pixels,
                                   unsigned short fallback_width,
                                   const NdsGpu2dDirectFrame* direct_frame,

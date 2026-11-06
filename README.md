@@ -313,6 +313,16 @@ restores it once that wait falls again. `[display] performance_governor`
 (`auto`, the default, `off`, `stage1` or `stage2`) sets its mode;
 `NDS_PERFORMANCE_GOVERNOR` and `--performance-governor` override it.
 
+`second_screen_size` (0..60, default 0) shows the other LCD in the `single`
+layout, to the right of the main screen and bottom-aligned, as a percent of its
+size. In a portrait window (taller than wide) it goes just below the main
+screen, centred. The pair is fitted as one image, so `window_mode` and
+`scaling` apply to it and the main screen is never covered. The percent is a
+minimum: with `window_mode = "letterbox"`, space the main screen can't use goes
+to the second screen too, up to the main screen's size. Clicking the inset
+touches the bottom LCD when that is the screen it shows. It is also in the
+runtime menu (Esc), along with the audio volume and mute.
+
 `startup_mode = "automatic"` sets the retail firmware's Automatic-mode flag
 in the runner's private in-memory firmware image. With a Slot-1 cartridge
 inserted, the real BIOS/firmware/card path then launches it without navigating
