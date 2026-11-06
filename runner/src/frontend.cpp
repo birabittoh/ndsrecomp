@@ -2468,7 +2468,7 @@ void draw_separate_screen(FrontendPresentation& presentation, int screen,
 }
 
 // Single-screen layout: present presentation.shown_screen, with the other LCD
-// as an optional inset beside it, and the runtime menu, virtual stylus (bottom
+// as an optional inset next to it, and the runtime menu, virtual stylus (bottom
 // LCD only) and savestate notice on the shown screen.
 // The GL window has no SDL renderer, so there the stylus and notice go
 // through the presenter's overlay layer, and an open runtime menu (drawn into
@@ -4236,7 +4236,9 @@ int nds_run_interactive_frontend(const NdsFrontendOptions& initial_options) {
                        presentation.shown_screen == 1 ||
                        presentation.inset_percent > 0) &&
                           event.button.x >= bottom_content_left &&
-                          event.button.x < bottom_content_left + kScreenWidth
+                          event.button.x < bottom_content_left + kScreenWidth &&
+                          event.button.y >= 0 &&
+                          event.button.y < kScreenHeight
                     : stacked_left_route ==
                           NdsStackedRelativeMouseRoute::Touchscreen)) {
                 mouse_down = true;
