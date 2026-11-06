@@ -26,8 +26,10 @@ struct NdsGxSnapshotPolygon {
     uint32_t num_vertices = 0;
     float x = 0.f;  // screen centroid
     float y = 0.f;
+    uint64_t identity = 0;  // surface and texcoords: which model polygon it is
     melonDS::Vertex vertices[10];
     int32_t final_z[10] = {};
+    melonDS::Polygon source;  // its vertex pointers do not outlive the bank
 };
 
 void nds_gx_snapshot_polygon(const melonDS::Polygon& polygon,
@@ -35,25 +37,32 @@ void nds_gx_snapshot_polygon(const melonDS::Polygon& polygon,
 
 // Pairs two images' polygons, both in submission order. Writes the index in
 // `a` for each polygon of `b`, or -1, and returns the number paired. Polygons
-// come and go as they leave the view, so a mismatch looks ahead for the point
-// where the sequences line up again. Textures repeat across a scene, so a pair
-// must also be close on screen.
+// are paired by what they are, their surface and texcoords, not by where they
+// sit in the list: a model's polygons look alike, so one leaving the view must
+// not pair each later one with its neighbour. Their positions only choose
+// among repeats.
 size_t nds_gx_match(const NdsGxSnapshotPolygon* a, size_t a_count,
                     const NdsGxSnapshotPolygon* b, size_t b_count,
                     int32_t* b_to_a);
 
-// Writes the polygon halfway from `from` to `to`, its vertices into `vertices`
-// (room for to.NumVertices). False when they are too different to blend, and
-// `out` is then not usable.
-bool nds_gx_blend_polygon(const NdsGxSnapshotPolygon& from,
-                          const melonDS::Polygon& to, int32_t render_width,
-                          melonDS::Polygon* out, melonDS::Vertex* vertices);
+struct NdsGxBlendCounts {
+    size_t paired = 0;     // polygons of `current` with one in `last`
+    size_t departing = 0;  // polygons of `last` still showing halfway
+};
 
-// Writes `polygon` moved by (dx, dy) pixels, leaving vertices on the screen
-// edge in place so that clipped geometry still reaches it.
-void nds_gx_shift_polygon(const melonDS::Polygon& polygon, float dx, float dy,
-                          int32_t render_width, melonDS::Polygon* out,
-                          melonDS::Vertex* vertices);
+// Writes the image halfway from `last` to `current`, whose polygons are in
+// `bank`. `polygons` gets one per polygon of `current`, in the same order, then
+// `counts->departing` more; it needs room for 2048, and `vertices` for ten
+// each. Corner v of polygon i is written at vertices[i * 10 + v]. False when
+// the two images are different scenes.
+//
+// Polygons are not blended one by one: every polygon with a corner at the same
+// clip-space vertex gets the same result, so a mesh cannot come apart.
+bool nds_gx_blend_image(const NdsGxSnapshotPolygon* last, size_t last_count,
+                        const NdsGxSnapshotPolygon* current,
+                        const melonDS::Polygon* bank, size_t count,
+                        int32_t render_width, melonDS::Polygon* polygons,
+                        melonDS::Vertex* vertices, NdsGxBlendCounts* counts);
 
 // After GPU3D::VBlank. `swap` means the game's SWAP_BUFFERS took effect there,
 // `new_image` that its geometry differs from the last swap.
