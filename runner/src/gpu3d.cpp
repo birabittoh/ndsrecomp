@@ -728,7 +728,7 @@ bool nds_gpu3d_renderer_requires_compute() {
 }
 
 bool nds_gpu3d_compute_renderer_built() {
-#if defined(NDS_HAVE_COMPUTE_RENDERER)
+#if defined(NDS_GPU3D_GL_BRIDGE) || defined(NDS_USE_PLUME)
     return true;
 #else
     return false;
@@ -736,7 +736,9 @@ bool nds_gpu3d_compute_renderer_built() {
 }
 
 const char* nds_gpu3d_compiled_accelerated_backend() {
-#if defined(NDS_USE_NATIVE_GL)
+#if defined(NDS_USE_PLUME)
+    return "plume";
+#elif defined(NDS_USE_NATIVE_GL)
     return "native-gl";
 #else
     return "compute";
@@ -927,6 +929,16 @@ bool nds_gpu3d_use_compute_renderer() {
     g_compute_rendered_frame = false;
     g_compute_readback_pending = false;
     g_compute_frame_ready = false;
+    return true;
+#elif defined(NDS_USE_PLUME)
+    // The Plume host presents, but has no 3D passes of its own yet: the
+    // installed (threaded) integer renderer keeps rasterizing, and its lines
+    // reach the presenter through the ordinary CPU composite. Reporting
+    // success keeps the host's start/fallback logic identical to the GL
+    // backends', so the 3D passes can replace this without touching it.
+    std::fprintf(stderr,
+        "[gpu3d] accelerated backend: plume (presentation only; 3D is "
+        "still rasterized by the software renderer)\n");
     return true;
 #else
     return false;

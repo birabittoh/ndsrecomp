@@ -35,8 +35,8 @@ option(NDS_ENABLE_COMPUTE_RENDERER
     "Build the selected melonDS accelerated renderer (OpenGL 4.3 context)"
     ON)
 set(NDS_ACCELERATED_RENDERER "OPENGL" CACHE STRING
-    "Developer build selection: COMPUTE or OPENGL native rasterization")
-set_property(CACHE NDS_ACCELERATED_RENDERER PROPERTY STRINGS COMPUTE OPENGL)
+    "Developer build selection: COMPUTE or OPENGL native rasterization, or PLUME (Vulkan/D3D12, in progress)")
+set_property(CACHE NDS_ACCELERATED_RENDERER PROPERTY STRINGS COMPUTE OPENGL PLUME)
 option(NDS_BUILD_NATIVE_GL_TESTS "Build focused SDL3/native-GL context checks" OFF)
 option(NDS_LEAN_DIAGNOSTICS "Experiment: diagnostic sampling is explicitly armed" OFF)
 option(NDS_CAPTURE_VIEW_REUSE "Experiment: reuse unchanged immutable capture texture views" OFF)
@@ -96,8 +96,8 @@ if(NDS_ARM9_DYNARMIC_ROOT)
         message(STATUS "Optional ARM9 native host unavailable; retaining portable faithful execution")
     endif()
 endif()
-if(NOT NDS_ACCELERATED_RENDERER MATCHES "^(COMPUTE|OPENGL)$")
-    message(FATAL_ERROR "NDS_ACCELERATED_RENDERER must be COMPUTE or OPENGL")
+if(NOT NDS_ACCELERATED_RENDERER MATCHES "^(COMPUTE|OPENGL|PLUME)$")
+    message(FATAL_ERROR "NDS_ACCELERATED_RENDERER must be COMPUTE, OPENGL or PLUME")
 endif()
 set(NDS_SDL_BACKEND "SDL3" CACHE STRING
     "Host presentation backend: SDL3, SDL2, or NONE")
@@ -171,6 +171,18 @@ if(NDS_ENABLE_COMPUTE_RENDERER AND NDS_ACCELERATED_RENDERER STREQUAL "OPENGL")
         string(APPEND NDS_BUILD_VARIANT "-")
     endif()
     string(APPEND NDS_BUILD_VARIANT "native-gl-v1")
+endif()
+# A GL host (COMPUTE or OPENGL): glad, OpenGLSupport and the GL tests. PLUME
+# shares the frontend-facing host API but none of the GL sources.
+set(NDS_GL_HOST OFF)
+if(NDS_ENABLE_COMPUTE_RENDERER AND NOT NDS_ACCELERATED_RENDERER STREQUAL "PLUME")
+    set(NDS_GL_HOST ON)
+endif()
+if(NDS_ENABLE_COMPUTE_RENDERER AND NDS_ACCELERATED_RENDERER STREQUAL "PLUME")
+    if(NDS_BUILD_VARIANT)
+        string(APPEND NDS_BUILD_VARIANT "-")
+    endif()
+    string(APPEND NDS_BUILD_VARIANT "plume-v1")
 endif()
 if(NDS_MKDS_IMPLEMENTATION STREQUAL "HLE")
     if(NDS_BUILD_VARIANT)
@@ -934,7 +946,10 @@ if(NDS_PROFILE_HLE_HEAT)
     set_property(SOURCE src/main.cpp src/runtime_arm.cpp APPEND PROPERTY
         COMPILE_DEFINITIONS NDS_PROFILE_HLE_HEAT=1)
 endif()
-if(NDS_ENABLE_COMPUTE_RENDERER)
+if(NDS_ENABLE_COMPUTE_RENDERER AND NDS_ACCELERATED_RENDERER STREQUAL "PLUME")
+    include("${CMAKE_CURRENT_SOURCE_DIR}/cmake/NdsPlume.cmake")
+    nds_add_plume_renderer(nds_runner)
+elseif(NDS_ENABLE_COMPUTE_RENDERER)
     if(NDS_ACCELERATED_RENDERER STREQUAL "OPENGL")
         target_sources(nds_runner PRIVATE vendor/melonds/GPU3D_OpenGL.cpp
             src/melonds_compute/CaptureReference.cpp
@@ -1055,7 +1070,7 @@ if(NOT MSVC)
         set_source_files_properties(vendor/melonds/net/Net_PCap.cpp
             PROPERTIES COMPILE_OPTIONS "-w")
     endif()
-    if(NDS_ENABLE_COMPUTE_RENDERER)
+    if(NDS_GL_HOST)
         set_source_files_properties(
             vendor/melonds/GPU3D_Compute.cpp
             vendor/melonds/GPU3D_Texcache.cpp
@@ -1066,7 +1081,7 @@ if(NOT MSVC)
             PROPERTIES COMPILE_OPTIONS "-w")
     endif()
 endif()
-if(NDS_ENABLE_COMPUTE_RENDERER)
+if(NDS_GL_HOST)
     if(MSVC)
         set_source_files_properties(vendor/melonds/OpenGLSupport.cpp
             PROPERTIES COMPILE_OPTIONS
@@ -1301,7 +1316,7 @@ ndsrecomp_link_tomlpp(frontend_config_test)
   target_include_directories(gpu3d_interp_test PRIVATE src vendor/melonds)
   add_test(NAME gpu3d_interp_test COMMAND gpu3d_interp_test)
 
-  if(NDS_BUILD_NATIVE_GL_TESTS AND NDS_ENABLE_COMPUTE_RENDERER AND NDS_SDL_BACKEND STREQUAL "SDL3")
+  if(NDS_BUILD_NATIVE_GL_TESTS AND NDS_GL_HOST AND NDS_SDL_BACKEND STREQUAL "SDL3")
     add_executable(native_gl_test tests/native_gl_test.cpp
         src/melonds_compute/CaptureReference.cpp src/melonds_compute/GPU_OpenGL.cpp
         src/melonds_compute/PlatformCompute.cpp vendor/melonds/GPU3D.cpp
@@ -1660,7 +1675,7 @@ ndsrecomp_link_tomlpp(frontend_config_test)
       ${NDS_ARM_RECOMP_INCLUDE_DIRS})
   add_test(NAME gpu2d_window_test COMMAND gpu2d_window_test)
 
-  if(NDS_BUILD_NATIVE_GL_TESTS AND NDS_ENABLE_COMPUTE_RENDERER AND NDS_SDL_BACKEND STREQUAL "SDL3")
+  if(NDS_BUILD_NATIVE_GL_TESTS AND NDS_GL_HOST AND NDS_SDL_BACKEND STREQUAL "SDL3")
     add_executable(gpu2d_direct_gl_test tests/gpu2d_direct_gl_test.cpp
         src/emu_profile.cpp src/dispatch_timing.cpp src/host_profile.cpp
         src/host_prof_ring.cpp src/host_unwind_x64.cpp vendor/melonds/glad/glad.c)
