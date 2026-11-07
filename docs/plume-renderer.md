@@ -76,10 +76,22 @@ is the rect's size; otherwise it draws offscreen and box-resolves or filters.
 Milestone 1 (presentation): done, Linux/Vulkan verified (guest frame hashes
 identical to a soft-3D GL build).
 
-Milestones 2 and 3 (3D passes, HD compose): first draft. In a user playtest
-it renders, but it sometimes froze, model outlines (one DS pixel wide) were
-too wide, and smooth_3d does not run (interpolation is gated on an
-accelerated `Renderer3D`, and here the installed one is the soft renderer).
+Milestones 2 and 3 (3D passes, HD compose): first draft, then fixes for the
+first playtest (untested in game since):
+- Freezes: emulation frames stalled for seconds while pipelines compiled in
+  them. Pass 2 no longer needs a pipeline per polygon ID (bit 7 test plus
+  REPLACE with the dynamic reference); every pipeline the passes can bind is
+  found by a dry run and built on a background thread at start-up
+  (`[plume3d] warm-up: N pipelines ready`); the driver pipeline cache is
+  saved as `plume-pipelines.bin` beside settings.toml. Frames over 8 ms log
+  `[plume3d] slow frame` with pipelines built and resizes. Raster resizes
+  wait for the request to hold 15 frames. The host acquires a swap chain
+  image only after every step that can fail.
+- Outlines: `[display] thin_outlines` (default on, Esc menu) draws them one
+  presented pixel wide; off gives one DS pixel.
+- smooth_3d works: the soft renderer keeps the real list and only the Plume
+  raster draws the halfway list (`nds_gx_interp_presented`). It needs HD
+  (internal scale above 1).
 
 Not done: antialiasing (resolution_scale above 100 supersamples instead),
 Windows/D3D12 and macOS (no `{NSWindow, CAMetalLayer}` wiring),
