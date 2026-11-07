@@ -1635,7 +1635,37 @@ struct FrontendPresentation {
     // the options and the frame loop syncs them here before each present.
     NdsWindowMode window_mode = NdsWindowMode::Letterbox;
     NdsScalingFilter scaling = NdsScalingFilter::Integer;
+    // Live [display] resolution_scale / internal_resolution, for hosts that
+    // size the 3D raster from the presented rect (Plume).
+    uint16_t resolution_scale = 0;
+    uint8_t internal_resolution = 1;
 };
+
+// The top window's host presenter composes the 3D layer itself (direct OBJ and
+// HD frames). Only then are those surfaces worth emitting; otherwise the CPU
+// composite carries the 3D layer, as on the SDL path.
+bool presenter_composes_3d(const FrontendPresentation& presentation) {
+#if defined(NDS_HAVE_COMPUTE_RENDERER)
+    return presentation.gl_top && nds_compute_host_composes_3d();
+#else
+    (void)presentation;
+    return false;
+#endif
+}
+
+// The window flag the accelerated top-window presenter needs: a GL context,
+// or a Vulkan surface for Plume on Linux. Plume on Windows presents through
+// D3D12 on the plain HWND, and a Vulkan-flagged window would make SDL require
+// a Vulkan loader there for nothing.
+uint64_t accelerated_window_flag() {
+#if defined(NDS_USE_PLUME) && defined(__linux__)
+    return static_cast<uint64_t>(SDL_WINDOW_VULKAN);
+#elif defined(NDS_USE_PLUME)
+    return 0u;
+#else
+    return static_cast<uint64_t>(SDL_WINDOW_OPENGL);
+#endif
+}
 
 // docs/frame_interpolation.md, MVP blend mode. Holds the previous DS frame's
 // post-compositor ARGB pixels per screen plus the scratch the blend is built
@@ -2195,6 +2225,8 @@ bool create_presentation(const NdsFrontendOptions& options,
     presentation.antialiasing = options.antialiasing;
     presentation.window_mode = options.window_mode;
     presentation.scaling = options.scaling;
+    presentation.resolution_scale = options.resolution_scale;
+    presentation.internal_resolution = options.internal_resolution;
     presentation.inset_percent =
         presentation.single ? options.second_screen_size : 0;
     const int aa_scale = presentation.gl_top ? 1 : options.antialiasing >= 8 ? 4 :
@@ -2219,8 +2251,7 @@ bool create_presentation(const NdsFrontendOptions& options,
         : kScreenHeight * 2 * kWindowScale;
     const uint64_t top_window_flags =
         SDL_WINDOW_RESIZABLE | SDL_WINDOW_ALLOW_HIGHDPI |
-        (presentation.gl_top
-             ? static_cast<uint64_t>(SDL_WINDOW_OPENGL) : 0u);
+        (presentation.gl_top ? accelerated_window_flag() : 0u);
     const std::string single_title =
         options.game_name.empty() ? "ndsrecomp" : options.game_name;
     presentation.windows[0] = create_window(
@@ -2432,7 +2463,8 @@ bool apply_performance_governor_stage(
     nds_gpu3d_set_display_readback_latency(stage >= 1u);
     presentation.sample_scale =
         stage >= 2u ? 1 : presentation.configured_sample_scale;
-    nds_gpu2d_set_hd_emit(target_scale > 1u && presentation.gl_top);
+    nds_gpu2d_set_hd_emit(target_scale > 1u &&
+                          presenter_composes_3d(presentation));
     return true;
 }
 
@@ -2590,6 +2622,8 @@ PresentationTicks present_single_screen(FrontendPresentation& presentation,
             nds_frontend_latency::enabled.load(std::memory_order_relaxed);
         nds_compute_host_set_present_mode(presentation.window_mode,
                                           presentation.scaling);
+        nds_compute_host_set_raster_request(presentation.resolution_scale,
+                                            presentation.internal_resolution);
         nds_compute_host_set_inset(other_pixels,
                                    static_cast<unsigned>(other_width),
                                    presentation.inset_percent);
@@ -2681,6 +2715,8 @@ PresentationTicks present_screens(FrontendPresentation& presentation,
         gl_ticks.diagnostic = latency;
         nds_compute_host_set_present_mode(presentation.window_mode,
                                           presentation.scaling);
+        nds_compute_host_set_raster_request(presentation.resolution_scale,
+                                            presentation.internal_resolution);
         if (!nds_compute_host_present_top(
                 top_pixels, static_cast<uint16_t>(top_width),
                 direct ? &direct_frame : nullptr, &gl_ticks,
@@ -2889,7 +2925,7 @@ int nds_run_interactive_frontend(const NdsFrontendOptions& initial_options) {
     // The adaptive compositor only pays for the extra per-pixel stores when
     // something can consume them.
     nds_gpu2d_set_hd_emit(initial_internal_resolution > 1 &&
-                          presentation.gl_top);
+                          presenter_composes_3d(presentation));
     nds_texture_upscale_set_factor(options.texture_upscale);
 
 #if defined(NDS_HAVE_COMPUTE_RENDERER)
@@ -2914,7 +2950,8 @@ int nds_run_interactive_frontend(const NdsFrontendOptions& initial_options) {
         }
     }
     nds_gpu2d_set_direct_present(
-        nds_compute_host_has_visible_context());
+        nds_compute_host_has_visible_context() &&
+        nds_compute_host_composes_3d() && nds_compute_host_presents_direct());
     const char* window_direct = std::getenv("NDS_COMPUTE_WINDOW_DIRECT");
     nds_gpu2d_set_direct_windows(window_direct &&
         std::strcmp(window_direct, "1") == 0 && options.internal_resolution == 1u &&
@@ -4942,6 +4979,8 @@ int nds_run_interactive_frontend(const NdsFrontendOptions& initial_options) {
                        blend_cache.previous[1].size());
             presentation.window_mode = options.window_mode;
             presentation.scaling = options.scaling;
+            presentation.resolution_scale = options.resolution_scale;
+            presentation.internal_resolution = options.internal_resolution;
             presentation.inset_percent =
                 presentation.single ? options.second_screen_size : 0;
             const PresentationTicks synthetic_ticks = present_screens(
@@ -4972,6 +5011,8 @@ int nds_run_interactive_frontend(const NdsFrontendOptions& initial_options) {
         nds_gpu3d_set_interpolation(options.smooth_3d);
         presentation.window_mode = options.window_mode;
         presentation.scaling = options.scaling;
+        presentation.resolution_scale = options.resolution_scale;
+        presentation.internal_resolution = options.internal_resolution;
         presentation.inset_percent =
             presentation.single ? options.second_screen_size : 0;
         const PresentationTicks presentation_ticks = present_screens(
@@ -5160,8 +5201,8 @@ int nds_run_interactive_frontend(const NdsFrontendOptions& initial_options) {
                 const uint8_t effective =
                     perf_governor.stage >= 2u ? 1u : target;
                 if (nds_gpu3d_set_runtime_internal_scale(effective)) {
-                    nds_gpu2d_set_hd_emit(effective > 1u &&
-                                          presentation.gl_top);
+                    nds_gpu2d_set_hd_emit(
+                        effective > 1u && presenter_composes_3d(presentation));
                     std::fprintf(stderr,
                                  "[display] internal %ux -> %ux "
                                  "(presented %dx%d, resolution scale "
@@ -5681,7 +5722,8 @@ void nds_frontend_black_band_scan(bool enabled, bool reset) {
     g_black_band.enabled = enabled ? 1 : 0;
 #if defined(NDS_HAVE_COMPUTE_RENDERER)
     nds_gpu2d_set_direct_present(
-        !enabled && nds_compute_host_has_visible_context());
+        !enabled && nds_compute_host_has_visible_context() &&
+        nds_compute_host_composes_3d() && nds_compute_host_presents_direct());
 #endif
 }
 

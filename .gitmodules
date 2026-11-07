@@ -4,3 +4,6 @@
 [submodule "external/arm-recomp-core"]
 	path = external/arm-recomp-core
 	url = https://github.com/mstan/arm-recomp-core.git
+[submodule "external/plume"]
+	path = external/plume
+	url = https://github.com/birabittoh/plume.git
