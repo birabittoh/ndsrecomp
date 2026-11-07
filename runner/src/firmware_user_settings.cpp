@@ -257,3 +257,63 @@ bool nds_read_player_name(const std::vector<uint8_t>& fw, unsigned copy,
     *out = text;
     return true;
 }
+
+bool nds_apply_wifi_ap_slot(std::vector<uint8_t>& fw, bool* changed) {
+    if (changed) *changed = false;
+    size_t user = 0;
+    if (!user_settings_base(fw, &user) || user < 0x400u) return false;
+    constexpr size_t kSsidOffset = 0x40u;
+    constexpr size_t kSsidLength = 0x20u;
+    constexpr size_t kStatusOffset = 0xE7u;
+    constexpr size_t kConfiguredOffset = 0xEFu;
+    constexpr size_t kSlotCrcOffset = 0xFEu;
+    constexpr uint8_t kStatusNormal = 0x00u;
+    constexpr uint8_t kStatusNotConfigured = 0xFFu;
+    // Must equal WifiAP::APName (0001-wifi-ap-identity.patch).
+    static constexpr char kRunnerAp[] = "ndsrecomp";
+    static constexpr char kMelonAp[] = "melonAP";
+
+    const auto ssid_is = [&](size_t slot, const char* name) {
+        const size_t len = std::strlen(name);
+        if (std::memcmp(fw.data() + slot + kSsidOffset, name, len) != 0)
+            return false;
+        for (size_t i = len; i < kSsidLength; ++i)
+            if (fw[slot + kSsidOffset + i] != 0u) return false;
+        return true;
+    };
+    const auto set_ssid = [&](size_t slot) {
+        std::memset(fw.data() + slot + kSsidOffset, 0, kSsidLength);
+        std::memcpy(fw.data() + slot + kSsidOffset, kRunnerAp,
+                    sizeof(kRunnerAp) - 1u);
+    };
+    const auto reseal = [&](size_t slot) {
+        put16(fw, slot + kSlotCrcOffset,
+              nds_firmware_crc16(fw.data() + slot, kSlotCrcOffset, 0u));
+        if (changed) *changed = true;
+    };
+
+    const size_t first = user - 0x400u;
+    bool have_runner_ap = false;
+    for (size_t i = 0; i < 3u; ++i) {
+        const size_t slot = first + i * 0x100u;
+        if (fw[slot + kStatusOffset] != kStatusNormal) continue;
+        if (ssid_is(slot, kMelonAp)) {
+            set_ssid(slot);
+            reseal(slot);
+        }
+        if (ssid_is(slot, kRunnerAp)) have_runner_ap = true;
+    }
+    if (have_runner_ap) return true;
+    for (size_t i = 0; i < 3u; ++i) {
+        const size_t slot = first + i * 0x100u;
+        if (fw[slot + kStatusOffset] != kStatusNotConfigured) continue;
+        // Same layout as generated_firmware.cpp's configured slot.
+        std::memset(fw.data() + slot, 0, 0x100u);
+        set_ssid(slot);
+        fw[slot + kStatusOffset] = kStatusNormal;
+        fw[slot + kConfiguredOffset] = 0x01u;
+        reseal(slot);
+        return true;
+    }
+    return true;
+}
