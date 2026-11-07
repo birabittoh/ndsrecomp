@@ -14,16 +14,21 @@
 #pragma once
 
 #include <cstdint>
+#include <string>
 
 namespace melonDS { class GPU; struct Polygon; }
 
 // Host lifetime: after the device exists, and before it goes away.
-bool nds_plume3d_start();
+// `pipeline_cache_path`: a file the driver's pipeline cache is loaded from
+// and saved to, or empty for none.
+bool nds_plume3d_start(const std::string& pipeline_cache_path);
 void nds_plume3d_stop();
 bool nds_plume3d_ready();
 
-// The raster the next frame is drawn at. Clamped to [native, device limit].
-void nds_plume3d_request_size(uint32_t width, uint32_t height);
+// The raster the next frame is drawn at, clamped to the device limit, and
+// the outline width in raster pixels (0: one DS pixel). A changed size is
+// taken once it has been asked for over several frames.
+void nds_plume3d_request_size(uint32_t width, uint32_t height, uint32_t edge_pixels);
 
 // Draws a render list (the one GPU3D latched at VBlank, or smooth_3d's
 // halfway list) after the faithful renderer's RenderFrame, which made the

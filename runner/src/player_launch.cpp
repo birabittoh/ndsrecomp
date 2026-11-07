@@ -165,6 +165,8 @@ bool write_default_settings(const fs::path& path,
         << "   # 3D frame rate in the corner of the screen\n"
         << "smooth_3d = " << (options.smooth_3d ? "true" : "false")
         << "   # blend 3D frames (experimental)\n"
+        << "thin_outlines = " << (options.thin_outlines ? "true" : "false")
+        << "   # 3D outlines one screen pixel wide, not one DS pixel\n"
         << "# Hybrid-graphics laptops: run on the discrete GPU.\n"
         << "discrete_gpu = " << (options.discrete_gpu ? "true" : "false")
         << "\n"

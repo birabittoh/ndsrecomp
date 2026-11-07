@@ -415,6 +415,16 @@ void nds_compute_host_set_raster_request(unsigned, unsigned)
     // The GL renderers take their whole-multiple scale from gpu3d.
 }
 
+void nds_compute_host_set_thin_outlines(bool)
+{
+    // melonDS's GL renderer draws no outlines above native.
+}
+
+void nds_compute_host_set_cache_directory(const char*)
+{
+    // The GL program binary cache has its own location (OpenGLSupport).
+}
+
 bool nds_compute_host_read_presented(std::vector<uint32_t>& pixels,
                                       unsigned& width, unsigned& height)
 {

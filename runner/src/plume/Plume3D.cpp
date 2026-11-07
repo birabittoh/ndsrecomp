@@ -20,10 +20,16 @@
 #include "Plume3D.h"
 
 #include <algorithm>
+#include <atomic>
+#include <chrono>
 #include <cmath>
 #include <cstdio>
 #include <cstring>
+#include <mutex>
+#include <string>
+#include <thread>
 #include <unordered_map>
+#include <vector>
 
 #include "PlumeContext.h"
 #include "GPU.h"
@@ -77,6 +83,15 @@ constexpr uint64_t kTexPalBytes = 1024u * 64u * 2u;
 // 16x the widest adaptive surface; the GL renderers' own cap.
 constexpr uint32_t kMaxRasterWidth = 448u * 16u;
 constexpr uint32_t kMaxRasterHeight = 192u * 16u;
+// A new raster size is taken once the request has held this many frames, so
+// dragging a window edge does not drain the GPU and reallocate every frame.
+constexpr uint32_t kResizeSettleFrames = 15;
+
+using Clock = std::chrono::steady_clock;
+
+double ms_since(Clock::time_point start) {
+    return std::chrono::duration<double, std::milli>(Clock::now() - start).count();
+}
 
 // Mirrors VSInput in gx.hlsl.
 struct GxVertex {
@@ -177,6 +192,17 @@ struct Targets {
 
 struct Renderer {
     bool ready = false;
+    // Pipelines are built on first use by the frame, and ahead of it by the
+    // warm-up thread; the map is shared between the two.
+    std::mutex pipelines_mutex;
+    std::thread warm;
+    std::atomic<bool> stop_warm{false};
+    std::atomic<bool> warm_done{false};
+    std::string cache_path;
+    size_t saved_pipelines = 0;
+    uint32_t built_this_frame = 0;
+    uint32_t pending_width = 0, pending_height = 0, pending_frames = 0;
+    uint32_t edge_pixels = 0, want_edge_pixels = 0;
     std::unique_ptr<RenderShader> shaders_vs[2];             // Z, W
     std::unique_ptr<RenderShader> shaders_ps[kNull][2];      // program x Z/W
     std::unique_ptr<RenderShader> fullscreen_vs, null_ps, final_ps;
@@ -277,10 +303,14 @@ bool create_layouts(Renderer& r) {
     return r.final_pipeline != nullptr;
 }
 
-RenderPipeline* pipeline_for(Renderer& r, const DrawState& s) {
+RenderPipeline* pipeline_for(Renderer& r, const DrawState& s, bool in_frame = true) {
     const uint64_t key = s.key();
-    auto found = r.pipelines.find(key);
-    if (found != r.pipelines.end()) return found->second.get();
+    {
+        std::lock_guard<std::mutex> lock(r.pipelines_mutex);
+        auto found = r.pipelines.find(key);
+        if (found != r.pipelines.end()) return found->second.get();
+    }
+    const auto build_start = Clock::now();
 
     static const RenderInputSlot input_slot(0, sizeof(GxVertex));
     static const RenderInputElement input_elements[] = {
@@ -349,14 +379,22 @@ RenderPipeline* pipeline_for(Renderer& r, const DrawState& s) {
     desc.stencilBackFace = face;
 
     auto pipeline = device().createGraphicsPipeline(desc);
-    RenderPipeline* result = pipeline.get();
     if (!pipeline) {
         std::fprintf(stderr, "[plume3d] pipeline creation failed (key %016llx)\n",
                      static_cast<unsigned long long>(key));
         return nullptr;
     }
-    r.pipelines.emplace(key, std::move(pipeline));
-    return result;
+    const double built_ms = ms_since(build_start);
+    if (in_frame) {
+        ++r.built_this_frame;
+        if (built_ms >= 2.0)
+            std::fprintf(stderr, "[plume3d] pipeline %016llx built in the frame: %.1f ms\n",
+                         static_cast<unsigned long long>(key), built_ms);
+    }
+    std::lock_guard<std::mutex> lock(r.pipelines_mutex);
+    // The other thread may have built the same one meanwhile; keep the first.
+    auto inserted = r.pipelines.emplace(key, std::move(pipeline));
+    return inserted.first->second.get();
 }
 
 bool create_slots(Renderer& r) {
@@ -568,8 +606,11 @@ void build_polygons(Renderer& r, Scale scale) {
 
 class Scene {
 public:
-    Scene(Renderer& r, RenderCommandList& commands, bool wbuffer)
-        : r_(r), commands_(commands) { s_.wbuffer = wbuffer; }
+    // With no command list, nothing is drawn: every state the passes would
+    // bind is collected into `states` instead (the warm-up's list).
+    Scene(Renderer& r, RenderCommandList* commands, bool wbuffer,
+          std::vector<DrawState>* states = nullptr)
+        : r_(r), commands_(commands), states_(states) { s_.wbuffer = wbuffer; }
 
     DrawState& state() { return s_; }
     void program(Program p) { s_.program = p; }
@@ -623,7 +664,7 @@ public:
         s_.fail_op = s_.depth_fail_op = s_.pass_op = RenderStencilOp::REPLACE;
         ref_ = 0;
         bind();
-        commands_.drawInstanced(3, 1, 0, 0);
+        if (commands_ && !failed_) commands_->drawInstanced(3, 1, 0, 0);
         s_ = saved;
         ref_ = saved_ref;
     }
@@ -632,25 +673,30 @@ public:
 
 private:
     void bind() {
+        if (!commands_) {
+            if (states_) states_->push_back(s_);
+            return;
+        }
         RenderPipeline* pipeline = pipeline_for(r_, s_);
         if (!pipeline) { failed_ = true; return; }
         if (pipeline != bound_) {
-            commands_.setPipeline(pipeline);
+            commands_->setPipeline(pipeline);
             bound_ = pipeline;
         }
         // Vulkan drops a dynamic reference when a pipeline is bound.
-        commands_.setStencilReference(ref_);
+        commands_->setStencilReference(ref_);
     }
 
     void draw(uint32_t first, uint32_t count) {
-        if (count == 0) return;
+        if (count == 0 && commands_) return;
         bind();
-        if (failed_) return;
-        commands_.drawIndexedInstanced(count, 1, first, 0, 0);
+        if (failed_ || !commands_) return;
+        commands_->drawIndexedInstanced(count, 1, first, 0, 0);
     }
 
     Renderer& r_;
-    RenderCommandList& commands_;
+    RenderCommandList* commands_;
+    std::vector<DrawState>* states_;
     DrawState s_;
     uint32_t ref_ = 0;
     const RenderPipeline* bound_ = nullptr;
@@ -660,8 +706,8 @@ private:
 using Cmp = RenderComparisonFunction;
 using Op = RenderStencilOp;
 
-void render_scene(Renderer& r, Scene& gl, const melonDS::GPU3D& gpu3d) {
-    const bool fog = (gpu3d.RenderDispCnt & (1 << 7)) != 0;
+void render_scene(Renderer& r, Scene& gl, uint32_t disp_cnt, uint32_t clear_attr1) {
+    const bool fog = (disp_cnt & (1 << 7)) != 0;
 
     // Pass 1: opaque pixels.
     gl.program(kOpaque);
@@ -679,12 +725,12 @@ void render_scene(Renderer& r, Scene& gl, const melonDS::GPU3D& gpu3d) {
     }
 
     gl.blend(true);
-    gl.state().alpha_blend = (gpu3d.RenderDispCnt & (1 << 3)) != 0;
+    gl.state().alpha_blend = (disp_cnt & (1 << 3)) != 0;
 
     if (r.num_opaque_polys > -1) {
         // Pass 2: translucent pixels against a clear plane of alpha zero
         // must be drawn with blending disabled.
-        if ((gpu3d.RenderClearAttr1 & 0x001F0000) == 0) {
+        if ((clear_attr1 & 0x001F0000) == 0) {
             gl.blend(false);
             for (int i = 0; i < r.num_polys;) {
                 const RendererPolygon& rp = r.polygons[i];
@@ -720,7 +766,7 @@ void render_scene(Renderer& r, Scene& gl, const melonDS::GPU3D& gpu3d) {
                     if (rp.poly->IsShadow) {
                         // A shadow against the clear plane only passes when its
                         // polygon ID matches the clear plane's.
-                        const uint32_t clear_id = (gpu3d.RenderClearAttr1 >> 24) & 0x3F;
+                        const uint32_t clear_id = (clear_attr1 >> 24) & 0x3F;
                         if (polyid != clear_id) { ++i; continue; }
                         gl.blend(true);
                         gl.color_mask(true);
@@ -731,11 +777,19 @@ void render_scene(Renderer& r, Scene& gl, const melonDS::GPU3D& gpu3d) {
                         gl.depth_mask((attr & (1 << 11)) != 0);
                         i += need_opaque ? gl.single(i) : gl.batch(i);
                     } else {
+                        // melonDS GL writes 0x40|polyid here with INVERT under
+                        // the write mask ~(0x40|polyid), which would need a
+                        // pipeline per polygon ID. Before pass 3 only the clear
+                        // plane (0xFF, or 0xFE under a shadow mask) has bit 7
+                        // set, so testing bit 7 and replacing with the dynamic
+                        // reference writes the same 0x40|polyid with one
+                        // pipeline. (On 0xFE, GL's INVERT also flips bit 0 of
+                        // the ID; nothing reads that.)
                         gl.color_mask(true);
                         gl.attr_mask(false, false, trans_fog, false);
-                        gl.stencil_func(Cmp::EQUAL, 0xFF, 0xFE);
-                        gl.stencil_op(Op::KEEP, Op::KEEP, Op::INVERT);
-                        gl.stencil_mask(~(0x40 | polyid));
+                        gl.stencil_func(Cmp::NOT_EQUAL, 0x40 | polyid, 0x80);
+                        gl.stencil_op(Op::KEEP, Op::KEEP, Op::REPLACE);
+                        gl.stencil_mask(0xFF);
                         gl.depth_mask((attr & (1 << 11)) != 0);
                         i += need_opaque ? gl.single(i) : gl.batch(i);
                     }
@@ -815,7 +869,8 @@ void render_scene(Renderer& r, Scene& gl, const melonDS::GPU3D& gpu3d) {
     }
 }
 
-void fill_config(GxConfig& c, const melonDS::GPU3D& g, const Targets& t, uint32_t render_width) {
+void fill_config(GxConfig& c, const melonDS::GPU3D& g, const Targets& t, uint32_t render_width,
+                 uint32_t edge_pixels) {
     std::memset(&c, 0, sizeof(c));
     c.screen_size[0] = float(t.width);
     c.screen_size[1] = float(t.height);
@@ -827,20 +882,120 @@ void fill_config(GxConfig& c, const melonDS::GPU3D& g, const Targets& t, uint32_
     c.fog_color = g.RenderFogColor;
     c.fog_offset = g.RenderFogOffset;
     c.fog_shift = g.RenderFogShift;
-    // One DS pixel: the outline width and the neighbour distance it tests.
+    // The outline width, as the neighbour distance it tests: what the host
+    // asked for (one presented pixel), or else one DS pixel.
     const float per_pixel = std::min(float(t.width) / float(render_width),
                                      float(t.height) / 192.0f);
-    c.edge_distance = std::max(1u, uint32_t(std::lround(per_pixel)));
+    c.edge_distance = edge_pixels ? edge_pixels
+                                  : std::max(1u, uint32_t(std::lround(per_pixel)));
     c.clear_poly_id = (g.RenderClearAttr1 >> 24) & 0x3F;
     c.clear_depth = ((g.RenderClearAttr2 & 0x7FFF) * 0x200) + 0x1FF;
 }
 
+// Every pipeline the passes can bind, found by running them dry over
+// polygons of each kind, under each frame-wide state they branch on. The one
+// left out is pass 2's translucent shadow, whose stencil mask depends on the
+// clear plane's polygon ID, beyond the two IDs tried here.
+std::vector<DrawState> warm_states(Renderer& r) {
+    std::vector<Polygon> polys;
+    const auto add = [&](uint32_t attr, bool translucent, bool shadow_mask, bool shadow) {
+        Polygon p{};
+        p.Attr = attr;
+        p.Translucent = translucent;
+        p.IsShadowMask = shadow_mask;
+        p.IsShadow = shadow;
+        polys.push_back(p);
+    };
+    for (uint32_t equal = 0; equal < 2; ++equal)
+        add((31u << 16) | (equal << 14), false, false, false);
+    add(10u << 16, true, true, false);
+    for (uint32_t shadow = 0; shadow < 2; ++shadow)
+        for (uint32_t alpha : {15u, 31u})
+            for (uint32_t equal = 0; equal < 2; ++equal)
+                for (uint32_t fog = 0; fog < 2; ++fog)
+                    for (uint32_t depth = 0; depth < 2; ++depth)
+                        add((alpha << 16) | (equal << 14) | (fog << 15) | (depth << 11),
+                            true, false, shadow != 0);
+
+    std::vector<DrawState> states;
+    for (uint32_t clear_id : {0u, 63u}) {
+        for (Polygon& p : polys)
+            if (p.IsShadow) p.Attr = (p.Attr & 0x00FFFFFFu) | (clear_id << 24);
+        r.num_polys = 0;
+        r.num_opaque_polys = -1;
+        for (const Polygon& p : polys) {
+            setup_polygon(&r.polygons[r.num_polys], &p);
+            if (r.num_opaque_polys < 0 && p.Translucent) r.num_opaque_polys = r.num_polys;
+            ++r.num_polys;
+        }
+        for (uint32_t frame = 0; frame < 16; ++frame) {
+            const uint32_t disp_cnt = ((frame & 1) ? (1u << 7) : 0u) | ((frame & 2) ? (1u << 3) : 0u);
+            const uint32_t clear_attr1 = ((frame & 4) ? (31u << 16) : 0u) | (clear_id << 24);
+            Scene scene(r, nullptr, (frame & 8) != 0, &states);
+            render_scene(r, scene, disp_cnt, clear_attr1);
+            // The stencil-clearing fullscreen draw.
+            scene.stencil_mask(0x80);
+            scene.clear_stencil();
+        }
+    }
+    r.num_polys = 0;
+    r.num_opaque_polys = -1;
+    std::vector<DrawState> unique;
+    for (const DrawState& s : states) {
+        const uint64_t key = s.key();
+        if (std::none_of(unique.begin(), unique.end(),
+                         [key](const DrawState& u) { return u.key() == key; }))
+            unique.push_back(s);
+    }
+    return unique;
+}
+
+std::vector<uint8_t> read_file(const std::string& path) {
+    std::vector<uint8_t> data;
+    FILE* file = std::fopen(path.c_str(), "rb");
+    if (!file) return data;
+    uint8_t buffer[65536];
+    size_t n;
+    while ((n = std::fread(buffer, 1, sizeof(buffer), file)) > 0)
+        data.insert(data.end(), buffer, buffer + n);
+    std::fclose(file);
+    return data;
+}
+
+void save_pipeline_cache(Renderer& r) {
+    if (r.cache_path.empty()) return;
+    size_t count;
+    {
+        std::lock_guard<std::mutex> lock(r.pipelines_mutex);
+        count = r.pipelines.size();
+    }
+    if (count == r.saved_pipelines) return;
+    std::vector<uint8_t> data;
+    if (!device().getPipelineCacheData(data) || data.empty()) return;
+    const std::string temp = r.cache_path + ".tmp";
+    FILE* file = std::fopen(temp.c_str(), "wb");
+    if (!file) return;
+    const bool ok = std::fwrite(data.data(), 1, data.size(), file) == data.size();
+    if (std::fclose(file) != 0 || !ok || std::rename(temp.c_str(), r.cache_path.c_str()) != 0) {
+        std::remove(temp.c_str());
+        return;
+    }
+    r.saved_pipelines = count;
+}
+
 }  // namespace
 
-bool nds_plume3d_start() {
+bool nds_plume3d_start(const std::string& pipeline_cache_path) {
     if (g_renderer) return true;
     if (!nds_plume_context()) return false;
     auto* r = new Renderer();
+    r->cache_path = pipeline_cache_path;
+    if (!r->cache_path.empty()) {
+        const std::vector<uint8_t> cache = read_file(r->cache_path);
+        // Plume checks the driver and device; stale data is dropped.
+        if (!cache.empty() && device().loadPipelineCache(cache.data(), cache.size()))
+            std::fprintf(stderr, "[plume3d] pipeline cache: %zu bytes\n", cache.size());
+    }
     auto fail = [&](const char* what) {
         std::fprintf(stderr, "[plume3d] %s failed\n", what);
         delete r;
@@ -857,12 +1012,31 @@ bool nds_plume3d_start() {
     r->ready = true;
     g_renderer = r;
     std::fprintf(stderr, "[plume3d] 3D renderer ready (any raster size)\n");
+
+    // Driver compiles take tens of milliseconds each; done in the frame they
+    // stall the game. Build them all now, off the emulation thread.
+    std::vector<DrawState> states = warm_states(*r);
+    r->warm = std::thread([r, states = std::move(states)] {
+        const auto start = Clock::now();
+        size_t built = 0;
+        for (const DrawState& s : states) {
+            if (r->stop_warm.load()) break;
+            if (pipeline_for(*r, s, false)) ++built;
+        }
+        std::fprintf(stderr, "[plume3d] warm-up: %zu pipelines ready in %.0f ms\n", built,
+                     ms_since(start));
+        r->warm_done.store(true);
+    });
     return true;
 }
 
 void nds_plume3d_stop() {
     if (!g_renderer) return;
-    wait_all(*g_renderer);
+    Renderer& r = *g_renderer;
+    r.stop_warm.store(true);
+    if (r.warm.joinable()) r.warm.join();
+    wait_all(r);
+    save_pipeline_cache(r);
     delete g_renderer;
     g_renderer = nullptr;
 }
@@ -871,10 +1045,11 @@ bool nds_plume3d_ready() {
     return g_renderer && g_renderer->ready;
 }
 
-void nds_plume3d_request_size(uint32_t width, uint32_t height) {
+void nds_plume3d_request_size(uint32_t width, uint32_t height, uint32_t edge_pixels) {
     if (!g_renderer) return;
     g_renderer->want_width = std::clamp(width, 64u, kMaxRasterWidth);
     g_renderer->want_height = std::clamp(height, 48u, kMaxRasterHeight);
+    g_renderer->want_edge_pixels = std::min(edge_pixels, 64u);
 }
 
 void nds_plume3d_invalidate() {
@@ -897,7 +1072,21 @@ void nds_plume3d_render(const melonDS::GPU& gpu, Polygon* const* polygons, uint3
     // falls back to software for it too); the CPU composite carries it.
     if (g3.RenderDispCnt & (1u << 14)) { r.valid = false; return; }
     if (r.want_width == 0 || r.want_height == 0) return;
+    const auto frame_start = Clock::now();
+    r.built_this_frame = 0;
+    r.edge_pixels = r.want_edge_pixels;
+    bool resized = false;
     if (r.targets.width != r.want_width || r.targets.height != r.want_height) {
+        // The first raster is made at once; later sizes wait until the
+        // request settles, the presenter resampling the old one meanwhile.
+        if (r.pending_width != r.want_width || r.pending_height != r.want_height) {
+            r.pending_width = r.want_width;
+            r.pending_height = r.want_height;
+            r.pending_frames = 0;
+        }
+        resized = r.targets.width == 0 || ++r.pending_frames >= kResizeSettleFrames;
+    }
+    if (resized) {
         if (!resize_targets(r, r.want_width, r.want_height)) {
             std::fprintf(stderr, "[plume3d] %ux%u raster allocation failed\n",
                          r.want_width, r.want_height);
@@ -934,7 +1123,7 @@ void nds_plume3d_render(const melonDS::GPU& gpu, Polygon* const* polygons, uint3
         slot.indices->unmap();
     }
     GxConfig config;
-    fill_config(config, g3, t, render_width);
+    fill_config(config, g3, t, render_width, r.edge_pixels);
     if (void* p = slot.config->map()) {
         std::memcpy(p, &config, sizeof(config));
         slot.config->unmap();
@@ -1008,8 +1197,8 @@ void nds_plume3d_render(const melonDS::GPU& gpu, Polygon* const* polygons, uint3
             RenderBufferReference(slot.indices.get()),
             uint32_t(r.num_indices * sizeof(uint32_t)), RenderFormat::R32_UINT);
         commands.setIndexBuffer(&index_view);
-        Scene scene(r, commands, r.polygons[0].poly->WBuffer);
-        render_scene(r, scene, g3);
+        Scene scene(r, &commands, r.polygons[0].poly->WBuffer);
+        render_scene(r, scene, g3.RenderDispCnt, g3.RenderClearAttr1);
         failed = scene.failed();
     }
 
@@ -1038,8 +1227,25 @@ void nds_plume3d_render(const melonDS::GPU& gpu, Polygon* const* polygons, uint3
     slot.submitted = true;
     r.slot = (r.slot + 1u) % kSlots;
     r.valid = !failed;
-    if (++r.frames == 1 || r.frames % 3600 == 0)
+    size_t pipelines;
+    {
+        std::lock_guard<std::mutex> lock(r.pipelines_mutex);
+        pipelines = r.pipelines.size();
+    }
+    ++r.frames;
+    const double frame_ms = ms_since(frame_start);
+    // What a freeze looks like from here: the frame's own CPU time, and why.
+    if (frame_ms >= 8.0)
+        std::fprintf(stderr,
+                     "[plume3d] slow frame %llu: %.1f ms (%u pipelines built%s, "
+                     "%d polygons)\n",
+                     static_cast<unsigned long long>(r.frames), frame_ms, r.built_this_frame,
+                     resized ? ", raster resized" : "", r.num_polys);
+    if (r.frames == 1 || r.frames % 3600 == 0)
         std::fprintf(stderr, "[plume3d] frame %llu: %d polygons, %u vertices, %zu pipelines%s\n",
                      static_cast<unsigned long long>(r.frames), r.num_polys, r.num_vertices,
-                     r.pipelines.size(), failed ? ", a pipeline failed" : "");
+                     pipelines, failed ? ", a pipeline failed" : "");
+    // New pipelines reach the disk cache once the warm-up is through, then
+    // whenever more have been built (checked every ten seconds or so).
+    if (r.warm_done.load() && r.frames % 600 == 0) save_pipeline_cache(r);
 }

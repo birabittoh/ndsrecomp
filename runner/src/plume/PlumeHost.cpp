@@ -180,6 +180,8 @@ uint64_t g_dropped = 0;
 // internal_resolution (the fixed multiplier): what the 3D raster is sized by.
 unsigned g_raster_percent = 100;
 unsigned g_raster_fixed = 1;
+bool g_thin_outlines = true;
+std::string g_cache_directory;
 NdsPlumeContext g_context;
 bool g_logged_hd = false;
 
@@ -687,7 +689,13 @@ void request_raster(const NdsPresentRect& rect, int width) {
         raster_w = uint32_t(width) * g_raster_fixed;
         raster_h = kHeight * g_raster_fixed;
     }
-    nds_plume3d_request_size(raster_w, raster_h);
+    // Thin outlines are one presented pixel wide: as many raster pixels as
+    // the raster has per pixel of the rect. Otherwise one DS pixel (0).
+    uint32_t edge = 0;
+    if (g_thin_outlines)
+        edge = std::max(1u, uint32_t((raster_h + uint32_t(std::max(rect.h, 1)) / 2) /
+                                     uint32_t(std::max(rect.h, 1))));
+    nds_plume3d_request_size(raster_w, raster_h, edge);
 }
 }  // namespace
 
@@ -744,7 +752,9 @@ bool nds_compute_host_start(SDL_Window* presentation_window)
         g_context.queue = g_backend.queue.get();
         // Without it the host still presents; above 1x it just has no HD
         // raster and keeps blitting the CPU composite.
-        if (!nds_plume3d_start())
+        if (!nds_plume3d_start(g_cache_directory.empty()
+                                   ? std::string()
+                                   : g_cache_directory + "/plume-pipelines.bin"))
             std::fprintf(stderr, "[plume] 3D renderer unavailable; presenting "
                                  "the CPU composite only\n");
     }
@@ -779,6 +789,16 @@ bool nds_compute_host_presents_direct()
     // The OBJ-only direct path needs a native 3D surface on the GPU, which
     // this host never has: native 3D is the soft renderer's, on the CPU.
     return false;
+}
+
+void nds_compute_host_set_thin_outlines(bool thin)
+{
+    g_thin_outlines = thin;
+}
+
+void nds_compute_host_set_cache_directory(const char* directory)
+{
+    g_cache_directory = directory ? directory : "";
 }
 
 void nds_compute_host_set_raster_request(unsigned percent, unsigned fixed_scale)
@@ -868,18 +888,6 @@ bool nds_compute_host_present_top(const unsigned int* fallback_pixels,
     }
 
     FrameSlot& slot = g_backend.slots[g_backend.slot];
-    uint32_t image_index = 0;
-    if (!chain.acquireTexture(slot.acquire.get(), &image_index) ||
-        image_index >= g_backend.framebuffers.size()) {
-        // Usually an out-of-date surface between the check above and here; the
-        // next frame's resize picks it up. A dropped frame, not a failure.
-        g_resize_pending = true;
-        if (++g_dropped == 1)
-            std::fprintf(stderr, "[plume] swap chain acquire failed; frames are "
-                                 "dropped until it recovers\n");
-        return true;
-    }
-
     unsigned long long start = SDL_GetPerformanceCounter();
     if (ticks->diagnostic) ticks->setup = start - diagnostic_begin;
     auto* staging = static_cast<uint8_t*>(slot.staging->map());
@@ -905,6 +913,21 @@ bool nds_compute_host_present_top(const unsigned int* fallback_pixels,
     const bool compose_offscreen = hd_active && !compose_direct &&
         ensure_compose_target(slot, raster_w, raster_h);
     if (hd_active && !compose_direct && !compose_offscreen) return false;
+
+    // Acquired last: every failure above returns before an image is taken,
+    // because an acquired image that is never presented stays out of the
+    // swap chain, and once all of them are, acquire blocks for good.
+    uint32_t image_index = 0;
+    if (!chain.acquireTexture(slot.acquire.get(), &image_index) ||
+        image_index >= g_backend.framebuffers.size()) {
+        // Usually an out-of-date surface between the check above and here; the
+        // next frame's resize picks it up. A dropped frame, not a failure.
+        g_resize_pending = true;
+        if (++g_dropped == 1)
+            std::fprintf(stderr, "[plume] swap chain acquire failed; frames are "
+                                 "dropped until it recovers\n");
+        return true;
+    }
 
     start = SDL_GetPerformanceCounter();
     RenderTexture* backbuffer = chain.getTexture(image_index);
