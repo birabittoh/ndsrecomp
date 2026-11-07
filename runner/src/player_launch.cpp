@@ -5,6 +5,7 @@
 #include <cctype>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <filesystem>
 #include <fstream>
 #include <vector>
@@ -24,6 +25,18 @@ namespace {
 const unsigned char kTitleConfig[] = {
 #include "nds_title_config.inc"
 };
+
+#if defined(NDS_EMBEDDED_DUMPS)
+const unsigned char kEmbeddedBios7[] = {
+#include "embedded_biosnds7.rom.inc"
+};
+const unsigned char kEmbeddedBios9[] = {
+#include "embedded_biosnds9.rom.inc"
+};
+const unsigned char kEmbeddedFirmware[] = {
+#include "embedded_firmware.bin.inc"
+};
+#endif
 
 constexpr const char* kBiosFiles[] = {
     "biosnds7.rom", "biosnds9.rom", "firmware.bin"};
@@ -256,11 +269,34 @@ bool rom_matches(const fs::path& path, const std::string& expected_sha1) {
     return gba::sha1(bytes.data(), bytes.size()).hex() == expected_sha1;
 }
 
-bool bios_complete(const fs::path& dir) {
+// Which dumps the folder has to hold. system.freebios replaces the two BIOS
+// dumps and system.generated_firmware replaces firmware.bin; neither is
+// then asked for nor loaded.
+struct DumpNeeds {
+    bool bios;
+    bool firmware;
+    bool any() const { return bios || firmware; }
+};
+
+DumpNeeds dump_needs(const NdsFrontendOptions& options) {
+    return {!options.freebios, !options.generated_firmware};
+}
+
+bool bios_complete(const fs::path& dir, DumpNeeds needs) {
     return std::all_of(std::begin(kBiosFiles), std::end(kBiosFiles),
                        [&](const char* name) {
+                           const bool firmware =
+                               std::strcmp(name, "firmware.bin") == 0;
+                           if (firmware ? !needs.firmware : !needs.bios)
+                               return true;
                            return fs::is_regular_file(dir / name);
                        });
+}
+
+const char* bios_files_wanted(DumpNeeds needs) {
+    if (needs.bios && needs.firmware)
+        return "biosnds7.rom, biosnds9.rom and firmware.bin";
+    return needs.bios ? "biosnds7.rom and biosnds9.rom" : "firmware.bin";
 }
 
 bool remember(const fs::path& settings, const char* key,
@@ -339,6 +375,7 @@ bool resolve_rom(const fs::path& root, const fs::path& settings,
 bool resolve_bios(const fs::path& root, const fs::path& settings,
                   const NdsFrontendOptions& options, fs::path* bios,
                   bool* cancelled) {
+    const DumpNeeds needs = dump_needs(options);
     std::vector<fs::path> candidates;
     if (!options.paths.bios.empty())
         candidates.push_back(resolve_stored(root, options.paths.bios));
@@ -348,7 +385,7 @@ bool resolve_bios(const fs::path& root, const fs::path& settings,
     candidates.push_back(NDS_SOURCE_BIOS_DIR);
 #endif
     for (const fs::path& dir : candidates) {
-        if (bios_complete(dir)) {
+        if (bios_complete(dir, needs)) {
             *bios = dir.lexically_normal();
             return true;
         }
@@ -356,30 +393,45 @@ bool resolve_bios(const fs::path& root, const fs::path& settings,
     for (;;) {
         std::string picked;
         switch (pick_folder(
-            "Select the folder with biosnds7.rom, biosnds9.rom and "
-            "firmware.bin", &picked)) {
+            std::string("Select the folder with ") +
+                bios_files_wanted(needs), &picked)) {
             case DialogResult::Picked:
                 break;
             case DialogResult::Cancelled:
                 *cancelled = true;
                 return false;
             case DialogResult::Unavailable:
-                nds_player_error("Put biosnds7.rom, biosnds9.rom and "
-                                 "firmware.bin in " +
+                nds_player_error(std::string("Put ") +
+                                 bios_files_wanted(needs) + " in " +
                                  (root / "bios").string() + ".");
                 return false;
         }
-        if (bios_complete(picked)) {
+        if (bios_complete(picked, needs)) {
             *bios = picked;
             remember(settings, "bios", to_stored(root, picked));
             return true;
         }
-        nds_player_error(picked + " must contain biosnds7.rom, biosnds9.rom "
-                                  "and firmware.bin.");
+        nds_player_error(picked + " must contain " +
+                         bios_files_wanted(needs) + ".");
     }
 }
 
 }  // namespace
+
+bool nds_player_embedded_dumps(std::vector<uint8_t>* arm9_bios,
+                               std::vector<uint8_t>* arm7_bios,
+                               std::vector<uint8_t>* firmware) {
+#if defined(NDS_EMBEDDED_DUMPS)
+    arm9_bios->assign(std::begin(kEmbeddedBios9), std::end(kEmbeddedBios9));
+    arm7_bios->assign(std::begin(kEmbeddedBios7), std::end(kEmbeddedBios7));
+    firmware->assign(std::begin(kEmbeddedFirmware),
+                     std::end(kEmbeddedFirmware));
+    return true;
+#else
+    (void)arm9_bios; (void)arm7_bios; (void)firmware;
+    return false;
+#endif
+}
 
 bool nds_player_requested(int argc, char** argv) {
     if (sizeof(kTitleConfig) <= 1u) return false;
@@ -439,15 +491,35 @@ bool nds_player_prepare(int argc, char** argv, NdsFrontendOptions* options,
     fs::path rom;
     fs::path bios;
     bool cancelled = false;
+#if defined(NDS_EMBEDDED_DUMPS)
+    // Nothing to ask for: the dumps are in the executable. The data
+    // directory stands in for the bios folder (the generated identity
+    // file, if any, lives there).
+    const bool embedded = true;
+    bios = root;
+    const bool have_bios = true;
+#else
+    const bool embedded = false;
+    // FreeBIOS with generated firmware loads no dump at all: nothing to ask
+    // for, and the data directory holds the generated identity file.
+    const bool have_bios = !dump_needs(*options).any();
+    if (have_bios) bios = root;
+#endif
     if (!resolve_rom(root, settings, *options, argc == 2 ? argv[1] : nullptr,
                      &rom, &cancelled) ||
-        !resolve_bios(root, settings, *options, &bios, &cancelled)) {
+        (!have_bios &&
+         !resolve_bios(root, settings, *options, &bios, &cancelled))) {
         if (cancelled) out->exit_code = 0;
         return false;
     }
     out->rom = rom.string();
     out->bios_dir = bios.string();
-    out->firmware = (bios / "firmware.bin").string();
+    // A generated image replaces the dump; passing the dump's path too
+    // would make main refuse --generated-firmware with --firmware-path.
+    out->firmware = embedded || options->generated_firmware
+        ? std::string()
+        : (bios / "firmware.bin").string();
+    out->embedded_dumps = embedded;
     out->save = options->paths.save.empty()
         ? (root / "saves" / (app + ".sav")).string()
         : resolve_stored(root, options->paths.save).string();
