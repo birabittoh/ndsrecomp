@@ -41,6 +41,16 @@ bool nds_compute_host_has_visible_context();
 // does not, the 2D compositor must keep the 3D layer in the CPU frame, and HD
 // layer surfaces would only be emitted to be ignored.
 bool nds_compute_host_composes_3d();
+// Whether the OBJ-only direct path (no CPU composite at all) can be used: it
+// needs the native 3D surface on the GPU. The GL host has one; the Plume host
+// keeps native 3D on the CPU (soft renderer) and composes only HD frames.
+bool nds_compute_host_presents_direct();
+// What the 3D raster is sized by, from [display]: `percent` of the presented
+// rect (resolution_scale; 0 = off) or else `fixed_scale` x native
+// (internal_resolution). Only the Plume host uses it, and takes the rect's
+// exact size rather than a whole multiple; the GL renderers' integer scale
+// comes from nds_gpu3d_set_internal_scale as before.
+void nds_compute_host_set_raster_request(unsigned percent, unsigned fixed_scale);
 // Observer only: the actual last swapped top-window image, in top-down
 // 0xFFRRGGBB order. Does not re-render or advance emulation. Never used by
 // ordinary presentation, capture hardware or performance measurements.

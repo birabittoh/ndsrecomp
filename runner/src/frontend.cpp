@@ -1618,6 +1618,10 @@ struct FrontendPresentation {
     // the options and the frame loop syncs them here before each present.
     NdsWindowMode window_mode = NdsWindowMode::Letterbox;
     NdsScalingFilter scaling = NdsScalingFilter::Integer;
+    // Live [display] resolution_scale / internal_resolution, for hosts that
+    // size the 3D raster from the presented rect (Plume).
+    uint16_t resolution_scale = 0;
+    uint8_t internal_resolution = 1;
 };
 
 // The top window's host presenter composes the 3D layer itself (direct OBJ and
@@ -2204,6 +2208,8 @@ bool create_presentation(const NdsFrontendOptions& options,
     presentation.antialiasing = options.antialiasing;
     presentation.window_mode = options.window_mode;
     presentation.scaling = options.scaling;
+    presentation.resolution_scale = options.resolution_scale;
+    presentation.internal_resolution = options.internal_resolution;
     presentation.inset_percent =
         presentation.single ? options.second_screen_size : 0;
     const int aa_scale = presentation.gl_top ? 1 : options.antialiasing >= 8 ? 4 :
@@ -2590,6 +2596,8 @@ PresentationTicks present_single_screen(FrontendPresentation& presentation,
             nds_frontend_latency::enabled.load(std::memory_order_relaxed);
         nds_compute_host_set_present_mode(presentation.window_mode,
                                           presentation.scaling);
+        nds_compute_host_set_raster_request(presentation.resolution_scale,
+                                            presentation.internal_resolution);
         nds_compute_host_set_inset(other_pixels,
                                    static_cast<unsigned>(other_width),
                                    presentation.inset_percent);
@@ -2681,6 +2689,8 @@ PresentationTicks present_screens(FrontendPresentation& presentation,
         gl_ticks.diagnostic = latency;
         nds_compute_host_set_present_mode(presentation.window_mode,
                                           presentation.scaling);
+        nds_compute_host_set_raster_request(presentation.resolution_scale,
+                                            presentation.internal_resolution);
         if (!nds_compute_host_present_top(
                 top_pixels, static_cast<uint16_t>(top_width),
                 direct ? &direct_frame : nullptr, &gl_ticks,
@@ -2914,7 +2924,7 @@ int nds_run_interactive_frontend(const NdsFrontendOptions& initial_options) {
     }
     nds_gpu2d_set_direct_present(
         nds_compute_host_has_visible_context() &&
-        nds_compute_host_composes_3d());
+        nds_compute_host_composes_3d() && nds_compute_host_presents_direct());
     const char* window_direct = std::getenv("NDS_COMPUTE_WINDOW_DIRECT");
     nds_gpu2d_set_direct_windows(window_direct &&
         std::strcmp(window_direct, "1") == 0 && options.internal_resolution == 1u &&
@@ -4932,6 +4942,8 @@ int nds_run_interactive_frontend(const NdsFrontendOptions& initial_options) {
                        blend_cache.previous[1].size());
             presentation.window_mode = options.window_mode;
             presentation.scaling = options.scaling;
+            presentation.resolution_scale = options.resolution_scale;
+            presentation.internal_resolution = options.internal_resolution;
             presentation.inset_percent =
                 presentation.single ? options.second_screen_size : 0;
             const PresentationTicks synthetic_ticks = present_screens(
@@ -4962,6 +4974,8 @@ int nds_run_interactive_frontend(const NdsFrontendOptions& initial_options) {
         nds_gpu3d_set_interpolation(options.smooth_3d);
         presentation.window_mode = options.window_mode;
         presentation.scaling = options.scaling;
+        presentation.resolution_scale = options.resolution_scale;
+        presentation.internal_resolution = options.internal_resolution;
         presentation.inset_percent =
             presentation.single ? options.second_screen_size : 0;
         const PresentationTicks presentation_ticks = present_screens(
@@ -5654,7 +5668,7 @@ void nds_frontend_black_band_scan(bool enabled, bool reset) {
 #if defined(NDS_HAVE_COMPUTE_RENDERER)
     nds_gpu2d_set_direct_present(
         !enabled && nds_compute_host_has_visible_context() &&
-        nds_compute_host_composes_3d());
+        nds_compute_host_composes_3d() && nds_compute_host_presents_direct());
 #endif
 }
 

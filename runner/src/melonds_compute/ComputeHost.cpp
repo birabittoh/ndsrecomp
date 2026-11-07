@@ -405,6 +405,16 @@ bool nds_compute_host_composes_3d()
     return true;
 }
 
+bool nds_compute_host_presents_direct()
+{
+    return true;
+}
+
+void nds_compute_host_set_raster_request(unsigned, unsigned)
+{
+    // The GL renderers take their whole-multiple scale from gpu3d.
+}
+
 bool nds_compute_host_read_presented(std::vector<uint32_t>& pixels,
                                       unsigned& width, unsigned& height)
 {
