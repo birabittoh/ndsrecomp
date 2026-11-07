@@ -33,12 +33,20 @@
 #include "net/net_ring.h"
 #include "emu_profile.h"
 
+// The accelerated-renderer bridge in this file (the melonDS GL/compute
+// renderer, its PBO readback, glFinish around rebuilds) is GL code. The Plume
+// build has a renderer host (NDS_HAVE_COMPUTE_RENDERER) but no GL, so it gets
+// none of it; its answers are the NDS_USE_PLUME branches below.
+#if defined(NDS_HAVE_COMPUTE_RENDERER) && !defined(NDS_USE_PLUME)
+#define NDS_GPU3D_GL_BRIDGE 1
+#endif
+
 #include "NDS.h"
 #include "GPU3D_Soft.h"
 #if defined(NDS_GX_COMMAND_CACHE)
 #include "GPU3D_CommandBatch.h"
 #endif
-#if defined(NDS_HAVE_COMPUTE_RENDERER)
+#if defined(NDS_GPU3D_GL_BRIDGE)
 #if defined(NDS_USE_NATIVE_GL)
 #include "GPU3D_OpenGL.h"
 #include "melonds_compute/CaptureReference.h"
@@ -157,7 +165,7 @@ bool validate_gpu3d_device(const melonDS::GPU3D& gpu,
 // a GTX 1060 and 12x (4K) at ~290 MiB, so the cap is 16.
 constexpr uint8_t kMaxInternalScale = kNdsMaxInternalScale;
 uint8_t g_internal_scale = 1u;
-#if defined(NDS_HAVE_COMPUTE_RENDERER)
+#if defined(NDS_GPU3D_GL_BRIDGE)
 bool g_display_readback_latency = false;
 bool g_compute_rendered_frame = false;
 bool g_compute_readback_pending = false;
@@ -574,7 +582,7 @@ bool GPU::MakeVRAMFlat_TexPalCoherent(
 namespace melonDS::Platform {
 
 void Log(LogLevel level, const char* fmt, ...) {
-#if defined(NDS_HAVE_COMPUTE_RENDERER)
+#if defined(NDS_GPU3D_GL_BRIDGE)
     // OpenGLSupport reports a cache miss at Error level even on the normal
     // successful uncached path. Latch only its real compiler/linker failures
     // so the runner can reject an unusable forced compute backend.
@@ -663,13 +671,13 @@ void nds_gpu3d_use_soft_renderer(bool threaded) {
     if (!renderer) {
         auto replacement = std::make_unique<melonDS::SoftRenderer>();
         renderer = replacement.get();
-#if defined(NDS_HAVE_COMPUTE_RENDERER)
+#if defined(NDS_GPU3D_GL_BRIDGE)
         // Release the readback objects while the outgoing accelerated
         // renderer's context is still the current one.
         compute_readback_shutdown();
 #endif
         g_nds.GPU.GPU3D.SetCurrentRenderer(std::move(replacement));
-#if defined(NDS_HAVE_COMPUTE_RENDERER)
+#if defined(NDS_GPU3D_GL_BRIDGE)
         g_compute_rendered_frame = false;
         g_compute_readback_pending = false;
         g_compute_frame_ready = false;
@@ -736,7 +744,7 @@ const char* nds_gpu3d_compiled_accelerated_backend() {
 }
 
 bool nds_gpu3d_compute_runtime_failed() {
-#if defined(NDS_HAVE_COMPUTE_RENDERER)
+#if defined(NDS_GPU3D_GL_BRIDGE)
     return g_compute_runtime_failed;
 #else
     return false;
@@ -744,7 +752,7 @@ bool nds_gpu3d_compute_runtime_failed() {
 }
 
 uint32_t nds_gpu3d_compute_output_texture() {
-#if defined(NDS_HAVE_COMPUTE_RENDERER)
+#if defined(NDS_GPU3D_GL_BRIDGE)
     auto* renderer = dynamic_cast<NdsAcceleratedRenderer*>(
         &g_nds.GPU.GPU3D.GetCurrentRenderer());
     return renderer ? renderer->GetLowResTexture() : 0u;
@@ -755,7 +763,7 @@ uint32_t nds_gpu3d_compute_output_texture() {
 
 bool nds_gpu3d_set_internal_scale(uint8_t scale) {
     if (scale < 1u || scale > kMaxInternalScale) return false;
-#if defined(NDS_HAVE_COMPUTE_RENDERER)
+#if defined(NDS_GPU3D_GL_BRIDGE)
     // The scale is baked into every compute shader and sizes every
     // framebuffer, so it cannot change under a live renderer.
     if (dynamic_cast<NdsAcceleratedRenderer*>(
@@ -768,7 +776,7 @@ bool nds_gpu3d_set_internal_scale(uint8_t scale) {
 
 bool nds_gpu3d_set_runtime_internal_scale(uint8_t scale) {
     if (scale < 1u || scale > kMaxInternalScale) return false;
-#if defined(NDS_HAVE_COMPUTE_RENDERER)
+#if defined(NDS_GPU3D_GL_BRIDGE)
     auto* renderer = dynamic_cast<NdsAcceleratedRenderer*>(
         &g_nds.GPU.GPU3D.GetCurrentRenderer());
     if (!renderer) {
@@ -811,7 +819,7 @@ bool nds_gpu3d_set_runtime_internal_scale(uint8_t scale) {
 }
 
 uint8_t nds_gpu3d_internal_scale() {
-#if defined(NDS_HAVE_COMPUTE_RENDERER)
+#if defined(NDS_GPU3D_GL_BRIDGE)
     auto* renderer = dynamic_cast<NdsAcceleratedRenderer*>(
         &g_nds.GPU.GPU3D.GetCurrentRenderer());
     // Report what is actually rendering, not what was requested, so a
@@ -825,7 +833,7 @@ uint8_t nds_gpu3d_internal_scale() {
 }
 
 void nds_gpu3d_set_display_readback_latency(bool enabled) {
-#if defined(NDS_HAVE_COMPUTE_RENDERER)
+#if defined(NDS_GPU3D_GL_BRIDGE)
     g_display_readback_latency = enabled;
 #else
     (void)enabled;
@@ -833,7 +841,7 @@ void nds_gpu3d_set_display_readback_latency(bool enabled) {
 }
 
 bool nds_gpu3d_display_readback_latency() {
-#if defined(NDS_HAVE_COMPUTE_RENDERER)
+#if defined(NDS_GPU3D_GL_BRIDGE)
     return g_display_readback_latency;
 #else
     return false;
@@ -841,7 +849,7 @@ bool nds_gpu3d_display_readback_latency() {
 }
 
 uint32_t nds_gpu3d_compute_output_texture_hires() {
-#if defined(NDS_HAVE_COMPUTE_RENDERER)
+#if defined(NDS_GPU3D_GL_BRIDGE)
     auto* renderer = dynamic_cast<NdsAcceleratedRenderer*>(
         &g_nds.GPU.GPU3D.GetCurrentRenderer());
     if (!renderer || renderer->GetScaleFactor() <= 1) return 0u;
@@ -852,7 +860,7 @@ uint32_t nds_gpu3d_compute_output_texture_hires() {
 }
 
 bool nds_gpu3d_use_compute_renderer() {
-#if defined(NDS_HAVE_COMPUTE_RENDERER)
+#if defined(NDS_GPU3D_GL_BRIDGE)
     std::fprintf(stderr,"[gpu3d] accelerated backend: %s\n", nds_gpu3d_compiled_accelerated_backend());
     g_compute_shader_setup_failed = false;
     g_compute_runtime_failed = false;
@@ -1041,7 +1049,7 @@ bool gpu3d_savestate_export(NdsGpu3dSaveState* out, std::string* error) {
     // can have an asynchronous readback; finish it before taking the device
     // snapshot so no host command references state being replaced.
     nds_gx_interp_show_real(g_nds.GPU.GPU3D);
-#if defined(NDS_HAVE_COMPUTE_RENDERER)
+#if defined(NDS_GPU3D_GL_BRIDGE)
     if (g_compute_readback_pending) compute_finish_readback();
     if (g_nds.GPU.GPU3D.IsRendererAccelerated()) glFinish();
 #endif
@@ -1118,7 +1126,7 @@ bool gpu3d_savestate_import(const NdsGpu3dSaveState& in,
 #if defined(NDS_GX_COMMAND_CACHE)
     g_command_cache.clear(); // restored RAM can reuse old generation numbers
 #endif
-#if defined(NDS_HAVE_COMPUTE_RENDERER)
+#if defined(NDS_GPU3D_GL_BRIDGE)
     if (g_compute_readback_pending) compute_finish_readback();
     if (g_nds.GPU.GPU3D.IsRendererAccelerated()) glFinish();
 #endif
@@ -1144,7 +1152,7 @@ bool gpu3d_savestate_import(const NdsGpu3dSaveState& in,
     auto& gpu = g_nds.GPU.GPU3D;
     gpu.GetCurrentRenderer().Reset(g_nds.GPU);
     gpu.RenderFrameIdentical = false;
-#if defined(NDS_HAVE_COMPUTE_RENDERER)
+#if defined(NDS_GPU3D_GL_BRIDGE)
     g_display_readback_latency = false;
     g_compute_rendered_frame = false;
     g_compute_readback_pending = false;
@@ -1157,7 +1165,7 @@ bool gpu3d_savestate_import(const NdsGpu3dSaveState& in,
 #if defined(NDS_USE_NATIVE_GL)
         latch_capture_reference();
 #endif
-#if defined(NDS_HAVE_COMPUTE_RENDERER)
+#if defined(NDS_GPU3D_GL_BRIDGE)
         if (gpu.IsRendererAccelerated()) {
             // A native-first job may already own the pack/fence. Never submit
             // it again after completing that readback during restore.
@@ -1198,7 +1206,7 @@ void nds_gpu3d_reset() {
     std::memset(g_gx_write_trace, 0, sizeof g_gx_write_trace);
     g_gx_write_trace_count = 0;
     g_gpu3d_profile = NdsGpu3dProfile{};
-#if defined(NDS_HAVE_COMPUTE_RENDERER)
+#if defined(NDS_GPU3D_GL_BRIDGE)
     g_compute_rendered_frame = false;
     g_compute_readback_pending = false;
     g_compute_frame_ready = false;
@@ -1493,7 +1501,7 @@ void nds_gpu3d_vcount215() {
     // See nds_gpu3d_vcount144. The compute submit/sync/map buckets in
     // NdsGpu3dProfile are a breakdown of this region, not an addend to it.
     NdsEmuScope emu_region(NDS_EMU_GPU3D_FRAME);
-#if defined(NDS_HAVE_COMPUTE_RENDERER)
+#if defined(NDS_GPU3D_GL_BRIDGE)
     if (g_nds.GPU.GPU3D.IsRendererAccelerated() &&
         g_display_readback_latency && g_compute_readback_pending)
         compute_finish_readback();
@@ -1503,7 +1511,7 @@ void nds_gpu3d_vcount215() {
 #if defined(NDS_USE_NATIVE_GL)
         latch_capture_reference();
 #endif
-#if defined(NDS_HAVE_COMPUTE_RENDERER)
+#if defined(NDS_GPU3D_GL_BRIDGE)
         if (g_nds.GPU.GPU3D.IsRendererAccelerated() &&
             !g_compute_readback_pending)
             g_compute_rendered_frame = true;
@@ -1520,14 +1528,14 @@ void nds_gpu3d_vcount215() {
 #if defined(NDS_USE_NATIVE_GL)
     latch_capture_reference();
 #endif
-#if defined(NDS_HAVE_COMPUTE_RENDERER)
+#if defined(NDS_GPU3D_GL_BRIDGE)
     if (g_nds.GPU.GPU3D.IsRendererAccelerated() &&
         !g_compute_readback_pending)
         g_compute_rendered_frame = true;
 #endif
     profile_add(g_gpu3d_profile.vcount215_ns, start);
     ++g_gpu3d_profile.vcount215_calls;
-#if defined(NDS_HAVE_COMPUTE_RENDERER)
+#if defined(NDS_GPU3D_GL_BRIDGE)
     if (g_compute_rendered_frame &&
         (compute_readback_overlap() || g_display_readback_latency) &&
         (nds_gpu2d_requires_3d_readback() || g_display_readback_latency))
@@ -1547,7 +1555,7 @@ const uint32_t* nds_gpu3d_capture_line(int line) {
 }
 
 const uint32_t* nds_gpu3d_line(int line) {
-#if defined(NDS_HAVE_COMPUTE_RENDERER)
+#if defined(NDS_GPU3D_GL_BRIDGE)
     if (g_nds.GPU.GPU3D.IsRendererAccelerated()) {
         const uint32_t width = g_nds.GPU.GPU3D.GetRenderWidth();
         if (!g_compute_frame_ready || g_nds.GPU.GPU3D.AbortFrame)
@@ -1611,7 +1619,7 @@ bool nds_gpu3d_projection_has_perspective() {
 }
 
 const uint32_t* nds_gpu3d_wide_line(int line) {
-#if defined(NDS_HAVE_COMPUTE_RENDERER)
+#if defined(NDS_GPU3D_GL_BRIDGE)
     if (g_nds.GPU.GPU3D.IsRendererAccelerated()) {
         const uint32_t width = g_nds.GPU.GPU3D.GetRenderWidth();
         if (!g_compute_frame_ready || g_nds.GPU.GPU3D.AbortFrame)
@@ -1642,7 +1650,7 @@ const uint32_t* nds_gpu3d_wide_line(int line) {
 }
 
 const uint32_t* nds_gpu3d_wide_attr_line(int line) {
-#if defined(NDS_HAVE_COMPUTE_RENDERER)
+#if defined(NDS_GPU3D_GL_BRIDGE)
     if (g_nds.GPU.GPU3D.IsRendererAccelerated()) {
         const uint32_t width = g_nds.GPU.GPU3D.GetRenderWidth();
         if (!g_compute_frame_ready || g_nds.GPU.GPU3D.AbortFrame)
@@ -1685,7 +1693,7 @@ void nds_gpu3d_start_frame() {
     // Swap. Only the actual renderer/readback operations require the GL owner.
     if (nds_cpu_render_on_worker() &&
         (g_nds.GPU.GPU3D.AbortFrame
-#if defined(NDS_HAVE_COMPUTE_RENDERER)
+#if defined(NDS_GPU3D_GL_BRIDGE)
          || g_compute_readback_pending || g_compute_rendered_frame
 #endif
         )) {
@@ -1699,7 +1707,7 @@ void nds_gpu3d_start_frame() {
         g_nds.GPU.GPU3D.RestartFrame(g_nds.GPU);
         g_nds.GPU.GPU3D.AbortFrame = false;
     }
-#if defined(NDS_HAVE_COMPUTE_RENDERER)
+#if defined(NDS_GPU3D_GL_BRIDGE)
     if (g_nds.GPU.GPU3D.IsRendererAccelerated()) {
         // Reference mode reproduces the original immediate submit+map here.
         // Forced overlap queues at VCount215 and pays only any unfinished

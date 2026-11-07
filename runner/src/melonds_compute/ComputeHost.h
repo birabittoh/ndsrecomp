@@ -30,9 +30,17 @@ struct NdsComputePresentationFrame {
     bool has_direct{}, has_hd{};
 };
 
+// Two implementations sit behind this API, selected at build time:
+// ComputeHost.cpp (OpenGL 4.3: COMPUTE and OPENGL) and src/plume/PlumeHost.cpp
+// (Plume: Vulkan, or D3D12 on Windows). The frontend drives either unchanged.
 bool nds_compute_host_start(SDL_Window* presentation_window = nullptr);
 bool nds_compute_host_make_current();
 bool nds_compute_host_has_visible_context();
+// Whether this host's presenter composes the 3D layer itself, from the
+// renderer's GPU surfaces (the OBJ-only direct path and the HD path). When it
+// does not, the 2D compositor must keep the 3D layer in the CPU frame, and HD
+// layer surfaces would only be emitted to be ignored.
+bool nds_compute_host_composes_3d();
 // Observer only: the actual last swapped top-window image, in top-down
 // 0xFFRRGGBB order. Does not re-render or advance emulation. Never used by
 // ordinary presentation, capture hardware or performance measurements.

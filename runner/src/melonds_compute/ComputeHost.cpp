@@ -400,6 +400,11 @@ bool nds_compute_host_has_visible_context()
     return g_active && g_visible;
 }
 
+bool nds_compute_host_composes_3d()
+{
+    return true;
+}
+
 bool nds_compute_host_read_presented(std::vector<uint32_t>& pixels,
                                       unsigned& width, unsigned& height)
 {
