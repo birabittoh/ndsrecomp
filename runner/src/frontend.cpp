@@ -2932,6 +2932,13 @@ int nds_run_interactive_frontend(const NdsFrontendOptions& initial_options) {
     // Activate only after every fallible visible-frontend allocation. From
     // here onward teardown always destroys the compute renderer while this
     // context is current.
+    if (!options.settings_path.empty()) {
+        // Driver pipeline caches live beside settings.toml.
+        const std::string path = options.settings_path;
+        const size_t slash = path.find_last_of("/\\");
+        nds_compute_host_set_cache_directory(
+            slash == std::string::npos ? "." : path.substr(0, slash).c_str());
+    }
     if (!nds_compute_host_start(
             presentation.gl_top ? presentation.windows[0] : nullptr)) {
         destroy_presentation(presentation);

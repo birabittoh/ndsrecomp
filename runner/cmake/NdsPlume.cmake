@@ -55,18 +55,44 @@ function(nds_add_plume_renderer target)
     plume_shaders_init()
 
     set(_shaders "${CMAKE_CURRENT_SOURCE_DIR}/src/plume/shaders")
-    plume_compile_vertex_shader(${target}
-        "${_shaders}/fullscreen.vert.hlsl" "ndsFullscreenVert" "VSMain")
-    plume_compile_pixel_shader(${target}
-        "${_shaders}/blit.frag.hlsl" "ndsBlitFrag" "PSMain")
+    # name, file, entry point, stage. gx.hlsl holds every 3D pass (several
+    # entry points sharing one constant block), compose.hlsl the HD composite.
+    set(_blobs
+        "ndsFullscreenVert|fullscreen.vert.hlsl|VSMain|vertex"
+        "ndsBlitFrag|blit.frag.hlsl|PSMain|pixel"
+        "ndsComposeFrag|compose.hlsl|PSMain|pixel"
+        "ndsGxVertZ|gx.hlsl|VSMainZ|vertex"
+        "ndsGxVertW|gx.hlsl|VSMainW|vertex"
+        "ndsGxOpaqueZ|gx.hlsl|PSOpaqueZ|pixel"
+        "ndsGxOpaqueW|gx.hlsl|PSOpaqueW|pixel"
+        "ndsGxTransZ|gx.hlsl|PSTransZ|pixel"
+        "ndsGxTransW|gx.hlsl|PSTransW|pixel"
+        "ndsGxShadowZ|gx.hlsl|PSShadowZ|pixel"
+        "ndsGxShadowW|gx.hlsl|PSShadowW|pixel"
+        "ndsGxNull|gx.hlsl|PSNull|pixel"
+        "ndsGxFinal|gx.hlsl|PSFinal|pixel")
+    set(_blob_headers)
+    foreach(_blob IN LISTS _blobs)
+        string(REPLACE "|" ";" _parts "${_blob}")
+        list(GET _parts 0 _name)
+        list(GET _parts 1 _file)
+        list(GET _parts 2 _entry)
+        list(GET _parts 3 _stage)
+        if(_stage STREQUAL "vertex")
+            plume_compile_vertex_shader(${target} "${_shaders}/${_file}" "${_name}" "${_entry}")
+        else()
+            plume_compile_pixel_shader(${target} "${_shaders}/${_file}" "${_name}" "${_entry}")
+        endif()
+        list(APPEND _blob_headers "${CMAKE_BINARY_DIR}/shaders/${_name}.hlsl.spirv.h")
+    endforeach()
     # The generated blob headers have no dependency edge of their own until a
-    # source includes them; make the host wait for all of them.
-    set_property(SOURCE src/plume/PlumeHost.cpp APPEND PROPERTY OBJECT_DEPENDS
-        "${CMAKE_BINARY_DIR}/shaders/ndsFullscreenVert.hlsl.spirv.h"
-        "${CMAKE_BINARY_DIR}/shaders/ndsBlitFrag.hlsl.spirv.h")
+    # source includes them; make the Plume sources wait for all of them.
+    set_property(SOURCE src/plume/PlumeHost.cpp src/plume/Plume3D.cpp APPEND
+        PROPERTY OBJECT_DEPENDS ${_blob_headers})
 
     target_sources(${target} PRIVATE
         src/plume/PlumeHost.cpp
+        src/plume/Plume3D.cpp
         src/melonds_compute/TextureUpscaleStub.cpp)
     target_compile_definitions(${target} PRIVATE
         NDS_HAVE_COMPUTE_RENDERER=1
