@@ -778,6 +778,7 @@ add_executable(nds_runner
     src/gpu2d.cpp
     src/gpu3d.cpp
     src/gpu3d_interp.cpp
+    src/gpu3d_gxstream.cpp
     src/title_patches.cpp
     ${NDS_TIER3_SOURCE}
     src/coverage_manifest.cpp
@@ -1375,10 +1376,18 @@ ndsrecomp_link_tomlpp(frontend_config_test)
   target_include_directories(gx_command_batch_test PRIVATE vendor/melonds)
   add_test(NAME gx_command_batch_test COMMAND gx_command_batch_test)
 
-  add_executable(gpu3d_interp_test tests/gpu3d_interp_test.cpp
-      src/gpu3d_interp.cpp)
-  target_include_directories(gpu3d_interp_test PRIVATE src vendor/melonds)
-  add_test(NAME gpu3d_interp_test COMMAND gpu3d_interp_test)
+  add_executable(gpu3d_gxstream_test tests/gpu3d_gxstream_test.cpp
+      src/gpu3d_gxstream.cpp
+      vendor/melonds/GPU3D.cpp vendor/melonds/GPU3D_Soft.cpp vendor/melonds/Savestate.cpp)
+  target_include_directories(gpu3d_gxstream_test PRIVATE src vendor/melonds)
+  add_test(NAME gpu3d_gxstream_test COMMAND gpu3d_gxstream_test)
+
+  # Offline smooth_3d diagnosis of an NDS_GX_CMD_TRACE (not a test).
+  add_executable(gx_interp_diag tests/gx_interp_diag.cpp
+      src/gpu3d_gxstream.cpp
+      vendor/melonds/GPU3D.cpp vendor/melonds/GPU3D_Soft.cpp vendor/melonds/Savestate.cpp)
+  target_include_directories(gx_interp_diag PRIVATE src vendor/melonds
+      ${CMAKE_CURRENT_SOURCE_DIR}/../recompiler/armv4t ${NDS_ARM_RECOMP_INCLUDE_DIRS})
 
   if(NDS_BUILD_NATIVE_GL_TESTS AND NDS_GL_HOST AND NDS_SDL_BACKEND STREQUAL "SDL3")
     add_executable(native_gl_test tests/native_gl_test.cpp
@@ -1579,6 +1588,7 @@ ndsrecomp_link_tomlpp(frontend_config_test)
       src/gpu2d.cpp
       src/gpu3d.cpp
       src/gpu3d_interp.cpp
+      src/gpu3d_gxstream.cpp
       src/dispatch_timing.cpp
       src/emu_profile.cpp
       # The worker threads in these units register themselves with the

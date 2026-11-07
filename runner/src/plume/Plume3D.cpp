@@ -1076,7 +1076,8 @@ RenderTexture* nds_plume3d_output(uint32_t* width, uint32_t* height) {
     return g_renderer->targets.output.get();
 }
 
-void nds_plume3d_render(const melonDS::GPU& gpu, uint64_t texture_generation) {
+void nds_plume3d_render(const melonDS::GPU& gpu, Polygon* const* polygons, uint32_t count,
+                        uint64_t texture_generation) {
     if (!g_renderer) return;
     Renderer& r = *g_renderer;
     const melonDS::GPU3D& g3 = gpu.GPU3D;
@@ -1115,8 +1116,8 @@ void nds_plume3d_render(const melonDS::GPU& gpu, uint64_t texture_generation) {
     // Render list.
     r.num_polys = 0;
     r.num_opaque_polys = -1;
-    for (uint32_t i = 0; i < g3.RenderNumPolygons; ++i) {
-        const Polygon* poly = g3.RenderPolygonRAM[i];
+    for (uint32_t i = 0; i < count && i < 2048; ++i) {
+        const Polygon* poly = polygons[i];
         if (poly->Degenerate) continue;
         setup_polygon(&r.polygons[r.num_polys], poly);
         if (r.num_opaque_polys < 0 && poly->Translucent) r.num_opaque_polys = r.num_polys;

@@ -106,12 +106,15 @@ struct NdsGpu3dProfile {
     // Motion smoothing (gpu3d_interp.h): blended images, their polygons, and
     // how many of those had a partner in the previous image.
     uint64_t gx_interp_images;
-    uint64_t gx_interp_polygons;
-    uint64_t gx_interp_blended;
+    uint64_t gx_interp_units;
+    uint64_t gx_interp_blended_units;
+    uint64_t gx_interp_skipped;
 };
 void nds_gpu3d_profile(NdsGpu3dProfile* out);
 // Motion smoothing for games drawing 3D below the DS frame rate.
 void nds_gpu3d_set_interpolation(bool enabled);
+// The mark key: with NDS_GX_CMD_TRACE, notes the moment in the command trace.
+void nds_gpu3d_mark_interp();
 // Host-only immutable capture-copy counters; unavailable paths return zeros.
 bool nds_gpu3d_capture_copy_counts(uint64_t* texture, uint64_t* palette);
 void nds_gpu3d_debug_history_reset();
