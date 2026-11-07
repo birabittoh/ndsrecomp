@@ -78,3 +78,22 @@ bool nds_apply_player_name(std::vector<uint8_t>& fw, const std::string& name);
 // provenance reporting; nothing in the boot path depends on it.
 bool nds_read_player_name(const std::vector<uint8_t>& fw, unsigned copy,
                           std::string* out);
+
+// ---- Wi-Fi connection slots vs the runner's virtual access point ---------
+//
+// The guest connects only to an AP whose SSID matches a configured
+// connection slot (three 0x100-byte slots at user-settings - 0x400; SSID at
+// +0x40, status at +0xE7, CRC16 start 0 over 0xFE bytes at +0xFE). The
+// runner's AP calls itself "ndsrecomp" (vendor/melonds/patches/
+// 0001-wifi-ap-identity.patch), so a dump whose slots were set up under
+// melonDS ("melonAP") or a real router never finds it: error 51099.
+//
+// Rewrites every configured "melonAP" slot's SSID to the runner's AP,
+// keeping the rest of the slot (WFC user ID, DNS, ...). If afterwards no
+// configured slot names the runner's AP, the first unconfigured slot is set
+// up for it (DHCP, no encryption). Slots set up for other networks stay as
+// they are. In-memory only, like every patch here. *changed (optional)
+// reports whether any byte moved. Returns false only for a malformed
+// layout; a dump with three slots all configured for other networks is left
+// untouched and still returns true.
+bool nds_apply_wifi_ap_slot(std::vector<uint8_t>& fw, bool* changed);

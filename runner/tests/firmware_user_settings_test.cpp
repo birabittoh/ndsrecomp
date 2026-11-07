@@ -255,6 +255,43 @@ void test_language() {
           "undersized image refused");
 }
 
+// A slot set up under melonDS ("melonAP") is retargeted to the runner's AP,
+// keeping its other bytes; with no matching slot, a free one is set up.
+void test_wifi_ap_slot() {
+    std::vector<uint8_t> fw = make_firmware();
+    const size_t slot1 = user_base(fw, 0) - 0x400u;
+    const auto slot_crc_ok = [&](size_t slot) {
+        return read16(fw, slot + 0xFEu) ==
+               nds_firmware_crc16(fw.data() + slot, 0xFEu, 0u);
+    };
+    bool changed = true;
+    std::vector<uint8_t> before = fw;
+    check(nds_apply_wifi_ap_slot(fw, &changed), "generated image applies");
+    check(!changed && fw == before, "generated image is already a no-op");
+
+    std::memset(fw.data() + slot1 + 0x40u, 0, 0x20u);
+    std::memcpy(fw.data() + slot1 + 0x40u, "melonAP", 7u);
+    fw[slot1 + 0xF0u] = 0xA5u;  // stands in for the WFC user ID
+    check(nds_apply_wifi_ap_slot(fw, &changed), "melonAP slot applies");
+    check(changed, "melonAP slot reported changed");
+    check(std::memcmp(fw.data() + slot1 + 0x40u, "ndsrecomp\0", 10u) == 0,
+          "melonAP SSID retargeted");
+    check(fw[slot1 + 0xF0u] == 0xA5u, "rest of the slot kept");
+    check(slot_crc_ok(slot1), "retargeted slot resealed");
+
+    std::memset(fw.data() + slot1 + 0x40u, 0, 0x20u);
+    std::memcpy(fw.data() + slot1 + 0x40u, "HomeRouter", 10u);
+    before = fw;
+    check(nds_apply_wifi_ap_slot(fw, &changed), "foreign slot applies");
+    check(std::memcmp(fw.data() + slot1, before.data() + slot1, 0x100u) == 0,
+          "foreign slot left alone");
+    const size_t slot2 = slot1 + 0x100u;
+    check(fw[slot2 + 0xE7u] == 0x00u &&
+              std::memcmp(fw.data() + slot2 + 0x40u, "ndsrecomp", 9u) == 0,
+          "free slot set up for the runner AP");
+    check(slot_crc_ok(slot2), "new slot sealed");
+}
+
 }  // namespace
 
 int main() {
@@ -267,6 +304,7 @@ int main() {
     test_hoisted_patches();
     test_patches_compose();
     test_language();
+    test_wifi_ap_slot();
     if (g_failures != 0) {
         std::fprintf(stderr, "firmware_user_settings_test: %d failure(s)\n",
                      g_failures);

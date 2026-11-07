@@ -2243,6 +2243,19 @@ int main(int argc, char** argv) {
             "(in-memory only; the dump on disk is untouched)\n",
             nds_firmware_language_name(frontend_options.firmware_language));
     }
+    // The guest only connects to an AP named in a configured slot; a dump
+    // set up under melonDS names "melonAP", which this runner's AP is not.
+    bool wifi_slot_changed = false;
+    if (!nds_apply_wifi_ap_slot(fw, &wifi_slot_changed)) {
+        std::fprintf(stderr,
+            "refusing to start: malformed firmware Wi-Fi connection slots\n");
+        return 1;
+    }
+    if (wifi_slot_changed) {
+        std::fprintf(stderr,
+            "[firmware] Wi-Fi connection slot pointed at the runner's "
+            "\"ndsrecomp\" access point (in-memory only)\n");
+    }
     if (!nds_apply_instance_mac(fw, frontend_options.instance_index)) {
         std::fprintf(stderr,
             "refusing to start: cannot apply per-instance guest MAC "
