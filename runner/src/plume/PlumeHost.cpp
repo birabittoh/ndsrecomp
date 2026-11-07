@@ -10,13 +10,15 @@
 // (cmake/NdsPlume.cmake) and linked in as byte arrays; nothing is compiled at
 // startup.
 //
-// Scope today: presentation only. The 3D layer is still rasterized by the
-// integer software renderer and arrives inside the CPU composite, so this
-// host reports nds_compute_host_composes_3d() == false and the frontend keeps
-// the direct OBJ and HD surfaces switched off. What it does do is everything
-// the GL presenter does with that composite: window mode and scaling filter
-// (nds_single_layout, shared with the GL path and mouse-to-touch), the
-// integer-mode box resolve, the single-screen inset and the frontend overlay.
+// Two ways a frame reaches the window. The CPU composite (native 3D from the
+// integer soft renderer) is blitted with the GL presenter's filters: window
+// mode and scaling (nds_single_layout, shared with the GL path and
+// mouse-to-touch), the integer-mode box resolve, the single-screen inset and
+// the frontend overlay. Above 1x the HD path composes instead: the 2D
+// compositor's HD surfaces plus the Plume 3D raster (Plume3D.cpp), whose size
+// this host picks from the rect it presents into, so 3D is drawn at the
+// window's own resolution rather than at a whole multiple of 256x192. The
+// OBJ-only direct path is never used here (nds_compute_host_presents_direct).
 //
 // Frames in flight: two slots, each with its own command list, fence, upload
 // buffer and textures. A slot is reused only after its fence has signalled,
@@ -37,13 +39,18 @@
 
 #include "plume_render_interface.h"
 
+#include "gpu2d.h"
 #include "gpu3d.h"
+#include "Plume3D.h"
+#include "PlumeContext.h"
 
 #include "shaders/ndsFullscreenVert.hlsl.spirv.h"
 #include "shaders/ndsBlitFrag.hlsl.spirv.h"
+#include "shaders/ndsComposeFrag.hlsl.spirv.h"
 #if defined(_WIN32)
 #include "shaders/ndsFullscreenVert.hlsl.dxil.h"
 #include "shaders/ndsBlitFrag.hlsl.dxil.h"
+#include "shaders/ndsComposeFrag.hlsl.dxil.h"
 #endif
 
 namespace plume {
@@ -78,6 +85,26 @@ struct BlitConstants {
     int32_t rect_size[2];
 };
 
+// Mirrors compose.hlsl.
+struct ComposeConstants {
+    uint32_t output_width;
+    uint32_t render_xpos;
+    uint32_t bldcnt;
+    uint32_t master_bright;
+    uint32_t eva;
+    uint32_t evb;
+    uint32_t evy;
+    uint32_t priority_3d;
+    uint32_t order_3d;
+    uint32_t pad[3];
+};
+
+// The HD surfaces (NdsGpu2dHdFrame), both in one RGBA32UI texture: top
+// pair in xy, below pair in zw. Plume maps no RG32UI format on Vulkan.
+constexpr RenderFormat kHdFormat = RenderFormat::R32G32B32A32_UINT;
+constexpr uint32_t kHdRowPitch = kMaxWidth * 16u;   // 7168, a multiple of 256
+constexpr uint64_t kHdImageBytes = uint64_t(kHdRowPitch) * kHeight;
+
 // The images one present uploads: the shown LCD, the other one as the
 // single-screen inset, and the frontend overlay (stylus, notices, FPS).
 enum Image : uint32_t { kMain, kInset, kOverlay, kImageCount };
@@ -88,6 +115,15 @@ struct ImageSlot {
     int width = 0;
 };
 
+// The offscreen HD composite, when it is not drawn straight into the rect:
+// at the 3D raster's size, then resampled into the rect like any image.
+struct ComposeTarget {
+    std::unique_ptr<RenderTexture> texture;
+    std::unique_ptr<RenderFramebuffer> framebuffer;
+    std::unique_ptr<RenderDescriptorSet> set;   // for the blit that reads it
+    uint32_t width = 0, height = 0;
+};
+
 struct FrameSlot {
     std::unique_ptr<RenderCommandList> commands;
     std::unique_ptr<RenderCommandFence> fence;
@@ -95,6 +131,12 @@ struct FrameSlot {
     // kImageCount images of kImageBytes each, at fixed offsets.
     std::unique_ptr<RenderBuffer> staging;
     ImageSlot images[kImageCount];
+    // HD: the two layer surfaces, their staging, and the compose inputs.
+    std::unique_ptr<RenderBuffer> hd_staging;
+    std::unique_ptr<RenderTexture> hd_layers;
+    int hd_width = 0;
+    std::unique_ptr<RenderDescriptorSet> compose_set;
+    ComposeTarget compose;
     bool submitted = false;
 };
 
@@ -110,6 +152,9 @@ struct Backend {
     std::unique_ptr<RenderShader> blit_shader;
     std::unique_ptr<RenderPipeline> opaque_pipeline;
     std::unique_ptr<RenderPipeline> blended_pipeline;
+    std::unique_ptr<RenderPipelineLayout> compose_layout;
+    std::unique_ptr<RenderShader> compose_shader;
+    std::unique_ptr<RenderPipeline> compose_pipeline;
     std::unique_ptr<RenderSampler> nearest;
     std::unique_ptr<RenderSampler> linear;
     FrameSlot slots[kFramesInFlight];
@@ -131,6 +176,12 @@ unsigned g_inset_width = 0;
 int g_inset_percent = 0;
 uint64_t g_presented = 0;
 uint64_t g_dropped = 0;
+// [display] resolution_scale (percent of the presented rect, 0 = fixed) and
+// internal_resolution (the fixed multiplier): what the 3D raster is sized by.
+unsigned g_raster_percent = 100;
+unsigned g_raster_fixed = 1;
+NdsPlumeContext g_context;
+bool g_logged_hd = false;
 
 // Same role as the GL host's identity strings: read by host_info for the
 // diagnostics bundle, so fixed buffers that outlive any reader.
@@ -195,13 +246,15 @@ void resize_if_needed() {
 std::unique_ptr<RenderShader> create_shader(const void* spirv, size_t spirv_size,
                                             const void* dxil, size_t dxil_size,
                                             const char* entry) {
-    const RenderShaderFormat format =
-        g_backend.render_interface->getCapabilities().shaderFormat;
-    if (format == RenderShaderFormat::SPIRV)
-        return g_backend.device->createShader(spirv, spirv_size, entry, format);
-    if (format == RenderShaderFormat::DXIL && dxil)
-        return g_backend.device->createShader(dxil, dxil_size, entry, format);
-    return nullptr;
+    return nds_plume_create_shader(spirv, spirv_size, dxil, dxil_size, entry);
+}
+
+RenderDescriptorSetDesc compose_set_desc() {
+    static const RenderDescriptorRange ranges[] = {
+        RenderDescriptorRange(RenderDescriptorRangeType::TEXTURE, 0, 1),
+        RenderDescriptorRange(RenderDescriptorRangeType::TEXTURE, 1, 1),
+    };
+    return RenderDescriptorSetDesc(ranges, 2);
 }
 
 RenderDescriptorSetDesc image_set_desc() {
@@ -229,11 +282,15 @@ bool create_pipelines() {
     const size_t vert_dxil_size = sizeof(ndsFullscreenVertBlobDXIL);
     const void* blit_dxil = ndsBlitFragBlobDXIL;
     const size_t blit_dxil_size = sizeof(ndsBlitFragBlobDXIL);
+    const void* compose_dxil = ndsComposeFragBlobDXIL;
+    const size_t compose_dxil_size = sizeof(ndsComposeFragBlobDXIL);
 #else
     const void* vert_dxil = nullptr;
     const size_t vert_dxil_size = 0;
     const void* blit_dxil = nullptr;
     const size_t blit_dxil_size = 0;
+    const void* compose_dxil = nullptr;
+    const size_t compose_dxil_size = 0;
 #endif
     g_backend.vertex_shader = create_shader(
         ndsFullscreenVertBlobSPIRV, sizeof(ndsFullscreenVertBlobSPIRV),
@@ -241,7 +298,11 @@ bool create_pipelines() {
     g_backend.blit_shader = create_shader(
         ndsBlitFragBlobSPIRV, sizeof(ndsBlitFragBlobSPIRV),
         blit_dxil, blit_dxil_size, "PSMain");
-    if (!g_backend.vertex_shader || !g_backend.blit_shader) {
+    g_backend.compose_shader = create_shader(
+        ndsComposeFragBlobSPIRV, sizeof(ndsComposeFragBlobSPIRV),
+        compose_dxil, compose_dxil_size, "PSMain");
+    if (!g_backend.vertex_shader || !g_backend.blit_shader ||
+        !g_backend.compose_shader) {
         std::fprintf(stderr,
             "[plume] no embedded shader blob for this API's shader format\n");
         return false;
@@ -262,6 +323,24 @@ bool create_pipelines() {
     desc.renderTargetBlend[0] = RenderBlendDesc::AlphaBlend();
     g_backend.blended_pipeline = g_backend.device->createGraphicsPipeline(desc);
     if (!g_backend.opaque_pipeline || !g_backend.blended_pipeline) return false;
+
+    // The HD composite writes opaque swap-chain-format pixels, into the rect
+    // or into an offscreen target of the same format.
+    const RenderDescriptorSetDesc compose_desc = compose_set_desc();
+    const RenderPushConstantRange compose_constants(
+        0, 0, 0, sizeof(ComposeConstants), RenderShaderStageFlag::PIXEL);
+    RenderPipelineLayoutDesc compose_layout_desc;
+    compose_layout_desc.pushConstantRanges = &compose_constants;
+    compose_layout_desc.pushConstantRangesCount = 1;
+    compose_layout_desc.descriptorSetDescs = &compose_desc;
+    compose_layout_desc.descriptorSetDescsCount = 1;
+    g_backend.compose_layout = g_backend.device->createPipelineLayout(compose_layout_desc);
+    if (!g_backend.compose_layout) return false;
+    desc.pipelineLayout = g_backend.compose_layout.get();
+    desc.pixelShader = g_backend.compose_shader.get();
+    desc.renderTargetBlend[0] = RenderBlendDesc::Copy();
+    g_backend.compose_pipeline = g_backend.device->createGraphicsPipeline(desc);
+    if (!g_backend.compose_pipeline) return false;
 
     RenderSamplerDesc sampler;
     sampler.mipmapMode = RenderMipmapMode::NEAREST;
@@ -288,6 +367,11 @@ bool create_slots() {
             image.set = g_backend.device->createDescriptorSet(image_set_desc());
             if (!image.set) return false;
         }
+        slot.hd_staging = g_backend.device->createBuffer(
+            RenderBufferDesc::UploadBuffer(kHdImageBytes));
+        slot.compose_set = g_backend.device->createDescriptorSet(compose_set_desc());
+        slot.compose.set = g_backend.device->createDescriptorSet(image_set_desc());
+        if (!slot.hd_staging || !slot.compose_set || !slot.compose.set) return false;
     }
     return true;
 }
@@ -389,12 +473,17 @@ bool start_presenter(SDL_Window* window) {
 
 void release_backend() {
     if (g_backend.queue) wait_all_slots();
+    nds_plume3d_stop();
+    g_context = NdsPlumeContext{};
     for (FrameSlot& slot : g_backend.slots) slot = FrameSlot{};
     g_backend.framebuffers.clear();
     g_backend.release_semaphores.clear();
     g_backend.swap_chain.reset();
     g_backend.blended_pipeline.reset();
     g_backend.opaque_pipeline.reset();
+    g_backend.compose_pipeline.reset();
+    g_backend.compose_shader.reset();
+    g_backend.compose_layout.reset();
     g_backend.blit_shader.reset();
     g_backend.vertex_shader.reset();
     g_backend.layout.reset();
@@ -450,31 +539,181 @@ void record_upload(FrameSlot& slot, Image image) {
 
 // Draws `image` into `rect` (drawable pixels, top-left origin; may extend
 // past the window in Original mode, which the scissor clips).
-void record_blit(FrameSlot& slot, Image image, const NdsPresentRect& rect,
-                 bool linear, uint32_t flags, uint32_t fb_width,
-                 uint32_t fb_height) {
-    if (rect.w <= 0 || rect.h <= 0) return;
+// The part of `rect` inside the framebuffer, as a scissor; false if none.
+bool clip_rect(const NdsPresentRect& rect, uint32_t fb_width, uint32_t fb_height,
+               RenderRect* out) {
+    if (rect.w <= 0 || rect.h <= 0) return false;
     const int32_t left = std::max(rect.x, 0);
     const int32_t top = std::max(rect.y, 0);
     const int32_t right = std::min<int32_t>(rect.x + rect.w, int32_t(fb_width));
     const int32_t bottom = std::min<int32_t>(rect.y + rect.h, int32_t(fb_height));
-    if (right <= left || bottom <= top) return;
+    if (right <= left || bottom <= top) return false;
+    *out = RenderRect(left, top, right, bottom);
+    return true;
+}
+
+void record_blit(FrameSlot& slot, RenderDescriptorSet* set, const NdsPresentRect& rect,
+                 bool linear, uint32_t flags, uint32_t fb_width,
+                 uint32_t fb_height) {
+    RenderRect scissor;
+    if (!clip_rect(rect, fb_width, fb_height, &scissor)) return;
     RenderCommandList& commands = *slot.commands;
-    ImageSlot& source = slot.images[image];
-    source.set->setSampler(1, linear ? g_backend.linear.get()
-                                     : g_backend.nearest.get());
+    commands.setGraphicsPipelineLayout(g_backend.layout.get());
+    set->setSampler(1, linear ? g_backend.linear.get()
+                              : g_backend.nearest.get());
     commands.setPipeline((flags & kBlitKeepAlpha)
                              ? g_backend.blended_pipeline.get()
                              : g_backend.opaque_pipeline.get());
-    commands.setGraphicsDescriptorSet(source.set.get(), 0);
+    commands.setGraphicsDescriptorSet(set, 0);
     const BlitConstants constants{flags, 0u, {rect.w, rect.h}};
     commands.setGraphicsPushConstants(0, &constants, 0, sizeof(constants));
     commands.setViewports(RenderViewport(float(rect.x), float(rect.y),
                                          float(rect.w), float(rect.h)));
-    commands.setScissors(RenderRect(left, top, right, bottom));
+    commands.setScissors(scissor);
     commands.drawInstanced(3, 1, 0, 0);
 }
+
+void record_blit(FrameSlot& slot, Image image, const NdsPresentRect& rect,
+                 bool linear, uint32_t flags, uint32_t fb_width,
+                 uint32_t fb_height) {
+    record_blit(slot, slot.images[image].set.get(), rect, linear, flags,
+                fb_width, fb_height);
+}
+
+// Interleaves the two HD layer surfaces into this slot's staging texture.
+bool stage_hd(FrameSlot& slot, const NdsGpu2dHdFrame& hd) {
+    const int width = hd.width;
+    if (slot.hd_width != width || !slot.hd_layers) {
+        slot.hd_layers = g_backend.device->createTexture(
+            RenderTextureDesc::Texture2D(uint32_t(width), kHeight, 1, kHdFormat));
+        if (!slot.hd_layers) {
+            std::fprintf(stderr, "[plume] HD surface creation failed (%dx%u)\n",
+                         width, kHeight);
+            slot.hd_width = 0;
+            return false;
+        }
+        slot.hd_width = width;
+    }
+    auto* staging = static_cast<uint8_t*>(slot.hd_staging->map());
+    if (!staging) return false;
+    for (uint32_t y = 0; y < kHeight; ++y) {
+        auto* dst = reinterpret_cast<uint32_t*>(staging + size_t(y) * kHdRowPitch);
+        const uint32_t* top = hd.top_pixels + size_t(y) * width * 2u;
+        const uint32_t* below = hd.below_pixels + size_t(y) * width * 2u;
+        for (int x = 0; x < width; ++x) {
+            dst[4 * x + 0] = top[2 * x];
+            dst[4 * x + 1] = top[2 * x + 1];
+            dst[4 * x + 2] = below[2 * x];
+            dst[4 * x + 3] = below[2 * x + 1];
+        }
+    }
+    slot.hd_staging->unmap();
+    return true;
+}
+
+void record_hd_upload(FrameSlot& slot) {
+    RenderCommandList& commands = *slot.commands;
+    RenderTexture* texture = slot.hd_layers.get();
+    commands.barriers(RenderBarrierStage::COPY,
+                      RenderTextureBarrier(texture, RenderTextureLayout::COPY_DEST));
+    commands.copyTextureRegion(
+        RenderTextureCopyLocation::Subresource(texture),
+        RenderTextureCopyLocation::PlacedFootprint(
+            slot.hd_staging.get(), kHdFormat, uint32_t(slot.hd_width), kHeight, 1,
+            kHdRowPitch / 16u, 0));
+    commands.barriers(RenderBarrierStage::GRAPHICS,
+                      RenderTextureBarrier(texture, RenderTextureLayout::SHADER_READ));
+}
+
+bool ensure_compose_target(FrameSlot& slot, uint32_t width, uint32_t height) {
+    ComposeTarget& target = slot.compose;
+    if (target.texture && target.width == width && target.height == height) return true;
+    target.framebuffer.reset();
+    target.texture = g_backend.device->createTexture(
+        RenderTextureDesc::ColorTarget(width, height, kSwapChainFormat));
+    if (!target.texture) {
+        std::fprintf(stderr, "[plume] compose target creation failed (%ux%u)\n",
+                     width, height);
+        target.width = target.height = 0;
+        return false;
+    }
+    const RenderTexture* color = target.texture.get();
+    RenderFramebufferDesc desc;
+    desc.colorAttachments = &color;
+    desc.colorAttachmentsCount = 1;
+    target.framebuffer = g_backend.device->createFramebuffer(desc);
+    if (!target.framebuffer) {
+        target.texture.reset();
+        target.width = target.height = 0;
+        return false;
+    }
+    target.width = width;
+    target.height = height;
+    return true;
+}
+
+// The HD compose draw under whatever framebuffer, viewport and scissor are
+// set: the output pixel grid is the viewport, whatever its size.
+void record_compose(FrameSlot& slot, RenderTexture* raster, const NdsGpu2dHdFrame& hd,
+                    int width) {
+    RenderCommandList& commands = *slot.commands;
+    slot.compose_set->setTexture(0, raster, RenderTextureLayout::SHADER_READ);
+    slot.compose_set->setTexture(1, slot.hd_layers.get(), RenderTextureLayout::SHADER_READ);
+    commands.setGraphicsPipelineLayout(g_backend.compose_layout.get());
+    commands.setPipeline(g_backend.compose_pipeline.get());
+    commands.setGraphicsDescriptorSet(slot.compose_set.get(), 0);
+    ComposeConstants constants{};
+    constants.output_width = uint32_t(width);
+    constants.render_xpos = hd.render_xpos;
+    constants.bldcnt = hd.bldcnt;
+    constants.master_bright = hd.master_bright;
+    constants.eva = hd.eva;
+    constants.evb = hd.evb;
+    constants.evy = hd.evy;
+    constants.priority_3d = hd.priority_3d;
+    constants.order_3d = hd.order_3d;
+    commands.setGraphicsPushConstants(0, &constants, 0, sizeof(constants));
+    commands.drawInstanced(3, 1, 0, 0);
+}
+
+// The 3D raster for a presented rect: resolution_scale percent of the rect
+// itself, any size, or the fixed internal_resolution multiple of native.
+void request_raster(const NdsPresentRect& rect, int width) {
+    uint32_t raster_w, raster_h;
+    if (g_raster_percent > 0) {
+        raster_w = uint32_t((uint64_t(std::max(rect.w, 1)) * g_raster_percent + 50) / 100);
+        raster_h = uint32_t((uint64_t(std::max(rect.h, 1)) * g_raster_percent + 50) / 100);
+    } else {
+        raster_w = uint32_t(width) * g_raster_fixed;
+        raster_h = kHeight * g_raster_fixed;
+    }
+    nds_plume3d_request_size(raster_w, raster_h);
+}
 }  // namespace
+
+const NdsPlumeContext* nds_plume_context()
+{
+    return g_context.device ? &g_context : nullptr;
+}
+
+void nds_plume_host_wait_idle()
+{
+    if (g_backend.queue) wait_all_slots();
+}
+
+std::unique_ptr<RenderShader> nds_plume_create_shader(
+    const void* spirv, size_t spirv_size, const void* dxil, size_t dxil_size,
+    const char* entry)
+{
+    if (!g_backend.render_interface || !g_backend.device) return nullptr;
+    const RenderShaderFormat format =
+        g_backend.render_interface->getCapabilities().shaderFormat;
+    if (format == RenderShaderFormat::SPIRV)
+        return g_backend.device->createShader(spirv, spirv_size, entry, format);
+    if (format == RenderShaderFormat::DXIL && dxil)
+        return g_backend.device->createShader(dxil, dxil_size, entry, format);
+    return nullptr;
+}
 
 bool nds_compute_host_start(SDL_Window* presentation_window)
 {
@@ -500,6 +739,14 @@ bool nds_compute_host_start(SDL_Window* presentation_window)
         if (!start_presenter(presentation_window))
             return fail_or_fallback("Plume presenter initialization");
         g_visible = true;
+        g_context.render_interface = g_backend.render_interface.get();
+        g_context.device = g_backend.device.get();
+        g_context.queue = g_backend.queue.get();
+        // Without it the host still presents; above 1x it just has no HD
+        // raster and keeps blitting the CPU composite.
+        if (!nds_plume3d_start())
+            std::fprintf(stderr, "[plume] 3D renderer unavailable; presenting "
+                                 "the CPU composite only\n");
     }
     if (!nds_gpu3d_use_compute_renderer())
         return fail_or_fallback("renderer initialization");
@@ -522,8 +769,22 @@ bool nds_compute_host_has_visible_context()
 
 bool nds_compute_host_composes_3d()
 {
-    // Not until the Plume 3D passes exist: the CPU composite carries 3D.
+    // The HD path composes from the Plume raster. At 1x the CPU composite
+    // still carries the 3D layer, from the soft renderer.
+    return g_active && g_visible && nds_plume3d_ready();
+}
+
+bool nds_compute_host_presents_direct()
+{
+    // The OBJ-only direct path needs a native 3D surface on the GPU, which
+    // this host never has: native 3D is the soft renderer's, on the CPU.
     return false;
+}
+
+void nds_compute_host_set_raster_request(unsigned percent, unsigned fixed_scale)
+{
+    g_raster_percent = percent;
+    g_raster_fixed = std::max(fixed_scale, 1u);
 }
 
 bool nds_compute_host_read_presented(std::vector<uint32_t>& pixels,
@@ -565,12 +826,12 @@ bool nds_compute_host_present_top(const unsigned int* fallback_pixels,
                                   unsigned antialiasing,
                                   const NdsComputePresentationFrame* owned)
 {
-    // The direct and HD surfaces are never produced for this host (see
-    // nds_compute_host_composes_3d), and antialiasing resolves samples of a
-    // denser 3D raster that does not exist yet.
+    // No direct frames are produced for this host (presents_direct is false).
+    // Antialiasing is the GL presenter's extra taps into an integer raster;
+    // here resolution_scale above 100% renders the denser raster itself and
+    // the box resolve integrates it.
     (void)direct_frame;
     (void)antialiasing;
-    (void)owned;
     if (!g_active || !g_visible || !ticks || !fallback_pixels) return false;
     const int width = fallback_width;
     if (width <= 0 || width > int(kMaxWidth)) return false;
@@ -580,6 +841,31 @@ bool nds_compute_host_present_top(const unsigned int* fallback_pixels,
     RenderSwapChain& chain = *g_backend.swap_chain;
     // Minimised (zero-sized surface): nothing to present to, and not an error.
     if (chain.isEmpty() || g_backend.framebuffers.empty()) return true;
+    const uint32_t fb_width = chain.getWidth();
+    const uint32_t fb_height = chain.getHeight();
+    const NdsSingleLayout layout = nds_single_layout(
+        g_window_mode, g_scaling, int(fb_width), int(fb_height), width,
+        int(kHeight), g_inset_percent);
+    const NdsPresentRect& rect = layout.main;
+    // Size the next 3D frame by this rect: from here on 3D follows the
+    // window pixel for pixel, whatever its size.
+    request_raster(rect, width);
+
+    // HD: the compositor's layer surfaces for this frame plus a Plume raster.
+    NdsGpu2dHdFrame hd{};
+    uint32_t raster_w = 0, raster_h = 0;
+    RenderTexture* raster = nds_gpu3d_internal_scale() > 1u
+        ? nds_plume3d_output(&raster_w, &raster_h) : nullptr;
+    const bool have_hd = owned ? (hd = owned->hd, owned->has_hd)
+                               : (raster && nds_gpu2d_hd_frame(&hd));
+    const bool hd_active = raster && have_hd && hd.width == width &&
+                           hd.top_pixels && hd.below_pixels;
+    if (owned && hd_active) nds_gpu2d_note_owned_hd_presented();
+    if (hd_active && !g_logged_hd) {
+        g_logged_hd = true;
+        std::fprintf(stderr, "[plume] HD compose: 3D raster %ux%u into a %dx%d rect\n",
+                     raster_w, raster_h, rect.w, rect.h);
+    }
 
     FrameSlot& slot = g_backend.slots[g_backend.slot];
     uint32_t image_index = 0;
@@ -600,48 +886,81 @@ bool nds_compute_host_present_top(const unsigned int* fallback_pixels,
     if (!staging) return false;
     const bool inset = g_inset_pixels != nullptr;
     const bool overlay = g_overlay_pixels != nullptr;
-    bool staged = stage_image(slot, staging, kMain, fallback_pixels, width);
+    bool staged = hd_active || stage_image(slot, staging, kMain, fallback_pixels, width);
     if (staged && inset)
         staged = stage_image(slot, staging, kInset, g_inset_pixels, int(g_inset_width));
     if (staged && overlay)
         staged = stage_image(slot, staging, kOverlay, g_overlay_pixels,
                              int(g_overlay_width));
     slot.staging->unmap();
+    if (staged && hd_active) staged = stage_hd(slot, hd);
     if (!staged) return false;
     ticks->upload += SDL_GetPerformanceCounter() - start;
 
+    // The HD composite is drawn at the raster's own density: straight into
+    // the rect when the raster is exactly the rect's size (the default),
+    // otherwise offscreen and then resampled like any image.
+    const bool compose_direct =
+        hd_active && int(raster_w) == rect.w && int(raster_h) == rect.h;
+    const bool compose_offscreen = hd_active && !compose_direct &&
+        ensure_compose_target(slot, raster_w, raster_h);
+    if (hd_active && !compose_direct && !compose_offscreen) return false;
+
     start = SDL_GetPerformanceCounter();
-    const uint32_t fb_width = chain.getWidth();
-    const uint32_t fb_height = chain.getHeight();
     RenderTexture* backbuffer = chain.getTexture(image_index);
     RenderCommandList& commands = *slot.commands;
     commands.begin();
-    record_upload(slot, kMain);
+    if (!hd_active) record_upload(slot, kMain);
     if (inset) record_upload(slot, kInset);
     if (overlay) record_upload(slot, kOverlay);
+    if (hd_active) record_hd_upload(slot);
+    if (compose_offscreen) {
+        RenderTexture* target = slot.compose.texture.get();
+        commands.barriers(RenderBarrierStage::GRAPHICS,
+                          RenderTextureBarrier(target, RenderTextureLayout::COLOR_WRITE));
+        commands.setFramebuffer(slot.compose.framebuffer.get());
+        commands.setViewports(RenderViewport(0.0f, 0.0f, float(raster_w), float(raster_h)));
+        commands.setScissors(RenderRect(0, 0, int32_t(raster_w), int32_t(raster_h)));
+        record_compose(slot, raster, hd, width);
+        commands.barriers(RenderBarrierStage::GRAPHICS,
+                          RenderTextureBarrier(target, RenderTextureLayout::SHADER_READ));
+        slot.compose.set->setTexture(0, target, RenderTextureLayout::SHADER_READ);
+    }
     commands.barriers(RenderBarrierStage::GRAPHICS,
                       RenderTextureBarrier(backbuffer, RenderTextureLayout::COLOR_WRITE));
     commands.setFramebuffer(g_backend.framebuffers[image_index].get());
     commands.setViewports(RenderViewport(0.0f, 0.0f, float(fb_width), float(fb_height)));
     commands.setScissors(RenderRect(0, 0, int32_t(fb_width), int32_t(fb_height)));
     commands.clearColor(0, RenderColor(0.0f, 0.0f, 0.0f, 1.0f));
-    commands.setGraphicsPipelineLayout(g_backend.layout.get());
 
-    const NdsSingleLayout layout = nds_single_layout(
-        g_window_mode, g_scaling, int(fb_width), int(fb_height), width,
-        int(kHeight), g_inset_percent);
-    const NdsPresentRect& rect = layout.main;
-    // The GL presenter's filter choice, at the CPU composite's own density:
-    // nearest at the exact rect, bilinear resampled, and a box resolve where
-    // integer (or nearest at 2x and up) would otherwise skip source texels.
-    const bool supersampled = width > rect.w || int(kHeight) > rect.h;
-    const bool box_resolve =
-        (g_scaling == NdsScalingFilter::Integer && supersampled) ||
-        (g_scaling == NdsScalingFilter::Nearest && width >= 2 * rect.w &&
-         int(kHeight) >= 2 * rect.h);
     const bool bilinear = g_scaling == NdsScalingFilter::Bilinear;
-    record_blit(slot, kMain, rect, bilinear && !box_resolve,
-                box_resolve ? kBlitBoxResolve : 0u, fb_width, fb_height);
+    if (compose_direct) {
+        RenderRect scissor;
+        if (clip_rect(rect, fb_width, fb_height, &scissor)) {
+            commands.setViewports(RenderViewport(float(rect.x), float(rect.y),
+                                                 float(rect.w), float(rect.h)));
+            commands.setScissors(scissor);
+            record_compose(slot, raster, hd, width);
+        }
+    } else if (compose_offscreen) {
+        // A denser raster is box resolved (every raster texel whose centre
+        // falls in the output pixel, any ratio); a sparser one is filtered.
+        const bool denser = int(raster_w) > rect.w || int(raster_h) > rect.h;
+        record_blit(slot, slot.compose.set.get(), rect, bilinear && !denser,
+                    denser ? kBlitBoxResolve : 0u, fb_width, fb_height);
+    } else {
+        // The GL presenter's filter choice, at the CPU composite's own
+        // density: nearest at the exact rect, bilinear resampled, and a box
+        // resolve where integer (or nearest at 2x and up) would otherwise
+        // skip source texels.
+        const bool supersampled = width > rect.w || int(kHeight) > rect.h;
+        const bool box_resolve =
+            (g_scaling == NdsScalingFilter::Integer && supersampled) ||
+            (g_scaling == NdsScalingFilter::Nearest && width >= 2 * rect.w &&
+             int(kHeight) >= 2 * rect.h);
+        record_blit(slot, kMain, rect, bilinear && !box_resolve,
+                    box_resolve ? kBlitBoxResolve : 0u, fb_width, fb_height);
+    }
     if (inset && layout.inset.w > 0 && layout.inset.h > 0) {
         // Point sampling a shrunk inset drops whole rows of text.
         const bool linear = bilinear || layout.inset.w < int(g_inset_width);

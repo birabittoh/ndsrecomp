@@ -57,6 +57,9 @@ using NdsAcceleratedRenderer = melonDS::ComputeRenderer;
 #endif
 #include "ComputeHost.h"
 #endif
+#if defined(NDS_USE_PLUME)
+#include "plume/Plume3D.h"
+#endif
 
 namespace {
 
@@ -477,6 +480,24 @@ bool profiling() {
     return enabled;
 }
 
+#if defined(NDS_USE_PLUME)
+// The Plume raster is presentation only (plume/Plume3D.h): it redraws the
+// render list the faithful renderer just consumed, after its RenderFrame made
+// the flat texture views coherent. At 1x the CPU composite is presented and
+// nothing is drawn here.
+void plume_render_frame() {
+    if (!nds_plume3d_ready()) return;
+    const auto& g3 = g_nds.GPU.GPU3D;
+    if (g_internal_scale <= 1u || g3.AbortFrame) {
+        nds_plume3d_invalidate();
+        return;
+    }
+    // Both views are refreshed from one VRAM generation counter.
+    nds_plume3d_render(g_nds.GPU, g_texture_flat_gen * 0x9E3779B97F4A7C15ull ^
+                                      g_texpal_flat_gen);
+}
+#endif
+
 void profile_add(uint64_t& dst, ProfileClock::time_point start) {
     dst += static_cast<uint64_t>(
         std::chrono::duration_cast<std::chrono::nanoseconds>(
@@ -812,10 +833,17 @@ bool nds_gpu3d_set_runtime_internal_scale(uint8_t scale) {
     g_nds.GPU.GPU3D.RenderFrameIdentical = false;
     return true;
 #else
+#if defined(NDS_USE_PLUME)
+    // The Plume raster is resized by its host from the presented rect and
+    // needs no rebuild; this integer only says whether to draw it (> 1).
+    g_internal_scale = scale;
+    if (scale <= 1u) nds_plume3d_invalidate();
+#else
     // Nothing to scale: this build has no accelerated renderer, so the only
     // raster is the native soft one. Report success so a governor stage (or a
     // governor-off startup pass) is not turned into a fatal error.
     (void)scale;
+#endif
     return true;
 #endif
 }
@@ -829,6 +857,10 @@ uint8_t nds_gpu3d_internal_scale() {
     if (renderer)
         return static_cast<uint8_t>(renderer->GetScaleFactor());
     return 1u;
+#elif defined(NDS_USE_PLUME)
+    // Above 1 only while a Plume raster can actually be drawn, so HD surfaces
+    // are never emitted for a presenter that has nothing to compose them with.
+    return nds_plume3d_ready() ? g_internal_scale : 1u;
 #else
     return 1u;
 #endif
@@ -931,14 +963,13 @@ bool nds_gpu3d_use_compute_renderer() {
     g_compute_frame_ready = false;
     return true;
 #elif defined(NDS_USE_PLUME)
-    // The Plume host presents, but has no 3D passes of its own yet: the
-    // installed (threaded) integer renderer keeps rasterizing, and its lines
-    // reach the presenter through the ordinary CPU composite. Reporting
-    // success keeps the host's start/fallback logic identical to the GL
-    // backends', so the 3D passes can replace this without touching it.
+    // The installed (threaded) integer renderer keeps rasterizing and serves
+    // every faithful consumer. Above 1x the Plume raster is drawn beside it
+    // for presentation (plume_render_frame), at whatever size the host asks.
     std::fprintf(stderr,
-        "[gpu3d] accelerated backend: plume (presentation only; 3D is "
-        "still rasterized by the software renderer)\n");
+        "[gpu3d] accelerated backend: plume (soft renderer for the native "
+        "surface; Plume raster %s)\n",
+        nds_plume3d_ready() ? "for HD presentation" : "unavailable");
     return true;
 #else
     return false;
@@ -1176,6 +1207,9 @@ bool gpu3d_savestate_import(const NdsGpu3dSaveState& in,
         gpu.GetCurrentRenderer().RenderFrame(g_nds.GPU);
 #if defined(NDS_USE_NATIVE_GL)
         latch_capture_reference();
+#endif
+#if defined(NDS_USE_PLUME)
+        plume_render_frame();
 #endif
 #if defined(NDS_GPU3D_GL_BRIDGE)
         if (gpu.IsRendererAccelerated()) {
@@ -1523,6 +1557,9 @@ void nds_gpu3d_vcount215() {
 #if defined(NDS_USE_NATIVE_GL)
         latch_capture_reference();
 #endif
+#if defined(NDS_USE_PLUME)
+        plume_render_frame();
+#endif
 #if defined(NDS_GPU3D_GL_BRIDGE)
         if (g_nds.GPU.GPU3D.IsRendererAccelerated() &&
             !g_compute_readback_pending)
@@ -1539,6 +1576,9 @@ void nds_gpu3d_vcount215() {
     g_nds.GPU.GPU3D.VCount215(g_nds.GPU);
 #if defined(NDS_USE_NATIVE_GL)
     latch_capture_reference();
+#endif
+#if defined(NDS_USE_PLUME)
+    plume_render_frame();
 #endif
 #if defined(NDS_GPU3D_GL_BRIDGE)
     if (g_nds.GPU.GPU3D.IsRendererAccelerated() &&
