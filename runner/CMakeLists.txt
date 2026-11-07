@@ -34,7 +34,7 @@ option(NDS_BOOTSTRAP_FIRMWARE
 option(NDS_ENABLE_COMPUTE_RENDERER
     "Build the selected melonDS accelerated renderer (OpenGL 4.3 context)"
     ON)
-set(NDS_ACCELERATED_RENDERER "COMPUTE" CACHE STRING
+set(NDS_ACCELERATED_RENDERER "OPENGL" CACHE STRING
     "Developer build selection: COMPUTE or OPENGL native rasterization")
 set_property(CACHE NDS_ACCELERATED_RENDERER PROPERTY STRINGS COMPUTE OPENGL)
 option(NDS_BUILD_NATIVE_GL_TESTS "Build focused SDL3/native-GL context checks" OFF)
