@@ -45,37 +45,42 @@ readback, `glFinish` around rebuilds, the melonDS GL/compute renderer) is
 gated on `NDS_GPU3D_GL_BRIDGE`, which the Plume build does not define.
 
 `nds_compute_host_composes_3d()` says whether a host's presenter composes the
-3D layer itself (the OBJ-only direct path and the HD path). The GL host
-does. The Plume host does not yet, so the frontend keeps direct present and
-HD layer emission off and the CPU composite carries the 3D layer, exactly
-as on the SDL path.
+3D layer itself; `nds_compute_host_presents_direct()` whether it can also take
+the OBJ-only direct path, which needs native 3D on the GPU. The GL host does
+both. The Plume host composes HD frames only: native 3D stays on the CPU.
 
-The presenter mirrors the GL one: `nds_single_layout` for the rect, the
-same nearest/bilinear choice, the integer-mode box resolve, the inset and
-the alpha-blended overlay. Images are top row first everywhere, with no GL
-flips. Two frames in flight, each with its own command list, fence, upload
-buffer and textures; a slot is reused only after its fence signals. Vsync is
-off, as the GL presenter's swap interval 0 is: the frontend paces from the
-audio queue.
+### 3D (Plume3D.cpp)
+
+The integer soft renderer stays the installed `Renderer3D` and serves every
+faithful consumer (2D compositor lines, capture, readback). Above 1x,
+`nds_gpu3d_vcount215` also hands the same latched render list to the Plume
+renderer, which draws it for presentation only. Nothing is read back.
+
+The raster has **any size**. The host sizes it from the rect it presents
+into (`resolution_scale` percent of it, or `internal_resolution` x native),
+so 3D lands 1:1 on screen pixels instead of at a whole multiple of 256x192.
+Vertices are melonDS's 1/16 pixel `HiresPosition` times a float ratio per
+axis. The frontend's integer internal scale only switches HD on (> 1).
+
+The passes port `GPU3D_OpenGL.cpp`: the same render keys, batching and
+opaque / translucent / shadow stencil programs. GL state becomes Plume
+pipelines, built on first use and keyed by every state the passes toggle,
+with the stencil reference dynamic. One final pass does edge marking, fog
+and the RGB6/alpha5 quantisation (`shaders/gx.hlsl`); lines become quads one
+DS pixel thick. The compose shader (`shaders/compose.hlsl`) is
+`kPresentFragment`'s HD path. It draws straight into the rect when the raster
+is the rect's size; otherwise it draws offscreen and box-resolves or filters.
 
 ## Status
 
-Milestone 1, presentation: done. Linux/Vulkan verified headless (600
-frames on a GTX 1060; guest frame hashes identical to a soft-3D GL build).
-Windows/D3D12 and macOS are not built or tested yet; macOS has no surface
-wiring (`{NSWindow, CAMetalLayer}`).
+Milestone 1 (presentation): done, Linux/Vulkan verified (guest frame hashes
+identical to a soft-3D GL build).
 
-Next:
+Milestones 2 and 3 (3D passes, HD compose): first draft. In a user playtest
+it renders, but it sometimes froze, model outlines (one DS pixel wide) were
+too wide, and smooth_3d does not run (interpolation is gated on an
+accelerated `Renderer3D`, and here the installed one is the soft renderer).
 
-1. The 3D passes: port `GPU3D_OpenGL.cpp` and `GPU3D_OpenGL_shaders.h` to a
-   Plume `Renderer3D` with HLSL shaders. It keeps the readback contract:
-   256..448-wide integer output, RGB6/alpha5 plus six polygon-ID bits, PBO-
-   style readback for the faithful compositor, HD normalisation. Guest
-   capture still comes from the retained integer rasterizer.
-2. The compose shader (`kPresentFragment` in `PresentShaders.h`): direct OBJ
-   and HD paths sampling that renderer's surfaces, then
-   `nds_compute_host_composes_3d()` returns true.
-3. `nds_compute_host_read_presented` (debug server observer): needs an
-   offscreen copy of the presented rect; it returns false today.
-4. Vsync via MAILBOX where the surface has it, and a Vulkan validation-layer
-   run.
+Not done: antialiasing (resolution_scale above 100 supersamples instead),
+Windows/D3D12 and macOS (no `{NSWindow, CAMetalLayer}` wiring),
+`nds_compute_host_read_presented`, vsync via MAILBOX, a validation-layer run.
