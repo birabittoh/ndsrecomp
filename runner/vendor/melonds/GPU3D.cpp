@@ -1872,7 +1872,28 @@ GPU3D::CmdFIFOEntry GPU3D::CmdFIFORead() noexcept
 
 void GPU3D::ExecuteCommand() noexcept
 {
-    CmdFIFOEntry entry = CmdFIFORead();
+    ExecuteEntry(CmdFIFORead());
+}
+
+void GPU3D::ExecuteReplayCommand(u32 command, const u32* params, u32 count) noexcept
+{
+    // The FIFO is bypassed: no IRQ, DMA or stall reaches the NDS.
+    CmdFIFOEntry entry {};
+    entry.Command = command;
+    if (count == 0)
+    {
+        ExecuteEntry(entry);
+        return;
+    }
+    for (u32 i = 0; i < count; i++)
+    {
+        entry.Param = params[i];
+        ExecuteEntry(entry);
+    }
+}
+
+void GPU3D::ExecuteEntry(CmdFIFOEntry entry) noexcept
+{
 
     //printf("FIFO: processing %02X %08X. Levels: FIFO=%d, PIPE=%d\n", entry.Command, entry.Param, CmdFIFO->Level(), CmdPIPE->Level());
 
@@ -1886,6 +1907,9 @@ void GPU3D::ExecuteCommand() noexcept
         // fast path for command which only have a single parameter
 
         /*printf("[GXS:%08X] 0x%02X,  0x%08X", GXStat, entry.Command, entry.Param);*/
+
+        if (ExecObserver)
+            ExecObserver(ExecObserverContext, entry.Command, &entry.Param, paramsRequiredCount);
 
         switch (entry.Command)
         {
@@ -2266,6 +2290,9 @@ void GPU3D::ExecuteCommand() noexcept
                 printf("\n");*/
 
                 ExecParamCount = 0;
+
+                if (ExecObserver)
+                    ExecObserver(ExecObserverContext, entry.Command, ExecParams, paramsRequiredCount);
 
                 switch (entry.Command)
                 {

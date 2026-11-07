@@ -41,6 +41,17 @@ The native readback and guest capture paths are unchanged. An actual-GL
 test runs both production output shaders on an asymmetric color fixture and
 checks their decoded RGB6 agreement.
 
+## 0025-gpu3d-command-observer-and-replay.patch
+
+2026-11-07: `GPU3D.{cpp,h}` gain two host-only hooks for smooth_3d
+(`runner/src/gpu3d_gxstream.h`). `ExecObserver` sees each geometry command
+with all its parameters as it executes, so the runner can record one command
+stream per 3D image. `ExecuteReplayCommand` runs one whole command on a
+private GPU3D instance without the FIFO, so no IRQ, DMA or stall reaches the
+NDS; `ExecuteCommand` now reads the FIFO and hands the entry to the shared
+`ExecuteEntry`. Neither hook is hardware state or enters the serializer, and
+with no observer set the engine behaves exactly as before.
+
 ## 0001-wifi-ap-identity.patch
 
 `src/WifiAP.cpp`: changes the hardcoded AP identity from melonDS's default

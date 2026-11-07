@@ -99,6 +99,15 @@ public:
     void SetEnabled(bool geometry, bool rendering) noexcept;
 
     void ExecuteCommand() noexcept;
+    // Host-only replay: runs one whole command on this instance's geometry
+    // state, bypassing the FIFO, so no IRQ, DMA or stall reaches the NDS.
+    // For a second, private GPU3D that redraws recorded command streams.
+    void ExecuteReplayCommand(u32 command, const u32* params, u32 count) noexcept;
+    // Host-only, not hardware state: sees each command with all its
+    // parameters as it executes (count is the command's parameter count).
+    using CommandObserver = void (*)(void* context, u32 command, const u32* params, u32 count);
+    CommandObserver ExecObserver = nullptr;
+    void* ExecObserverContext = nullptr;
 
     s32 CyclesToRunFor() const noexcept;
     void Run() noexcept;
@@ -171,6 +180,7 @@ private:
     void VecTest(u32 param) noexcept;
     void CmdFIFOWrite(const CmdFIFOEntry& entry) noexcept;
     CmdFIFOEntry CmdFIFORead() noexcept;
+    void ExecuteEntry(CmdFIFOEntry entry) noexcept;
     void FinishWork(s32 cycles) noexcept;
     void VertexPipelineSubmitCmd() noexcept
     {

@@ -1,0 +1,82 @@
+diff --git a/runner/vendor/melonds/GPU3D.cpp b/runner/vendor/melonds/GPU3D.cpp
+index c97e275..6c06ac8 100644
+--- a/runner/vendor/melonds/GPU3D.cpp
++++ b/runner/vendor/melonds/GPU3D.cpp
+@@ -1872,7 +1872,28 @@ GPU3D::CmdFIFOEntry GPU3D::CmdFIFORead() noexcept
+ 
+ void GPU3D::ExecuteCommand() noexcept
+ {
+-    CmdFIFOEntry entry = CmdFIFORead();
++    ExecuteEntry(CmdFIFORead());
++}
++
++void GPU3D::ExecuteReplayCommand(u32 command, const u32* params, u32 count) noexcept
++{
++    // The FIFO is bypassed: no IRQ, DMA or stall reaches the NDS.
++    CmdFIFOEntry entry {};
++    entry.Command = command;
++    if (count == 0)
++    {
++        ExecuteEntry(entry);
++        return;
++    }
++    for (u32 i = 0; i < count; i++)
++    {
++        entry.Param = params[i];
++        ExecuteEntry(entry);
++    }
++}
++
++void GPU3D::ExecuteEntry(CmdFIFOEntry entry) noexcept
++{
+ 
+     //printf("FIFO: processing %02X %08X. Levels: FIFO=%d, PIPE=%d\n", entry.Command, entry.Param, CmdFIFO->Level(), CmdPIPE->Level());
+ 
+@@ -1887,6 +1908,9 @@ void GPU3D::ExecuteCommand() noexcept
+ 
+         /*printf("[GXS:%08X] 0x%02X,  0x%08X", GXStat, entry.Command, entry.Param);*/
+ 
++        if (ExecObserver)
++            ExecObserver(ExecObserverContext, entry.Command, &entry.Param, paramsRequiredCount);
++
+         switch (entry.Command)
+         {
+         case 0x10: // matrix mode
+@@ -2267,6 +2291,9 @@ void GPU3D::ExecuteCommand() noexcept
+ 
+                 ExecParamCount = 0;
+ 
++                if (ExecObserver)
++                    ExecObserver(ExecObserverContext, entry.Command, ExecParams, paramsRequiredCount);
++
+                 switch (entry.Command)
+                 {
+                 case 0x16: // load 4x4
+diff --git a/runner/vendor/melonds/GPU3D.h b/runner/vendor/melonds/GPU3D.h
+index 3de7d79..38851a8 100644
+--- a/runner/vendor/melonds/GPU3D.h
++++ b/runner/vendor/melonds/GPU3D.h
+@@ -99,6 +99,15 @@ public:
+     void SetEnabled(bool geometry, bool rendering) noexcept;
+ 
+     void ExecuteCommand() noexcept;
++    // Host-only replay: runs one whole command on this instance's geometry
++    // state, bypassing the FIFO, so no IRQ, DMA or stall reaches the NDS.
++    // For a second, private GPU3D that redraws recorded command streams.
++    void ExecuteReplayCommand(u32 command, const u32* params, u32 count) noexcept;
++    // Host-only, not hardware state: sees each command with all its
++    // parameters as it executes (count is the command's parameter count).
++    using CommandObserver = void (*)(void* context, u32 command, const u32* params, u32 count);
++    CommandObserver ExecObserver = nullptr;
++    void* ExecObserverContext = nullptr;
+ 
+     s32 CyclesToRunFor() const noexcept;
+     void Run() noexcept;
+@@ -171,6 +180,7 @@ private:
+     void VecTest(u32 param) noexcept;
+     void CmdFIFOWrite(const CmdFIFOEntry& entry) noexcept;
+     CmdFIFOEntry CmdFIFORead() noexcept;
++    void ExecuteEntry(CmdFIFOEntry entry) noexcept;
+     void FinishWork(s32 cycles) noexcept;
+     void VertexPipelineSubmitCmd() noexcept
+     {
