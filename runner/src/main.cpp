@@ -440,6 +440,7 @@ int main(int argc, char** argv) {
     std::string cli_language;
     bool cli_generated_firmware = false;
     bool cli_freebios = false;
+    bool use_embedded_dumps = false;
     std::string cli_instance_index;
     std::string cli_save_path;
     std::string cli_execution_model = "faithful";
@@ -512,6 +513,7 @@ int main(int argc, char** argv) {
         dir = launch.bios_dir;
         rom_path = launch.rom;
         cli_firmware_path = launch.firmware;
+        use_embedded_dumps = launch.embedded_dumps;
         cli_save_path = launch.save;
         cli_savestate_dir = launch.savestate_dir;
         cli_diagnostics_dir = launch.log_dir;
@@ -1789,11 +1791,18 @@ int main(int argc, char** argv) {
             "arm7 %zu bytes SHA-1 %s\n",
             a9.size(), gba::sha1(a9.data(), a9.size()).hex().c_str(),
             a7.size(), gba::sha1(a7.data(), a7.size()).hex().c_str());
+    } else if (use_embedded_dumps) {
+        // fw is filled from the same source below.
     } else {
         a9 = read_file(dir + "/biosnds9.rom");
         a7 = read_file(dir + "/biosnds7.rom");
     }
     std::vector<uint8_t> fw;
+    if (use_embedded_dumps && !frontend_options.freebios) {
+        std::vector<uint8_t> embedded_fw;
+        nds_player_embedded_dumps(&a9, &a7, &embedded_fw);
+        if (!frontend_options.generated_firmware) fw = std::move(embedded_fw);
+    }
     if (frontend_options.generated_firmware) {
         std::array<uint8_t, 6> identity_mac{};
         if (!cli_identity_mac.empty()) {
@@ -1817,7 +1826,7 @@ int main(int argc, char** argv) {
             "[firmware] GENERATED image (opt-in, no dump), %zu bytes, "
             "SHA-1 %s\n", fw.size(),
             gba::sha1(fw.data(), fw.size()).hex().c_str());
-    } else {
+    } else if (!use_embedded_dumps) {
         fw = read_file(cli_firmware_path.empty() ? (dir + "/firmware.bin")
                                                  : cli_firmware_path);
     }

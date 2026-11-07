@@ -25,6 +25,18 @@ const unsigned char kTitleConfig[] = {
 #include "nds_title_config.inc"
 };
 
+#if defined(NDS_EMBEDDED_DUMPS)
+const unsigned char kEmbeddedBios7[] = {
+#include "embedded_biosnds7.rom.inc"
+};
+const unsigned char kEmbeddedBios9[] = {
+#include "embedded_biosnds9.rom.inc"
+};
+const unsigned char kEmbeddedFirmware[] = {
+#include "embedded_firmware.bin.inc"
+};
+#endif
+
 constexpr const char* kBiosFiles[] = {
     "biosnds7.rom", "biosnds9.rom", "firmware.bin"};
 
@@ -366,6 +378,21 @@ bool resolve_bios(const fs::path& root, const fs::path& settings,
 
 }  // namespace
 
+bool nds_player_embedded_dumps(std::vector<uint8_t>* arm9_bios,
+                               std::vector<uint8_t>* arm7_bios,
+                               std::vector<uint8_t>* firmware) {
+#if defined(NDS_EMBEDDED_DUMPS)
+    arm9_bios->assign(std::begin(kEmbeddedBios9), std::end(kEmbeddedBios9));
+    arm7_bios->assign(std::begin(kEmbeddedBios7), std::end(kEmbeddedBios7));
+    firmware->assign(std::begin(kEmbeddedFirmware),
+                     std::end(kEmbeddedFirmware));
+    return true;
+#else
+    (void)arm9_bios; (void)arm7_bios; (void)firmware;
+    return false;
+#endif
+}
+
 bool nds_player_requested(int argc, char** argv) {
     if (sizeof(kTitleConfig) <= 1u) return false;
     if (argc == 1) return true;
@@ -424,15 +451,29 @@ bool nds_player_prepare(int argc, char** argv, NdsFrontendOptions* options,
     fs::path rom;
     fs::path bios;
     bool cancelled = false;
+#if defined(NDS_EMBEDDED_DUMPS)
+    // Nothing to ask for: the dumps are in the executable. The data
+    // directory stands in for the bios folder (the generated identity
+    // file, if any, lives there).
+    const bool embedded = true;
+    bios = root;
+    const bool have_bios = true;
+#else
+    const bool embedded = false;
+    const bool have_bios = false;
+#endif
     if (!resolve_rom(root, settings, *options, argc == 2 ? argv[1] : nullptr,
                      &rom, &cancelled) ||
-        !resolve_bios(root, settings, *options, &bios, &cancelled)) {
+        (!have_bios &&
+         !resolve_bios(root, settings, *options, &bios, &cancelled))) {
         if (cancelled) out->exit_code = 0;
         return false;
     }
     out->rom = rom.string();
     out->bios_dir = bios.string();
-    out->firmware = (bios / "firmware.bin").string();
+    out->firmware = embedded ? std::string()
+                             : (bios / "firmware.bin").string();
+    out->embedded_dumps = embedded;
     out->save = options->paths.save.empty()
         ? (root / "saves" / (app + ".sav")).string()
         : resolve_stored(root, options->paths.save).string();

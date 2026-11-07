@@ -1000,6 +1000,30 @@ if(NDS_TITLE_CONFIG)
 endif()
 file(CONFIGURE OUTPUT "${CMAKE_CURRENT_BINARY_DIR}/generated/nds_title_config.inc"
     CONTENT "${_nds_title_config_bytes}0x00\n" @ONLY)
+# Optional: bake the BIOS and firmware dumps into the executable so a title
+# build only has to ask for the game. Point NDS_EMBED_DUMPS_DIR at a folder
+# holding biosnds7.rom, biosnds9.rom and firmware.bin; the runtime still
+# verifies their SHA-1 before booting.
+set(NDS_EMBED_DUMPS_DIR "" CACHE PATH
+    "Folder with biosnds7.rom, biosnds9.rom, firmware.bin to embed")
+set(_nds_have_embedded 0)
+if(NDS_EMBED_DUMPS_DIR AND EXISTS "${NDS_EMBED_DUMPS_DIR}/biosnds7.rom"
+   AND EXISTS "${NDS_EMBED_DUMPS_DIR}/biosnds9.rom"
+   AND EXISTS "${NDS_EMBED_DUMPS_DIR}/firmware.bin")
+    set(_nds_have_embedded 1)
+    foreach(_dump biosnds7.rom biosnds9.rom firmware.bin)
+        set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS
+            "${NDS_EMBED_DUMPS_DIR}/${_dump}")
+        file(READ "${NDS_EMBED_DUMPS_DIR}/${_dump}" _hex HEX)
+        string(REGEX REPLACE "(..)" "0x\\1," _bytes "${_hex}")
+        file(CONFIGURE OUTPUT
+            "${CMAKE_CURRENT_BINARY_DIR}/generated/embedded_${_dump}.inc"
+            CONTENT "${_bytes}\n" @ONLY)
+    endforeach()
+    message(STATUS "Embedding BIOS and firmware dumps from ${NDS_EMBED_DUMPS_DIR}")
+    set_property(SOURCE src/player_launch.cpp APPEND PROPERTY COMPILE_DEFINITIONS
+        "NDS_EMBEDDED_DUMPS=1")
+endif()
 set_property(SOURCE src/player_launch.cpp APPEND PROPERTY COMPILE_DEFINITIONS
     "NDS_SOURCE_BIOS_DIR=\"${CMAKE_CURRENT_SOURCE_DIR}/../bios\"")
 

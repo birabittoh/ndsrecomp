@@ -1,6 +1,8 @@
 #pragma once
 
+#include <cstdint>
 #include <string>
+#include <vector>
 
 #include "frontend.h"
 
@@ -29,6 +31,7 @@ struct NdsPlayerLaunch {
     std::string rom;
     std::string bios_dir;
     std::string firmware;
+    bool embedded_dumps = false;  // dumps come from the executable
     std::string save;
     std::string savestate_dir;
     std::string log_dir;
@@ -37,6 +40,12 @@ struct NdsPlayerLaunch {
 };
 
 bool nds_player_requested(int argc, char** argv);
+
+// The dumps baked in with -DNDS_EMBED_DUMPS_DIR. False when this build has
+// none, in which case the player supplies a folder instead.
+bool nds_player_embedded_dumps(std::vector<uint8_t>* arm9_bios,
+                               std::vector<uint8_t>* arm7_bios,
+                               std::vector<uint8_t>* firmware);
 
 // Load the embedded config and settings.toml into `options`, then find the
 // ROM and BIOS, asking the player for whichever is unknown and remembering
