@@ -798,8 +798,8 @@ void nds_diagnostics_maybe_write_performance_sample(
         "\"transitions\":%llu,\"compute_readback_ms\":%.3f},"
         "\"gx\":{\"vblanks\":%llu,\"swaps\":%llu,\"new_images\":%llu,"
         "\"swap_polygons\":%llu,\"lcd_flips\":%llu,"
-        "\"interp_images\":%llu,\"interp_polygons\":%llu,"
-        "\"interp_blended\":%llu},"
+        "\"interp_images\":%llu,\"interp_units\":%llu,"
+        "\"interp_blended_units\":%llu,\"interp_skipped\":%llu},"
         "\"cycles\":{\"arm9\":%llu,\"arm7\":%llu},"
         "\"tier3_delta\":{\"arm9\":{\"entries\":%llu,"
         "\"instructions\":%llu,\"clean_ram_rejects\":%llu},"
@@ -848,10 +848,12 @@ void nds_diagnostics_maybe_write_performance_sample(
                                     g_prev_gpu3d.gx_lcd_flips),
         (unsigned long long)sub_u64(gpu3d.gx_interp_images,
                                     g_prev_gpu3d.gx_interp_images),
-        (unsigned long long)sub_u64(gpu3d.gx_interp_polygons,
-                                    g_prev_gpu3d.gx_interp_polygons),
-        (unsigned long long)sub_u64(gpu3d.gx_interp_blended,
-                                    g_prev_gpu3d.gx_interp_blended),
+        (unsigned long long)sub_u64(gpu3d.gx_interp_units,
+                                    g_prev_gpu3d.gx_interp_units),
+        (unsigned long long)sub_u64(gpu3d.gx_interp_blended_units,
+                                    g_prev_gpu3d.gx_interp_blended_units),
+        (unsigned long long)sub_u64(gpu3d.gx_interp_skipped,
+                                    g_prev_gpu3d.gx_interp_skipped),
         (unsigned long long)sched_state.cycles[0],
         (unsigned long long)sched_state.cycles[1],
         (unsigned long long)sub_u64(tier3.entries[0],

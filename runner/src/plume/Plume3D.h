@@ -15,7 +15,7 @@
 
 #include <cstdint>
 
-namespace melonDS { class GPU; }
+namespace melonDS { class GPU; struct Polygon; }
 
 // Host lifetime: after the device exists, and before it goes away.
 bool nds_plume3d_start();
@@ -25,10 +25,12 @@ bool nds_plume3d_ready();
 // The raster the next frame is drawn at. Clamped to [native, device limit].
 void nds_plume3d_request_size(uint32_t width, uint32_t height);
 
-// Draws the render list GPU3D latched at VBlank, after the faithful
-// renderer's RenderFrame (which made the flat texture views coherent).
-// texture_generation changes whenever those views were refreshed.
-void nds_plume3d_render(const melonDS::GPU& gpu, uint64_t texture_generation);
+// Draws a render list (the one GPU3D latched at VBlank, or smooth_3d's
+// halfway list) after the faithful renderer's RenderFrame, which made the
+// flat texture views coherent. texture_generation changes whenever those
+// views were refreshed.
+void nds_plume3d_render(const melonDS::GPU& gpu, melonDS::Polygon* const* polygons,
+                        uint32_t count, uint64_t texture_generation);
 
 // The 3D layer is empty (AbortFrame) or not ours to draw: the presenter
 // falls back to the CPU composite until the next nds_plume3d_render.

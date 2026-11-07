@@ -493,8 +493,13 @@ void plume_render_frame() {
         return;
     }
     // Both views are refreshed from one VRAM generation counter.
-    nds_plume3d_render(g_nds.GPU, g_texture_flat_gen * 0x9E3779B97F4A7C15ull ^
-                                      g_texpal_flat_gen);
+    // smooth_3d's halfway image is drawn here only: the faithful renderer
+    // above drew the real list.
+    melonDS::Polygon* const* list = g3.RenderPolygonRAM.data();
+    uint32_t count = g3.RenderNumPolygons;
+    nds_gx_interp_presented(&list, &count);
+    nds_plume3d_render(g_nds.GPU, list, count,
+                       g_texture_flat_gen * 0x9E3779B97F4A7C15ull ^ g_texpal_flat_gen);
 }
 #endif
 
@@ -1252,6 +1257,7 @@ void nds_gpu3d_reset() {
     std::memset(g_gx_write_trace, 0, sizeof g_gx_write_trace);
     g_gx_write_trace_count = 0;
     g_gpu3d_profile = NdsGpu3dProfile{};
+    nds_gx_interp_reset();
 #if defined(NDS_GPU3D_GL_BRIDGE)
     g_compute_rendered_frame = false;
     g_compute_readback_pending = false;
@@ -1527,17 +1533,50 @@ void nds_gpu3d_set_interpolation(bool enabled) {
     g_gx_interpolation = enabled;
 }
 
+// NDS_GX_CMD_TRACE=<file> records each new 3D image's command stream and the
+// render list it produced (gpu3d_gxstream.h), for developing smooth_3d
+// offline. Independent of NDS_GX_TRACE.
+static FILE* gx_command_trace_file() {
+    static FILE* file = [] {
+        const char* path = std::getenv("NDS_GX_CMD_TRACE");
+        if (!path || !*path) return static_cast<FILE*>(nullptr);
+        FILE* opened = std::fopen(path, "wb");
+        if (opened) {
+            std::setvbuf(opened, nullptr, _IOFBF, 1 << 22);
+            std::fprintf(stderr, "[gx] tracing commands to %s\n", path);
+        } else {
+            std::fprintf(stderr, "[gx] cannot trace commands to %s: %s\n", path,
+                         std::strerror(errno));
+        }
+        nds_gx_interp_set_trace(opened);
+        return opened;
+    }();
+    return file;
+}
+
 void nds_gpu3d_vblank() {
+    gx_command_trace_file();
     const Gx3dFrame frame = count_3d_frame();
     auto& g3 = g_nds.GPU.GPU3D;
+    // VBlank consumes a SWAP_BUFFERS whenever geometry is on, shown or not.
+    const bool flushed = g3.GeometryEnabled && g3.FlushRequest;
     g3.VBlank();
+#if defined(NDS_USE_PLUME)
+    // The soft renderer stays faithful; only the Plume raster shows the
+    // halfway image, so smoothing needs that raster.
+    const bool active = g_gx_interpolation && nds_plume3d_ready() && g_internal_scale > 1u;
+    const NdsGxInterpTarget target = NdsGxInterpTarget::Presentation;
+#else
+    const bool active = g_gx_interpolation && g3.IsRendererAccelerated();
+    const NdsGxInterpTarget target = NdsGxInterpTarget::RenderList;
+#endif
     NdsGxInterpStats stats{};
-    nds_gx_interp_after_vblank(
-        g3, g_gx_interpolation && g3.IsRendererAccelerated(), frame.swap,
-        frame.new_image, &stats);
+    nds_gx_interp_after_vblank(g3, g_nds, active, target, flushed, frame.swap,
+                               frame.new_image, &stats);
     g_gpu3d_profile.gx_interp_images += stats.images;
-    g_gpu3d_profile.gx_interp_polygons += stats.polygons;
-    g_gpu3d_profile.gx_interp_blended += stats.blended;
+    g_gpu3d_profile.gx_interp_units += stats.units;
+    g_gpu3d_profile.gx_interp_blended_units += stats.blended_units;
+    g_gpu3d_profile.gx_interp_skipped += stats.skipped;
 }
 
 void nds_gpu3d_vcount215() {
