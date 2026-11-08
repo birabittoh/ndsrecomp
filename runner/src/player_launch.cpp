@@ -5,6 +5,7 @@
 #include <cctype>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <filesystem>
 #include <fstream>
 #include <vector>
@@ -274,11 +275,21 @@ bool rom_matches(const fs::path& path, const std::string& expected_sha1) {
     return gba::sha1(bytes.data(), bytes.size()).hex() == expected_sha1;
 }
 
-bool bios_complete(const fs::path& dir) {
+// Generated firmware (system.generated_firmware) needs only the two BIOS
+// dumps; firmware.bin is then neither asked for nor loaded.
+bool bios_complete(const fs::path& dir, bool need_firmware) {
     return std::all_of(std::begin(kBiosFiles), std::end(kBiosFiles),
                        [&](const char* name) {
+                           if (!need_firmware &&
+                               std::strcmp(name, "firmware.bin") == 0)
+                               return true;
                            return fs::is_regular_file(dir / name);
                        });
+}
+
+const char* bios_files_wanted(bool need_firmware) {
+    return need_firmware ? "biosnds7.rom, biosnds9.rom and firmware.bin"
+                         : "biosnds7.rom and biosnds9.rom";
 }
 
 bool remember(const fs::path& settings, const char* key,
@@ -338,6 +349,7 @@ bool resolve_rom(const fs::path& root, const fs::path& settings,
 bool resolve_bios(const fs::path& root, const fs::path& settings,
                   const NdsFrontendOptions& options, fs::path* bios,
                   bool* cancelled) {
+    const bool need_firmware = !options.generated_firmware;
     std::vector<fs::path> candidates;
     if (!options.paths.bios.empty())
         candidates.push_back(resolve_stored(root, options.paths.bios));
@@ -347,7 +359,7 @@ bool resolve_bios(const fs::path& root, const fs::path& settings,
     candidates.push_back(NDS_SOURCE_BIOS_DIR);
 #endif
     for (const fs::path& dir : candidates) {
-        if (bios_complete(dir)) {
+        if (bios_complete(dir, need_firmware)) {
             *bios = dir.lexically_normal();
             return true;
         }
@@ -355,26 +367,26 @@ bool resolve_bios(const fs::path& root, const fs::path& settings,
     for (;;) {
         std::string picked;
         switch (pick_folder(
-            "Select the folder with biosnds7.rom, biosnds9.rom and "
-            "firmware.bin", &picked)) {
+            std::string("Select the folder with ") +
+                bios_files_wanted(need_firmware), &picked)) {
             case DialogResult::Picked:
                 break;
             case DialogResult::Cancelled:
                 *cancelled = true;
                 return false;
             case DialogResult::Unavailable:
-                nds_player_error("Put biosnds7.rom, biosnds9.rom and "
-                                 "firmware.bin in " +
+                nds_player_error(std::string("Put ") +
+                                 bios_files_wanted(need_firmware) + " in " +
                                  (root / "bios").string() + ".");
                 return false;
         }
-        if (bios_complete(picked)) {
+        if (bios_complete(picked, need_firmware)) {
             *bios = picked;
             remember(settings, "bios", to_stored(root, picked));
             return true;
         }
-        nds_player_error(picked + " must contain biosnds7.rom, biosnds9.rom "
-                                  "and firmware.bin.");
+        nds_player_error(picked + " must contain " +
+                         bios_files_wanted(need_firmware) + ".");
     }
 }
 
@@ -473,8 +485,11 @@ bool nds_player_prepare(int argc, char** argv, NdsFrontendOptions* options,
     }
     out->rom = rom.string();
     out->bios_dir = bios.string();
-    out->firmware = embedded ? std::string()
-                             : (bios / "firmware.bin").string();
+    // A generated image replaces the dump; passing the dump's path too
+    // would make main refuse --generated-firmware with --firmware-path.
+    out->firmware = embedded || options->generated_firmware
+        ? std::string()
+        : (bios / "firmware.bin").string();
     out->embedded_dumps = embedded;
     out->save = options->paths.save.empty()
         ? (root / "saves" / (app + ".sav")).string()
