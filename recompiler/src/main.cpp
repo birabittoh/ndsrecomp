@@ -492,6 +492,248 @@ const ResolvedHleRoutine* find_hle_routine(
     return nullptr;
 }
 
+// ── Mid-instruction hooks (docs/midasm-hooks.md) ─────────────────────────
+//
+// At most one before- and one after-hook per (pc, mode); the manifest loader
+// rejects duplicates so the call order at a site is never implicit.
+struct HookSite {
+    const ConfigHook* before = nullptr;
+    const ConfigHook* after = nullptr;
+};
+using HookSites = std::unordered_map<uint64_t, HookSite>;
+
+// Decode the instruction an emitted function holds at guest `pc`, reading
+// through the function's source mapping exactly as emit_function_body does.
+bool decode_emitted_instr(const Function& fn, uint32_t pc, const uint8_t* rom,
+                          std::size_t rom_size, uint32_t rom_base,
+                          armv4t::Instr* out) {
+    const uint32_t step = fn.mode == CpuMode::Thumb ? 2u : 4u;
+    if (pc < fn.addr || pc >= fn.end_addr || (pc - fn.addr) % step != 0u)
+        return false;
+    const uint64_t source =
+        uint64_t{fn.source_addr ? fn.source_addr : fn.addr} + (pc - fn.addr);
+    if (source < rom_base || source - rom_base + step > rom_size) return false;
+    const std::size_t off = static_cast<std::size_t>(source - rom_base);
+    if (fn.mode == CpuMode::Thumb) {
+        *out = armv4t::ThumbDecoder::decode(
+            static_cast<uint16_t>(rom[off] | (rom[off + 1] << 8)), pc);
+    } else {
+        *out = armv4t::ArmDecoder::decode(
+            static_cast<uint32_t>(rom[off]) |
+            (static_cast<uint32_t>(rom[off + 1]) << 8) |
+            (static_cast<uint32_t>(rom[off + 2]) << 16) |
+            (static_cast<uint32_t>(rom[off + 3]) << 24), pc);
+    }
+    return true;
+}
+
+// Bind every manifest hook to the functions this bank will emit. A hook is a
+// statement about guest bytes, so each must land on a real, emitted
+// instruction start of the declared mode; anything else (a typo, an address
+// the finder never reached, a row pruned in favour of an earlier bank) would
+// silently never fire, and fails here instead.
+bool resolve_hooks(const HookManifest& manifest, const Config& cfg,
+                   const std::string& bank,
+                   const std::vector<Function>& funcs,
+                   const std::unordered_set<uint64_t>& pruned_keys,
+                   const uint8_t* rom, std::size_t rom_size, HookSites& out) {
+    if (manifest.bank != bank) {
+        std::fprintf(stderr,
+            "[emit] hook manifest bank '%s' does not match --bank '%s'\n",
+            manifest.bank.c_str(), bank.c_str());
+        return false;
+    }
+    std::string program_sha1 = cfg.identity.sha1;
+    std::transform(program_sha1.begin(), program_sha1.end(),
+                   program_sha1.begin(), [](unsigned char c) {
+                       return static_cast<char>(std::tolower(c));
+                   });
+    if (program_sha1.rfind("0x", 0u) == 0u) program_sha1.erase(0u, 2u);
+    if (manifest.program_sha1 != program_sha1) {
+        std::fprintf(stderr,
+            "[emit] hook manifest program SHA-1 %s does not match the "
+            "verified --bin image %s\n",
+            manifest.program_sha1.c_str(), program_sha1.c_str());
+        return false;
+    }
+    auto holders = [&](uint32_t pc, CpuMode mode) {
+        std::vector<const Function*> found;
+        for (const Function& fn : funcs) {
+            if (fn.mode != mode) continue;
+            armv4t::Instr ins;
+            if (decode_emitted_instr(fn, pc, rom, rom_size,
+                                     cfg.program.load_address, &ins))
+                found.push_back(&fn);
+        }
+        return found;
+    };
+    for (const ConfigHook& hook : manifest.hooks) {
+        const char* mode = hook.mode == CpuMode::Thumb ? "thumb" : "arm";
+        const auto found = holders(hook.address, hook.mode);
+        if (found.empty()) {
+            std::fprintf(stderr,
+                "[emit] hook '%s': 0x%08X (%s) is not an instruction of any "
+                "function emitted into bank '%s' (declare an [[entry_point]] "
+                "if the finder does not reach it)\n",
+                hook.name.c_str(), hook.address, mode, bank.c_str());
+            return false;
+        }
+        if (pruned_keys.count(function_key(hook.address, hook.mode)) != 0u) {
+            std::fprintf(stderr,
+                "[emit] hook '%s': the dispatch row for 0x%08X (%s) is pruned "
+                "in favour of a preceding bank, so entries there would bypass "
+                "the hook; hook it in that bank instead\n",
+                hook.name.c_str(), hook.address, mode);
+            return false;
+        }
+        armv4t::Instr ins;
+        decode_emitted_instr(*found.front(), hook.address, rom, rom_size,
+                             cfg.program.load_address, &ins);
+        if (hook.when == HookWhen::After &&
+            (ins.is_branch || ins.is_call || ins.is_pc_writing ||
+             ins.is_undefined)) {
+            std::fprintf(stderr,
+                "[emit] hook '%s': an after hook cannot follow 0x%08X `%s`, "
+                "which does not fall through on every path\n",
+                hook.name.c_str(), hook.address,
+                armv4t::format_ir(ins).c_str());
+            return false;
+        }
+        const bool jumps = hook.returns_bool
+            ? (hook.on_true == HookAction::Jump ||
+               hook.on_false == HookAction::Jump)
+            : hook.action == HookAction::Jump;
+        if (jumps && holders(hook.jump_address, hook.mode).empty()) {
+            std::fprintf(stderr,
+                "[emit] hook '%s': jump_address 0x%08X is not a %s "
+                "instruction of any function emitted into bank '%s'\n",
+                hook.name.c_str(), hook.jump_address, mode, bank.c_str());
+            return false;
+        }
+        HookSite& site = out[function_key(hook.address, hook.mode)];
+        (hook.when == HookWhen::Before ? site.before : site.after) = &hook;
+    }
+    return true;
+}
+
+std::string hook_call_expr(const ConfigHook& hook) {
+    std::string call = hook.name + "(";
+    for (std::size_t i = 0; i < hook.registers.size(); ++i) {
+        if (i) call += ", ";
+        const uint8_t slot = hook.registers[i];
+        call += slot == kHookArgCpsr ? std::string("&g_cpu.cpsr")
+                                     : "&g_cpu.R[" + std::to_string(slot) + "]";
+    }
+    return call + ")";
+}
+
+// Declares only the handlers this shard calls, in manifest order, so editing
+// one hook leaves every other shard's bytes (and its object file) unchanged.
+void emit_hook_declarations(std::FILE* f, const HookManifest& manifest,
+                            const HookSites& sites,
+                            const std::vector<Function>& funcs,
+                            std::size_t first, std::size_t last) {
+    std::unordered_set<const ConfigHook*> used;
+    for (std::size_t index = first; index < last; ++index) {
+        const Function& fn = funcs[index];
+        const uint32_t step = fn.mode == CpuMode::Thumb ? 2u : 4u;
+        for (uint32_t pc = fn.addr; pc < fn.end_addr; pc += step) {
+            auto found = sites.find(function_key(pc, fn.mode));
+            if (found == sites.end()) continue;
+            if (found->second.before) used.insert(found->second.before);
+            if (found->second.after) used.insert(found->second.after);
+        }
+    }
+    if (used.empty()) return;
+    std::unordered_set<std::string> declared;
+    std::fputs("/* Title hook handlers (docs/midasm-hooks.md). */\n", f);
+    for (const ConfigHook& hook : manifest.hooks) {
+        if (used.count(&hook) == 0u) continue;
+        if (!declared.insert(hook.name).second) continue;
+        std::string params;
+        for (std::size_t i = 0; i < hook.registers.size(); ++i)
+            params += i ? ", uint32_t*" : "uint32_t*";
+        std::fprintf(f, "extern %s %s(%s);\n",
+                     hook.returns_bool ? "bool" : "void", hook.name.c_str(),
+                     params.empty() ? "void" : params.c_str());
+    }
+    std::fputs("\n", f);
+}
+
+// Lower a hook-selected `return` / `jump` by running a synthetic `bx lr` or
+// `b <target>` at the hooked PC through the normal instruction emitter, so
+// interworking, the host call-stack return check, link slots and the
+// transfer's own cycle charge are exactly what that guest instruction would
+// produce. The block braces scope its pc-named temporaries away from the
+// real instruction's, which follows at the same label.
+std::string emit_hook_outcome(HookAction action, const ConfigHook& hook,
+                              const armv4t::CodegenCtx& ctx) {
+    if (action == HookAction::Continue) return std::string();
+    const bool thumb = hook.mode == CpuMode::Thumb;
+    armv4t::Instr synth;
+    if (action == HookAction::Return) {
+        synth = thumb ? armv4t::ThumbDecoder::decode(0x4770u, hook.address)
+                      : armv4t::ArmDecoder::decode(0xE12FFF1Eu, hook.address);
+    } else {
+        synth = thumb ? armv4t::ThumbDecoder::decode(0xE000u, hook.address)
+                      : armv4t::ArmDecoder::decode(0xEA000000u, hook.address);
+        synth.branch_target = hook.jump_address;
+    }
+    armv4t::CodegenCtx synth_ctx = ctx;
+    synth_ctx.force_bx_c_return = false;
+    synth_ctx.inline_leaves = nullptr;
+    bool not_implemented = false;
+    std::string text = armv4t::ArmCodegen::emit_instr(synth, synth_ctx,
+                                                      &not_implemented);
+    if (not_implemented) {
+        std::fprintf(stderr, "[emit] internal error: hook outcome for '%s' "
+                     "did not lower\n", hook.name.c_str());
+        std::exit(1);
+    }
+    return text;
+}
+
+// Emit a hook call at one instruction boundary.
+//
+// before: placed after the instruction's label, behind its own copy of the
+// instruction's yield check. A yield there returns with the hook not yet
+// run, and the resume enters the same label and re-checks, so the handler
+// runs exactly once per executed instance of the instruction. The
+// instruction's own (identical) check that follows sees the same scheduler
+// state, because a handler performs no ticks.
+//
+// after: placed after the instruction's tick and unwind check, before the
+// next label, so a resume at the next PC does not re-run it.
+void emit_hook_site(std::FILE* f, const ConfigHook& hook, uint32_t pc,
+                    const armv4t::CodegenCtx& ctx) {
+    const bool before = hook.when == HookWhen::Before;
+    std::fprintf(f, "    /* hook %s (%s) */\n", hook.name.c_str(),
+                 before ? "before" : "after");
+    if (before)
+        std::fprintf(f,
+            "    g_cpu.R[15] = 0x%08Xu;\n"
+            "    if (runtime_should_yield()) return;\n", pc);
+    const std::string call = hook_call_expr(hook);
+    if (!hook.returns_bool) {
+        std::fprintf(f, "    %s;\n", call.c_str());
+        const std::string outcome = emit_hook_outcome(hook.action, hook, ctx);
+        if (!outcome.empty())
+            std::fprintf(f, "    {\n%s    }\n", outcome.c_str());
+        return;
+    }
+    const std::string on_true = emit_hook_outcome(hook.on_true, hook, ctx);
+    const std::string on_false = emit_hook_outcome(hook.on_false, hook, ctx);
+    if (on_false.empty())
+        std::fprintf(f, "    if (%s) {\n%s    }\n", call.c_str(),
+                     on_true.c_str());
+    else if (on_true.empty())
+        std::fprintf(f, "    if (!%s) {\n%s    }\n", call.c_str(),
+                     on_false.c_str());
+    else
+        std::fprintf(f, "    if (%s) {\n%s    } else {\n%s    }\n",
+                     call.c_str(), on_true.c_str(), on_false.c_str());
+}
+
 // ── Tiny-leaf inlining pass (beads-yjp.67) ───────────────────────────────
 //
 // A "tiny leaf" is a guest function that is entirely a straight-line
@@ -685,7 +927,9 @@ void emit_function_body(std::FILE* f, const Function& fn,
                             inline_leaves,
                         unsigned* inline_leaf_sites,
                         uint32_t local_label_addr,
-                        uint32_t local_label_end_addr) {
+                        uint32_t local_label_end_addr,
+                        const HookSites* hooks,
+                        unsigned* hook_sites) {
     const uint32_t step = (fn.mode == CpuMode::Thumb) ? 2u : 4u;
     armv4t::CodegenCtx ctx;
     ctx.names_by_key = &func_names_by_key;
@@ -879,10 +1123,23 @@ void emit_function_body(std::FILE* f, const Function& fn,
 
         std::fprintf(f, "    /* %08X  %s */\n", pc,
                      armv4t::format_ir(ins).c_str());
+        const HookSite* site = nullptr;
+        if (hooks) {
+            auto found = hooks->find(function_key(pc, fn.mode));
+            if (found != hooks->end()) site = &found->second;
+        }
+        if (site && site->before) {
+            emit_hook_site(f, *site->before, pc, ctx);
+            if (hook_sites) ++*hook_sites;
+        }
         bool ni = false;
         ctx.force_bx_c_return = bx_c_return_pcs.count(pc) != 0;
         std::fputs(armv4t::ArmCodegen::emit_instr(ins, ctx, &ni).c_str(), f);
         (void)ni;  // abort path is in the emit; tracked at audit time
+        if (site && site->after) {
+            emit_hook_site(f, *site->after, pc, ctx);
+            if (hook_sites) ++*hook_sites;
+        }
         pc += step;
     }
     // Fall-through tail dispatch: if the body ended by hitting end_addr
@@ -1160,7 +1417,10 @@ void write_bank_body(const std::string& dir,
                      bool msr_fast_path,
                      const std::unordered_map<uint64_t, armv4t::InlineLeaf>&
                          inline_leaves,
-                     unsigned* inline_leaf_sites) {
+                     unsigned* inline_leaf_sites,
+                     const HookManifest* hook_manifest,
+                     const HookSites* hooks,
+                     unsigned* hook_sites) {
     std::unordered_map<uint64_t, std::string> name_by_key;
     // Direct C calls stay within a body shard. Cross-shard transfers use the
     // normal runtime dispatcher, which keeps shards independently compilable
@@ -1188,6 +1448,8 @@ void write_bank_body(const std::string& dir,
         "   is never consulted at runtime — an unlowered op aborts via\n"
         "   runtime_unimplemented_op (PRINCIPLES.md). */\n"
         "#include \"runtime_arm.h\"\n\n");
+    if (hook_manifest && hooks)
+        emit_hook_declarations(f, *hook_manifest, *hooks, funcs, first, last);
     if (g_flat_execution)
         std::fputs("#define NDS_FLAT_GENERATED_BODY 1\n#include \"execution_region.h\"\n\n",f);
     std::unordered_set<std::string> shard_bodies;
@@ -1262,7 +1524,7 @@ void write_bank_body(const std::string& dir,
                 !coalesced, member + 1u < block_end,
                 trace_live_transfers, msr_fast_path,
                 shard_leaves.empty() ? nullptr : &shard_leaves,
-                inline_leaf_sites, block_lo, block_hi);
+                inline_leaf_sites, block_lo, block_hi, hooks, hook_sites);
         }
         std::fprintf(f, "}\n\n");
         if (hle) {
@@ -1288,6 +1550,7 @@ void write_bank_body(const std::string& dir,
 
 int main(int argc, char** argv) {
     std::string config_path, bin_path, out_dir, bank, hle_manifest_path;
+    std::string hook_manifest_path;
     std::vector<std::string> preceding_dispatch_paths;
     bool audit = false;
     bool validate_live_bytes = false;
@@ -1328,6 +1591,7 @@ int main(int argc, char** argv) {
         else if (a == "--out") out_dir = next();
         else if (a == "--bank") bank = next();
         else if (a == "--hle-manifest") hle_manifest_path = next();
+        else if (a == "--hooks") hook_manifest_path = next();
         else if (a == "--preceding-dispatch")
             preceding_dispatch_paths.push_back(next());
         else if (a == "--audit") audit = true;
@@ -1412,6 +1676,20 @@ int main(int argc, char** argv) {
         }
         if (!load_hle_profile_manifest(hle_manifest_path, hle_manifest))
             return 1;
+    }
+
+    HookManifest hook_manifest;
+    if (!hook_manifest_path.empty()) {
+        // Hooks are baked into emitted bodies: there is nothing to attach
+        // them to without emission, and the flat region emitter is a
+        // separate lowering that does not honour them.
+        if (audit || dispatch_only || bank.empty() || g_flat_execution) {
+            std::fprintf(stderr,
+                "--hooks requires body emission and an explicit --bank, and "
+                "is incompatible with --flat-execution\n");
+            return 2;
+        }
+        if (!load_hook_manifest(hook_manifest_path, hook_manifest)) return 1;
     }
 
     Image img{bin.data(), bin.size(), cfg.program.load_address};
@@ -1692,6 +1970,11 @@ int main(int argc, char** argv) {
                                   finder.functions(), funcs, bin.data(),
                                   bin.size(), hle_routines))
             return 1;
+        HookSites hook_sites;
+        if (!hook_manifest_path.empty() &&
+            !resolve_hooks(hook_manifest, cfg, bank, funcs, pruned_keys,
+                           bin.data(), bin.size(), hook_sites))
+            return 1;
         auto emission_addr = [](const Function& fn) {
             return fn.source_addr ? fn.source_addr : fn.addr;
         };
@@ -1733,11 +2016,31 @@ int main(int argc, char** argv) {
         unsigned emitted_shards = 0u;
         unsigned inline_leaf_count = 0u;
         unsigned inline_leaf_sites = 0u;
-        const std::unordered_map<uint64_t, armv4t::InlineLeaf> inline_leaves =
+        std::unordered_map<uint64_t, armv4t::InlineLeaf> inline_leaves =
             build_inline_leaves(funcs, superblocks, bin.data(), bin.size(),
                                 cfg.program.load_address, names,
                                 inline_leaf_max_insns, hle_routines,
                                 pruned_keys, &inline_leaf_count);
+        // An inlined copy of a leaf would run its instructions without the
+        // hook calls its own body carries, so a hooked leaf is never inlined.
+        unsigned hooked_leaves = 0u;
+        for (auto it = inline_leaves.begin(); it != inline_leaves.end();) {
+            const armv4t::InlineLeaf& leaf = it->second;
+            const CpuMode mode = leaf.thumb ? CpuMode::Thumb : CpuMode::Arm;
+            const uint32_t step = leaf.thumb ? 2u : 4u;
+            bool hooked = false;
+            for (uint32_t pc = leaf.addr; pc <= leaf.terminator_pc && !hooked;
+                 pc += step)
+                hooked = hook_sites.count(function_key(pc, mode)) != 0u;
+            if (hooked) {
+                it = inline_leaves.erase(it);
+                ++hooked_leaves;
+            } else {
+                ++it;
+            }
+        }
+        inline_leaf_count -= hooked_leaves;
+        unsigned emitted_hook_sites = 0u;
         if (!dispatch_only) {
             write_bank_header(out_dir, funcs, names);
             if (shards == 0u) shards = 1u;
@@ -1761,7 +2064,11 @@ int main(int argc, char** argv) {
                                 hle_routines,
                                 msr_fast_path,
                                 inline_leaves,
-                                &inline_leaf_sites);
+                                &inline_leaf_sites,
+                                hook_manifest_path.empty()
+                                    ? nullptr : &hook_manifest,
+                                hook_sites.empty() ? nullptr : &hook_sites,
+                                &emitted_hook_sites);
                 ++emitted_shards;
             };
             if (stable_address_shards) {
@@ -1831,6 +2138,19 @@ int main(int argc, char** argv) {
                     inline_leaf_count, inline_leaf_max_insns,
                     inline_leaf_sites, inline_leaf_sites == 1u ? "" : "s",
                     inline_leaf_max_insns == 0u ? " [pass disabled]" : "");
+        if (!hook_manifest_path.empty()) {
+            std::printf("[emit] hooks: %zu declared in %s, %u site%s emitted, "
+                        "%u hooked %s kept out of line\n",
+                        hook_manifest.hooks.size(),
+                        hook_manifest_path.c_str(), emitted_hook_sites,
+                        emitted_hook_sites == 1u ? "" : "s", hooked_leaves,
+                        hooked_leaves == 1u ? "leaf" : "leaves");
+            if (emitted_hook_sites < hook_manifest.hooks.size()) {
+                std::fprintf(stderr,
+                    "[emit] internal error: a resolved hook was not emitted\n");
+                return 1;
+            }
+        }
         if (!msr_fast_path)
             std::printf("[emit] MSR CPSR fast path DISABLED "
                         "(--no-msr-fast-path)\n");

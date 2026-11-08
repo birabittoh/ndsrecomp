@@ -127,6 +127,19 @@ if(Python3_Interpreter_FOUND)
         --core-include "${CMAKE_CURRENT_LIST_DIR}/../external/arm-recomp-core/common"
         --work "${CMAKE_CURRENT_BINARY_DIR}/flat-execution-work")
   endif()
+  if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang" AND NOT MSVC)
+    # Compiles and executes a hooked fixture bank (docs/midasm-hooks.md).
+    # The bank is C; the test drives the same toolchain with `-x c`.
+    add_test(NAME hooks_end_to_end
+      COMMAND "${Python3_EXECUTABLE}"
+        "${CMAKE_CURRENT_LIST_DIR}/tests/test_hooks.py"
+        --recompiler $<TARGET_FILE:nds_recompile>
+        --compiler "${CMAKE_CXX_COMPILER}"
+        --runtime-include "${CMAKE_CURRENT_LIST_DIR}/armv4t"
+        --core-include
+            "${CMAKE_CURRENT_LIST_DIR}/../external/arm-recomp-core/common"
+        --work "${CMAKE_CURRENT_BINARY_DIR}/hooks-work")
+  endif()
   add_test(
       NAME live_shard_identity_test
       COMMAND "${Python3_EXECUTABLE}"
