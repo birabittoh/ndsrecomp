@@ -819,6 +819,25 @@ if(NDS_MKDS_IMPLEMENTATION STREQUAL "HLE")
 endif()
 message(STATUS "MKDS implementation: ${NDS_MKDS_IMPLEMENTATION}")
 message(STATUS "MKDS card PIO implementation: ${NDS_MKDS_CARD_PIO_IMPLEMENTATION}")
+# Title-owned handlers for hooks baked into title banks by
+# `nds_recompile --hooks` (docs/midasm-hooks.md). A bank generated with hooks
+# references its handlers by name, so leaving them out fails at link time
+# rather than at run time. Sources compile only into nds_runner, never into
+# the bank archive, so editing a handler does not rebuild any bank.
+set(NDS_TITLE_HOOK_SOURCES "" CACHE STRING
+    "Semicolon list of C/C++ sources defining title hook handlers")
+if(NDS_TITLE_HOOK_SOURCES)
+    foreach(_hook_source IN LISTS NDS_TITLE_HOOK_SOURCES)
+        if(NOT IS_ABSOLUTE "${_hook_source}" OR NOT EXISTS "${_hook_source}")
+            message(FATAL_ERROR
+                "NDS_TITLE_HOOK_SOURCES entry '${_hook_source}' must be an "
+                "existing absolute path")
+        endif()
+    endforeach()
+    target_sources(nds_runner PRIVATE ${NDS_TITLE_HOOK_SOURCES})
+    list(LENGTH NDS_TITLE_HOOK_SOURCES _hook_source_count)
+    message(STATUS "Title hook sources: ${_hook_source_count}")
+endif()
 ndsrecomp_limit_link(nds_runner)
 if(NDS_CORE_IPO)
     # Do not enable global IPO: imported banks, the native SDK and slirp keep
