@@ -7,6 +7,7 @@
 #include "Platform.h"
 #include "Savestate.h"
 
+#include <cmath>
 #include <cstdio>
 #include <cstdlib>
 #include <functional>
@@ -262,6 +263,58 @@ void test_jump() {
     check(!nds_gx_lerp_streams(a, b, 0.5f, &mid, nullptr), "a jump does not blend");
 }
 
+
+// A bone turning fast (100 degrees between images, past what per-entry limits
+// allow) blends as a rotation: halfway it is turned 50 degrees and keeps its
+// length, where averaging the entries would shrink it to a third.
+void test_fast_turn() {
+    auto turned = [](double degrees) {
+        const double r = degrees * 3.14159265358979 / 180;
+        const int32_t c = int32_t(std::lround(std::cos(r) * kOne));
+        const int32_t sn = int32_t(std::lround(std::sin(r) * kOne));
+        Builder b;
+        b.begin();
+        b.model(0);
+        // MTX_MULT_3x3, rows (c, s, 0), (-s, c, 0), (0, 0, 1).
+        b.cmd(0x1A, {uint32_t(c), uint32_t(sn), 0, uint32_t(-sn), uint32_t(c), 0, 0, 0,
+                     uint32_t(kOne)});
+        b.triangle(0x800);
+        b.swap();
+        return b;
+    };
+    Engine e;
+    NdsGxStream a, b, mid;
+    check(e.frame(turned(0), &a), "image a");
+    check(e.frame(turned(100), &b), "image b");
+    NdsGxLerpStats stats;
+    check(nds_gx_lerp_streams(a, b, 0.5f, &mid, &stats) && stats.blended_units == 1,
+          "a fast turn blends");
+    NdsGxReplayer replayer(e.nds);
+    check(replayer.run(mid) && replayer.count() == 1, "halfway image draws");
+    if (replayer.count() != 1) return;
+    // The triangle's corner on the local x axis, relative to the origin
+    // corner at the screen centre.
+    const Polygon& p = *replayer.polygons()[0];
+    double best = 0, angle = 0;
+    for (uint32_t v = 0; v < p.NumVertices; ++v) {
+        const double dx = p.Vertices[v]->HiresPosition[0] / 16.0 - 128;
+        const double dy = 96 - p.Vertices[v]->HiresPosition[1] / 16.0;
+        const double len = std::hypot(dx, dy);
+        // Of the two outer corners, the one that started on +x.
+        // In clip units: the view is 256x192, the model's units square.
+        const double at = std::atan2(dy / 48, dx / 64) * 180 / 3.14159265358979;
+        if (len > 8 && std::abs(at - 50) < std::abs(angle - 50)) {
+            best = len;
+            angle = at;
+        }
+    }
+    // 0x800 is half the view: 64 px across, and 48 px up (192 / 4).
+    const double expected = std::hypot(64 * std::cos(50 * 3.14159265358979 / 180),
+                                       48 * std::sin(50 * 3.14159265358979 / 180));
+    check(std::abs(angle - 50) < 3, "turned halfway");
+    check(std::abs(best - expected) < 2, "not shrunk");
+}
+
 void test_start_needs_a_swap() {
     melonDS::NDS nds;
     GPU3D& g = nds.GPU.GPU3D;
@@ -288,6 +341,7 @@ int main() {
     test_look_alikes();
     test_other_mesh();
     test_jump();
+    test_fast_turn();
     test_start_needs_a_swap();
     if (g_failures) {
         std::fprintf(stderr, "%d failure(s)\n", g_failures);

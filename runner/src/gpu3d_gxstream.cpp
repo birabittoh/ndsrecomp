@@ -59,6 +59,175 @@ int32_t blend(int32_t a, int32_t b, float t) {
         int64_t(a) + std::llround(double(int64_t(b) - int64_t(a)) * double(t)));
 }
 
+// Where the 3x3 linear part of a matrix command's parameters sits: the
+// first entry of each row, or none (scale, translation, 3-row-less forms).
+// The DS multiplies row vectors, so each row is a local axis.
+struct Layout {
+    int rows[3] = {-1, -1, -1};
+    int stride = 0;  // entries per row, 3 or 4
+};
+
+Layout layout_of(uint8_t op) {
+    Layout l;
+    switch (op) {
+        case 0x16: case 0x18: l = {{0, 4, 8}, 4}; break;
+        case 0x17: case 0x19: case 0x1A: l = {{0, 3, 6}, 3}; break;
+        default: break;
+    }
+    return l;
+}
+
+// A 3x3 block as rotation times a scale per row (local axis), which is what
+// a model's bones, a camera and a scaled model are made of.
+struct Pose {
+    double q[4] = {};  // unit quaternion w, x, y, z
+    double scale[3] = {};
+};
+
+bool decompose(const int32_t* m, const Layout& l, Pose* out) {
+    double u[3][3];
+    for (int r = 0; r < 3; ++r) {
+        const int32_t* row = m + l.rows[r];
+        const double x = row[0], y = row[1], z = row[2];
+        const double len = std::sqrt(x * x + y * y + z * z);
+        // Below 1/64: degenerate or a projection's rows, not a pose.
+        if (len < 64.0) return false;
+        out->scale[r] = len;
+        u[r][0] = x / len;
+        u[r][1] = y / len;
+        u[r][2] = z / len;
+    }
+    // Orthogonal rows only: shear does not survive this decomposition.
+    for (int a = 0; a < 3; ++a)
+        for (int b = a + 1; b < 3; ++b)
+            if (std::fabs(u[a][0] * u[b][0] + u[a][1] * u[b][1] + u[a][2] * u[b][2]) > 0.02)
+                return false;
+    const double det = u[0][0] * (u[1][1] * u[2][2] - u[1][2] * u[2][1]) -
+                       u[0][1] * (u[1][0] * u[2][2] - u[1][2] * u[2][0]) +
+                       u[0][2] * (u[1][0] * u[2][1] - u[1][1] * u[2][0]);
+    if (det < 0) {
+        // A mirror: carried by the last axis's scale.
+        out->scale[2] = -out->scale[2];
+        for (double& v : u[2]) v = -v;
+    }
+    // Quaternion of the rotation whose rows are u (Shepperd).
+    double* q = out->q;
+    const double tr = u[0][0] + u[1][1] + u[2][2];
+    if (tr > 0) {
+        const double k = std::sqrt(tr + 1.0) * 2;
+        q[0] = 0.25 * k;
+        q[1] = (u[1][2] - u[2][1]) / k;
+        q[2] = (u[2][0] - u[0][2]) / k;
+        q[3] = (u[0][1] - u[1][0]) / k;
+    } else if (u[0][0] > u[1][1] && u[0][0] > u[2][2]) {
+        const double k = std::sqrt(1.0 + u[0][0] - u[1][1] - u[2][2]) * 2;
+        q[0] = (u[1][2] - u[2][1]) / k;
+        q[1] = 0.25 * k;
+        q[2] = (u[1][0] + u[0][1]) / k;
+        q[3] = (u[2][0] + u[0][2]) / k;
+    } else if (u[1][1] > u[2][2]) {
+        const double k = std::sqrt(1.0 + u[1][1] - u[0][0] - u[2][2]) * 2;
+        q[0] = (u[2][0] - u[0][2]) / k;
+        q[1] = (u[1][0] + u[0][1]) / k;
+        q[2] = 0.25 * k;
+        q[3] = (u[2][1] + u[1][2]) / k;
+    } else {
+        const double k = std::sqrt(1.0 + u[2][2] - u[0][0] - u[1][1]) * 2;
+        q[0] = (u[0][1] - u[1][0]) / k;
+        q[1] = (u[2][0] + u[0][2]) / k;
+        q[2] = (u[2][1] + u[1][2]) / k;
+        q[3] = 0.25 * k;
+    }
+    const double n = std::sqrt(q[0] * q[0] + q[1] * q[1] + q[2] * q[2] + q[3] * q[3]);
+    for (int i = 0; i < 4; ++i) q[i] /= n;
+    return true;
+}
+
+// The poses of one thing moving: at most this much rotation and scale change
+// between two images. A limb in a run turns about 40 degrees per image at 30.
+constexpr double kMaxTurnCos = 0.5;  // cos of half of 120 degrees
+bool plausible_poses(const Pose& a, const Pose& b) {
+    double dot = 0;
+    for (int i = 0; i < 4; ++i) dot += a.q[i] * b.q[i];
+    if (std::fabs(dot) < kMaxTurnCos) return false;
+    for (int r = 0; r < 3; ++r) {
+        if ((a.scale[r] < 0) != (b.scale[r] < 0)) return false;
+        const double ratio = std::fabs(b.scale[r]) / std::fabs(a.scale[r]);
+        if (ratio < 0.5 || ratio > 2.0) return false;
+    }
+    return true;
+}
+
+void write_pose(const Pose& a, const Pose& b, double t, const Layout& l, int32_t* out) {
+    // Slerp, the short way round.
+    double qb[4];
+    double dot = 0;
+    for (int i = 0; i < 4; ++i) dot += a.q[i] * b.q[i];
+    const double sign = dot < 0 ? -1.0 : 1.0;
+    for (int i = 0; i < 4; ++i) qb[i] = b.q[i] * sign;
+    dot = std::fabs(dot);
+    double q[4];
+    if (dot > 0.9995) {
+        for (int i = 0; i < 4; ++i) q[i] = a.q[i] + (qb[i] - a.q[i]) * t;
+    } else {
+        const double theta = std::acos(dot);
+        const double wa = std::sin((1 - t) * theta) / std::sin(theta);
+        const double wb = std::sin(t * theta) / std::sin(theta);
+        for (int i = 0; i < 4; ++i) q[i] = a.q[i] * wa + qb[i] * wb;
+    }
+    const double n = std::sqrt(q[0] * q[0] + q[1] * q[1] + q[2] * q[2] + q[3] * q[3]);
+    const double w = q[0] / n, x = q[1] / n, y = q[2] / n, z = q[3] / n;
+    // Rows of the rotation, matching decompose().
+    const double rot[3][3] = {
+        {1 - 2 * (y * y + z * z), 2 * (x * y + w * z), 2 * (x * z - w * y)},
+        {2 * (x * y - w * z), 1 - 2 * (x * x + z * z), 2 * (y * z + w * x)},
+        {2 * (x * z + w * y), 2 * (y * z - w * x), 1 - 2 * (x * x + y * y)},
+    };
+    for (int r = 0; r < 3; ++r) {
+        const double s = a.scale[r] + (b.scale[r] - a.scale[r]) * t;
+        for (int c = 0; c < 3; ++c) out[l.rows[r] + c] = int32_t(std::llround(rot[r][c] * s));
+    }
+}
+
+// The parameters of one matrix command `t` of the way from a to b, or false
+// when the two are not one thing moving. `out` may be null (check only) and
+// may alias b.
+//
+// The 3x3 part of a load or multiply is blended as rotation (slerp) and
+// scale, so a fast-turning bone neither shrinks halfway nor is refused;
+// anything else (projections, sheared matrices, the rest of the entries) is
+// blended linearly and judged per entry.
+bool blend_command(uint8_t op, const int32_t* a, const int32_t* b, uint32_t n, float t,
+                   int32_t* out) {
+    const Layout l = layout_of(op);
+    Pose pa, pb;
+    bool posed = l.stride && n >= uint32_t(l.rows[2] + 3) && decompose(a, l, &pa) &&
+                 decompose(b, l, &pb);
+    if (posed && !plausible_poses(pa, pb)) return false;
+    // Under about 3.6 degrees, linear blending shrinks nothing visible and,
+    // unlike rebuilding the rotation, keeps a still matrix exactly as it is.
+    bool turning = false;
+    if (posed) {
+        double dot = 0;
+        for (int i = 0; i < 4; ++i) dot += pa.q[i] * pb.q[i];
+        turning = std::fabs(dot) <= 0.9995;
+    }
+    auto in_pose = [&](uint32_t e) {
+        if (!posed) return false;
+        for (int r = 0; r < 3; ++r)
+            if (e >= uint32_t(l.rows[r]) && e < uint32_t(l.rows[r] + 3)) return true;
+        return false;
+    };
+    for (uint32_t e = 0; e < n; ++e)
+        if (!in_pose(e) && !plausible(a[e], b[e], is_translation(op, e))) return false;
+    if (!out) return true;
+    int32_t rotated[16];
+    if (turning) write_pose(pa, pb, t, l, rotated);
+    for (uint32_t e = 0; e < n; ++e)
+        out[e] = turning && in_pose(e) ? rotated[e] : blend(a[e], b[e], t);
+    return true;
+}
+
 uint64_t mix(uint64_t hash, uint32_t value) {
     hash ^= value;
     hash *= 1099511628211ull;
@@ -125,26 +294,21 @@ int64_t unit_cost(const NdsGxStream& a, const Unit& ua, const std::vector<uint8_
         const uint8_t op = b.ops[j];
         if (a.ops[i] != op || a.count(i) != b.count(j)) return -1;
         if (!is_blended(op) || modes_a[i] == 3) continue;
-        const uint32_t* pa = &a.params[a.first[i]];
-        const uint32_t* pb = &b.params[b.first[j]];
-        for (uint32_t e = 0; e < b.count(j); ++e) {
-            const int32_t va = int32_t(pa[e]), vb = int32_t(pb[e]);
-            if (!plausible(va, vb, is_translation(op, e))) return -1;
-            cost += std::llabs(int64_t(vb) - int64_t(va));
-        }
+        const auto* pa = reinterpret_cast<const int32_t*>(&a.params[a.first[i]]);
+        const auto* pb = reinterpret_cast<const int32_t*>(&b.params[b.first[j]]);
+        if (!blend_command(op, pa, pb, b.count(j), 0.5f, nullptr)) return -1;
+        for (uint32_t e = 0; e < b.count(j); ++e)
+            cost += std::llabs(int64_t(pb[e]) - int64_t(pa[e]));
     }
     return cost;
 }
 
 // A 4x4 matrix halfway, or b's own when the two are not one thing moving.
 void blend_matrix(const int32_t* a, const int32_t* b, float t, int32_t* out) {
-    for (int i = 0; i < 16; ++i) {
-        if (!plausible(a[i], b[i], i >= 12 && i <= 14)) {
-            std::copy_n(b, 16, out);
-            return;
-        }
-    }
-    for (int i = 0; i < 16; ++i) out[i] = blend(a[i], b[i], t);
+    int32_t mid[16];
+    // A 4x4 load (0x16) has the layout of a stored matrix.
+    if (blend_command(0x16, a, b, 16, t, mid)) std::copy_n(mid, 16, out);
+    else std::copy_n(b, 16, out);
 }
 
 void blend_state(const NdsGxGeometryState& a, const NdsGxGeometryState& b, float t,
@@ -398,10 +562,10 @@ bool nds_gx_lerp_streams(const NdsGxStream& a, const NdsGxStream& b, float t,
         for (uint32_t k = 0; k < ub.end - ub.begin; ++k) {
             const uint32_t i = ua.begin + k, jj = ub.begin + k;
             if (!is_blended(b.ops[jj]) || modes_b[jj] == 3) continue;
-            const uint32_t* pa = &a.params[a.first[i]];
-            uint32_t* po = &out->params[b.first[jj]];
-            for (uint32_t e = 0; e < b.count(jj); ++e)
-                po[e] = uint32_t(blend(int32_t(pa[e]), int32_t(po[e]), t));
+            const auto* pa = reinterpret_cast<const int32_t*>(&a.params[a.first[i]]);
+            auto* po = reinterpret_cast<int32_t*>(&out->params[b.first[jj]]);
+            // Checked by unit_cost; b's own values stay if it still refuses.
+            blend_command(b.ops[jj], pa, po, b.count(jj), t, po);
         }
     }
     return true;
