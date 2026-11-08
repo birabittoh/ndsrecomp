@@ -26,7 +26,8 @@ function(nds_add_plume_renderer target)
     # Linux: Plume builds its Vulkan surface straight from the frontend's
     # SDL_Window. Not on Apple, where the same #elif chain in Plume would swap
     # its native {NSWindow, CAMetalLayer} pair for a bare SDL_Window* that its
-    # Metal surface code does not accept.
+    # VK_EXT_metal_surface code does not accept. Apple runs Plume's Vulkan
+    # backend on MoltenVK; PlumeHost.cpp hands it that pair.
     if(UNIX AND NOT APPLE AND NOT ANDROID)
         set(PLUME_SDL3_VULKAN_ENABLED ON CACHE BOOL "Enable SDL3 Vulkan integration" FORCE)
     endif()
@@ -52,7 +53,18 @@ function(nds_add_plume_renderer target)
     # Fetches a pinned DXC unless PLUME_DXC_EXECUTABLE is given. The Windows
     # SDK's DXC has no SPIR-V backend, so the fetched one is used there too.
     include("${_plume_dir}/examples/cmake/PlumeShaders.cmake")
-    plume_shaders_init()
+    if(APPLE)
+        # MoltenVK consumes the SPIR-V. plume_shaders_init would also fetch
+        # SPIRV-Cross, and every shader would then be cross-compiled to a
+        # Metal library through xcrun for a Metal backend nothing here uses.
+        if(NOT DEFINED PLUME_DXC_EXECUTABLE)
+            plume_fetch_dxc()
+        endif()
+        plume_build_file_to_c()
+        file(MAKE_DIRECTORY "${CMAKE_BINARY_DIR}/shaders")
+    else()
+        plume_shaders_init()
+    endif()
 
     set(_shaders "${CMAKE_CURRENT_SOURCE_DIR}/src/plume/shaders")
     # name, file, entry point, stage. gx.hlsl holds every 3D pass (several

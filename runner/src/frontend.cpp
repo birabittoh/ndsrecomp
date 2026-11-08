@@ -1648,12 +1648,15 @@ bool presenter_composes_3d(const FrontendPresentation& presentation) {
 }
 
 // The window flag the accelerated top-window presenter needs: a GL context,
-// or a Vulkan surface for Plume on Linux. Plume on Windows presents through
+// a Vulkan surface for Plume on Linux, or a Metal view for Plume on Apple
+// (MoltenVK draws into its CAMetalLayer). Plume on Windows presents through
 // D3D12 on the plain HWND, and a Vulkan-flagged window would make SDL require
 // a Vulkan loader there for nothing.
 uint64_t accelerated_window_flag() {
 #if defined(NDS_USE_PLUME) && defined(__linux__)
     return static_cast<uint64_t>(SDL_WINDOW_VULKAN);
+#elif defined(NDS_USE_PLUME) && defined(__APPLE__)
+    return static_cast<uint64_t>(SDL_WINDOW_METAL);
 #elif defined(NDS_USE_PLUME)
     return 0u;
 #else

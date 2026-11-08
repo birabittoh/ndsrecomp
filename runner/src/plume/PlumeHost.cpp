@@ -1,10 +1,12 @@
 // GPL-3.0-or-later; see THIRD_PARTY_ATTRIBUTION.md.
 //
 // The Plume renderer host: the ComputeHost.h API over Plume, an RHI over
-// Vulkan (Linux, and Windows on request) and D3D12 (Windows). It replaces the
-// GL host (src/melonds_compute/ComputeHost.cpp) in NDS_ACCELERATED_RENDERER=
-// PLUME builds, and owns the top window's presentation: the window carries a
-// Vulkan surface or a D3D12 swap chain, never a GL context.
+// Vulkan (Linux, Apple through MoltenVK, and Windows on request) and D3D12
+// (Windows). It replaces the GL host (src/melonds_compute/ComputeHost.cpp) in
+// NDS_ACCELERATED_RENDERER=PLUME builds, and owns the top window's
+// presentation: the window carries a Vulkan surface (on Apple one made from
+// the CAMetalLayer of an SDL Metal view) or a D3D12 swap chain, never a GL
+// context.
 //
 // Shaders are HLSL in src/plume/shaders, compiled by DXC at build time
 // (cmake/NdsPlume.cmake) and linked in as byte arrays; nothing is compiled at
@@ -36,6 +38,10 @@
 #define SDL_MAIN_HANDLED
 #include <SDL3/SDL.h>
 #include <SDL3/SDL_main.h>
+#if defined(__APPLE__)
+#include <SDL3/SDL_metal.h>
+#include <dlfcn.h>
+#endif
 
 #include "plume_render_interface.h"
 
@@ -55,6 +61,9 @@
 
 namespace plume {
 extern std::unique_ptr<RenderInterface> CreateVulkanInterface();
+#if defined(__APPLE__)
+void SetVulkanGetInstanceProcAddr(void* getInstanceProcAddr);
+#endif
 #if defined(_WIN32)
 extern std::unique_ptr<RenderInterface> CreateD3D12Interface();
 #endif
@@ -164,6 +173,11 @@ struct Backend {
 
 Backend g_backend;
 SDL_Window* g_window = nullptr;
+#if defined(__APPLE__)
+// Owns the CAMetalLayer the MoltenVK surface draws into; outlives the swap
+// chain and goes with release_backend.
+SDL_MetalView g_metal_view = nullptr;
+#endif
 bool g_active = false;
 bool g_visible = false;
 bool g_resize_pending = false;
@@ -385,11 +399,63 @@ RenderWindow render_window_for(SDL_Window* window) {
         nullptr));
 #elif defined(PLUME_SDL3_VULKAN_ENABLED)
     return window;
+#elif defined(__APPLE__)
+    // Plume's Vulkan backend makes a VK_EXT_metal_surface from the layer and
+    // reads the drawable size from the NSWindow.
+    if (!g_metal_view) g_metal_view = SDL_Metal_CreateView(window);
+    void* const ns_window = SDL_GetPointerProperty(
+        SDL_GetWindowProperties(window), SDL_PROP_WINDOW_COCOA_WINDOW_POINTER,
+        nullptr);
+    void* const layer = g_metal_view ? SDL_Metal_GetLayer(g_metal_view) : nullptr;
+    return RenderWindow{ns_window, layer};
 #else
     (void)window;
     return RenderWindow{};
 #endif
 }
+
+bool render_window_valid(const RenderWindow& window) {
+#if defined(_WIN32) || defined(PLUME_SDL3_VULKAN_ENABLED)
+    return window != nullptr;
+#elif defined(__APPLE__)
+    return window.window != nullptr && window.view != nullptr;
+#else
+    (void)window;
+    return false;
+#endif
+}
+
+#if defined(__APPLE__)
+// volk looks for the Vulkan loader or MoltenVK under bare names (found
+// through DYLD_* paths, /usr/local/lib and /usr/lib) and as frameworks. That
+// misses a MoltenVK shipped beside the runner or in its app bundle, and
+// Homebrew on Apple Silicon (/opt/homebrew/lib). Point Plume at the first of
+// those that loads, for a retry after volk's own search came up empty.
+bool use_fallback_vulkan_library() {
+    std::vector<std::string> candidates;
+    if (const char* base = SDL_GetBasePath()) {
+        candidates.push_back(std::string(base) + "libMoltenVK.dylib");
+        candidates.push_back(std::string(base) + "../Frameworks/libMoltenVK.dylib");
+    }
+    candidates.push_back("/opt/homebrew/lib/libvulkan.1.dylib");
+    candidates.push_back("/opt/homebrew/lib/libMoltenVK.dylib");
+    candidates.push_back("/usr/local/lib/libMoltenVK.dylib");
+    for (const std::string& path : candidates) {
+        void* const library = dlopen(path.c_str(), RTLD_NOW | RTLD_LOCAL);
+        if (!library) continue;
+        void* const get_instance_proc_addr = dlsym(library, "vkGetInstanceProcAddr");
+        if (!get_instance_proc_addr) {
+            dlclose(library);
+            continue;
+        }
+        // Stays loaded for the life of the process, as volk's own would.
+        std::fprintf(stderr, "[plume] Vulkan from %s\n", path.c_str());
+        SetVulkanGetInstanceProcAddr(get_instance_proc_addr);
+        return true;
+    }
+    return false;
+}
+#endif
 
 bool create_interface() {
 #if defined(_WIN32)
@@ -414,9 +480,17 @@ bool create_interface() {
     g_backend.render_interface = CreateVulkanInterface();
     g_backend.api = "Vulkan";
     return g_backend.render_interface != nullptr;
+#elif defined(__APPLE__)
+    g_backend.render_interface = CreateVulkanInterface();
+    if (!g_backend.render_interface && use_fallback_vulkan_library())
+        g_backend.render_interface = CreateVulkanInterface();
+    if (!g_backend.render_interface)
+        std::fprintf(stderr, "[plume] no Vulkan driver: install MoltenVK "
+                             "(Vulkan SDK or `brew install molten-vk`) or put "
+                             "libMoltenVK.dylib beside the runner\n");
+    g_backend.api = "Vulkan";
+    return g_backend.render_interface != nullptr;
 #else
-    // Apple needs a {NSWindow, CAMetalLayer} pair (SDL_Metal_CreateView);
-    // not wired yet.
     return false;
 #endif
 }
@@ -438,8 +512,14 @@ bool start_presenter(SDL_Window* window) {
         std::fprintf(stderr, "[plume] queue or frame slot creation failed\n");
         return false;
     }
+    const RenderWindow render_window = render_window_for(window);
+    if (!render_window_valid(render_window)) {
+        std::fprintf(stderr, "[plume] the presentation window has no native "
+                             "handle: %s\n", SDL_GetError());
+        return false;
+    }
     g_backend.swap_chain = g_backend.queue->createSwapChain(RenderSwapChainDesc(
-        render_window_for(window), kSwapChainFormat, kSwapChainBuffers));
+        render_window, kSwapChainFormat, kSwapChainBuffers));
     if (!g_backend.swap_chain) {
         std::fprintf(stderr, "[plume] no swap chain on the presentation window\n");
         return false;
@@ -494,6 +574,10 @@ void release_backend() {
     g_backend.queue.reset();
     g_backend.device.reset();
     g_backend.render_interface.reset();
+#if defined(__APPLE__)
+    if (g_metal_view) SDL_Metal_DestroyView(g_metal_view);
+    g_metal_view = nullptr;
+#endif
     g_backend.slot = 0;
     g_backend.api = "";
     g_window = nullptr;
