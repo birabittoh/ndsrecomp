@@ -30,6 +30,9 @@ Current build choices:
   (`mph-submit-hle-v2`). The SERVER canary shows a material observed gain;
   LLE remains the supported default pending owner playtest feedback. See
   [the contract and qualification limits](docs/mph-submit-hle.md).
+- `nds_recompile --hooks` + `NDS_TITLE_HOOK_SOURCES`: title-owned calls baked
+  into generated banks at chosen instructions. Generating without `--hooks` is
+  the LLE build. See [mid-instruction hooks](docs/midasm-hooks.md).
 
 ## Binding and continuations
 
