@@ -539,6 +539,248 @@ bool load_hle_profile_manifest(const std::string& path,
     return true;
 }
 
+namespace {
+
+bool c_identifier(const std::string& text) {
+    if (text.empty() || text.size() > 96u) return false;
+    const unsigned char first = static_cast<unsigned char>(text.front());
+    if (!(std::isalpha(first) != 0 || first == '_')) return false;
+    return std::all_of(text.begin() + 1, text.end(), [](unsigned char c) {
+        return std::isalnum(c) != 0 || c == '_';
+    });
+}
+
+bool parse_hook_action(const std::string& s, HookAction& out) {
+    if (s == "continue") { out = HookAction::Continue; return true; }
+    if (s == "return")   { out = HookAction::Return;   return true; }
+    if (s == "jump")     { out = HookAction::Jump;     return true; }
+    return false;
+}
+
+bool parse_hook_register(const std::string& s, uint8_t& out) {
+    if (s == "sp")   { out = 13u; return true; }
+    if (s == "lr")   { out = 14u; return true; }
+    if (s == "cpsr") { out = kHookArgCpsr; return true; }
+    if (s.size() < 2u || s.size() > 3u || s[0] != 'r') return false;
+    if (!std::all_of(s.begin() + 1, s.end(),
+                     [](unsigned char c) { return std::isdigit(c) != 0; }))
+        return false;
+    if (s.size() == 3u && s[1] == '0') return false;   // no "r05"
+    const unsigned n = static_cast<unsigned>(std::stoul(s.substr(1)));
+    if (n > 14u) return false;                          // r15 rejected
+    out = static_cast<uint8_t>(n);
+    return true;
+}
+
+// Reads an optional string-valued enum key; a present key of the wrong type
+// is an error rather than "absent".
+bool get_optional_string(const toml::table& t, std::string_view key,
+                         std::string& out, bool& present) {
+    present = false;
+    const toml::node* node = t.get(key);
+    if (!node) return true;
+    const auto value = node->value<std::string>();
+    if (!value) return false;
+    out = *value;
+    present = true;
+    return true;
+}
+
+bool parse_one_hook(const toml::table& t, std::size_t index,
+                    ConfigHook& hook) {
+    static const std::unordered_set<std::string> kKeys = {
+        "address", "mode", "name", "registers", "when", "action",
+        "on_true", "on_false", "jump_address", "note"};
+    for (const auto& [key, value] : t) {
+        (void)value;
+        if (kKeys.count(std::string(key.str())) == 0u) {
+            std::fprintf(stderr, "%s[[hook]] %zu: unknown key '%s'\n",
+                         kAbortHeader, index, std::string(key.str()).c_str());
+            return false;
+        }
+    }
+    auto fail = [&](const char* what) {
+        std::fprintf(stderr, "%s[[hook]] %zu%s%s: %s\n", kAbortHeader, index,
+                     hook.name.empty() ? "" : " ", hook.name.c_str(), what);
+        return false;
+    };
+
+    bool ok = true;
+    std::string err;
+    hook.name = get_string_field(t, "name", true, ok, err);
+    if (!ok || !c_identifier(hook.name))
+        return fail("name must be a C identifier of at most 96 characters");
+    hook.address = get_manifest_u32(t, "address", ok);
+    if (!ok) return fail("address must be a non-negative 32-bit integer");
+    const std::string mode = get_string_field(t, "mode", true, ok, err);
+    if (!ok || !parse_mode(mode, hook.mode))
+        return fail("mode must be \"arm\" or \"thumb\"");
+    const uint32_t alignment = hook.mode == CpuMode::Thumb ? 2u : 4u;
+    if (hook.address % alignment != 0u)
+        return fail("address is not aligned to the instruction width");
+
+    if (const toml::node* node = t.get("registers")) {
+        const toml::array* regs = node->as_array();
+        if (!regs) return fail("registers must be an array of strings");
+        uint32_t seen = 0u;
+        for (const auto& element : *regs) {
+            const auto text = element.value<std::string>();
+            uint8_t slot = 0u;
+            if (!text || !parse_hook_register(*text, slot))
+                return fail("registers accepts r0..r14, sp, lr and cpsr "
+                            "(r15/pc cannot be passed)");
+            if (seen & (1u << slot))
+                return fail("registers names the same register twice");
+            seen |= 1u << slot;
+            hook.registers.push_back(slot);
+        }
+    }
+
+    std::string text;
+    bool present = false;
+    if (!get_optional_string(t, "when", text, present))
+        return fail("when must be a string");
+    if (present) {
+        if (text == "before") hook.when = HookWhen::Before;
+        else if (text == "after") hook.when = HookWhen::After;
+        else return fail("when must be \"before\" or \"after\"");
+    }
+
+    bool have_action = false, have_true = false, have_false = false;
+    if (!get_optional_string(t, "action", text, have_action) ||
+        (have_action && !parse_hook_action(text, hook.action)))
+        return fail("action must be \"continue\", \"return\" or \"jump\"");
+    if (!get_optional_string(t, "on_true", text, have_true) ||
+        (have_true && !parse_hook_action(text, hook.on_true)))
+        return fail("on_true must be \"continue\", \"return\" or \"jump\"");
+    if (!get_optional_string(t, "on_false", text, have_false) ||
+        (have_false && !parse_hook_action(text, hook.on_false)))
+        return fail("on_false must be \"continue\", \"return\" or \"jump\"");
+    hook.returns_bool = have_true || have_false;
+    if (have_action && hook.returns_bool)
+        return fail("action is exclusive with on_true / on_false");
+    if (hook.returns_bool && hook.on_true == hook.on_false &&
+        hook.on_true != HookAction::Jump)
+        return fail("on_true and on_false select the same outcome; use "
+                    "action instead");
+
+    const bool uses_jump = hook.returns_bool
+        ? (hook.on_true == HookAction::Jump || hook.on_false == HookAction::Jump)
+        : hook.action == HookAction::Jump;
+    if (hook.returns_bool && hook.on_true == HookAction::Jump &&
+        hook.on_false == HookAction::Jump)
+        return fail("only one outcome may jump (there is one jump_address)");
+    const bool have_jump_address = t.get("jump_address") != nullptr;
+    if (uses_jump != have_jump_address)
+        return fail(uses_jump ? "a jump outcome requires jump_address"
+                              : "jump_address is set but no outcome jumps");
+    if (uses_jump) {
+        hook.jump_address = get_manifest_u32(t, "jump_address", ok);
+        if (!ok || hook.jump_address % alignment != 0u)
+            return fail("jump_address must be a 32-bit address aligned to "
+                        "the hook's instruction width (B keeps the mode)");
+    }
+
+    const bool changes_flow = hook.returns_bool ||
+        hook.action != HookAction::Continue;
+    if (hook.when == HookWhen::After && changes_flow)
+        return fail("an after hook may only continue; put a control-flow "
+                    "hook before the following instruction instead");
+
+    hook.note = get_string_field(t, "note", false, ok, err);
+    if (!ok) return fail("note must be a string");
+    return true;
+}
+
+}  // namespace
+
+bool load_hook_manifest(const std::string& path, HookManifest& out) {
+    out = HookManifest{};
+    out.source_path = path;
+
+    toml::table tbl;
+    try {
+        tbl = toml::parse_file(path);
+    } catch (const toml::parse_error& e) {
+        std::fprintf(stderr, "%shook manifest parse error in %s: %s\n",
+                     kAbortHeader, path.c_str(), e.what());
+        return false;
+    }
+
+    const auto version = tbl["version"].value<int64_t>();
+    const auto* program = tbl["program"].as_table();
+    const auto* hooks = tbl["hook"].as_array();
+    if (!version || !program || !hooks || tbl.size() != 3u) {
+        std::fprintf(stderr,
+            "%shook manifest requires exactly version, [program], and "
+            "[[hook]] keys\n", kAbortHeader);
+        return false;
+    }
+    if (*version != 1) {
+        std::fprintf(stderr, "%shook manifest version must be 1 (got %lld)\n",
+                     kAbortHeader, static_cast<long long>(*version));
+        return false;
+    }
+    out.version = 1u;
+
+    bool ok = true;
+    std::string err;
+    out.bank = get_string_field(*program, "bank", true, ok, err);
+    out.program_sha1 = hex_lower(
+        get_string_field(*program, "sha1", true, ok, err));
+    if (!ok || program->size() != 2u || !safe_profile_bank(out.bank) ||
+        out.program_sha1.size() != 40u ||
+        !std::all_of(out.program_sha1.begin(), out.program_sha1.end(),
+                     [](unsigned char c) { return std::isxdigit(c) != 0; })) {
+        std::fprintf(stderr,
+            "%shook [program] requires only a bank name and the 40-digit "
+            "SHA-1 of the bank's --bin image\n", kAbortHeader);
+        return false;
+    }
+    if (hooks->empty()) {
+        std::fprintf(stderr, "%shook manifest declares no [[hook]]\n",
+                     kAbortHeader);
+        return false;
+    }
+
+    std::unordered_set<std::string> sites;
+    for (std::size_t index = 0; index < hooks->size(); ++index) {
+        const auto* table = (*hooks)[index].as_table();
+        if (!table) {
+            std::fprintf(stderr, "%s[[hook]] %zu is not a table\n",
+                         kAbortHeader, index);
+            return false;
+        }
+        ConfigHook hook;
+        if (!parse_one_hook(*table, index, hook)) return false;
+        const std::string site = std::to_string(hook.address) +
+            (hook.mode == CpuMode::Thumb ? ":thumb:" : ":arm:") +
+            (hook.when == HookWhen::Before ? "before" : "after");
+        if (!sites.insert(site).second) {
+            std::fprintf(stderr,
+                "%s[[hook]] %zu %s: a hook already sits %s 0x%08X (%s); "
+                "combine them in one handler so the order is explicit\n",
+                kAbortHeader, index, hook.name.c_str(),
+                hook.when == HookWhen::Before ? "before" : "after",
+                hook.address, hook.mode == CpuMode::Thumb ? "thumb" : "arm");
+            return false;
+        }
+        for (const ConfigHook& other : out.hooks) {
+            if (other.name != hook.name) continue;
+            if (other.registers.size() != hook.registers.size() ||
+                other.returns_bool != hook.returns_bool) {
+                std::fprintf(stderr,
+                    "%s[[hook]] %zu: handler '%s' is declared twice with "
+                    "different signatures\n",
+                    kAbortHeader, index, hook.name.c_str());
+                return false;
+            }
+        }
+        out.hooks.push_back(std::move(hook));
+    }
+    return true;
+}
+
 bool load_config(const std::string& path, Config& out) {
     out = Config{};
     out.source_path = path;

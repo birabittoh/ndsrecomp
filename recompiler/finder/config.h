@@ -121,6 +121,41 @@ struct HleProfileManifest {
     std::vector<HleProfileRoutine> routines;
 };
 
+// Title-owned mid-instruction hook table (docs/midasm-hooks.md). One manifest
+// per generated bank, bound to that bank's name and image SHA-1, so a hook
+// can only ever be baked into the exact bytes it was written against.
+enum class HookWhen : uint8_t { Before, After };
+enum class HookAction : uint8_t { Continue, Return, Jump };
+
+// Register-argument slot. 0..14 name g_cpu.R[n]; kHookArgCpsr names
+// g_cpu.cpsr. R15 is deliberately not passable: generated code uses static
+// PC semantics, so a handler write to it would be silently discarded.
+constexpr uint8_t kHookArgCpsr = 16u;
+
+struct ConfigHook {
+    uint32_t    address = 0;
+    CpuMode     mode = CpuMode::Arm;
+    std::string name;                 // C identifier of the host handler
+    std::vector<uint8_t> registers;   // handler arguments, in order
+    HookWhen    when = HookWhen::Before;
+    // A handler that returns bool selects on_true / on_false; otherwise
+    // `action` runs unconditionally after the call.
+    bool        returns_bool = false;
+    HookAction  action = HookAction::Continue;
+    HookAction  on_true = HookAction::Continue;
+    HookAction  on_false = HookAction::Continue;
+    uint32_t    jump_address = 0;     // valid only when some outcome is Jump
+    std::string note;
+};
+
+struct HookManifest {
+    std::string source_path;
+    uint32_t    version = 0;
+    std::string bank;
+    std::string program_sha1;
+    std::vector<ConfigHook> hooks;
+};
+
 // Load a TOML config from `path`. On success returns true and
 // populates `out`. On parse/structural error returns false and
 // writes a human-readable diagnostic to stderr.
@@ -134,6 +169,12 @@ bool load_config(const std::string& path, Config& out);
 // silently instrument a different guest routine.
 bool load_hle_profile_manifest(const std::string& path,
                                HleProfileManifest& out);
+
+// Load a strict hook manifest. Like the HLE manifest, unknown keys,
+// duplicates and contradictory outcomes fail closed. Checks that need the
+// discovered functions (address is an emitted instruction start, jump target
+// exists) are done by the emitter, which has them.
+bool load_hook_manifest(const std::string& path, HookManifest& out);
 
 // Verify the config's identity hashes against the binary bytes.
 // Returns true on match; false and prints a diagnostic on
