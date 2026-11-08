@@ -275,21 +275,34 @@ bool rom_matches(const fs::path& path, const std::string& expected_sha1) {
     return gba::sha1(bytes.data(), bytes.size()).hex() == expected_sha1;
 }
 
-// Generated firmware (system.generated_firmware) needs only the two BIOS
-// dumps; firmware.bin is then neither asked for nor loaded.
-bool bios_complete(const fs::path& dir, bool need_firmware) {
+// Which dumps the folder has to hold. system.freebios replaces the two BIOS
+// dumps and system.generated_firmware replaces firmware.bin; neither is
+// then asked for nor loaded.
+struct DumpNeeds {
+    bool bios;
+    bool firmware;
+    bool any() const { return bios || firmware; }
+};
+
+DumpNeeds dump_needs(const NdsFrontendOptions& options) {
+    return {!options.freebios, !options.generated_firmware};
+}
+
+bool bios_complete(const fs::path& dir, DumpNeeds needs) {
     return std::all_of(std::begin(kBiosFiles), std::end(kBiosFiles),
                        [&](const char* name) {
-                           if (!need_firmware &&
-                               std::strcmp(name, "firmware.bin") == 0)
+                           const bool firmware =
+                               std::strcmp(name, "firmware.bin") == 0;
+                           if (firmware ? !needs.firmware : !needs.bios)
                                return true;
                            return fs::is_regular_file(dir / name);
                        });
 }
 
-const char* bios_files_wanted(bool need_firmware) {
-    return need_firmware ? "biosnds7.rom, biosnds9.rom and firmware.bin"
-                         : "biosnds7.rom and biosnds9.rom";
+const char* bios_files_wanted(DumpNeeds needs) {
+    if (needs.bios && needs.firmware)
+        return "biosnds7.rom, biosnds9.rom and firmware.bin";
+    return needs.bios ? "biosnds7.rom and biosnds9.rom" : "firmware.bin";
 }
 
 bool remember(const fs::path& settings, const char* key,
@@ -349,7 +362,7 @@ bool resolve_rom(const fs::path& root, const fs::path& settings,
 bool resolve_bios(const fs::path& root, const fs::path& settings,
                   const NdsFrontendOptions& options, fs::path* bios,
                   bool* cancelled) {
-    const bool need_firmware = !options.generated_firmware;
+    const DumpNeeds needs = dump_needs(options);
     std::vector<fs::path> candidates;
     if (!options.paths.bios.empty())
         candidates.push_back(resolve_stored(root, options.paths.bios));
@@ -359,7 +372,7 @@ bool resolve_bios(const fs::path& root, const fs::path& settings,
     candidates.push_back(NDS_SOURCE_BIOS_DIR);
 #endif
     for (const fs::path& dir : candidates) {
-        if (bios_complete(dir, need_firmware)) {
+        if (bios_complete(dir, needs)) {
             *bios = dir.lexically_normal();
             return true;
         }
@@ -368,7 +381,7 @@ bool resolve_bios(const fs::path& root, const fs::path& settings,
         std::string picked;
         switch (pick_folder(
             std::string("Select the folder with ") +
-                bios_files_wanted(need_firmware), &picked)) {
+                bios_files_wanted(needs), &picked)) {
             case DialogResult::Picked:
                 break;
             case DialogResult::Cancelled:
@@ -376,17 +389,17 @@ bool resolve_bios(const fs::path& root, const fs::path& settings,
                 return false;
             case DialogResult::Unavailable:
                 nds_player_error(std::string("Put ") +
-                                 bios_files_wanted(need_firmware) + " in " +
+                                 bios_files_wanted(needs) + " in " +
                                  (root / "bios").string() + ".");
                 return false;
         }
-        if (bios_complete(picked, need_firmware)) {
+        if (bios_complete(picked, needs)) {
             *bios = picked;
             remember(settings, "bios", to_stored(root, picked));
             return true;
         }
         nds_player_error(picked + " must contain " +
-                         bios_files_wanted(need_firmware) + ".");
+                         bios_files_wanted(needs) + ".");
     }
 }
 
@@ -474,7 +487,10 @@ bool nds_player_prepare(int argc, char** argv, NdsFrontendOptions* options,
     const bool have_bios = true;
 #else
     const bool embedded = false;
-    const bool have_bios = false;
+    // FreeBIOS with generated firmware loads no dump at all: nothing to ask
+    // for, and the data directory holds the generated identity file.
+    const bool have_bios = !dump_needs(*options).any();
+    if (have_bios) bios = root;
 #endif
     if (!resolve_rom(root, settings, *options, argc == 2 ? argv[1] : nullptr,
                      &rom, &cancelled) ||
