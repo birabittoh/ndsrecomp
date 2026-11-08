@@ -3069,7 +3069,7 @@ int nds_run_interactive_frontend(const NdsFrontendOptions& initial_options) {
 
     std::fprintf(stderr,
         "[sdl] controls: gamepad=Player 1 | bottom mouse=touch | "
-        "Esc=settings%s\n",
+        "Esc=settings | hold Shift=fast-forward%s\n",
         options.tab_turbo ? " | hold Tab=turbo" : "");
     std::fputs("[sdl] keyboard:", stderr);
     for (size_t row = 0; row < options.keyboard_bindings.size(); ++row)
@@ -3602,8 +3602,11 @@ int nds_run_interactive_frontend(const NdsFrontendOptions& initial_options) {
         return presentation_window_focused[0] ||
                (presentation.separate && presentation_window_focused[1]);
     };
-    auto clear_tab_turbo = [&]() {
-        if (options.tab_turbo) turbo_pressed = false;
+    // Both turbo sources (Shift, and the developer Tab) drop on focus loss so
+    // a key released in another window cannot leave fast-forward latched.
+    auto clear_tab_turbo = [&]() { turbo_pressed = false; };
+    auto is_shift_key = [](SDL_Scancode key) {
+        return key == SDL_SCANCODE_LSHIFT || key == SDL_SCANCODE_RSHIFT;
     };
     auto runtime_menu_open = [&]() {
         return runtime_ui && recomp_runtime_ui_is_open(runtime_ui);
@@ -4140,6 +4143,10 @@ int nds_run_interactive_frontend(const NdsFrontendOptions& initial_options) {
                     ++host_key_presses;
                     keyboard_pressed |= bit;
                     publish_keys();
+                } else if (is_shift_key(scancode)) {
+                    // Hold Shift to fast-forward, unless the user bound Shift
+                    // to a DS button above.
+                    turbo_pressed = true;
                 }
             }
             if (event.type == SDL_KEYUP && !event.key.repeat) {
@@ -4158,6 +4165,8 @@ int nds_run_interactive_frontend(const NdsFrontendOptions& initial_options) {
                 } else if (const uint16_t bit = nds_binding_mask(options.keyboard_bindings, scancode)) {
                     keyboard_pressed &= static_cast<uint16_t>(~bit);
                     publish_keys();
+                } else if (is_shift_key(scancode)) {
+                    turbo_pressed = false;
                 }
             }
             if (event.type == SDL_CONTROLLERDEVICEADDED && !controller) {
