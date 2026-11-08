@@ -5005,7 +5005,10 @@ int nds_run_interactive_frontend(const NdsFrontendOptions& initial_options) {
             // extra present.
             SDL_PumpEvents();
         }
-        nds_gpu3d_set_interpolation(options.smooth_3d);
+        // Fast-forward shows the game's own 3D images only: building and
+        // drawing the halfway image costs host time that turbo would rather
+        // spend running more DS frames, and at turbo speed it is not seen.
+        nds_gpu3d_set_interpolation(options.smooth_3d && !turbo_active);
         nds_compute_host_set_thin_outlines(options.thin_outlines);
         presentation.window_mode = options.window_mode;
         presentation.scaling = options.scaling;
