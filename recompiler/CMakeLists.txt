@@ -39,6 +39,15 @@ target_include_directories(hle_manifest_test PRIVATE
 ndsrecomp_link_tomlpp(hle_manifest_test)
 add_test(NAME hle_manifest_test COMMAND hle_manifest_test)
 
+add_executable(hook_manifest_test
+    tests/hook_manifest_test.cpp
+    finder/config.cpp
+    support/sha1.cpp)
+target_include_directories(hook_manifest_test PRIVATE
+    finder support ${NDS_ARM_RECOMP_INCLUDE_DIRS})
+ndsrecomp_link_tomlpp(hook_manifest_test)
+add_test(NAME hook_manifest_test COMMAND hook_manifest_test)
+
 # The recompiler driver: config + function finder + audit/emit.
 add_executable(nds_recompile
     src/main.cpp
