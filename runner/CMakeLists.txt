@@ -34,8 +34,8 @@ option(NDS_BOOTSTRAP_FIRMWARE
 option(NDS_ENABLE_COMPUTE_RENDERER
     "Build the selected melonDS accelerated renderer (OpenGL 4.3 context)"
     ON)
-set(NDS_ACCELERATED_RENDERER "OPENGL" CACHE STRING
-    "Developer build selection: COMPUTE or OPENGL native rasterization, or PLUME (Vulkan/D3D12, in progress)")
+set(NDS_ACCELERATED_RENDERER "PLUME" CACHE STRING
+    "Accelerated renderer: PLUME (Vulkan, D3D12 on Windows, MoltenVK on Apple; default), or the GL backends COMPUTE or OPENGL")
 set_property(CACHE NDS_ACCELERATED_RENDERER PROPERTY STRINGS COMPUTE OPENGL PLUME)
 option(NDS_BUILD_NATIVE_GL_TESTS "Build focused SDL3/native-GL context checks" OFF)
 option(NDS_LEAN_DIAGNOSTICS "Experiment: diagnostic sampling is explicitly armed" OFF)

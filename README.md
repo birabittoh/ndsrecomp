@@ -268,11 +268,11 @@ window; keyboard input remains shared by the DS session. Adaptive widescreen
 is a title capability, not framebuffer stretching: unsupported screen choices
 are rejected. A title may expose the top screen, bottom screen, or both
 independently. The native 256x192 compositor remains the parity path; adaptive
-output is opt-in. The default `auto` renderer policy prefers the OpenGL 4.3
-compute backend and its direct GPU-resident adaptive path when eligible, with
-startup fallback to threaded software. `NDS_3D_RENDERER=soft` forces the
-faithful floor; `NDS_3D_RENDERER=compute` forces OpenGL and fails loudly if it
-cannot start. HUD sprites can be anchored to the widened left/right corners
+output is opt-in. The default `auto` renderer policy prefers the compiled
+accelerated backend (Plume unless the build picked a GL one, see
+`docs/plume-renderer.md`), with startup fallback to threaded software.
+`NDS_3D_RENDERER=soft` forces the faithful floor; `NDS_3D_RENDERER=compute`
+forces the accelerated backend and fails loudly if it cannot start. HUD sprites can be anchored to the widened left/right corners
 while center overlays remain centered. `adaptive_capability` requires an exact
 `[game].sha1`, allowing new
 title projects to opt into audited screens without adding their ROM hashes to

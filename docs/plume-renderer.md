@@ -1,26 +1,30 @@
 # Plume renderer host
 
-`NDS_ACCELERATED_RENDERER=PLUME` builds the runner's renderer host on
-[Plume](https://github.com/birabittoh/plume) (`external/plume`, the fork
-Eternal Sonata Reprise uses): an RHI over Vulkan, D3D12 and Metal. The top
-window then carries a Vulkan surface (Linux) or a D3D12 swap chain (Windows)
-instead of a GL context, and every shader is HLSL compiled ahead of time.
-Nothing is compiled by the driver at startup.
+`NDS_ACCELERATED_RENDERER=PLUME`, the default, builds the runner's renderer
+host on [Plume](https://github.com/birabittoh/plume) (`external/plume`, the
+fork Eternal Sonata Reprise uses): an RHI over Vulkan, D3D12 and Metal. The
+top window then carries a Vulkan surface (Linux), a D3D12 swap chain
+(Windows) or a Vulkan surface on an SDL Metal view's `CAMetalLayer` (Apple,
+through MoltenVK) instead of a GL context, and every shader is HLSL compiled
+ahead of time. Nothing is compiled by the driver at startup.
 
-The two GL backends (`COMPUTE`, `OPENGL`) are unchanged and remain the
-default. This is a third compile-time choice, not a runtime switch.
+The two GL backends (`COMPUTE`, `OPENGL`) are unchanged and still build with
+`-DNDS_ACCELERATED_RENDERER=OPENGL` (or `COMPUTE`). This is a compile-time
+choice, not a runtime switch.
 
 ## Build
 
 ```sh
 git submodule update --init --recursive      # external/plume and its contrib/
-cmake -S runner -B build-plume -G Ninja -DNDS_ACCELERATED_RENDERER=PLUME ...
+cmake -S runner -B build -G Ninja ...      # PLUME unless told otherwise
 ```
 
 Configure fetches a pinned DXC (`renderbag/dxc-bin`) through Plume's
 `PlumeShaders.cmake`, unless `PLUME_DXC_EXECUTABLE` names one. DXC turns
 `runner/src/plume/shaders/*.hlsl` into SPIR-V (and DXIL on Windows), and
 Plume's `file_to_c` embeds each blob as a byte array (`<build>/shaders/`).
+On Apple only SPIR-V is built: MoltenVK runs it, and Plume's Metal backend
+(and its SPIRV-Cross to `xcrun metal` step) is not used.
 
 A second build directory beside a GL one does not need to recompile the
 banks: pass the GL build's archive with `NDS_PREBUILT_BANK_ARCHIVE` and its
@@ -34,6 +38,12 @@ banks.
 `auto` falls back to the SDL renderer path with threaded software 3D, like
 the GL backends. On Windows `NDS_PLUME_API=vulkan` asks for Vulkan before
 D3D12.
+
+On Apple the runner needs MoltenVK at run time. The Vulkan loader or
+`libMoltenVK.dylib` is found under the usual names (Vulkan SDK, `/usr/local`,
+frameworks); failing that, beside the executable, in the app bundle's
+`Frameworks/`, or in `/opt/homebrew/lib` (`brew install molten-vk`). Startup
+logs `[plume] Vulkan from <path>` when one of the latter is used.
 
 ## Design
 
@@ -94,5 +104,5 @@ first playtest (untested in game since):
   (internal scale above 1).
 
 Not done: antialiasing (resolution_scale above 100 supersamples instead),
-Windows/D3D12 and macOS (no `{NSWindow, CAMetalLayer}` wiring),
+Windows/D3D12 and macOS/MoltenVK untested (built and wired, never run),
 `nds_compute_host_read_presented`, vsync via MAILBOX, a validation-layer run.
