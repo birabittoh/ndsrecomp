@@ -54,3 +54,6 @@ void nds_gx_interp_show_real(melonDS::GPU3D& gpu3d);
 void nds_gx_interp_reset();
 // NDS_GX_CMD_TRACE: record each image's commands while smoothing is off too.
 void nds_gx_interp_set_trace(FILE* file);
+// The user saw something wrong just now: with NDS_GX_CMD_TRACE_RING, save
+// the images around it. Any thread.
+void nds_gx_interp_mark();

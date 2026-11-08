@@ -1361,6 +1361,12 @@ ndsrecomp_link_tomlpp(frontend_config_test)
   target_include_directories(gpu3d_gxstream_test PRIVATE src vendor/melonds)
   add_test(NAME gpu3d_gxstream_test COMMAND gpu3d_gxstream_test)
 
+  # Offline smooth_3d diagnosis of an NDS_GX_CMD_TRACE (not a test).
+  add_executable(gx_interp_diag tests/gx_interp_diag.cpp
+      src/gpu3d_gxstream.cpp
+      vendor/melonds/GPU3D.cpp vendor/melonds/GPU3D_Soft.cpp vendor/melonds/Savestate.cpp)
+  target_include_directories(gx_interp_diag PRIVATE src vendor/melonds)
+
   if(NDS_BUILD_NATIVE_GL_TESTS AND NDS_GL_HOST AND NDS_SDL_BACKEND STREQUAL "SDL3")
     add_executable(native_gl_test tests/native_gl_test.cpp
         src/melonds_compute/CaptureReference.cpp src/melonds_compute/GPU_OpenGL.cpp

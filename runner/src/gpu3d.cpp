@@ -1529,6 +1529,10 @@ static Gx3dFrame count_3d_frame() {
     return {true, new_image};
 }
 
+void nds_gpu3d_mark_interp() {
+    nds_gx_interp_mark();
+}
+
 void nds_gpu3d_set_interpolation(bool enabled) {
     g_gx_interpolation = enabled;
 }

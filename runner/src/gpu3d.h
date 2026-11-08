@@ -113,6 +113,8 @@ struct NdsGpu3dProfile {
 void nds_gpu3d_profile(NdsGpu3dProfile* out);
 // Motion smoothing for games drawing 3D below the DS frame rate.
 void nds_gpu3d_set_interpolation(bool enabled);
+// The mark key: with NDS_GX_CMD_TRACE, notes the moment in the command trace.
+void nds_gpu3d_mark_interp();
 // Host-only immutable capture-copy counters; unavailable paths return zeros.
 bool nds_gpu3d_capture_copy_counts(uint64_t* texture, uint64_t* palette);
 void nds_gpu3d_debug_history_reset();

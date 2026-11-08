@@ -171,9 +171,14 @@ private:
     melonDS::u32 line_[448] = {};
 };
 
+void put_bytes(std::vector<uint8_t>* out, const void* data, size_t size) {
+    const auto* bytes = static_cast<const uint8_t*>(data);
+    out->insert(out->end(), bytes, bytes + size);
+}
+
 template <typename T>
-void put(FILE* file, const T& value) {
-    std::fwrite(&value, sizeof(value), 1, file);
+void put(std::vector<uint8_t>* out, const T& value) {
+    put_bytes(out, &value, sizeof(value));
 }
 
 template <typename T>
@@ -310,7 +315,8 @@ bool NdsGxRecorder::after_vblank(const GPU3D& gpu3d, bool flushed, NdsGxStream* 
 }
 
 bool nds_gx_lerp_streams(const NdsGxStream& a, const NdsGxStream& b, float t,
-                         NdsGxStream* out, NdsGxLerpStats* stats) {
+                         NdsGxStream* out, NdsGxLerpStats* stats,
+                         std::vector<NdsGxUnitMatch>* report) {
     NdsGxLerpStats local;
     NdsGxLerpStats& st = stats ? *stats : local;
     st = NdsGxLerpStats{};
@@ -336,15 +342,27 @@ bool nds_gx_lerp_streams(const NdsGxStream& a, const NdsGxStream& b, float t,
     };
     static thread_local std::vector<Candidate> candidates;
     candidates.clear();
+    if (report) {
+        report->assign(units_b.size(), NdsGxUnitMatch{});
+        for (uint32_t j = 0; j < units_b.size(); ++j) {
+            (*report)[j].begin = units_b[j].begin;
+            (*report)[j].end = units_b[j].end;
+        }
+    }
     for (uint32_t j = 0; j < units_b.size(); ++j) {
         if (!units_b[j].moving) continue;
         ++st.moving_units;
         const auto found = by_signature.find(units_b[j].signature);
+        if (report) (*report)[j].status = NdsGxUnitStatus::NoSignature;
         if (found == by_signature.end()) continue;
+        bool any = false;
         for (const uint32_t i : found->second) {
             const int64_t cost = unit_cost(a, units_a[i], modes_a, b, units_b[j]);
             if (cost >= 0) candidates.push_back({cost, j, i});
+            any |= cost >= 0;
         }
+        if (report)
+            (*report)[j].status = any ? NdsGxUnitStatus::Taken : NdsGxUnitStatus::Implausible;
     }
     // Look-alikes: each copy takes the one that moved least.
     std::sort(candidates.begin(), candidates.end(), [](const Candidate& l, const Candidate& r) {
@@ -359,6 +377,11 @@ bool nds_gx_lerp_streams(const NdsGxStream& a, const NdsGxStream& b, float t,
         b_to_a[c.b] = int32_t(c.a);
         a_used[c.a] = 1;
         ++st.blended_units;
+        if (report) {
+            (*report)[c.b].status = NdsGxUnitStatus::Blended;
+            (*report)[c.b].a_begin = int32_t(units_a[c.a].begin);
+            (*report)[c.b].cost = c.cost;
+        }
     }
     // Below half, the two images are different scenes (a cut, a menu).
     if (st.moving_units > 0 && st.blended_units * 2 < st.moving_units) return false;
@@ -436,38 +459,59 @@ void nds_gx_trace_polygon(const Polygon& p, NdsGxTracePolygon* out) {
     }
 }
 
-void nds_gx_trace_image(FILE* file, uint32_t vblank, const NdsGxStream& stream,
-                        const GPU3D& gpu3d) {
-    std::fwrite("GXCI", 4, 1, file);
-    put(file, vblank);
-    put(file, uint32_t(sizeof(NdsGxGeometryState)));
-    put(file, stream.start);
-    put(file, uint32_t(stream.size()));
-    put(file, uint32_t(stream.params.size()));
-    std::fwrite(stream.ops.data(), 1, stream.ops.size(), file);
-    std::vector<uint8_t> counts(stream.size());
-    for (size_t i = 0; i < stream.size(); ++i) counts[i] = uint8_t(stream.count(i));
-    std::fwrite(counts.data(), 1, counts.size(), file);
-    std::fwrite(stream.params.data(), sizeof(uint32_t), stream.params.size(), file);
-    put(file, uint32_t(gpu3d.RenderNumPolygons));
+void nds_gx_trace_image(std::vector<uint8_t>* out, uint32_t vblank,
+                        const NdsGxStream& stream, const GPU3D& gpu3d) {
+    put_bytes(out, "GXCI", 4);
+    put(out, vblank);
+    put(out, uint32_t(sizeof(NdsGxGeometryState)));
+    put(out, stream.start);
+    put(out, uint32_t(stream.size()));
+    put(out, uint32_t(stream.params.size()));
+    put_bytes(out, stream.ops.data(), stream.ops.size());
+    for (size_t i = 0; i < stream.size(); ++i) put(out, uint8_t(stream.count(i)));
+    put_bytes(out, stream.params.data(), stream.params.size() * sizeof(uint32_t));
+    put(out, uint32_t(gpu3d.RenderNumPolygons));
     for (uint32_t i = 0; i < gpu3d.RenderNumPolygons; ++i) {
         NdsGxTracePolygon p;
         nds_gx_trace_polygon(*gpu3d.RenderPolygonRAM[i], &p);
-        put(file, p.attr);
-        put(file, p.tex_param);
-        put(file, p.tex_palette);
-        put(file, p.num_vertices);
-        put(file, p.flags);
-        put(file, p.final_z);
-        put(file, p.final_w);
-        std::fwrite(p.vertices, sizeof(Vertex), p.num_vertices, file);
+        put(out, p.attr);
+        put(out, p.tex_param);
+        put(out, p.tex_palette);
+        put(out, p.num_vertices);
+        put(out, p.flags);
+        put(out, p.final_z);
+        put(out, p.final_w);
+        put_bytes(out, p.vertices, sizeof(Vertex) * p.num_vertices);
     }
+}
+
+void nds_gx_trace_image(FILE* file, uint32_t vblank, const NdsGxStream& stream,
+                        const GPU3D& gpu3d) {
+    std::vector<uint8_t> bytes;
+    nds_gx_trace_image(&bytes, vblank, stream, gpu3d);
+    std::fwrite(bytes.data(), 1, bytes.size(), file);
+}
+
+void nds_gx_trace_mark(FILE* file, uint32_t vblank, uint32_t mark) {
+    std::vector<uint8_t> bytes;
+    put_bytes(&bytes, "GXMK", 4);
+    put(&bytes, vblank);
+    put(&bytes, mark);
+    std::fwrite(bytes.data(), 1, bytes.size(), file);
 }
 
 bool nds_gx_trace_read(FILE* file, NdsGxTraceImage* out) {
     char magic[4];
-    if (std::fread(magic, 4, 1, file) != 1 || std::memcmp(magic, "GXCI", 4) != 0)
-        return false;
+    out->marks.clear();
+    for (;;) {
+        if (std::fread(magic, 4, 1, file) != 1) return false;
+        if (std::memcmp(magic, "GXMK", 4) != 0) break;
+        uint32_t vblank = 0, mark = 0;
+        if (!get(file, &vblank) || !get(file, &mark)) return false;
+        (void)mark;
+        out->marks.push_back(vblank);
+    }
+    if (std::memcmp(magic, "GXCI", 4) != 0) return false;
     uint32_t state_size = 0, commands = 0, params = 0, polygons = 0;
     if (!get(file, &out->vblank) || !get(file, &state_size) ||
         state_size != sizeof(NdsGxGeometryState) || !get(file, &out->stream.start) ||

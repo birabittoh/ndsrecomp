@@ -129,8 +129,25 @@ struct NdsGxLerpStats {
 // than a matrix one is identical (same vertices, texcoords, normals, stack
 // slots), and among look-alikes (two copies of one model) the one whose
 // matrices moved least is taken. False when too little of `b` is in `a`.
+// How each unit of `b` was treated, for diagnostics.
+enum class NdsGxUnitStatus : uint8_t {
+    Still,        // sets no blended matrix
+    Blended,      // matched in `a`
+    NoSignature,  // nothing in `a` draws the same
+    Implausible,  // same signature, but a matrix entry jumped too far
+    Taken,        // its look-alikes in `a` went to cheaper matches
+};
+
+struct NdsGxUnitMatch {
+    uint32_t begin = 0, end = 0;  // command range in `b`
+    int32_t a_begin = -1;         // its partner's first command in `a`
+    NdsGxUnitStatus status = NdsGxUnitStatus::Still;
+    int64_t cost = -1;
+};
+
 bool nds_gx_lerp_streams(const NdsGxStream& a, const NdsGxStream& b, float t,
-                         NdsGxStream* out, NdsGxLerpStats* stats);
+                         NdsGxStream* out, NdsGxLerpStats* stats,
+                         std::vector<NdsGxUnitMatch>* units = nullptr);
 
 // A private geometry engine that redraws streams.
 class NdsGxReplayer {
@@ -157,8 +174,13 @@ private:
 //   2 shadow mask, 4 shadow, 8 facing view, 16 w-buffer, 32 degenerate,
 //   64 line), s32 final_z[10], final_w[10], and its vertices as melonDS
 //   Vertex bytes.
+//   A "GXMK", u32 vblank, u32 mark record (the user's mark key, at that
+//   vblank of the same count) comes before the first image traced after it.
 void nds_gx_trace_image(FILE* file, uint32_t vblank, const NdsGxStream& stream,
                         const melonDS::GPU3D& gpu3d);
+void nds_gx_trace_image(std::vector<uint8_t>* out, uint32_t vblank,
+                        const NdsGxStream& stream, const melonDS::GPU3D& gpu3d);
+void nds_gx_trace_mark(FILE* file, uint32_t vblank, uint32_t mark);
 
 struct NdsGxTracePolygon {
     uint32_t attr = 0, tex_param = 0, tex_palette = 0, num_vertices = 0, flags = 0;
@@ -168,6 +190,7 @@ struct NdsGxTracePolygon {
 
 struct NdsGxTraceImage {
     uint32_t vblank = 0;
+    std::vector<uint32_t> marks;  // vblanks of marks recorded just before this image
     NdsGxStream stream;
     std::vector<NdsGxTracePolygon> polygons;
 };

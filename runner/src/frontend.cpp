@@ -4147,6 +4147,10 @@ int nds_run_interactive_frontend(const NdsFrontendOptions& initial_options) {
                     // Hold Shift to fast-forward, unless the user bound Shift
                     // to a DS button above.
                     turbo_pressed = true;
+                } else if (scancode == SDL_SCANCODE_M) {
+                    // Marks the moment in an NDS_GX_CMD_TRACE (smooth_3d
+                    // debugging); nothing without one.
+                    nds_gpu3d_mark_interp();
                 }
             }
             if (event.type == SDL_KEYUP && !event.key.repeat) {
