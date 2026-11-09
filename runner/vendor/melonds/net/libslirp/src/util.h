@@ -38,6 +38,7 @@
 #include <winsock2.h>
 #include <windows.h>
 #include <ws2tcpip.h>
+#include <io.h> /* open/read/lseek/close; MinGW pulls it in implicitly */
 #else
 #include <unistd.h>
 #include <sys/socket.h>

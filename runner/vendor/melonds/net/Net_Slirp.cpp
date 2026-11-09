@@ -70,7 +70,7 @@ int clock_gettime(int, struct timespec *spec)
 #endif // __WIN32__
 
 
-ssize_t Net_Slirp::SlirpCbSendPacket(const void* buf, size_t len, void* opaque) noexcept
+slirp_ssize_t Net_Slirp::SlirpCbSendPacket(const void* buf, size_t len, void* opaque) noexcept
 {
     if (len > 2048)
     {

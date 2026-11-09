@@ -104,7 +104,7 @@ private:
     static const SlirpCb cb;
     static int SlirpCbGetREvents(int idx, void* opaque) noexcept;
     static int SlirpCbAddPoll(int fd, int events, void* opaque) noexcept;
-    static ssize_t SlirpCbSendPacket(const void* buf, size_t len, void* opaque) noexcept;
+    static slirp_ssize_t SlirpCbSendPacket(const void* buf, size_t len, void* opaque) noexcept;
     void HandleDNSFrame(u8* data, int len) noexcept;
 
     Platform::SendPacketCallback Callback;

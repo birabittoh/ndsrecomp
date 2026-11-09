@@ -61,6 +61,12 @@
 #else
 #define NDS_DXIL(name) nullptr, 0
 #endif
+
+#if defined(_WIN32)
+// windows.h, through Plume's D3D12 backend, defines DrawState as a macro
+// (DrawStateA) and ::Polygon as a GDI function.
+#undef DrawState
+#endif
 #define NDS_SHADER(name, entry) \
     nds_plume_create_shader(name##BlobSPIRV, sizeof(name##BlobSPIRV), NDS_DXIL(name), entry)
 
@@ -1063,7 +1069,7 @@ RenderTexture* nds_plume3d_output(uint32_t* width, uint32_t* height) {
     return g_renderer->targets.output.get();
 }
 
-void nds_plume3d_render(const melonDS::GPU& gpu, Polygon* const* polygons, uint32_t count,
+void nds_plume3d_render(const melonDS::GPU& gpu, melonDS::Polygon* const* polygons, uint32_t count,
                         uint64_t texture_generation) {
     if (!g_renderer) return;
     Renderer& r = *g_renderer;
@@ -1104,7 +1110,7 @@ void nds_plume3d_render(const melonDS::GPU& gpu, Polygon* const* polygons, uint3
     r.num_polys = 0;
     r.num_opaque_polys = -1;
     for (uint32_t i = 0; i < count && i < 2048; ++i) {
-        const Polygon* poly = polygons[i];
+        const melonDS::Polygon* poly = polygons[i];
         if (poly->Degenerate) continue;
         setup_polygon(&r.polygons[r.num_polys], poly);
         if (r.num_opaque_polys < 0 && poly->Translucent) r.num_opaque_polys = r.num_polys;

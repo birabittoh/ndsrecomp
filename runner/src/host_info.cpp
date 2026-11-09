@@ -39,7 +39,7 @@ std::string trim(const std::string& text) {
 
 #if defined(__x86_64__) || defined(__i386__) || defined(_MSC_VER)
 bool cpuid_regs(unsigned leaf, unsigned regs[4]) {
-#if defined(_MSC_VER) && !defined(__GNUC__)
+#if defined(_MSC_VER) && !defined(__GNUC__) && !defined(__clang__)
     int out[4];
     __cpuid(out, static_cast<int>(leaf));
     for (int i = 0; i < 4; ++i) regs[i] = static_cast<unsigned>(out[i]);
