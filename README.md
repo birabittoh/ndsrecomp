@@ -56,8 +56,11 @@ Prime Hunters early gameplay footage:
   scenes.
 - Experimental Nintendo WFC plumbing for title projects, demonstrated with
   Mario Kart DS reaching Wiimmfi multiplayer.
-- Experimental same-machine local wireless multiplayer for MKDS through a
-  localhost transport. LAN/across-machine play is not validated or claimed.
+- Experimental local wireless multiplayer, validated for MKDS between
+  instances on one machine. The transport also finds runners on the local
+  network (UDP broadcast on ports 26710-26725; allow the runner through the
+  firewall, or use `--local-wireless-link loopback`) and delivers frames
+  reliably, but LAN/across-machine play is not validated yet.
 - A separate melonDS-based accuracy oracle and machine-readable traversal
   evidence for differential testing.
 
