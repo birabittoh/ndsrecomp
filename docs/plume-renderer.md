@@ -105,4 +105,5 @@ first playtest (untested in game since):
 
 Not done: antialiasing (resolution_scale above 100 supersamples instead),
 Windows/D3D12 and macOS/MoltenVK untested (built and wired, never run),
-`nds_compute_host_read_presented`, vsync via MAILBOX, a validation-layer run.
+`nds_compute_host_read_presented`, a validation-layer run. Vsync is always
+on (MAILBOX where available, else FIFO), with no setting.

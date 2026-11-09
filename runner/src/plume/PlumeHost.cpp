@@ -524,10 +524,11 @@ bool start_presenter(SDL_Window* window) {
         std::fprintf(stderr, "[plume] no swap chain on the presentation window\n");
         return false;
     }
-    // The GL presenter swaps with interval 0 and the frontend paces itself
-    // from the audio queue, so a present must not block on the vblank here
-    // either: vsync off (immediate where the surface supports it).
-    g_backend.swap_chain->setVsyncEnabled(false);
+    // Vsync is always on, with no setting to turn it off. The frontend paces
+    // itself from the audio queue, so Vulkan prefers MAILBOX: the flip lands
+    // on a vblank (no tearing) but a present never blocks for a whole
+    // refresh. Without MAILBOX it falls back to FIFO.
+    g_backend.swap_chain->setVsyncEnabled(true);
     // A swap chain has no images until its first resize.
     if (!g_backend.swap_chain->resize()) {
         std::fprintf(stderr, "[plume] initial swap chain resize failed\n");
