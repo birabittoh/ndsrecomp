@@ -15,8 +15,10 @@
 //   saves/          cartridge battery save
 //   savestates/     savestate slots
 //   bios/           optional home for the BIOS and firmware dumps
-//   logs/           <app>_NNN.log (stderr, log_file.h), performance logs
-//                   and coverage manifests
+//
+// Logs are the exception: they always go to logs/ next to the executable
+// (<app>_NNN.log from stderr, log_file.h, performance logs and coverage
+// manifests).
 //
 // The directory is named after [game].app_name:
 //   Linux    $XDG_DATA_HOME/<app> (~/.local/share/<app>)

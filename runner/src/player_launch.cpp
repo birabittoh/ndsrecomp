@@ -536,8 +536,11 @@ bool nds_player_prepare(int argc, char** argv, NdsFrontendOptions* options,
     const fs::path root = data_directory(app);
     const fs::path settings = root / "settings.toml";
     std::error_code fs_error;
-    for (const char* sub : {"saves", "savestates", "logs"})
-        fs::create_directories(root / sub, fs_error);
+    // Logs sit next to the executable whatever the data directory is, so a
+    // bug report never means hunting through Documents.
+    const fs::path logs = executable_dir() / "logs";
+    for (const fs::path& dir : {root / "saves", root / "savestates", logs})
+        fs::create_directories(dir, fs_error);
     if (fs_error) {
         nds_player_error("Cannot create " + root.string() + ": " +
                          fs_error.message());
@@ -603,7 +606,7 @@ bool nds_player_prepare(int argc, char** argv, NdsFrontendOptions* options,
         : resolve_stored(root, options->paths.save);
     out->save = save.string();
     out->savestate_dir = (root / "savestates").string();
-    out->log_dir = (root / "logs").string();
+    out->log_dir = logs.string();
     out->data_dir = root.string();
     if (args.instance >= 0 && !apply_instance(args.instance, save, options,
                                               out)) {

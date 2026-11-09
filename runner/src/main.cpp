@@ -864,8 +864,8 @@ int main(int argc, char** argv) {
         }
     }
     {
-        // As in rexglue: <settings folder>/logs, which for a player is the
-        // data directory and otherwise the executable's directory.
+        // <executable's directory>/logs; a player's instance N from 1 on
+        // uses its logs/instance-N subdirectory (player_launch.h).
         const auto exe_dir = exe_dir_from_argv(argv[0]);
         const std::filesystem::path log_dir = player_log_dir.empty()
             ? exe_dir / "logs"
