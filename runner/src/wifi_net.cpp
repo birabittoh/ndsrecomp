@@ -839,6 +839,10 @@ struct LocalMpFrame {
     uint32_t sender = 0;
     uint32_t type = 0;
     uint64_t timestamp = 0;
+    // Sender's steady_clock at send, in ns. The latency lab measures its
+    // delay from here, not from when this process got round to reading the
+    // socket (see LocalMpTransport::Admit).
+    int64_t sent_ns = 0;
     std::vector<uint8_t> payload;
 };
 
@@ -1067,7 +1071,8 @@ public:
 private:
     static constexpr uint32_t kMagic = 0x4946494Eu;
     static constexpr uint32_t kMaxInstances = 16;
-    static constexpr uint32_t kHeaderBytes = 24;
+    // magic, sender, type, len, guest timestamp (u64), send time (u64 ns)
+    static constexpr uint32_t kHeaderBytes = 32;
     static constexpr size_t kMaxFrameBytes = 0x948;
     static constexpr size_t kQueueCapacity = 1024;
     static constexpr size_t kDelayedCapacity = 8192;
@@ -1181,6 +1186,9 @@ private:
         WriteLe32(&datagram, type);
         WriteLe32(&datagram, static_cast<uint32_t>(len));
         WriteLe64(&datagram, timestamp);
+        WriteLe64(&datagram, static_cast<uint64_t>(
+            std::chrono::duration_cast<std::chrono::nanoseconds>(
+                now.time_since_epoch()).count()));
         if (len > 0)
             datagram.insert(datagram.end(), data, data + len);
 
@@ -1240,6 +1248,7 @@ private:
             frame.type = ReadLe32(datagram + 8u);
             const uint32_t len = ReadLe32(datagram + 12u);
             frame.timestamp = ReadLe64(datagram + 16u);
+            frame.sent_ns = static_cast<int64_t>(ReadLe64(datagram + 24u));
             if (frame.sender == instance_) continue;
             if (frame.sender >= kMaxInstances) continue;
             if (len > kMaxFrameBytes) continue;
@@ -1277,7 +1286,17 @@ private:
         uint32_t hold_us = tuning_.delay_ms * 1000u;
         if (tuning_.jitter_ms)
             hold_us += rng_() % (tuning_.jitter_ms * 1000u + 1u);
-        auto release = std::chrono::steady_clock::now() +
+        // Count the delay from the send, as a network would: the datagram
+        // is in the socket from send + delay on, however long this guest
+        // then sleeps with its radio off before reading it. Counting from
+        // the read instead adds a whole beacon interval whenever the guest
+        // powers down within the delay (it only reads while awake), which
+        // skews beacons and broke the auth/assoc handshake. Both instances
+        // run on this machine, so their steady clocks agree.
+        auto release = std::chrono::steady_clock::time_point(
+                           std::chrono::duration_cast<
+                               std::chrono::steady_clock::duration>(
+                               std::chrono::nanoseconds(frame.sent_ns))) +
                        std::chrono::microseconds(hold_us);
         // Jitter varies the delay but never reorders: a relay path keeps
         // datagram order nearly always, and FIFO keeps the queue sorted.
