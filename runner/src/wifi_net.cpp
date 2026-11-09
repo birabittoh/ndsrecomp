@@ -45,6 +45,14 @@
 #include <winsock2.h>
 #include <mswsock.h>
 #include <ws2tcpip.h>
+#else
+#include <arpa/inet.h>
+#include <cerrno>
+#include <fcntl.h>
+#include <netinet/in.h>
+#include <poll.h>
+#include <sys/socket.h>
+#include <unistd.h>
 #endif
 
 #if defined(NDS_ENABLE_PCAP_BACKEND) && defined(_WIN32)
@@ -711,6 +719,121 @@ void WriteLe64(std::vector<uint8_t>* out, uint64_t value) {
     WriteLe32(out, static_cast<uint32_t>(value >> 32u));
 }
 
+// Nonblocking localhost UDP socket, Winsock or BSD sockets. Local wireless
+// only needs socket/bind/sendto/recvfrom and a bounded readability wait.
+#ifdef _WIN32
+using LocalSocket = SOCKET;
+constexpr LocalSocket kInvalidLocalSocket = INVALID_SOCKET;
+int LocalSocketError() { return WSAGetLastError(); }
+// Nothing left to read, or a peer port that is not bound yet.
+bool LocalSocketDrained(int err) {
+    return err == WSAEWOULDBLOCK || err == WSAECONNRESET;
+}
+bool LocalSocketPeerGone(int err) { return err == WSAECONNRESET; }
+void LocalSocketClose(LocalSocket s) { closesocket(s); }
+#else
+using LocalSocket = int;
+constexpr LocalSocket kInvalidLocalSocket = -1;
+int LocalSocketError() { return errno; }
+bool LocalSocketDrained(int err) {
+    return err == EAGAIN || err == EWOULDBLOCK || err == ECONNREFUSED ||
+           err == EINTR;
+}
+bool LocalSocketPeerGone(int err) {
+    return err == ECONNREFUSED || err == EINTR;
+}
+void LocalSocketClose(LocalSocket s) { ::close(s); }
+#endif
+
+// A UDP socket bound to 127.0.0.1:port, nonblocking. Logs and returns
+// kInvalidLocalSocket on failure.
+LocalSocket LocalSocketOpen(uint16_t port, const char* tag) {
+    LocalSocket s = ::socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
+    if (s == kInvalidLocalSocket) {
+        melonDS::Platform::Log(melonDS::Platform::Error,
+            "[%s] socket failed: %d\n", tag, LocalSocketError());
+        return kInvalidLocalSocket;
+    }
+#ifdef _WIN32
+    // Sending to a port nobody has bound yet must not make the next
+    // recvfrom fail with WSAECONNRESET.
+    BOOL reset_enabled = FALSE;
+    DWORD bytes_returned = 0;
+    WSAIoctl(s, SIO_UDP_CONNRESET, &reset_enabled, sizeof(reset_enabled),
+             nullptr, 0, &bytes_returned, nullptr, nullptr);
+#endif
+    sockaddr_in addr{};
+    addr.sin_family = AF_INET;
+    addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    addr.sin_port = htons(port);
+    if (::bind(s, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) != 0) {
+        melonDS::Platform::Log(melonDS::Platform::Error,
+            "[%s] bind 127.0.0.1:%u failed: %d\n", tag,
+            static_cast<unsigned>(port), LocalSocketError());
+        LocalSocketClose(s);
+        return kInvalidLocalSocket;
+    }
+#ifdef _WIN32
+    u_long nonblocking = 1;
+    const bool nonblocking_ok = ioctlsocket(s, FIONBIO, &nonblocking) == 0;
+#else
+    const int flags = ::fcntl(s, F_GETFL, 0);
+    const bool nonblocking_ok =
+        flags >= 0 && ::fcntl(s, F_SETFL, flags | O_NONBLOCK) == 0;
+#endif
+    if (!nonblocking_ok) {
+        melonDS::Platform::Log(melonDS::Platform::Error,
+            "[%s] nonblocking setup failed: %d\n", tag, LocalSocketError());
+        LocalSocketClose(s);
+        return kInvalidLocalSocket;
+    }
+    return s;
+}
+
+// True when `s` became readable within `timeout_us`.
+bool LocalSocketWaitReadable(LocalSocket s, int64_t timeout_us) {
+#ifdef _WIN32
+    fd_set readable;
+    FD_ZERO(&readable);
+    FD_SET(s, &readable);
+    timeval tv{};
+    tv.tv_sec = static_cast<long>(timeout_us / 1000000);
+    tv.tv_usec = static_cast<long>(timeout_us % 1000000);
+    return ::select(0, &readable, nullptr, nullptr, &tv) > 0;
+#else
+    // poll() has millisecond resolution; round up so a short remaining
+    // wait still waits instead of spinning.
+    pollfd fd{};
+    fd.fd = s;
+    fd.events = POLLIN;
+    const int timeout_ms = static_cast<int>((timeout_us + 999) / 1000);
+    return ::poll(&fd, 1, timeout_ms) > 0 && (fd.revents & POLLIN) != 0;
+#endif
+}
+
+int LocalSocketSendTo(LocalSocket s, const uint8_t* data, size_t len,
+                      uint16_t port) {
+    sockaddr_in target{};
+    target.sin_family = AF_INET;
+    target.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    target.sin_port = htons(port);
+    return static_cast<int>(::sendto(
+        s, reinterpret_cast<const char*>(data), static_cast<int>(len), 0,
+        reinterpret_cast<sockaddr*>(&target), sizeof(target)));
+}
+
+int LocalSocketRecv(LocalSocket s, uint8_t* data, size_t capacity) {
+    sockaddr_in from{};
+#ifdef _WIN32
+    int from_len = sizeof(from);
+#else
+    socklen_t from_len = sizeof(from);
+#endif
+    return static_cast<int>(::recvfrom(
+        s, reinterpret_cast<char*>(data), static_cast<int>(capacity), 0,
+        reinterpret_cast<sockaddr*>(&from), &from_len));
+}
+
 struct LocalMpFrame {
     uint32_t sender = 0;
     uint32_t type = 0;
@@ -752,53 +875,17 @@ public:
 
     void Begin() {
         if (!enabled_) return;
-#ifdef _WIN32
-        if (socket_ != INVALID_SOCKET) return;
+        if (socket_ != kInvalidLocalSocket) return;
 
-        socket_ = ::socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
-        if (socket_ == INVALID_SOCKET) {
-            melonDS::Platform::Log(melonDS::Platform::Error,
-                "[local_mp] socket failed: %d\n", WSAGetLastError());
-            return;
-        }
-
-        BOOL reset_enabled = FALSE;
-        DWORD bytes_returned = 0;
-        WSAIoctl(socket_, SIO_UDP_CONNRESET, &reset_enabled,
-                 sizeof(reset_enabled), nullptr, 0, &bytes_returned,
-                 nullptr, nullptr);
-
-        sockaddr_in addr{};
-        addr.sin_family = AF_INET;
-        addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
-        addr.sin_port = htons(static_cast<uint16_t>(base_port_ + instance_));
-        if (::bind(socket_, reinterpret_cast<sockaddr*>(&addr),
-                   sizeof(addr)) == SOCKET_ERROR) {
-            melonDS::Platform::Log(melonDS::Platform::Error,
-                "[local_mp] bind 127.0.0.1:%u failed: %d\n",
-                static_cast<unsigned>(base_port_ + instance_),
-                WSAGetLastError());
-            CloseSocket();
-            return;
-        }
-
-        u_long nonblocking = 1;
-        if (ioctlsocket(socket_, FIONBIO, &nonblocking) == SOCKET_ERROR) {
-            melonDS::Platform::Log(melonDS::Platform::Error,
-                "[local_mp] nonblocking setup failed: %d\n", WSAGetLastError());
-            CloseSocket();
-            return;
-        }
+        socket_ = LocalSocketOpen(
+            static_cast<uint16_t>(base_port_ + instance_), "local_mp");
+        if (socket_ == kInvalidLocalSocket) return;
 
         melonDS::Platform::Log(melonDS::Platform::Info,
             "[local_mp] enabled instance=%u port=%u\n",
             static_cast<unsigned>(instance_),
             static_cast<unsigned>(base_port_ + instance_));
         g_savestate_network_guard.SetLocalMpListening(true);
-#else
-        melonDS::Platform::Log(melonDS::Platform::Warn,
-            "[local_mp] localhost UDP transport is currently Windows-only\n");
-#endif
     }
 
     void End() {
@@ -806,9 +893,7 @@ public:
         packet_queue_.Clear();
         reply_queue_.Clear();
         last_host_id_ = -1;
-#ifdef _WIN32
         CloseSocket();
-#endif
     }
 
     int SendPacket(uint8_t* data, int len, uint64_t timestamp) {
@@ -961,24 +1046,13 @@ private:
     // false = deadline reached. select() wakes on arrival with microsecond
     // latency; the timeout only bites when the peer is genuinely absent.
     bool WaitForData(std::chrono::steady_clock::time_point deadline) {
-#ifdef _WIN32
-        if (socket_ == INVALID_SOCKET) return false;
+        if (socket_ == kInvalidLocalSocket) return false;
         const auto now = std::chrono::steady_clock::now();
         if (now >= deadline) return false;
         const auto remaining =
             std::chrono::duration_cast<std::chrono::microseconds>(deadline -
                                                                   now);
-        fd_set readable;
-        FD_ZERO(&readable);
-        FD_SET(socket_, &readable);
-        timeval tv{};
-        tv.tv_sec = static_cast<long>(remaining.count() / 1000000);
-        tv.tv_usec = static_cast<long>(remaining.count() % 1000000);
-        return ::select(0, &readable, nullptr, nullptr, &tv) > 0;
-#else
-        (void)deadline;
-        return false;
-#endif
+        return LocalSocketWaitReadable(socket_, remaining.count());
     }
 
     static int LatencyBucket(std::chrono::steady_clock::duration d) {
@@ -996,8 +1070,7 @@ private:
     int SendGeneric(uint32_t type, uint8_t* data, int len,
                     uint64_t timestamp) {
         if (!enabled_) return 0;
-#ifdef _WIN32
-        if (socket_ == INVALID_SOCKET) return 0;
+        if (socket_ == kInvalidLocalSocket) return 0;
         if (len < 0 || static_cast<size_t>(len) > kMaxFrameBytes) return 0;
         if (len > 0 && !data) return 0;
 
@@ -1024,51 +1097,41 @@ private:
         int sent = 0;
         for (uint32_t i = 0; i < kMaxInstances; ++i) {
             if (i == instance_) continue;
-            sockaddr_in target{};
-            target.sin_family = AF_INET;
-            target.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
-            target.sin_port = htons(static_cast<uint16_t>(base_port_ + i));
-            if (::sendto(socket_,
-                         reinterpret_cast<const char*>(datagram.data()),
-                         static_cast<int>(datagram.size()), 0,
-                         reinterpret_cast<sockaddr*>(&target),
-                         sizeof(target)) != SOCKET_ERROR) {
+            const uint16_t port = static_cast<uint16_t>(base_port_ + i);
+            if (LocalSocketSendTo(socket_, datagram.data(), datagram.size(),
+                                  port) >= 0) {
                 sent = len;
                 stats_frames_sent_.fetch_add(1, std::memory_order_relaxed);
-            } else if (send_error_log_counter_ < 8u) {
-                ++send_error_log_counter_;
-                melonDS::Platform::Log(melonDS::Platform::Warn,
-                    "[local_mp] sendto 127.0.0.1:%u failed: %d\n",
-                    static_cast<unsigned>(base_port_ + i),
-                    WSAGetLastError());
+            } else {
+                const int err = LocalSocketError();
+                // An unbound peer port is the normal case for 14 of the
+                // 15 targets; only report real failures.
+                if (!LocalSocketDrained(err) && send_error_log_counter_ < 8u) {
+                    ++send_error_log_counter_;
+                    melonDS::Platform::Log(melonDS::Platform::Warn,
+                        "[local_mp] sendto 127.0.0.1:%u failed: %d\n",
+                        static_cast<unsigned>(port), err);
+                }
             }
         }
         return sent;
-#else
-        (void)type;
-        (void)data;
-        (void)len;
-        (void)timestamp;
-        return 0;
-#endif
     }
 
     void DrainSocket() {
-#ifdef _WIN32
-        if (!enabled_ || socket_ == INVALID_SOCKET) return;
+        if (!enabled_ || socket_ == kInvalidLocalSocket) return;
         for (;;) {
             uint8_t datagram[kHeaderBytes + kMaxFrameBytes];
-            sockaddr_in from{};
-            int from_len = sizeof(from);
-            const int got = ::recvfrom(
-                socket_, reinterpret_cast<char*>(datagram), sizeof(datagram),
-                0, reinterpret_cast<sockaddr*>(&from), &from_len);
-            if (got == SOCKET_ERROR) {
-                const int err = WSAGetLastError();
-                if (err != WSAEWOULDBLOCK && err != WSAECONNRESET) {
+            const int got =
+                LocalSocketRecv(socket_, datagram, sizeof(datagram));
+            if (got < 0) {
+                const int err = LocalSocketError();
+                if (!LocalSocketDrained(err)) {
                     melonDS::Platform::Log(melonDS::Platform::Warn,
                         "[local_mp] recvfrom failed: %d\n", err);
                 }
+                // A stale ICMP port-unreachable error is consumed by this
+                // call; datagrams queued behind it are still there.
+                if (LocalSocketPeerGone(err)) continue;
                 return;
             }
             if (got < static_cast<int>(kHeaderBytes)) continue;
@@ -1106,16 +1169,13 @@ private:
             else
                 packet_queue_.TryPush(std::move(frame));
         }
-#endif
     }
 
-#ifdef _WIN32
     void CloseSocket() {
-        if (socket_ == INVALID_SOCKET) return;
-        closesocket(socket_);
-        socket_ = INVALID_SOCKET;
+        if (socket_ == kInvalidLocalSocket) return;
+        LocalSocketClose(socket_);
+        socket_ = kInvalidLocalSocket;
     }
-#endif
 
     bool enabled_ = false;
     uint32_t instance_ = 0;
@@ -1140,9 +1200,7 @@ private:
     std::atomic<uint64_t> stats_turnaround_[7] = {};
     std::chrono::steady_clock::time_point last_cmd_send_wall_{};
     std::chrono::steady_clock::time_point last_cmd_recv_wall_{};
-#ifdef _WIN32
-    SOCKET socket_ = INVALID_SOCKET;
-#endif
+    LocalSocket socket_ = kInvalidLocalSocket;
 };
 
 class LocalWfcPeerBridge {
