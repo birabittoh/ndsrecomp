@@ -1253,10 +1253,9 @@ if(CMAKE_DL_LIBS)
     target_link_libraries(nds_runner PRIVATE ${CMAKE_DL_LIBS})
 endif()
 if(WIN32)
-    target_link_libraries(nds_runner PRIVATE ws2_32)
-    if(NDS_ENABLE_PCAP_BACKEND)
-        target_link_libraries(nds_runner PRIVATE iphlpapi)
-    endif()
+    # iphlpapi: the local wireless LAN link lists the network interfaces
+    # (net/mp_link.cpp), and the pcap backend uses it too.
+    target_link_libraries(nds_runner PRIVATE ws2_32 iphlpapi)
 endif()
 
 # The dual-CPU boot nests deeply enough to exhaust the 8 MB main-thread stack
@@ -1332,7 +1331,7 @@ ndsrecomp_link_tomlpp(frontend_config_test)
       src/net/mp_link.cpp)
   target_include_directories(mp_link_test PRIVATE src)
   if(WIN32)
-    target_link_libraries(mp_link_test PRIVATE ws2_32)
+    target_link_libraries(mp_link_test PRIVATE ws2_32 iphlpapi)
   endif()
   add_test(NAME mp_link_test COMMAND mp_link_test)
 

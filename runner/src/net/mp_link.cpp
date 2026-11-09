@@ -2,6 +2,8 @@
 
 #include "net/mp_link.h"
 
+#include <algorithm>
+#include <chrono>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -13,10 +15,13 @@
 #include <winsock2.h>
 #include <mswsock.h>
 #include <ws2tcpip.h>
+#include <iphlpapi.h>
 #else
 #include <arpa/inet.h>
 #include <cerrno>
 #include <fcntl.h>
+#include <ifaddrs.h>
+#include <net/if.h>
 #include <netdb.h>
 #include <netinet/in.h>
 #include <poll.h>
@@ -66,6 +71,82 @@ sockaddr_in ToSockaddr(const PeerAddr& addr) {
     out.sin_family = AF_INET;
     out.sin_addr.s_addr = htonl(addr.ip);
     out.sin_port = htons(addr.port);
+    return out;
+}
+
+// The subnet broadcast address of `ip`/`prefix`, added to `out` once.
+// Skipped: point-to-point and host routes, loopback, link-local.
+void AddSubnetBroadcast(uint32_t ip, uint32_t prefix,
+                        std::vector<uint32_t>* out) {
+    if (prefix == 0 || prefix >= 31) return;
+    if ((ip >> 24) == 127 || (ip >> 16) == 0xA9FE) return;
+    const uint32_t broadcast = ip | (0xFFFFFFFFu >> prefix);
+    if (std::find(out->begin(), out->end(), broadcast) == out->end())
+        out->push_back(broadcast);
+}
+
+// The subnet broadcast address of every IPv4 network this machine is on
+// over Ethernet or Wi-Fi. 255.255.255.255 is no substitute: Windows sends
+// it out of a single interface, the one with the lowest metric, which on
+// a PC with VirtualBox, Hyper-V or a VPN is often not the LAN. Tunnels
+// (VPNs, Tailscale) are left out: they don't carry broadcast, and the
+// peers behind them are reached with --local-wireless-peer.
+std::vector<uint32_t> LocalSubnetBroadcasts() {
+    std::vector<uint32_t> out;
+#ifdef _WIN32
+    ULONG size = 16 * 1024;
+    std::vector<unsigned char> buffer;
+    ULONG rc = ERROR_BUFFER_OVERFLOW;
+    for (int tries = 0; tries < 3 && rc == ERROR_BUFFER_OVERFLOW; ++tries) {
+        buffer.resize(size);
+        rc = GetAdaptersAddresses(
+            AF_INET,
+            GAA_FLAG_SKIP_ANYCAST | GAA_FLAG_SKIP_MULTICAST |
+                GAA_FLAG_SKIP_DNS_SERVER,
+            nullptr, reinterpret_cast<IP_ADAPTER_ADDRESSES*>(buffer.data()),
+            &size);
+    }
+    if (rc != NO_ERROR) return out;
+    for (const IP_ADAPTER_ADDRESSES* adapter =
+             reinterpret_cast<const IP_ADAPTER_ADDRESSES*>(buffer.data());
+         adapter; adapter = adapter->Next) {
+        if (adapter->OperStatus != IfOperStatusUp) continue;
+        if (adapter->IfType != IF_TYPE_ETHERNET_CSMACD &&
+            adapter->IfType != IF_TYPE_IEEE80211)
+            continue;
+        for (const IP_ADAPTER_UNICAST_ADDRESS* unicast =
+                 adapter->FirstUnicastAddress;
+             unicast; unicast = unicast->Next) {
+            const sockaddr* addr = unicast->Address.lpSockaddr;
+            if (!addr || addr->sa_family != AF_INET) continue;
+            const uint32_t ip = ntohl(
+                reinterpret_cast<const sockaddr_in*>(addr)->sin_addr.s_addr);
+            AddSubnetBroadcast(ip, unicast->OnLinkPrefixLength, &out);
+        }
+    }
+#else
+    ifaddrs* list = nullptr;
+    if (::getifaddrs(&list) != 0) return out;
+    for (const ifaddrs* it = list; it; it = it->ifa_next) {
+        if (!it->ifa_addr || !it->ifa_netmask ||
+            it->ifa_addr->sa_family != AF_INET)
+            continue;
+        if (!(it->ifa_flags & IFF_UP) || !(it->ifa_flags & IFF_BROADCAST) ||
+            (it->ifa_flags & (IFF_LOOPBACK | IFF_POINTOPOINT)))
+            continue;
+        const uint32_t ip = ntohl(
+            reinterpret_cast<const sockaddr_in*>(it->ifa_addr)
+                ->sin_addr.s_addr);
+        const uint32_t mask = ntohl(
+            reinterpret_cast<const sockaddr_in*>(it->ifa_netmask)
+                ->sin_addr.s_addr);
+        uint32_t prefix = 0;
+        while (prefix < 32 && (mask & (0x80000000u >> prefix))) ++prefix;
+        AddSubnetBroadcast(ip, prefix, &out);
+    }
+    ::freeifaddrs(list);
+#endif
+    std::sort(out.begin(), out.end());
     return out;
 }
 
@@ -156,13 +237,14 @@ public:
     }
 
     void SendDiscovery(const uint8_t* data, size_t len) override {
+        if (config_.lan) RefreshBroadcasts();
         for (uint32_t i = 0; i < kMaxInstances; ++i) {
             const uint16_t port = static_cast<uint16_t>(config_.base_port + i);
             if (i != config_.instance)
                 SendTo(PeerAddr{INADDR_LOOPBACK, port}, data, len);
             // Another machine may run any instance index, this one too.
-            if (config_.lan)
-                SendTo(PeerAddr{INADDR_BROADCAST, port}, data, len);
+            for (uint32_t broadcast : broadcasts_)
+                SendTo(PeerAddr{broadcast, port}, data, len);
         }
         for (const PeerAddr& peer : config_.peers) SendTo(peer, data, len);
     }
@@ -242,9 +324,35 @@ private:
         return static_cast<uint16_t>(config_.base_port + config_.instance);
     }
 
+    // Networks come and go (Wi-Fi roaming, a cable plugged in), so the
+    // broadcast list is read again every few seconds and logged when it
+    // changes. With no usable interface, 255.255.255.255 is the fallback.
+    void RefreshBroadcasts() {
+        const auto now = std::chrono::steady_clock::now();
+        if (broadcasts_read_ &&
+            now - broadcasts_read_at_ < std::chrono::seconds(5))
+            return;
+        broadcasts_read_ = true;
+        broadcasts_read_at_ = now;
+        std::vector<uint32_t> fresh = LocalSubnetBroadcasts();
+        if (fresh.empty()) fresh.push_back(INADDR_BROADCAST);
+        if (fresh == broadcasts_) return;
+        broadcasts_ = std::move(fresh);
+        std::string text;
+        for (uint32_t broadcast : broadcasts_) {
+            const std::string addr = FormatPeerAddress(PeerAddr{broadcast, 0});
+            text += " " + addr.substr(0, addr.rfind(':'));
+        }
+        std::fprintf(stderr, "[local_mp] discovery broadcast to%s\n",
+                     text.c_str());
+    }
+
     UdpLinkConfig config_;
     Socket socket_ = kInvalidSocket;
     uint32_t send_error_log_counter_ = 0;
+    std::vector<uint32_t> broadcasts_;
+    bool broadcasts_read_ = false;
+    std::chrono::steady_clock::time_point broadcasts_read_at_{};
 };
 
 }  // namespace

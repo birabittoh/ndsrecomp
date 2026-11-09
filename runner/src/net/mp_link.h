@@ -9,8 +9,10 @@
 //   loopback: bound to 127.0.0.1:(base_port + instance). Discovery goes to
 //             the other 15 instance ports on this machine.
 //   lan:      bound to 0.0.0.0:(base_port + instance). Discovery also goes
-//             to the broadcast address on all 16 instance ports, and to
-//             the configured peers (for networks that drop broadcast).
+//             to the subnet broadcast address of every Ethernet / Wi-Fi
+//             network this machine is on, on all 16 instance ports, and
+//             to the configured peers (for networks that drop broadcast,
+//             and for peers behind a VPN).
 //             Other instances on this machine are found as in loopback.
 //
 // Not thread-safe: the transport calls it from the emulation thread.
