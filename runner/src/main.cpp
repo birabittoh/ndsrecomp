@@ -1496,6 +1496,9 @@ int main(int argc, char** argv) {
         const char* stats = std::getenv("NDS_LOCAL_MP_STATS");
         resolved_network.local_wireless_stats_log =
             stats && stats[0] && std::strcmp(stats, "0") != 0;
+        const char* trace = std::getenv("NDS_LOCAL_MP_TRACE");
+        resolved_network.local_wireless_trace =
+            trace && trace[0] && std::strcmp(trace, "0") != 0;
     }
 
     // Resolve the user-facing backend name to the bridge enum. Replay is

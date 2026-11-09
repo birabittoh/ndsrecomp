@@ -142,6 +142,8 @@ struct NdsWifiNetworkConfig {
     // NDS_LOCAL_MP_STATS=1: one "[local_mp] stats" line per second on
     // stderr while the transport is open.
     bool local_wireless_stats_log = false;
+    // NDS_LOCAL_MP_TRACE=1: log the auth/assoc handshake frames.
+    bool local_wireless_trace = false;
 };
 
 // Wiimmfi M8: query surface for a --network-backend replay run's outcome.

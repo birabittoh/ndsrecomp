@@ -874,6 +874,9 @@ struct LocalMpTuning {
     bool late_replies = false;
     uint32_t reply_budget_us = 2000;
     bool stats_log = false;
+    // NDS_LOCAL_MP_TRACE=1: one line per non-beacon management frame at
+    // send, socket arrival, release to the guest, and guest pickup.
+    bool trace = false;
 };
 
 class LocalMpTransport {
@@ -1096,6 +1099,9 @@ private:
                 RecordHostWait(start);
                 return 0;
             }
+            if (tuning_.trace)
+                TraceFrame("rx-take", frame.type, frame.payload.data(),
+                           static_cast<int>(frame.payload.size()));
             if (timestamp) *timestamp = frame.timestamp;
             if (frame.type == 1u) last_host_id_ = static_cast<int>(frame.sender);
             if (!frame.payload.empty())
@@ -1198,6 +1204,7 @@ private:
                 }
             }
         }
+        if (tuning_.trace) TraceFrame("tx", type, data, len);
         // Per logical frame, not per fan-out target: on loopback every
         // send goes to all 15 other ports, but only real peers receive it.
         stats_sent_by_type_[low_type & 3u].fetch_add(
@@ -1252,6 +1259,9 @@ private:
     // Applies the latency lab to a validated datagram: drop it, hold it
     // for the configured delay, or hand it straight on.
     void Admit(LocalMpFrame&& frame) {
+        if (tuning_.trace)
+            TraceFrame("rx-arrive", frame.type, frame.payload.data(),
+                       static_cast<int>(frame.payload.size()));
         if (tuning_.loss_pct && rng_() % 100u < tuning_.loss_pct) {
             stats_injected_drops_.fetch_add(1, std::memory_order_relaxed);
             return;
@@ -1297,10 +1307,51 @@ private:
                 std::chrono::steady_clock::now() - last_cmd_send_wall_)]
                 .fetch_add(1, std::memory_order_relaxed);
         }
-        if (low_type == 2u)
-            reply_queue_.TryPush(std::move(frame));
-        else
-            packet_queue_.TryPush(std::move(frame));
+        if (tuning_.trace)
+            TraceFrame("rx-ready", frame.type, frame.payload.data(),
+                       static_cast<int>(frame.payload.size()));
+        const bool queued = low_type == 2u
+            ? reply_queue_.TryPush(std::move(frame))
+            : packet_queue_.TryPush(std::move(frame));
+        if (!queued && tuning_.trace)
+            std::fprintf(stderr, "[local_mp] trace inst=%u queue full, "
+                         "frame dropped\n", static_cast<unsigned>(instance_));
+    }
+
+    // Payload = melonDS TX header (12 bytes: [8] rate, [9] channel,
+    // [10..11] length) + 802.11 frame. Beacons and MP traffic are skipped:
+    // this is for the auth/assoc handshake.
+    void TraceFrame(const char* what, uint32_t type, const uint8_t* p,
+                    int len) {
+        if ((type & 0xFFFFu) != 0u || len < 12 + 24 || !p) return;
+        const unsigned fc = p[12] | (p[13] << 8);
+        if ((fc & 0x000C) != 0) return;   // management frames only
+        if ((fc & 0x00F0) == 0x0080) return;  // not beacons
+        const double ms = std::chrono::duration<double, std::milli>(
+            std::chrono::steady_clock::now().time_since_epoch()).count();
+        const auto mac = [p](int o) {
+            static char buf[2][18];
+            static int slot = 0;
+            char* b = buf[slot++ & 1];
+            std::snprintf(b, 18, "%02x:%02x:%02x:%02x:%02x:%02x", p[o],
+                          p[o + 1], p[o + 2], p[o + 3], p[o + 4], p[o + 5]);
+            return b;
+        };
+        const char* a1 = mac(12 + 4);
+        const char* a2 = mac(12 + 10);
+        char body[32] = "";
+        if (len >= 12 + 24 + 6) {
+            std::snprintf(body, sizeof(body), " body=%04x,%04x,%04x",
+                          p[36] | (p[37] << 8), p[38] | (p[39] << 8),
+                          p[40] | (p[41] << 8));
+        }
+        std::fprintf(stderr,
+            "[local_mp] trace inst=%u t=%.1f %s fc=%04x chan=%u seq=%u "
+            "to=%s from=%s%s\n",
+            static_cast<unsigned>(instance_), ms, what, fc,
+            static_cast<unsigned>(p[9]),
+            static_cast<unsigned>((p[34] | (p[35] << 8)) >> 4), a1, a2,
+            body);
     }
 
     // NDS_LOCAL_MP_STATS=1: one line per second of per-second deltas, only
@@ -2081,6 +2132,7 @@ melonDS::Wifi* nds_wifi3d_attach() {
         tuning.reply_budget_us =
             g_network_config.local_wireless_reply_budget_us;
         tuning.stats_log = g_network_config.local_wireless_stats_log;
+        tuning.trace = g_network_config.local_wireless_trace;
         g_bridge->local_mp.Configure(
             g_network_config.local_wireless_enabled,
             g_network_config.local_wireless_instance,
