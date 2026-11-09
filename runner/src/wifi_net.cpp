@@ -33,6 +33,7 @@
 #include <deque>
 #include <memory>
 #include <mutex>
+#include <random>
 #include <string>
 #include <array>
 #include <thread>
@@ -865,12 +866,28 @@ private:
     size_t capacity_;
 };
 
+// Phase 0 latency lab knobs (see NdsLocalWirelessOptions in frontend.h).
+struct LocalMpTuning {
+    uint32_t delay_ms = 0;
+    uint32_t jitter_ms = 0;
+    uint32_t loss_pct = 0;
+    bool late_replies = false;
+    uint32_t reply_budget_us = 2000;
+    bool stats_log = false;
+};
+
 class LocalMpTransport {
 public:
-    void Configure(bool enabled, uint32_t instance, uint16_t base_port) {
+    void Configure(bool enabled, uint32_t instance, uint16_t base_port,
+                   const LocalMpTuning& tuning) {
         enabled_ = enabled && instance < kMaxInstances;
         instance_ = instance;
         base_port_ = base_port;
+        tuning_ = tuning;
+        rng_.seed(0x9E3779B9u ^ instance ^
+                  static_cast<uint32_t>(std::chrono::steady_clock::now()
+                                            .time_since_epoch()
+                                            .count()));
     }
 
     void Begin() {
@@ -885,13 +902,28 @@ public:
             "[local_mp] enabled instance=%u port=%u\n",
             static_cast<unsigned>(instance_),
             static_cast<unsigned>(base_port_ + instance_));
+        if (tuning_.delay_ms || tuning_.jitter_ms || tuning_.loss_pct ||
+            tuning_.late_replies) {
+            std::fprintf(stderr,
+                "[local_mp] latency lab: delay=%u ms jitter=%u ms loss=%u%% "
+                "late_replies=%s reply_budget=%u us\n",
+                static_cast<unsigned>(tuning_.delay_ms),
+                static_cast<unsigned>(tuning_.jitter_ms),
+                static_cast<unsigned>(tuning_.loss_pct),
+                tuning_.late_replies ? "on" : "off",
+                static_cast<unsigned>(tuning_.reply_budget_us));
+        }
         g_savestate_network_guard.SetLocalMpListening(true);
+        stats_log_last_ = std::chrono::steady_clock::now();
+        SnapshotStats(&stats_log_prev_);
     }
 
     void End() {
         g_savestate_network_guard.SetLocalMpListening(false);
         packet_queue_.Clear();
         reply_queue_.Clear();
+        delayed_.clear();
+        last_release_ = {};
         last_host_id_ = -1;
         CloseSocket();
     }
@@ -925,12 +957,19 @@ public:
     uint16_t RecvReplies(uint8_t* data, uint64_t timestamp, uint16_t aidmask) {
         uint16_t received = 0;
         const auto start = std::chrono::steady_clock::now();
-        const auto deadline = start + std::chrono::milliseconds(25);
+        // Late-reply mode: the host gives the clients only a short budget,
+        // then carries on. A reply that misses it stays queued and is taken
+        // as the reply to a later cmd -- to the guest this looks like a
+        // lossy radio that keeps missing reply windows, not a stall.
+        const auto deadline = tuning_.late_replies
+            ? start + std::chrono::microseconds(tuning_.reply_budget_us)
+            : start + std::chrono::milliseconds(25);
         stats_recv_replies_calls_.fetch_add(1, std::memory_order_relaxed);
         for (;;) {
             DrainSocket();
             LocalMpFrame frame;
             if (!reply_queue_.TryPop(&frame)) {
+                if ((received & aidmask) == aidmask) break;
                 // Wait on the socket itself: a datagram arrival wakes this
                 // thread immediately. Sleeping a fixed tick here instead
                 // costs every MP cmd/reply exchange a millisecond-scale
@@ -947,9 +986,16 @@ public:
                 continue;
             }
             if (frame.timestamp + 32u < timestamp) {
-                stats_stale_reply_drops_.fetch_add(1,
-                                                   std::memory_order_relaxed);
-                continue;
+                // Late mode still refuses replies from far in the past (a
+                // previous session); 1 s of guest time is far beyond any
+                // round trip the lab or a relay produces.
+                if (!tuning_.late_replies ||
+                    frame.timestamp + kLateReplyWindowUs < timestamp) {
+                    stats_stale_reply_drops_.fetch_add(
+                        1, std::memory_order_relaxed);
+                    continue;
+                }
+                stats_late_replies_.fetch_add(1, std::memory_order_relaxed);
             }
             const uint16_t aid = static_cast<uint16_t>(frame.type >> 16u);
             if (aid == 0 || aid > 15) continue;
@@ -959,13 +1005,18 @@ public:
                             frame.payload.data(), frame.payload.size());
             }
             received |= static_cast<uint16_t>(1u << aid);
-            if ((received & aidmask) == aidmask) break;
+            // Strict mode stops at the first full set, as before. Late mode
+            // keeps popping so a backlog collapses to the newest reply per
+            // client instead of lagging further behind with every cmd.
+            if (!tuning_.late_replies && (received & aidmask) == aidmask)
+                break;
         }
         stats_recv_replies_wait_us_.fetch_add(
             static_cast<uint64_t>(
                 std::chrono::duration_cast<std::chrono::microseconds>(
                     std::chrono::steady_clock::now() - start).count()),
             std::memory_order_relaxed);
+        MaybeLogStats();
         return received;
     }
 
@@ -989,6 +1040,19 @@ public:
             stats_recv_host_wait_us_.load(std::memory_order_relaxed);
         out->stale_reply_drops =
             stats_stale_reply_drops_.load(std::memory_order_relaxed);
+        out->late_replies =
+            stats_late_replies_.load(std::memory_order_relaxed);
+        out->injected_drops =
+            stats_injected_drops_.load(std::memory_order_relaxed);
+        out->bytes_sent = stats_bytes_sent_.load(std::memory_order_relaxed);
+        out->bytes_received =
+            stats_bytes_received_.load(std::memory_order_relaxed);
+        for (int i = 0; i < 4; ++i) {
+            out->sent_by_type[i] =
+                stats_sent_by_type_[i].load(std::memory_order_relaxed);
+            out->received_by_type[i] =
+                stats_received_by_type_[i].load(std::memory_order_relaxed);
+        }
         for (int i = 0; i < 7; ++i) {
             out->reply_latency_ms[i] =
                 stats_reply_latency_[i].load(std::memory_order_relaxed);
@@ -1003,12 +1067,20 @@ private:
     static constexpr uint32_t kHeaderBytes = 24;
     static constexpr size_t kMaxFrameBytes = 0x948;
     static constexpr size_t kQueueCapacity = 1024;
+    static constexpr size_t kDelayedCapacity = 8192;
+    static constexpr uint64_t kLateReplyWindowUs = 1000000;
+
+    struct DelayedFrame {
+        std::chrono::steady_clock::time_point release;
+        LocalMpFrame frame;
+    };
 
     int RecvPacketGeneric(uint8_t* data, uint64_t* timestamp, bool block) {
         const auto start = std::chrono::steady_clock::now();
         const auto deadline = start + std::chrono::milliseconds(25);
         if (block)
             stats_recv_host_calls_.fetch_add(1, std::memory_order_relaxed);
+        MaybeLogStats();
         for (;;) {
             DrainSocket();
             LocalMpFrame frame;
@@ -1041,18 +1113,30 @@ private:
             std::memory_order_relaxed);
     }
 
-    // Blocks until the transport socket is readable or `deadline` passes.
-    // True = readable (caller should DrainSocket and re-check its queue),
-    // false = deadline reached. select() wakes on arrival with microsecond
-    // latency; the timeout only bites when the peer is genuinely absent.
+    // Blocks until the transport socket is readable, a delayed frame comes
+    // due, or `deadline` passes. True = caller should DrainSocket and
+    // re-check its queue, false = deadline reached. poll() wakes on arrival
+    // immediately; the timeout only bites when the peer is genuinely absent.
     bool WaitForData(std::chrono::steady_clock::time_point deadline) {
         if (socket_ == kInvalidLocalSocket) return false;
-        const auto now = std::chrono::steady_clock::now();
-        if (now >= deadline) return false;
-        const auto remaining =
-            std::chrono::duration_cast<std::chrono::microseconds>(deadline -
-                                                                  now);
-        return LocalSocketWaitReadable(socket_, remaining.count());
+        auto now = std::chrono::steady_clock::now();
+        if (now >= deadline) return ReleaseDue(now);
+        auto wake = deadline;
+        if (!delayed_.empty() && delayed_.front().release < wake)
+            wake = delayed_.front().release;
+        if (wake > now) {
+            const auto remaining =
+                std::chrono::duration_cast<std::chrono::microseconds>(wake -
+                                                                      now);
+            if (LocalSocketWaitReadable(socket_, remaining.count()))
+                return true;
+            now = std::chrono::steady_clock::now();
+        }
+        return now < deadline || ReleaseDue(now);
+    }
+
+    bool ReleaseDue(std::chrono::steady_clock::time_point now) const {
+        return !delayed_.empty() && delayed_.front().release <= now;
     }
 
     static int LatencyBucket(std::chrono::steady_clock::duration d) {
@@ -1114,6 +1198,13 @@ private:
                 }
             }
         }
+        // Per logical frame, not per fan-out target: on loopback every
+        // send goes to all 15 other ports, but only real peers receive it.
+        stats_sent_by_type_[low_type & 3u].fetch_add(
+            1, std::memory_order_relaxed);
+        stats_bytes_sent_.fetch_add(datagram.size(),
+                                    std::memory_order_relaxed);
+        if (low_type != 2u) MaybeLogStats();
         return sent;
     }
 
@@ -1132,7 +1223,7 @@ private:
                 // A stale ICMP port-unreachable error is consumed by this
                 // call; datagrams queued behind it are still there.
                 if (LocalSocketPeerGone(err)) continue;
-                return;
+                break;
             }
             if (got < static_cast<int>(kHeaderBytes)) continue;
             if (ReadLe32(datagram) != kMagic) continue;
@@ -1148,27 +1239,135 @@ private:
             if (kHeaderBytes + len != static_cast<uint32_t>(got)) continue;
             frame.payload.assign(datagram + kHeaderBytes,
                                  datagram + kHeaderBytes + len);
-
-            // Receiving a validated datagram is the first authoritative
-            // evidence that another local instance exists. UDP sendto()
-            // success alone only proves that the local stack accepted a
-            // datagram, not that a peer is listening.
-            g_savestate_network_guard.NoteLocalMpPeer();
-            stats_frames_received_.fetch_add(1, std::memory_order_relaxed);
-            const uint32_t low_type = frame.type & 0xFFFFu;
-            if (low_type == 1u) {
-                last_cmd_recv_wall_ = std::chrono::steady_clock::now();
-            } else if (low_type == 2u &&
-                       last_cmd_send_wall_.time_since_epoch().count() != 0) {
-                stats_reply_latency_[LatencyBucket(
-                    std::chrono::steady_clock::now() - last_cmd_send_wall_)]
-                    .fetch_add(1, std::memory_order_relaxed);
-            }
-            if (low_type == 2u)
-                reply_queue_.TryPush(std::move(frame));
-            else
-                packet_queue_.TryPush(std::move(frame));
+            Admit(std::move(frame));
         }
+        const auto now = std::chrono::steady_clock::now();
+        while (ReleaseDue(now)) {
+            LocalMpFrame frame = std::move(delayed_.front().frame);
+            delayed_.pop_front();
+            Deliver(std::move(frame));
+        }
+    }
+
+    // Applies the latency lab to a validated datagram: drop it, hold it
+    // for the configured delay, or hand it straight on.
+    void Admit(LocalMpFrame&& frame) {
+        if (tuning_.loss_pct && rng_() % 100u < tuning_.loss_pct) {
+            stats_injected_drops_.fetch_add(1, std::memory_order_relaxed);
+            return;
+        }
+        if (!tuning_.delay_ms && !tuning_.jitter_ms) {
+            Deliver(std::move(frame));
+            return;
+        }
+        if (delayed_.size() >= kDelayedCapacity) {
+            stats_injected_drops_.fetch_add(1, std::memory_order_relaxed);
+            return;
+        }
+        uint32_t hold_us = tuning_.delay_ms * 1000u;
+        if (tuning_.jitter_ms)
+            hold_us += rng_() % (tuning_.jitter_ms * 1000u + 1u);
+        auto release = std::chrono::steady_clock::now() +
+                       std::chrono::microseconds(hold_us);
+        // Jitter varies the delay but never reorders: a relay path keeps
+        // datagram order nearly always, and FIFO keeps the queue sorted.
+        if (release < last_release_) release = last_release_;
+        last_release_ = release;
+        delayed_.push_back(DelayedFrame{release, std::move(frame)});
+    }
+
+    // The moment a datagram "arrives" as far as the guest can tell.
+    void Deliver(LocalMpFrame&& frame) {
+        // Receiving a validated datagram is the first authoritative
+        // evidence that another local instance exists. UDP sendto()
+        // success alone only proves that the local stack accepted a
+        // datagram, not that a peer is listening.
+        g_savestate_network_guard.NoteLocalMpPeer();
+        stats_frames_received_.fetch_add(1, std::memory_order_relaxed);
+        stats_bytes_received_.fetch_add(kHeaderBytes + frame.payload.size(),
+                                        std::memory_order_relaxed);
+        const uint32_t low_type = frame.type & 0xFFFFu;
+        stats_received_by_type_[low_type & 3u].fetch_add(
+            1, std::memory_order_relaxed);
+        if (low_type == 1u) {
+            last_cmd_recv_wall_ = std::chrono::steady_clock::now();
+        } else if (low_type == 2u &&
+                   last_cmd_send_wall_.time_since_epoch().count() != 0) {
+            stats_reply_latency_[LatencyBucket(
+                std::chrono::steady_clock::now() - last_cmd_send_wall_)]
+                .fetch_add(1, std::memory_order_relaxed);
+        }
+        if (low_type == 2u)
+            reply_queue_.TryPush(std::move(frame));
+        else
+            packet_queue_.TryPush(std::move(frame));
+    }
+
+    // NDS_LOCAL_MP_STATS=1: one line per second of per-second deltas, only
+    // while traffic flows, for the Phase 0 table in HANDOFF_ONLINE_LOBBY.md.
+    void MaybeLogStats() {
+        if (!tuning_.stats_log || socket_ == kInvalidLocalSocket) return;
+        const auto now = std::chrono::steady_clock::now();
+        const auto elapsed = now - stats_log_last_;
+        if (elapsed < std::chrono::seconds(1)) return;
+        NdsLocalMpStats cur{};
+        SnapshotStats(&cur);
+        const NdsLocalMpStats& p = stats_log_prev_;
+        const double secs =
+            std::chrono::duration<double>(elapsed).count();
+        const auto rate = [secs](uint64_t a, uint64_t b) {
+            return static_cast<double>(a - b) / secs;
+        };
+        if (cur.frames_received != p.frames_received ||
+            cur.sent_by_type[1] != p.sent_by_type[1] ||
+            cur.sent_by_type[2] != p.sent_by_type[2]) {
+            char hist[2][64];
+            for (int h = 0; h < 2; ++h) {
+                const uint64_t* c =
+                    h ? cur.turnaround_ms : cur.reply_latency_ms;
+                const uint64_t* q = h ? p.turnaround_ms : p.reply_latency_ms;
+                int n = 0;
+                for (int i = 0; i < 7; ++i) {
+                    n += std::snprintf(hist[h] + n, sizeof(hist[h]) - n,
+                                       "%s%llu", i ? "/" : "",
+                                       static_cast<unsigned long long>(
+                                           c[i] - q[i]));
+                }
+            }
+            std::fprintf(stderr,
+                "[local_mp] stats inst=%u "
+                "tx/s pkt=%.0f cmd=%.0f reply=%.0f ack=%.0f kB=%.1f | "
+                "rx/s pkt=%.0f cmd=%.0f reply=%.0f ack=%.0f kB=%.1f | "
+                "host replies calls=%.0f timeouts=%.0f wait_ms=%.1f "
+                "late=%.0f stale=%.0f | "
+                "client host-wait calls=%.0f timeouts=%.0f wait_ms=%.1f | "
+                "lab_drops=%.0f held=%zu | "
+                "reply_lat_ms[<1/2/4/8/16/32/32+]=%s turnaround=%s\n",
+                static_cast<unsigned>(instance_),
+                rate(cur.sent_by_type[0], p.sent_by_type[0]),
+                rate(cur.sent_by_type[1], p.sent_by_type[1]),
+                rate(cur.sent_by_type[2], p.sent_by_type[2]),
+                rate(cur.sent_by_type[3], p.sent_by_type[3]),
+                rate(cur.bytes_sent, p.bytes_sent) / 1024.0,
+                rate(cur.received_by_type[0], p.received_by_type[0]),
+                rate(cur.received_by_type[1], p.received_by_type[1]),
+                rate(cur.received_by_type[2], p.received_by_type[2]),
+                rate(cur.received_by_type[3], p.received_by_type[3]),
+                rate(cur.bytes_received, p.bytes_received) / 1024.0,
+                rate(cur.recv_replies_calls, p.recv_replies_calls),
+                rate(cur.recv_replies_timeouts, p.recv_replies_timeouts),
+                rate(cur.recv_replies_wait_us, p.recv_replies_wait_us) /
+                    1000.0,
+                rate(cur.late_replies, p.late_replies),
+                rate(cur.stale_reply_drops, p.stale_reply_drops),
+                rate(cur.recv_host_calls, p.recv_host_calls),
+                rate(cur.recv_host_timeouts, p.recv_host_timeouts),
+                rate(cur.recv_host_wait_us, p.recv_host_wait_us) / 1000.0,
+                rate(cur.injected_drops, p.injected_drops),
+                delayed_.size(), hist[0], hist[1]);
+        }
+        stats_log_prev_ = cur;
+        stats_log_last_ = now;
     }
 
     void CloseSocket() {
@@ -1180,6 +1379,10 @@ private:
     bool enabled_ = false;
     uint32_t instance_ = 0;
     uint16_t base_port_ = 26710;
+    LocalMpTuning tuning_{};
+    std::minstd_rand rng_{};
+    std::deque<DelayedFrame> delayed_;
+    std::chrono::steady_clock::time_point last_release_{};
     LocalMpFrameQueue packet_queue_{kQueueCapacity};
     LocalMpFrameQueue reply_queue_{kQueueCapacity};
     int last_host_id_ = -1;
@@ -1196,10 +1399,18 @@ private:
     std::atomic<uint64_t> stats_recv_host_timeouts_{0};
     std::atomic<uint64_t> stats_recv_host_wait_us_{0};
     std::atomic<uint64_t> stats_stale_reply_drops_{0};
+    std::atomic<uint64_t> stats_late_replies_{0};
+    std::atomic<uint64_t> stats_injected_drops_{0};
+    std::atomic<uint64_t> stats_bytes_sent_{0};
+    std::atomic<uint64_t> stats_bytes_received_{0};
+    std::atomic<uint64_t> stats_sent_by_type_[4] = {};
+    std::atomic<uint64_t> stats_received_by_type_[4] = {};
     std::atomic<uint64_t> stats_reply_latency_[7] = {};
     std::atomic<uint64_t> stats_turnaround_[7] = {};
     std::chrono::steady_clock::time_point last_cmd_send_wall_{};
     std::chrono::steady_clock::time_point last_cmd_recv_wall_{};
+    std::chrono::steady_clock::time_point stats_log_last_{};
+    NdsLocalMpStats stats_log_prev_{};
     LocalSocket socket_ = kInvalidLocalSocket;
 };
 
@@ -1861,10 +2072,20 @@ melonDS::Wifi* nds_wifi3d_attach() {
     g_bridge->network_state.wfc_dns_ipv4 = g_network_config.wfc_dns_ipv4;
     g_bridge->network_state.pcap_adapter_requested =
         g_network_config.pcap_adapter;
-    g_bridge->local_mp.Configure(
-        g_network_config.local_wireless_enabled,
-        g_network_config.local_wireless_instance,
-        g_network_config.local_wireless_base_port);
+    {
+        LocalMpTuning tuning;
+        tuning.delay_ms = g_network_config.local_wireless_delay_ms;
+        tuning.jitter_ms = g_network_config.local_wireless_jitter_ms;
+        tuning.loss_pct = g_network_config.local_wireless_loss_pct;
+        tuning.late_replies = g_network_config.local_wireless_late_replies;
+        tuning.reply_budget_us =
+            g_network_config.local_wireless_reply_budget_us;
+        tuning.stats_log = g_network_config.local_wireless_stats_log;
+        g_bridge->local_mp.Configure(
+            g_network_config.local_wireless_enabled,
+            g_network_config.local_wireless_instance,
+            g_network_config.local_wireless_base_port, tuning);
+    }
     g_bridge->local_wfc_peer.Configure(
         g_network_config.slirp_virtual_network_instance);
     if (g_network_config.local_wireless_enabled) {

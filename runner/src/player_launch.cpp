@@ -8,6 +8,7 @@
 #include <cstring>
 #include <filesystem>
 #include <fstream>
+#include <utility>
 #include <vector>
 
 #if defined(NDS_HAVE_SDL3)
@@ -471,6 +472,9 @@ namespace {
 struct PlayerArgs {
     const char* rom = nullptr;
     int instance = -1;
+    // Latency-lab flags (nds_is_local_wireless_tuning_flag), applied after
+    // the settings file so the command line wins.
+    std::vector<std::pair<std::string, std::string>> local_wireless_tuning;
 };
 
 bool is_nds_path(const char* arg) {
@@ -491,6 +495,8 @@ bool parse_player_args(int argc, char** argv, PlayerArgs* out) {
             if (end == argv[i] || *end != '\0' || value < 0 || value > 15)
                 return false;
             out->instance = static_cast<int>(value);
+        } else if (nds_is_local_wireless_tuning_flag(arg) && i + 1 < argc) {
+            out->local_wireless_tuning.emplace_back(arg, argv[++i]);
         } else if (arg[0] != '-' && !out->rom && is_nds_path(argv[i])) {
             out->rom = argv[i];
         } else {
@@ -570,6 +576,14 @@ bool nds_player_prepare(int argc, char** argv, NdsFrontendOptions* options,
 #endif
     PlayerArgs args;
     parse_player_args(argc, argv, &args);
+    for (const auto& [flag, value] : args.local_wireless_tuning) {
+        if (!nds_parse_local_wireless_tuning(flag, value,
+                                             &options->local_wireless,
+                                             &error)) {
+            nds_player_error(error);
+            return false;
+        }
+    }
     if (!resolve_rom(root, settings, *options, args.rom, &rom, &cancelled) ||
         (!have_bios &&
          !resolve_bios(root, settings, *options, &bios, &cancelled))) {

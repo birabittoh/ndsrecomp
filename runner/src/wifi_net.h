@@ -133,6 +133,15 @@ struct NdsWifiNetworkConfig {
     bool local_wireless_enabled = false;
     uint32_t local_wireless_instance = 0;
     uint16_t local_wireless_base_port = 26710;
+    // Latency lab, see NdsLocalWirelessOptions (frontend.h).
+    uint32_t local_wireless_delay_ms = 0;
+    uint32_t local_wireless_jitter_ms = 0;
+    uint32_t local_wireless_loss_pct = 0;
+    bool local_wireless_late_replies = false;
+    uint32_t local_wireless_reply_budget_us = 2000;
+    // NDS_LOCAL_MP_STATS=1: one "[local_mp] stats" line per second on
+    // stderr while the transport is open.
+    bool local_wireless_stats_log = false;
 };
 
 // Wiimmfi M8: query surface for a --network-backend replay run's outcome.
@@ -202,6 +211,14 @@ struct NdsLocalMpStats {
     uint64_t recv_host_timeouts = 0;    // client: hit the 25 ms deadline
     uint64_t recv_host_wait_us = 0;     // client: total wall-clock inside calls
     uint64_t stale_reply_drops = 0;  // replies older than the freshness window
+    uint64_t late_replies = 0;       // late-reply mode: stale but accepted
+    uint64_t injected_drops = 0;     // latency lab: --local-wireless-loss-pct
+    uint64_t bytes_sent = 0;         // per logical frame, header included
+    uint64_t bytes_received = 0;
+    // Index = frame type: 0 packet/beacon, 1 MP cmd, 2 reply, 3 ack.
+    // sent_by_type counts logical frames (one per send, not per target).
+    uint64_t sent_by_type[4] = {};
+    uint64_t received_by_type[4] = {};
     // Wall-clock latency histograms, bucket edges 1/2/4/8/16/32 ms (last
     // bucket = >=32 ms). reply_latency: host side, MP-cmd datagram sent ->
     // reply datagram received. turnaround: client side, MP-cmd datagram

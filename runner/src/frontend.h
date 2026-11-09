@@ -163,6 +163,17 @@ struct NdsNetworkOptions {
 struct NdsLocalWirelessOptions {
     bool enabled = false;
     uint16_t base_port = 26710;
+    // Latency lab (HANDOFF_ONLINE_LOBBY.md Phase 0): every received datagram
+    // is held for delay_ms (+ up to jitter_ms) before the guest sees it, and
+    // loss_pct of them are dropped. Applied on receive, so running both
+    // instances with the same delay gives a round trip of 2 x delay_ms.
+    uint32_t delay_ms = 0;
+    uint32_t jitter_ms = 0;
+    uint32_t loss_pct = 0;
+    // Host side: wait only reply_budget_us for MP replies instead of 25 ms,
+    // and accept a reply that arrives late as the reply to a later MP cmd.
+    bool late_replies = false;
+    uint32_t reply_budget_us = 2000;
 };
 
 struct NdsMphPrimeControlBindings {
@@ -500,6 +511,16 @@ bool nds_parse_ipv4(const std::string& value, uint32_t* out);
 bool nds_parse_network_backend(const std::string& value, std::string* out);
 bool nds_parse_local_wireless_base_port(const std::string& value,
                                         uint16_t* out);
+// The latency-lab flags shared by the dev CLI and player mode:
+// --local-wireless-delay-ms 0..2000, --local-wireless-jitter-ms 0..2000,
+// --local-wireless-loss-pct 0..100, --local-wireless-late-replies on|off,
+// --local-wireless-reply-budget-us 0..25000. True if `flag` is one of them.
+bool nds_is_local_wireless_tuning_flag(const std::string& flag);
+// Parses one of those flags into `out`. On failure *error names the range.
+bool nds_parse_local_wireless_tuning(const std::string& flag,
+                                     const std::string& value,
+                                     NdsLocalWirelessOptions* out,
+                                     std::string* error);
 const char* nds_screen_layout_name(NdsScreenLayout value);
 const char* nds_fullscreen_mode_name(NdsFullscreenMode value);
 const char* nds_window_mode_name(NdsWindowMode value);

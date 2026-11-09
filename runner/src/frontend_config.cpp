@@ -540,6 +540,57 @@ bool nds_parse_local_wireless_base_port(const std::string& value,
     return true;
 }
 
+namespace {
+
+bool parse_u32_in_range(const std::string& value, uint32_t max,
+                        uint32_t* out) {
+    if (value.empty()) return false;
+    char* end = nullptr;
+    const long long parsed = std::strtoll(value.c_str(), &end, 10);
+    if (!end || *end != '\0' || parsed < 0 ||
+        parsed > static_cast<long long>(max))
+        return false;
+    *out = static_cast<uint32_t>(parsed);
+    return true;
+}
+
+}  // namespace
+
+bool nds_is_local_wireless_tuning_flag(const std::string& flag) {
+    return flag == "--local-wireless-delay-ms" ||
+           flag == "--local-wireless-jitter-ms" ||
+           flag == "--local-wireless-loss-pct" ||
+           flag == "--local-wireless-late-replies" ||
+           flag == "--local-wireless-reply-budget-us";
+}
+
+bool nds_parse_local_wireless_tuning(const std::string& flag,
+                                     const std::string& value,
+                                     NdsLocalWirelessOptions* out,
+                                     std::string* error) {
+    const auto fail = [&](const char* range) {
+        if (error) *error = "invalid " + flag + " (expected " + range + ")";
+        return false;
+    };
+    if (flag == "--local-wireless-delay-ms")
+        return parse_u32_in_range(value, 2000, &out->delay_ms) ||
+               fail("0..2000");
+    if (flag == "--local-wireless-jitter-ms")
+        return parse_u32_in_range(value, 2000, &out->jitter_ms) ||
+               fail("0..2000");
+    if (flag == "--local-wireless-loss-pct")
+        return parse_u32_in_range(value, 100, &out->loss_pct) ||
+               fail("0..100");
+    if (flag == "--local-wireless-reply-budget-us")
+        return parse_u32_in_range(value, 25000, &out->reply_budget_us) ||
+               fail("0..25000");
+    if (flag == "--local-wireless-late-replies")
+        return nds_parse_on_off(value, &out->late_replies) ||
+               fail("on or off");
+    if (error) *error = "unknown flag " + flag;
+    return false;
+}
+
 const char* nds_screen_layout_name(NdsScreenLayout value) {
     switch (value) {
         case NdsScreenLayout::Separate: return "separate";

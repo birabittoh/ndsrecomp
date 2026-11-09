@@ -464,6 +464,7 @@ int main(int argc, char** argv) {
     std::string cli_wfc_provider;
     std::string cli_local_wireless_enabled;
     std::string cli_local_wireless_base_port;
+    std::vector<std::pair<std::string, std::string>> cli_local_wireless_tuning;
     // Wiimmfi M8: capture/replay at the Ethernet backend boundary.
     std::string cli_net_capture_out;
     std::string cli_net_capture_in;
@@ -698,6 +699,8 @@ int main(int argc, char** argv) {
             cli_local_wireless_enabled = argv[++i];
         } else if (a == "--local-wireless-port" && i + 1 < argc) {
             cli_local_wireless_base_port = argv[++i];
+        } else if (nds_is_local_wireless_tuning_flag(a) && i + 1 < argc) {
+            cli_local_wireless_tuning.emplace_back(a, argv[++i]);
         } else if (a == "--net-capture-out" && i + 1 < argc) {
             cli_net_capture_out = argv[++i];
         } else if (a == "--net-capture-in" && i + 1 < argc) {
@@ -795,6 +798,10 @@ int main(int argc, char** argv) {
                 "[--wfc on|off] "
                 "[--wfc-provider kaeru|wiimmfi|wiimmfi-direct|local|<ipv4>] "
                 "[--local-wireless on|off] [--local-wireless-port 1024..65520] "
+                "[--local-wireless-delay-ms MS] [--local-wireless-jitter-ms MS] "
+                "[--local-wireless-loss-pct PCT] "
+                "[--local-wireless-late-replies on|off] "
+                "[--local-wireless-reply-budget-us US] "
                 "[--net-capture-out FILE] [--net-capture-in FILE] "
                 "[--net-capture-raw] [--net-capture-no-pcap] "
                 "[--net-capture-scenario NAME] "
@@ -1363,6 +1370,15 @@ int main(int argc, char** argv) {
                      "invalid --local-wireless-port (expected 1024..65520)\n");
         return 2;
     }
+    for (const auto& [flag, value] : cli_local_wireless_tuning) {
+        std::string tuning_error;
+        if (!nds_parse_local_wireless_tuning(
+                flag, value, &frontend_options.local_wireless,
+                &tuning_error)) {
+            std::fprintf(stderr, "%s\n", tuning_error.c_str());
+            return 2;
+        }
+    }
     if (frontend_options.local_wireless.enabled &&
         frontend_options.instance_index > 15u) {
         std::fprintf(stderr,
@@ -1466,6 +1482,21 @@ int main(int argc, char** argv) {
         frontend_options.instance_index;
     resolved_network.local_wireless_base_port =
         frontend_options.local_wireless.base_port;
+    resolved_network.local_wireless_delay_ms =
+        frontend_options.local_wireless.delay_ms;
+    resolved_network.local_wireless_jitter_ms =
+        frontend_options.local_wireless.jitter_ms;
+    resolved_network.local_wireless_loss_pct =
+        frontend_options.local_wireless.loss_pct;
+    resolved_network.local_wireless_late_replies =
+        frontend_options.local_wireless.late_replies;
+    resolved_network.local_wireless_reply_budget_us =
+        frontend_options.local_wireless.reply_budget_us;
+    {
+        const char* stats = std::getenv("NDS_LOCAL_MP_STATS");
+        resolved_network.local_wireless_stats_log =
+            stats && stats[0] && std::strcmp(stats, "0") != 0;
+    }
 
     // Resolve the user-facing backend name to the bridge enum. Replay is
     // always available; pcap is available only in builds that opt into the
