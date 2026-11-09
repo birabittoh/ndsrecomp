@@ -180,6 +180,12 @@ struct NdsLocalWirelessOptions {
     // replies take microseconds. With real latency, frames wait for the
     // next wake-up and the join times out.
     bool stay_awake = false;
+    // Link: lan (default) finds runners on the local network by broadcast
+    // and other instances on this machine; loopback only the latter.
+    bool lan = true;
+    // Runners to contact directly (host or host:port, port defaulting to
+    // base_port), for networks that drop broadcast. Lan link only.
+    std::vector<std::string> peers;
 };
 
 struct NdsMphPrimeControlBindings {

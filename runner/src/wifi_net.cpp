@@ -31,6 +31,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <deque>
+#include <map>
 #include <memory>
 #include <mutex>
 #include <random>
@@ -67,6 +68,9 @@
 #include "net/net_classify.h"
 #include "net/net_capture.h"
 #include "net/net_replay.h"
+#include "net/mp_link.h"
+#include "net/mp_reliable.h"
+#include "net/mp_wire.h"
 
 // Explicit relative paths, not bare quote-includes: runner/src/wifi.h
 // (the existing hand-written device model's header, kept as a thin bridge
@@ -703,11 +707,6 @@ uint32_t ReadLe32(const uint8_t* p) {
            (static_cast<uint32_t>(p[3]) << 24u);
 }
 
-uint64_t ReadLe64(const uint8_t* p) {
-    return static_cast<uint64_t>(ReadLe32(p)) |
-           (static_cast<uint64_t>(ReadLe32(p + 4u)) << 32u);
-}
-
 void WriteLe32(std::vector<uint8_t>* out, uint32_t value) {
     out->push_back(static_cast<uint8_t>(value));
     out->push_back(static_cast<uint8_t>(value >> 8u));
@@ -715,136 +714,7 @@ void WriteLe32(std::vector<uint8_t>* out, uint32_t value) {
     out->push_back(static_cast<uint8_t>(value >> 24u));
 }
 
-void WriteLe64(std::vector<uint8_t>* out, uint64_t value) {
-    WriteLe32(out, static_cast<uint32_t>(value));
-    WriteLe32(out, static_cast<uint32_t>(value >> 32u));
-}
-
-// Nonblocking localhost UDP socket, Winsock or BSD sockets. Local wireless
-// only needs socket/bind/sendto/recvfrom and a bounded readability wait.
-#ifdef _WIN32
-using LocalSocket = SOCKET;
-constexpr LocalSocket kInvalidLocalSocket = INVALID_SOCKET;
-int LocalSocketError() { return WSAGetLastError(); }
-// Nothing left to read, or a peer port that is not bound yet.
-bool LocalSocketDrained(int err) {
-    return err == WSAEWOULDBLOCK || err == WSAECONNRESET;
-}
-bool LocalSocketPeerGone(int err) { return err == WSAECONNRESET; }
-void LocalSocketClose(LocalSocket s) { closesocket(s); }
-#else
-using LocalSocket = int;
-constexpr LocalSocket kInvalidLocalSocket = -1;
-int LocalSocketError() { return errno; }
-bool LocalSocketDrained(int err) {
-    return err == EAGAIN || err == EWOULDBLOCK || err == ECONNREFUSED ||
-           err == EINTR;
-}
-bool LocalSocketPeerGone(int err) {
-    return err == ECONNREFUSED || err == EINTR;
-}
-void LocalSocketClose(LocalSocket s) { ::close(s); }
-#endif
-
-// A UDP socket bound to 127.0.0.1:port, nonblocking. Logs and returns
-// kInvalidLocalSocket on failure.
-LocalSocket LocalSocketOpen(uint16_t port, const char* tag) {
-    LocalSocket s = ::socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
-    if (s == kInvalidLocalSocket) {
-        melonDS::Platform::Log(melonDS::Platform::Error,
-            "[%s] socket failed: %d\n", tag, LocalSocketError());
-        return kInvalidLocalSocket;
-    }
-#ifdef _WIN32
-    // Sending to a port nobody has bound yet must not make the next
-    // recvfrom fail with WSAECONNRESET.
-    BOOL reset_enabled = FALSE;
-    DWORD bytes_returned = 0;
-    WSAIoctl(s, SIO_UDP_CONNRESET, &reset_enabled, sizeof(reset_enabled),
-             nullptr, 0, &bytes_returned, nullptr, nullptr);
-#endif
-    sockaddr_in addr{};
-    addr.sin_family = AF_INET;
-    addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
-    addr.sin_port = htons(port);
-    if (::bind(s, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) != 0) {
-        melonDS::Platform::Log(melonDS::Platform::Error,
-            "[%s] bind 127.0.0.1:%u failed: %d\n", tag,
-            static_cast<unsigned>(port), LocalSocketError());
-        LocalSocketClose(s);
-        return kInvalidLocalSocket;
-    }
-#ifdef _WIN32
-    u_long nonblocking = 1;
-    const bool nonblocking_ok = ioctlsocket(s, FIONBIO, &nonblocking) == 0;
-#else
-    const int flags = ::fcntl(s, F_GETFL, 0);
-    const bool nonblocking_ok =
-        flags >= 0 && ::fcntl(s, F_SETFL, flags | O_NONBLOCK) == 0;
-#endif
-    if (!nonblocking_ok) {
-        melonDS::Platform::Log(melonDS::Platform::Error,
-            "[%s] nonblocking setup failed: %d\n", tag, LocalSocketError());
-        LocalSocketClose(s);
-        return kInvalidLocalSocket;
-    }
-    return s;
-}
-
-// True when `s` became readable within `timeout_us`.
-bool LocalSocketWaitReadable(LocalSocket s, int64_t timeout_us) {
-#ifdef _WIN32
-    fd_set readable;
-    FD_ZERO(&readable);
-    FD_SET(s, &readable);
-    timeval tv{};
-    tv.tv_sec = static_cast<long>(timeout_us / 1000000);
-    tv.tv_usec = static_cast<long>(timeout_us % 1000000);
-    return ::select(0, &readable, nullptr, nullptr, &tv) > 0;
-#else
-    // poll() has millisecond resolution; round up so a short remaining
-    // wait still waits instead of spinning.
-    pollfd fd{};
-    fd.fd = s;
-    fd.events = POLLIN;
-    const int timeout_ms = static_cast<int>((timeout_us + 999) / 1000);
-    return ::poll(&fd, 1, timeout_ms) > 0 && (fd.revents & POLLIN) != 0;
-#endif
-}
-
-int LocalSocketSendTo(LocalSocket s, const uint8_t* data, size_t len,
-                      uint16_t port) {
-    sockaddr_in target{};
-    target.sin_family = AF_INET;
-    target.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
-    target.sin_port = htons(port);
-    return static_cast<int>(::sendto(
-        s, reinterpret_cast<const char*>(data), static_cast<int>(len), 0,
-        reinterpret_cast<sockaddr*>(&target), sizeof(target)));
-}
-
-int LocalSocketRecv(LocalSocket s, uint8_t* data, size_t capacity) {
-    sockaddr_in from{};
-#ifdef _WIN32
-    int from_len = sizeof(from);
-#else
-    socklen_t from_len = sizeof(from);
-#endif
-    return static_cast<int>(::recvfrom(
-        s, reinterpret_cast<char*>(data), static_cast<int>(capacity), 0,
-        reinterpret_cast<sockaddr*>(&from), &from_len));
-}
-
-struct LocalMpFrame {
-    uint32_t sender = 0;
-    uint32_t type = 0;
-    uint64_t timestamp = 0;
-    // Sender's steady_clock at send, in ns. The latency lab measures its
-    // delay from here, not from when this process got round to reading the
-    // socket (see LocalMpTransport::Admit).
-    int64_t sent_ns = 0;
-    std::vector<uint8_t> payload;
-};
+using LocalMpFrame = mpnet::Frame;
 
 class LocalMpFrameQueue {
 public:
@@ -882,6 +752,10 @@ struct LocalMpTuning {
     // send, socket arrival, release to the guest, and guest pickup.
     bool trace = false;
     bool stay_awake = false;
+    // Link (HANDOFF_ONLINE_LOBBY.md Phase 1): loopback reaches instances
+    // on this machine only, lan also finds runners on the local network.
+    bool lan = false;
+    std::vector<mpnet::PeerAddr> peers;
 };
 
 class LocalMpTransport {
@@ -900,16 +774,31 @@ public:
 
     void Begin() {
         if (!enabled_) return;
-        if (socket_ != kInvalidLocalSocket) return;
+        if (LinkOpen()) return;
 
-        socket_ = LocalSocketOpen(
-            static_cast<uint16_t>(base_port_ + instance_), "local_mp");
-        if (socket_ == kInvalidLocalSocket) return;
+        mpnet::UdpLinkConfig link_config;
+        link_config.lan = tuning_.lan;
+        link_config.instance = instance_;
+        link_config.base_port = base_port_;
+        link_config.peers = tuning_.peers;
+        link_ = mpnet::MakeUdpLink(link_config);
+        if (!link_->Open()) {
+            link_.reset();
+            return;
+        }
+        // A fresh node id per session: peers tell a restarted runner from
+        // the old one, and two machines may both run instance 0.
+        uint32_t node = 0;
+        while (node == 0)
+            node = static_cast<uint32_t>(rng_()) ^
+                   (static_cast<uint32_t>(rng_()) << 16u);
+        rel_.Reset(node);
+        peers_.clear();
 
-        melonDS::Platform::Log(melonDS::Platform::Info,
-            "[local_mp] enabled instance=%u port=%u\n",
-            static_cast<unsigned>(instance_),
-            static_cast<unsigned>(base_port_ + instance_));
+        std::fprintf(stderr,
+            "[local_mp] enabled instance=%u node=%08x link=%s\n",
+            static_cast<unsigned>(instance_), static_cast<unsigned>(node),
+            link_->Describe().c_str());
         if (tuning_.delay_ms || tuning_.jitter_ms || tuning_.loss_pct ||
             tuning_.late_replies || tuning_.stay_awake) {
             std::fprintf(stderr,
@@ -925,6 +814,7 @@ public:
         g_savestate_network_guard.SetLocalMpListening(true);
         stats_log_last_ = std::chrono::steady_clock::now();
         SnapshotStats(&stats_log_prev_);
+        SendHellos(std::chrono::steady_clock::now());
     }
 
     void End() {
@@ -940,8 +830,10 @@ public:
         late_ack_only_ = 0;
         delayed_.clear();
         last_release_ = {};
-        last_host_id_ = -1;
-        CloseSocket();
+        peers_.clear();
+        rel_.Reset(0);
+        if (link_) link_->Close();
+        link_.reset();
     }
 
     int SendPacket(uint8_t* data, int len, uint64_t timestamp) {
@@ -966,7 +858,6 @@ public:
     }
 
     int RecvHostPacket(uint8_t* data, uint64_t* timestamp) {
-        (void)last_host_id_;
         return RecvPacketGeneric(data, timestamp, true);
     }
 
@@ -1132,11 +1023,11 @@ public:
     }
 
     bool TraceEnabled() const {
-        return tuning_.trace && socket_ != kInvalidLocalSocket;
+        return tuning_.trace && LinkOpen();
     }
 
     bool InhibitPowerDown() const {
-        return tuning_.stay_awake && socket_ != kInvalidLocalSocket;
+        return tuning_.stay_awake && LinkOpen();
     }
 
     void SnapshotStats(NdsLocalMpStats* out) const {
@@ -1170,6 +1061,18 @@ public:
         out->bytes_sent = stats_bytes_sent_.load(std::memory_order_relaxed);
         out->bytes_received =
             stats_bytes_received_.load(std::memory_order_relaxed);
+        out->rel_retransmits =
+            stats_rel_retransmits_.load(std::memory_order_relaxed);
+        out->rel_duplicates =
+            stats_rel_duplicates_.load(std::memory_order_relaxed);
+        out->rel_reordered =
+            stats_rel_reordered_.load(std::memory_order_relaxed);
+        out->rel_gap_skips =
+            stats_rel_gap_skips_.load(std::memory_order_relaxed);
+        out->rel_give_ups =
+            stats_rel_give_ups_.load(std::memory_order_relaxed);
+        out->rel_held = stats_rel_held_.load(std::memory_order_relaxed);
+        out->peers = stats_peers_.load(std::memory_order_relaxed);
         for (int i = 0; i < 4; ++i) {
             out->sent_by_type[i] =
                 stats_sent_by_type_[i].load(std::memory_order_relaxed);
@@ -1185,12 +1088,15 @@ public:
     }
 
 private:
-    static constexpr uint32_t kMagic = 0x4946494Eu;
-    static constexpr uint32_t kMaxInstances = 16;
-    // magic, sender, type, len, guest timestamp (u64), send time (u64 ns)
-    static constexpr uint32_t kHeaderBytes = 32;
-    static constexpr size_t kMaxFrameBytes = 0x948;
+    static constexpr uint32_t kMaxInstances = mpnet::kMaxInstances;
+    static constexpr size_t kMaxFrameBytes = mpnet::kMaxPayloadBytes;
     static constexpr size_t kQueueCapacity = 1024;
+    // Peers: at most the other 15 radios in range. One unheard from for
+    // kPeerTimeout is gone (hellos keep idle peers alive every
+    // kHelloInterval).
+    static constexpr size_t kMaxPeers = 15;
+    static constexpr std::chrono::milliseconds kHelloInterval{1000};
+    static constexpr std::chrono::milliseconds kPeerTimeout{5000};
     static constexpr size_t kDelayedCapacity = 8192;
     static constexpr uint64_t kLateReplyWindowUs = 1000000;
     static constexpr size_t kLateQueueCapacity = 256;
@@ -1337,7 +1243,6 @@ private:
                 TraceFrame("rx-take", frame.type, frame.payload.data(),
                            static_cast<int>(frame.payload.size()));
             if (timestamp) *timestamp = frame.timestamp;
-            if (frame.type == 1u) last_host_id_ = static_cast<int>(frame.sender);
             if (!frame.payload.empty())
                 std::memcpy(data, frame.payload.data(), frame.payload.size());
             if (block) RecordHostWait(start);
@@ -1353,30 +1258,39 @@ private:
             std::memory_order_relaxed);
     }
 
-    // Blocks until the transport socket is readable, a delayed frame comes
-    // due, or `deadline` passes. True = caller should DrainSocket and
-    // re-check its queue, false = deadline reached. poll() wakes on arrival
-    // immediately; the timeout only bites when the peer is genuinely absent.
+    // Blocks until a datagram arrives, a delayed frame or a reliability or
+    // hello timer comes due, or `deadline` passes. True = caller should
+    // DrainSocket and re-check its queue, false = deadline reached. The
+    // wait wakes on arrival immediately; the timeout only bites when the
+    // peer is genuinely absent.
     bool WaitForData(std::chrono::steady_clock::time_point deadline) {
-        if (socket_ == kInvalidLocalSocket) return false;
+        if (!LinkOpen()) return false;
         auto now = std::chrono::steady_clock::now();
-        if (now >= deadline) return ReleaseDue(now);
+        if (now >= deadline) return ReleaseDue(now) || ServiceDue(now);
         auto wake = deadline;
         if (!delayed_.empty() && delayed_.front().release < wake)
             wake = delayed_.front().release;
+        wake = std::min(wake, NextServiceDeadline());
         if (wake > now) {
             const auto remaining =
                 std::chrono::duration_cast<std::chrono::microseconds>(wake -
                                                                       now);
-            if (LocalSocketWaitReadable(socket_, remaining.count()))
-                return true;
+            if (link_->WaitReadable(remaining.count())) return true;
             now = std::chrono::steady_clock::now();
         }
-        return now < deadline || ReleaseDue(now);
+        return now < deadline || ReleaseDue(now) || ServiceDue(now);
     }
 
     bool ReleaseDue(std::chrono::steady_clock::time_point now) const {
         return !delayed_.empty() && delayed_.front().release <= now;
+    }
+
+    std::chrono::steady_clock::time_point NextServiceDeadline() const {
+        return std::min(rel_.NextDeadline(), last_hello_ + kHelloInterval);
+    }
+
+    bool ServiceDue(std::chrono::steady_clock::time_point now) const {
+        return NextServiceDeadline() <= now;
     }
 
     static int LatencyBucket(std::chrono::steady_clock::duration d) {
@@ -1391,10 +1305,36 @@ private:
         return 6;
     }
 
+    bool LinkOpen() const { return link_ && link_->IsOpen(); }
+
+    // Datagrams from the reliability layer, addressed by node.
+    mpnet::Reliable::SendFn PeerSender() {
+        return [this](uint32_t node, const uint8_t* data, size_t len) {
+            const auto it = peers_.find(node);
+            if (it == peers_.end() || !link_) return;
+            if (link_->SendTo(it->second.addr, data, len))
+                stats_frames_sent_.fetch_add(1, std::memory_order_relaxed);
+        };
+    }
+
+    // Discovery to every address a peer might listen on, plus a hello to
+    // each known peer, which also keeps an idle link alive.
+    void SendHellos(std::chrono::steady_clock::time_point now) {
+        if (!LinkOpen()) return;
+        last_hello_ = now;
+        rel_.SendControl(0, mpnet::kFlagHello, now,
+                         [this](uint32_t, const uint8_t* data, size_t len) {
+                             link_->SendDiscovery(data, len);
+                         });
+        const auto send = PeerSender();
+        for (const auto& [node, peer] : peers_)
+            rel_.SendControl(node, mpnet::kFlagHello, now, send);
+    }
+
     int SendGeneric(uint32_t type, uint8_t* data, int len,
                     uint64_t timestamp) {
         if (!enabled_) return 0;
-        if (socket_ == kInvalidLocalSocket) return 0;
+        if (!LinkOpen()) return 0;
         if (len < 0 || static_cast<size_t>(len) > kMaxFrameBytes) return 0;
         if (len > 0 && !data) return 0;
 
@@ -1408,95 +1348,140 @@ private:
                 .fetch_add(1, std::memory_order_relaxed);
         }
 
-        std::vector<uint8_t> datagram;
-        datagram.reserve(kHeaderBytes + static_cast<size_t>(len));
-        WriteLe32(&datagram, kMagic);
-        WriteLe32(&datagram, instance_);
-        WriteLe32(&datagram, type);
-        WriteLe32(&datagram, static_cast<uint32_t>(len));
-        WriteLe64(&datagram, timestamp);
-        WriteLe64(&datagram, static_cast<uint64_t>(
-            std::chrono::duration_cast<std::chrono::nanoseconds>(
-                now.time_since_epoch()).count()));
-        if (len > 0)
-            datagram.insert(datagram.end(), data, data + len);
+        LocalMpFrame frame;
+        frame.type = type;
+        frame.timestamp = timestamp;
+        if (len > 0) frame.payload.assign(data, data + len);
+        // Every radio frame but beacons must arrive: late-reply mode has
+        // no radio-level retransmission left (see mp_reliable.h).
+        const bool reliable =
+            !mpnet::IsBeacon(type, data, static_cast<size_t>(len));
+        rel_.Send(&frame, reliable, now, PeerSender());
 
-        int sent = 0;
-        for (uint32_t i = 0; i < kMaxInstances; ++i) {
-            if (i == instance_) continue;
-            const uint16_t port = static_cast<uint16_t>(base_port_ + i);
-            if (LocalSocketSendTo(socket_, datagram.data(), datagram.size(),
-                                  port) >= 0) {
-                sent = len;
-                stats_frames_sent_.fetch_add(1, std::memory_order_relaxed);
-            } else {
-                const int err = LocalSocketError();
-                // An unbound peer port is the normal case for 14 of the
-                // 15 targets; only report real failures.
-                if (!LocalSocketDrained(err) && send_error_log_counter_ < 8u) {
-                    ++send_error_log_counter_;
-                    melonDS::Platform::Log(melonDS::Platform::Warn,
-                        "[local_mp] sendto 127.0.0.1:%u failed: %d\n",
-                        static_cast<unsigned>(port), err);
-                }
-            }
-        }
         if (low_type == 0u) NoteAssocResponse(data, len);
         if (tuning_.trace) TraceFrame("tx", type, data, len);
-        // Per logical frame, not per fan-out target: on loopback every
-        // send goes to all 15 other ports, but only real peers receive it.
+        // Per logical frame, not per peer.
         stats_sent_by_type_[low_type & 3u].fetch_add(
             1, std::memory_order_relaxed);
-        stats_bytes_sent_.fetch_add(datagram.size(),
-                                    std::memory_order_relaxed);
+        stats_bytes_sent_.fetch_add(
+            mpnet::kHeaderBytes + frame.payload.size(),
+            std::memory_order_relaxed);
         if (low_type != 2u) MaybeLogStats();
-        return sent;
+        // The radio transmitted it whether or not anyone is in range.
+        return len;
     }
 
     void DrainSocket() {
-        if (!enabled_ || socket_ == kInvalidLocalSocket) return;
+        if (!enabled_ || !LinkOpen()) return;
         for (;;) {
-            uint8_t datagram[kHeaderBytes + kMaxFrameBytes];
-            const int got =
-                LocalSocketRecv(socket_, datagram, sizeof(datagram));
-            if (got < 0) {
-                const int err = LocalSocketError();
-                if (!LocalSocketDrained(err)) {
-                    melonDS::Platform::Log(melonDS::Platform::Warn,
-                        "[local_mp] recvfrom failed: %d\n", err);
-                }
-                // A stale ICMP port-unreachable error is consumed by this
-                // call; datagrams queued behind it are still there.
-                if (LocalSocketPeerGone(err)) continue;
-                break;
-            }
-            if (got < static_cast<int>(kHeaderBytes)) continue;
-            if (ReadLe32(datagram) != kMagic) continue;
-
+            uint8_t datagram[mpnet::kMaxDatagramBytes];
+            mpnet::PeerAddr from;
+            const int got = link_->Recv(datagram, sizeof(datagram), &from);
+            if (got <= 0) break;
             LocalMpFrame frame;
-            frame.sender = ReadLe32(datagram + 4u);
-            frame.type = ReadLe32(datagram + 8u);
-            const uint32_t len = ReadLe32(datagram + 12u);
-            frame.timestamp = ReadLe64(datagram + 16u);
-            frame.sent_ns = static_cast<int64_t>(ReadLe64(datagram + 24u));
-            if (frame.sender == instance_) continue;
-            if (frame.sender >= kMaxInstances) continue;
-            if (len > kMaxFrameBytes) continue;
-            if (kHeaderBytes + len != static_cast<uint32_t>(got)) continue;
-            frame.payload.assign(datagram + kHeaderBytes,
-                                 datagram + kHeaderBytes + len);
+            if (!mpnet::Decode(datagram, static_cast<size_t>(got), &frame))
+                continue;
+            if (frame.node == rel_.self()) continue;  // own broadcast
+            frame.from = from;
             Admit(std::move(frame));
         }
         const auto now = std::chrono::steady_clock::now();
         while (ReleaseDue(now)) {
             LocalMpFrame frame = std::move(delayed_.front().frame);
             delayed_.pop_front();
-            Deliver(std::move(frame));
+            Process(std::move(frame), now);
         }
+        Service(now);
+    }
+
+    // A datagram through the latency lab: the peer table, then the
+    // reliability layer, which hands on the guest's frames in order.
+    void Process(LocalMpFrame&& frame,
+                 std::chrono::steady_clock::time_point now) {
+        if (!NotePeer(frame, now)) return;
+        std::vector<LocalMpFrame> ready;
+        rel_.Receive(std::move(frame), now, &ready);
+        for (LocalMpFrame& f : ready) Deliver(std::move(f));
+    }
+
+    // Known peer: refreshed. New node: becomes a peer and gets a hello
+    // straight back, so it learns this one without waiting for discovery.
+    // False when the datagram is to be ignored.
+    bool NotePeer(const LocalMpFrame& frame,
+                  std::chrono::steady_clock::time_point now) {
+        const auto it = peers_.find(frame.node);
+        if (it != peers_.end()) {
+            if (now - it->second.last_heard <= kPeerTimeout) {
+                it->second.last_heard = now;
+                return true;
+            }
+            // This guest stopped polling the radio for longer than the
+            // peer timeout (Service did not run), and the peer has already
+            // dropped it and restarted its streams. Start over too, rather
+            // than wait on frames it is never going to send.
+            rel_.RemovePeer(it->first);
+            peers_.erase(it);
+        }
+        // A new node at a known address is that runner restarted.
+        for (auto p = peers_.begin(); p != peers_.end();) {
+            if (p->second.addr == frame.from) {
+                std::fprintf(stderr,
+                    "[local_mp] inst=%u peer %08x replaced by %08x at %s\n",
+                    static_cast<unsigned>(instance_),
+                    static_cast<unsigned>(p->first),
+                    static_cast<unsigned>(frame.node),
+                    mpnet::FormatPeerAddress(frame.from).c_str());
+                rel_.RemovePeer(p->first);
+                p = peers_.erase(p);
+            } else {
+                ++p;
+            }
+        }
+        if (peers_.size() >= kMaxPeers) return false;
+        peers_[frame.node] = PeerInfo{frame.from, now};
+        rel_.AddPeer(frame.node);
+        std::fprintf(stderr, "[local_mp] inst=%u peer %08x at %s\n",
+                     static_cast<unsigned>(instance_),
+                     static_cast<unsigned>(frame.node),
+                     mpnet::FormatPeerAddress(frame.from).c_str());
+        rel_.SendControl(frame.node, mpnet::kFlagHello, now, PeerSender());
+        return true;
+    }
+
+    // Timers: reliability (retransmits, acks, gaps), hellos, peers gone.
+    void Service(std::chrono::steady_clock::time_point now) {
+        std::vector<LocalMpFrame> ready;
+        rel_.Service(now, PeerSender(), &ready);
+        for (LocalMpFrame& f : ready) Deliver(std::move(f));
+        if (now - last_hello_ >= kHelloInterval) SendHellos(now);
+        for (auto p = peers_.begin(); p != peers_.end();) {
+            if (now - p->second.last_heard > kPeerTimeout) {
+                std::fprintf(stderr,
+                    "[local_mp] inst=%u peer %08x gone (silent %lld ms)\n",
+                    static_cast<unsigned>(instance_),
+                    static_cast<unsigned>(p->first),
+                    static_cast<long long>(kPeerTimeout.count()));
+                rel_.RemovePeer(p->first);
+                p = peers_.erase(p);
+            } else {
+                ++p;
+            }
+        }
+        const mpnet::Reliable::Stats rs = rel_.stats();
+        stats_rel_retransmits_.store(rs.retransmits,
+                                     std::memory_order_relaxed);
+        stats_rel_duplicates_.store(rs.duplicates, std::memory_order_relaxed);
+        stats_rel_reordered_.store(rs.reordered, std::memory_order_relaxed);
+        stats_rel_gap_skips_.store(rs.gap_skips, std::memory_order_relaxed);
+        stats_rel_give_ups_.store(rs.give_ups, std::memory_order_relaxed);
+        stats_rel_held_.store(rs.held, std::memory_order_relaxed);
+        stats_peers_.store(rs.peers, std::memory_order_relaxed);
     }
 
     // Applies the latency lab to a validated datagram: drop it, hold it
-    // for the configured delay, or hand it straight on.
+    // for the configured delay, or hand it straight on. It stands in for
+    // the network, so it sees every datagram, retransmissions and the
+    // transport's own hellos and acks included.
     void Admit(LocalMpFrame&& frame) {
         if (tuning_.trace)
             TraceFrame("rx-arrive", frame.type, frame.payload.data(),
@@ -1505,8 +1490,9 @@ private:
             stats_injected_drops_.fetch_add(1, std::memory_order_relaxed);
             return;
         }
+        const auto now = std::chrono::steady_clock::now();
         if (!tuning_.delay_ms && !tuning_.jitter_ms) {
-            Deliver(std::move(frame));
+            Process(std::move(frame), now);
             return;
         }
         if (delayed_.size() >= kDelayedCapacity) {
@@ -1516,18 +1502,22 @@ private:
         uint32_t hold_us = tuning_.delay_ms * 1000u;
         if (tuning_.jitter_ms)
             hold_us += rng_() % (tuning_.jitter_ms * 1000u + 1u);
+        const auto hold = std::chrono::microseconds(hold_us);
         // Count the delay from the send, as a network would: the datagram
         // is in the socket from send + delay on, however long this guest
         // then sleeps with its radio off before reading it. Counting from
         // the read instead adds a whole beacon interval whenever the guest
         // powers down within the delay (it only reads while awake), which
-        // skews beacons and broke the auth/assoc handshake. Both instances
-        // run on this machine, so their steady clocks agree.
+        // skews beacons and broke the auth/assoc handshake. Instances on
+        // this machine share the steady clock; a sender on another machine
+        // does not, so its stamp is only trusted when it is plausible.
         auto release = std::chrono::steady_clock::time_point(
                            std::chrono::duration_cast<
                                std::chrono::steady_clock::duration>(
                                std::chrono::nanoseconds(frame.sent_ns))) +
-                       std::chrono::microseconds(hold_us);
+                       hold;
+        if (release > now + hold || release < now - std::chrono::seconds(1))
+            release = now + hold;
         // Jitter varies the delay but never reorders: a relay path keeps
         // datagram order nearly always, and FIFO keeps the queue sorted.
         if (release < last_release_) release = last_release_;
@@ -1543,7 +1533,7 @@ private:
         // datagram, not that a peer is listening.
         g_savestate_network_guard.NoteLocalMpPeer();
         stats_frames_received_.fetch_add(1, std::memory_order_relaxed);
-        stats_bytes_received_.fetch_add(kHeaderBytes + frame.payload.size(),
+        stats_bytes_received_.fetch_add(mpnet::kHeaderBytes + frame.payload.size(),
                                         std::memory_order_relaxed);
         const uint32_t low_type = frame.type & 0xFFFFu;
         stats_received_by_type_[low_type & 3u].fetch_add(
@@ -1608,7 +1598,7 @@ private:
     // NDS_LOCAL_MP_STATS=1: one line per second of per-second deltas, only
     // while traffic flows, for the Phase 0 table in HANDOFF_ONLINE_LOBBY.md.
     void MaybeLogStats() {
-        if (!tuning_.stats_log || socket_ == kInvalidLocalSocket) return;
+        if (!tuning_.stats_log || !LinkOpen()) return;
         const auto now = std::chrono::steady_clock::now();
         const auto elapsed = now - stats_log_last_;
         if (elapsed < std::chrono::seconds(1)) return;
@@ -1644,6 +1634,8 @@ private:
                 "late=%.0f ack_only=%.0f trimmed=%.0f stale=%.0f | "
                 "client host-wait calls=%.0f timeouts=%.0f wait_ms=%.1f | "
                 "lab_drops=%.0f held=%zu | "
+                "rel retx=%.0f dup=%.0f reorder=%.0f gap_skips=%.0f "
+                "give_ups=%.0f waiting=%llu peers=%llu | "
                 "reply_lat_ms[<1/2/4/8/16/32/32+]=%s turnaround=%s\n",
                 static_cast<unsigned>(instance_),
                 rate(cur.sent_by_type[0], p.sent_by_type[0]),
@@ -1668,17 +1660,24 @@ private:
                 rate(cur.recv_host_timeouts, p.recv_host_timeouts),
                 rate(cur.recv_host_wait_us, p.recv_host_wait_us) / 1000.0,
                 rate(cur.injected_drops, p.injected_drops),
-                delayed_.size(), hist[0], hist[1]);
+                delayed_.size(),
+                rate(cur.rel_retransmits, p.rel_retransmits),
+                rate(cur.rel_duplicates, p.rel_duplicates),
+                rate(cur.rel_reordered, p.rel_reordered),
+                rate(cur.rel_gap_skips, p.rel_gap_skips),
+                rate(cur.rel_give_ups, p.rel_give_ups),
+                static_cast<unsigned long long>(cur.rel_held),
+                static_cast<unsigned long long>(cur.peers), hist[0],
+                hist[1]);
         }
         stats_log_prev_ = cur;
         stats_log_last_ = now;
     }
 
-    void CloseSocket() {
-        if (socket_ == kInvalidLocalSocket) return;
-        LocalSocketClose(socket_);
-        socket_ = kInvalidLocalSocket;
-    }
+    struct PeerInfo {
+        mpnet::PeerAddr addr;
+        std::chrono::steady_clock::time_point last_heard;
+    };
 
     bool enabled_ = false;
     uint32_t instance_ = 0;
@@ -1700,8 +1699,10 @@ private:
     uint16_t late_known_macs_ = 0;
     uint16_t late_reply_seq_[16]{};
     uint16_t late_ack_only_ = 0;
-    int last_host_id_ = -1;
-    uint32_t send_error_log_counter_ = 0;
+    std::unique_ptr<mpnet::MpLink> link_;
+    mpnet::Reliable rel_;
+    std::map<uint32_t, PeerInfo> peers_;
+    std::chrono::steady_clock::time_point last_hello_{};
     // Always-on wait/traffic counters (see NdsLocalMpStats in wifi_net.h).
     // Relaxed atomics: written on the emulation thread, snapshotted from
     // the debug-server thread.
@@ -1724,11 +1725,17 @@ private:
     std::atomic<uint64_t> stats_received_by_type_[4] = {};
     std::atomic<uint64_t> stats_reply_latency_[7] = {};
     std::atomic<uint64_t> stats_turnaround_[7] = {};
+    std::atomic<uint64_t> stats_rel_retransmits_{0};
+    std::atomic<uint64_t> stats_rel_duplicates_{0};
+    std::atomic<uint64_t> stats_rel_reordered_{0};
+    std::atomic<uint64_t> stats_rel_gap_skips_{0};
+    std::atomic<uint64_t> stats_rel_give_ups_{0};
+    std::atomic<uint64_t> stats_rel_held_{0};
+    std::atomic<uint64_t> stats_peers_{0};
     std::chrono::steady_clock::time_point last_cmd_send_wall_{};
     std::chrono::steady_clock::time_point last_cmd_recv_wall_{};
     std::chrono::steady_clock::time_point stats_log_last_{};
     NdsLocalMpStats stats_log_prev_{};
-    LocalSocket socket_ = kInvalidLocalSocket;
 };
 
 class LocalWfcPeerBridge {
@@ -2400,6 +2407,19 @@ melonDS::Wifi* nds_wifi3d_attach() {
         tuning.stats_log = g_network_config.local_wireless_stats_log;
         tuning.trace = g_network_config.local_wireless_trace;
         tuning.stay_awake = g_network_config.local_wireless_stay_awake;
+        tuning.lan = g_network_config.local_wireless_lan;
+        for (const std::string& text :
+             g_network_config.local_wireless_peers) {
+            mpnet::PeerAddr addr;
+            std::string error;
+            if (mpnet::ParsePeerAddress(
+                    text, g_network_config.local_wireless_base_port, &addr,
+                    &error))
+                tuning.peers.push_back(addr);
+            else
+                std::fprintf(stderr, "[local_mp] %s, ignored\n",
+                             error.c_str());
+        }
         g_bridge->local_mp.Configure(
             g_network_config.local_wireless_enabled,
             g_network_config.local_wireless_instance,

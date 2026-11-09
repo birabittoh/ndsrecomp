@@ -127,9 +127,10 @@ struct NdsWifiNetworkConfig {
     uint32_t wfc_clear_crt_errno_addr = 0;
 
     // Local wireless / Download Play / NiFi transport. Disabled by default;
-    // when enabled, each runner process binds localhost UDP port
-    // local_wireless_base_port + instance_index and fans MP frames out to
-    // the other local instance slots.
+    // when enabled, each runner process binds UDP port
+    // local_wireless_base_port + instance_index (on all interfaces with the
+    // lan link, on 127.0.0.1 with loopback), finds the other runners in
+    // range and sends them its radio frames reliably (net/mp_reliable.h).
     bool local_wireless_enabled = false;
     uint32_t local_wireless_instance = 0;
     uint16_t local_wireless_base_port = 26710;
@@ -140,6 +141,9 @@ struct NdsWifiNetworkConfig {
     bool local_wireless_late_replies = false;
     uint32_t local_wireless_reply_budget_us = 2000;
     bool local_wireless_stay_awake = false;
+    // Link, see NdsLocalWirelessOptions (frontend.h).
+    bool local_wireless_lan = true;
+    std::vector<std::string> local_wireless_peers;
     // NDS_LOCAL_MP_STATS=1: one "[local_mp] stats" line per second on
     // stderr while the transport is open.
     bool local_wireless_stats_log = false;
@@ -220,6 +224,16 @@ struct NdsLocalMpStats {
     uint64_t injected_drops = 0;     // latency lab: --local-wireless-loss-pct
     uint64_t bytes_sent = 0;         // per logical frame, header included
     uint64_t bytes_received = 0;
+    // Reliable delivery (net/mp_reliable.h): datagrams sent again, received
+    // again, received after a gap; gaps given up on and sent frames dropped
+    // unacknowledged (both lose data); frames waiting behind a gap now.
+    uint64_t rel_retransmits = 0;
+    uint64_t rel_duplicates = 0;
+    uint64_t rel_reordered = 0;
+    uint64_t rel_gap_skips = 0;
+    uint64_t rel_give_ups = 0;
+    uint64_t rel_held = 0;
+    uint64_t peers = 0;              // other runners in range now
     // Index = frame type: 0 packet/beacon, 1 MP cmd, 2 reply, 3 ack.
     // sent_by_type counts logical frames (one per send, not per target).
     uint64_t sent_by_type[4] = {};

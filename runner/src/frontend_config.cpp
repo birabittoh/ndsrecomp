@@ -556,13 +556,17 @@ bool parse_u32_in_range(const std::string& value, uint32_t max,
 
 }  // namespace
 
+constexpr size_t kMaxLocalWirelessPeers = 8;
+
 bool nds_is_local_wireless_tuning_flag(const std::string& flag) {
     return flag == "--local-wireless-delay-ms" ||
            flag == "--local-wireless-jitter-ms" ||
            flag == "--local-wireless-loss-pct" ||
            flag == "--local-wireless-late-replies" ||
            flag == "--local-wireless-reply-budget-us" ||
-           flag == "--local-wireless-stay-awake";
+           flag == "--local-wireless-stay-awake" ||
+           flag == "--local-wireless-link" ||
+           flag == "--local-wireless-peer";
 }
 
 bool nds_parse_local_wireless_tuning(const std::string& flag,
@@ -591,6 +595,18 @@ bool nds_parse_local_wireless_tuning(const std::string& flag,
     if (flag == "--local-wireless-stay-awake")
         return nds_parse_on_off(value, &out->stay_awake) ||
                fail("on or off");
+    if (flag == "--local-wireless-link") {
+        if (value == "lan") out->lan = true;
+        else if (value == "loopback") out->lan = false;
+        else return fail("lan or loopback");
+        return true;
+    }
+    if (flag == "--local-wireless-peer") {
+        if (value.empty() || out->peers.size() >= kMaxLocalWirelessPeers)
+            return fail("HOST or HOST:PORT, at most 8 peers");
+        out->peers.push_back(value);
+        return true;
+    }
     if (error) *error = "unknown flag " + flag;
     return false;
 }
@@ -1304,6 +1320,30 @@ static bool apply_frontend_config(toml::table& root,
                         "local_wireless.base_port must be 1024..65520";
                 }
                 return false;
+            }
+        }
+        if (const auto value = (*local)["link"].value<std::string>()) {
+            if (*value != "lan" && *value != "loopback") {
+                if (error)
+                    *error = "local_wireless.link must be lan or loopback";
+                return false;
+            }
+            options->local_wireless.lan = *value == "lan";
+        }
+        if (const toml::array* peers = (*local)["peers"].as_array()) {
+            options->local_wireless.peers.clear();
+            for (const auto& entry : *peers) {
+                const auto text = entry.value<std::string>();
+                if (!text || text->empty() ||
+                    options->local_wireless.peers.size() >=
+                        kMaxLocalWirelessPeers) {
+                    if (error) {
+                        *error = "local_wireless.peers must be at most 8 "
+                                 "\"HOST\" or \"HOST:PORT\" strings";
+                    }
+                    return false;
+                }
+                options->local_wireless.peers.push_back(*text);
             }
         }
     }

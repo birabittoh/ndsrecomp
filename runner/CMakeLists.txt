@@ -736,6 +736,9 @@ add_executable(nds_runner
     src/net/net_sanitize.cpp
     src/net/net_replay.cpp
     src/net/wfc_provider.cpp
+    src/net/mp_wire.cpp
+    src/net/mp_reliable.cpp
+    src/net/mp_link.cpp
     src/spu.cpp
     src/vram.cpp
     src/gpu2d.cpp
@@ -1307,6 +1310,24 @@ ndsrecomp_link_tomlpp(frontend_config_test)
       src/net/wfc_provider.cpp)
   target_include_directories(wfc_provider_test PRIVATE src)
   add_test(NAME wfc_provider_test COMMAND wfc_provider_test)
+
+  add_executable(mp_reliable_test
+      tests/mp_reliable_test.cpp
+      src/net/mp_wire.cpp
+      src/net/mp_reliable.cpp)
+  target_include_directories(mp_reliable_test PRIVATE src)
+  add_test(NAME mp_reliable_test COMMAND mp_reliable_test)
+
+  add_executable(mp_link_test
+      tests/mp_link_test.cpp
+      src/net/mp_wire.cpp
+      src/net/mp_reliable.cpp
+      src/net/mp_link.cpp)
+  target_include_directories(mp_link_test PRIVATE src)
+  if(WIN32)
+    target_link_libraries(mp_link_test PRIVATE ws2_32)
+  endif()
+  add_test(NAME mp_link_test COMMAND mp_link_test)
 
   add_executable(net_ring_test
       tests/net_ring_test.cpp
