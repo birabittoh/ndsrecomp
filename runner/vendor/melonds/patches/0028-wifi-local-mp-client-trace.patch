@@ -1,0 +1,39 @@
+Subject: Wifi: local wireless MP client trace
+
+ndsrecomp modification to vendored melonDS src/Wifi.cpp and src/Wifi.h
+(GPLv3 5(a) notice; see patches/README.md for the convention).
+
+Diagnostics only; no behaviour change. While the runner hook
+nds_wifi_local_mp_trace_enabled() returns true (NDS_LOCAL_MP_TRACE=1 with
+the local MP transport open), the MP client logs to stderr:
+
+- each host frame it takes in CheckRX: cmd/ack/other, the frame's guest
+  timestamp against USTimestamp ("ahead"), NextSync before and after,
+  ComStatus and both reply TX slots;
+- each SendMPReply: the reply slots, whether the previous reply is marked
+  done, and the reply sent (address, length, duration, valid);
+- a cmd dropped from RX as a duplicate (same sequence number);
+- how many USTimer ticks it waited past NextSync for a host frame
+  (MPClientMissStreak, a new member used only by the trace).
+
+--- a/src/Wifi.h
++++ b/src/Wifi.h
+@@ class Wifi, MP state
++    u32 MPClientMissStreak = 0; // latency trace only
+--- a/src/Wifi.cpp
++++ b/src/Wifi.cpp
+@@ (runner hook declarations)
++bool nds_wifi_local_mp_trace_enabled();
+@@ Wifi::SendMPReply, before marking the previous reply done
++    trace: reply slots and previous reply state
+@@ Wifi::SendMPReply, after the duration check
++    trace: reply sent
+@@ Wifi::FinishRX, MP cmd sequence check
++    trace: duplicate cmd dropped
+@@ Wifi::CheckRX, MP client sync
++    const u64 prevsync = NextSync;
++    trace: frame kind, timestamp vs USTimestamp, NextSync, slots
+@@ Wifi::USTimer, MP client past NextSync
+-            CheckRX(2);
++            const bool got = CheckRX(2);
++            trace: ticks waited for a host frame

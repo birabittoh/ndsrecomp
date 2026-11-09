@@ -35,6 +35,7 @@
 void nds_wifi_on_local_mp_disconnected();
 bool nds_wifi_inhibit_power_down();
 uint16_t nds_wifi_local_mp_take_ack_only();
+bool nds_wifi_local_mp_trace_enabled();
 
 namespace melonDS
 {
@@ -864,6 +865,12 @@ void Wifi::SendMPReply(u16 clienttime, u16 clientmask)
 
     // mark the last packet as success. dunno what the MSB is, it changes.
     //if (slot->Valid)
+    const bool trace = ::nds_wifi_local_mp_trace_enabled();
+    if (trace)
+        fprintf(stderr, "[mp-client] reply us=%llu clienttime=%u reply1=%04X reply2=%04X prev_valid=%d prev_addr=%04X prev_stat=%04X\n",
+                (unsigned long long)USTimestamp, clienttime,
+                IOPORT(W_TXSlotReply1), IOPORT(W_TXSlotReply2), slot->Valid ? 1 : 0,
+                slot->Addr, (IOPORT(W_TXSlotReply2) & 0x8000) ? *(u16*)&RAM[slot->Addr] : 0);
     if (IOPORT(W_TXSlotReply2) & 0x8000)
         *(u16*)&RAM[slot->Addr] = 0x0001;
 
@@ -890,6 +897,9 @@ void Wifi::SendMPReply(u16 clienttime, u16 clientmask)
         u32 duration = PreambleLen(slot->Rate) + (slot->Length * (slot->Rate==2 ? 4:8));
         if (duration > clienttime)
             slot->Valid = false;
+        if (trace)
+            fprintf(stderr, "[mp-client] reply send addr=%04X len=%u duration=%u valid=%d\n",
+                    slot->Addr, slot->Length, duration, slot->Valid ? 1 : 0);
     }
 
     // this seems to be set upon IRQ0
@@ -1443,6 +1453,8 @@ void Wifi::FinishRX()
             else if (MACEqual(&RXBuffer[12 + 4], MPCmdMAC))
             {
                 if (seqno == MPLastSeqno) cmd_dupe = true;
+                if (cmd_dupe && ::nds_wifi_local_mp_trace_enabled())
+                    fprintf(stderr, "[mp-client] duplicate cmd seq=%u dropped from RX\n", (unsigned)seqno);
                 MPLastSeqno = seqno;
 
                 rxflags |= 0x000C;
@@ -1751,6 +1763,7 @@ bool Wifi::CheckRX(int type) // 0=regular 1=MP replies 2=MP host frames
         // timestamp it came with
         // we also need to determine how far we can run after having received this frame
 
+        const u64 prevsync = NextSync;
         RXTimestamp = timestamp;
         if (RXTimestamp < USTimestamp) RXTimestamp = USTimestamp;
         NextSync = RXTimestamp + (framelen * (txrate==0x14 ? 4:8));
@@ -1768,6 +1781,19 @@ bool Wifi::CheckRX(int type) // 0=regular 1=MP replies 2=MP host frames
             u32 runahead = *(u32*)&RXBuffer[0];
 
             NextSync += runahead;
+        }
+
+        // ndsrecomp: local wireless latency trace (NDS_LOCAL_MP_TRACE=1)
+        if (::nds_wifi_local_mp_trace_enabled())
+        {
+            const char* kind = MACEqual(&RXBuffer[12 + 4], MPCmdMAC) ? "cmd"
+                             : MACEqual(&RXBuffer[12 + 4], MPAckMAC) ? "ack" : "other";
+            fprintf(stderr, "[mp-client] rx %s fc=%04X stamp=%llu us=%llu ahead=%lld prevsync=%llu nextsync=%llu com=%u reply1=%04X reply2=%04X\n",
+                    kind, framectl, (unsigned long long)timestamp,
+                    (unsigned long long)USTimestamp,
+                    (long long)USTimestamp - (long long)timestamp,
+                    (unsigned long long)prevsync, (unsigned long long)NextSync,
+                    (unsigned)ComStatus, IOPORT(W_TXSlotReply1), IOPORT(W_TXSlotReply2));
         }
     }
     else
@@ -1823,7 +1849,17 @@ void Wifi::USTimer(u32 param)
         if (USTimestamp >= NextSync)
         {
             // TODO: not do this every tick if it fails to receive a frame!
-            CheckRX(2);
+            const bool got = CheckRX(2);
+            if (::nds_wifi_local_mp_trace_enabled())
+            {
+                if (!got) ++MPClientMissStreak;
+                else if (MPClientMissStreak)
+                {
+                    fprintf(stderr, "[mp-client] waited %u ticks past nextsync (us=%llu)\n",
+                            MPClientMissStreak, (unsigned long long)USTimestamp);
+                    MPClientMissStreak = 0;
+                }
+            }
         }
     }
 

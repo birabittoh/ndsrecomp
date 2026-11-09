@@ -71,6 +71,15 @@ Only `--local-wireless-late-replies on` returns a non-zero mask: there the
 runner delivers each client's replies FIFO, one per cmd, so every reply
 reaches the guest exactly once. Behaviour is otherwise unchanged.
 
+## 0028-wifi-local-mp-client-trace.patch
+
+2026-11-09: `Wifi.cpp`/`Wifi.h`: with `NDS_LOCAL_MP_TRACE=1` and the local
+MP transport open (runner hook `nds_wifi_local_mp_trace_enabled()`), the MP
+client logs each host frame it syncs to (timestamp vs its own clock,
+NextSync), each reply it sends and how the reply slots move, duplicate cmds
+dropped from RX, and how long it waited for host frames. Diagnostics only;
+behaviour is unchanged.
+
 ## 0001-wifi-ap-identity.patch
 
 `src/WifiAP.cpp`: changes the hardcoded AP identity from melonDS's default

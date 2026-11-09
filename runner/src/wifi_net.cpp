@@ -933,6 +933,10 @@ public:
         reply_queue_.Clear();
         for (auto& q : late_queue_) q.clear();
         for (auto& t : late_seen_) t = {};
+        for (auto& t : late_polled_since_) t = {};
+        late_last_mask_ = 0;
+        late_known_macs_ = 0;
+        last_host_frame_wall_ = {};
         late_ack_only_ = 0;
         delayed_.clear();
         last_release_ = {};
@@ -1022,7 +1026,8 @@ public:
     // proxy. The host waits at most the budget, then hands the guest the
     // OLDEST queued reply of each client, one per cmd, so every reply a
     // client sent is delivered exactly once and in order. A client with
-    // nothing queued yet but heard from recently is reported as having
+    // nothing queued yet but heard from recently, or newly polled (see
+    // kLateJoinGrace), is reported as having
     // answered without a frame (TakeLateAckOnly; vendored patch 0027): it
     // did get the cmd, and its reply is still in flight. Reporting it
     // failed instead makes both WM ends retransmit data that is going to
@@ -1056,6 +1061,7 @@ public:
         for (uint32_t aid = 1; aid < 16; ++aid) {
             const uint16_t bit = static_cast<uint16_t>(1u << aid);
             if ((aidmask & bit) == 0) continue;
+            if ((late_last_mask_ & bit) == 0) late_polled_since_[aid] = now;
             auto& q = late_queue_[aid];
             // A reply from a previous session (or a client that went
             // quiet for a second of guest time) is not this exchange's.
@@ -1081,14 +1087,32 @@ public:
                 if (frame.timestamp + 32u < timestamp)
                     stats_late_replies_.fetch_add(
                         1, std::memory_order_relaxed);
+                if (frame.payload.size() >= 12u + 24u)
+                    late_reply_seq_[aid] = static_cast<uint16_t>(
+                        (frame.payload[12 + 22] |
+                         (frame.payload[12 + 23] << 8)) >> 4);
                 q.pop_front();
                 received |= bit;
-            } else if (late_seen_[aid].time_since_epoch().count() != 0 &&
-                       now - late_seen_[aid] < kLateAliveWindow) {
-                ack_only |= bit;
+            } else if (LateClientPresent(aid, now)) {
+                // The client did get this cmd; its reply is still in
+                // flight. Hand WM the empty reply the client's radio sends
+                // on its own when nothing is queued: WM only treats a
+                // reply frame as an answer and otherwise re-sends the cmd
+                // at once (same sequence number). The client's hardware
+                // filters that duplicate out of its RX ring but still
+                // retires its previous reply, so DQ9's WL code on ARM7
+                // finds a reply finished outside an MP cmd, raises status
+                // 0x80 (0x037FA0F0) and WM disconnects (reason 0x8003).
+                // Without the client's MAC yet, fall back to answering
+                // without a frame (TakeLateAckOnly).
+                if (FabricateDefaultReply(aid, &data[(aid - 1u) * 1024u]))
+                    received |= bit;
+                else
+                    ack_only |= bit;
                 stats_late_ack_only_.fetch_add(1, std::memory_order_relaxed);
             }
         }
+        late_last_mask_ = aidmask;
         late_ack_only_ = ack_only;
         stats_recv_replies_wait_us_.fetch_add(
             static_cast<uint64_t>(
@@ -1105,6 +1129,10 @@ public:
         const uint16_t mask = late_ack_only_;
         late_ack_only_ = 0;
         return mask;
+    }
+
+    bool TraceEnabled() const {
+        return tuning_.trace && socket_ != kInvalidLocalSocket;
     }
 
     bool InhibitPowerDown() const {
@@ -1171,6 +1199,25 @@ private:
     // TakeLateAckOnly. Well above any relay round trip, well below WM's
     // own MP lifetime, so a client that really left is still reported.
     static constexpr std::chrono::milliseconds kLateAliveWindow{500};
+    // A client that has just joined is polled for a whole round trip
+    // before its first reply can arrive (7+ cmds at 100 ms). Reporting
+    // those cmds failed brings back the retransmissions and duplicates
+    // late mode exists to avoid, in the middle of the game's own join
+    // handshake. It gets this long to send its first reply.
+    static constexpr std::chrono::milliseconds kLateJoinGrace{2000};
+    static constexpr std::chrono::milliseconds kHostGoneAfter{2000};
+
+    // Whether a polled client with nothing queued still counts as having
+    // answered (TakeLateAckOnly): heard from recently, or newly polled
+    // and not heard from since.
+    bool LateClientPresent(uint32_t aid,
+                           std::chrono::steady_clock::time_point now) const {
+        const auto seen = late_seen_[aid];
+        const auto polled = late_polled_since_[aid];
+        if (seen.time_since_epoch().count() != 0 && seen >= polled)
+            return now - seen < kLateAliveWindow;
+        return now - polled < kLateJoinGrace;
+    }
 
     // Moves arrived replies into per-client FIFOs (late mode only).
     void SortLateReplies(uint64_t timestamp) {
@@ -1195,6 +1242,48 @@ private:
             }
             q.push_back(std::move(frame));
         }
+    }
+
+    // An association response this host sends (802.11 management subtype
+    // 1, status 0) names a client's MAC and AID: what FabricateDefaultReply
+    // needs to answer for that client.
+    void NoteAssocResponse(const uint8_t* p, int len) {
+        if (len < 12 + 24 + 6) return;
+        const unsigned fc = p[12] | (p[13] << 8);
+        if ((fc & 0x00FC) != 0x0010) return;
+        const unsigned status = p[12 + 24 + 2] | (p[12 + 24 + 3] << 8);
+        const unsigned aid = (p[12 + 24 + 4] | (p[12 + 24 + 5] << 8)) & 0x3FFFu;
+        if (status != 0 || aid == 0 || aid > 15) return;
+        std::memcpy(late_client_mac_[aid], p + 12 + 4, 6);
+        std::memcpy(late_bssid_, p + 12 + 16, 6);
+        late_channel_ = p[9];
+        late_known_macs_ |= static_cast<uint16_t>(1u << aid);
+        late_reply_seq_[aid] = 0;
+    }
+
+    // Writes the client hardware's automatic empty reply (the layout of
+    // Wifi::SendMPDefaultReply) for `aid` into `out`. Its sequence number is
+    // half the space away from the client's own, so neither ever repeats
+    // the other's.
+    bool FabricateDefaultReply(uint32_t aid, uint8_t* out) {
+        if ((late_known_macs_ & (1u << aid)) == 0) return false;
+        static const uint8_t kMpReplyMac[6] = {0x03, 0x09, 0xBF,
+                                               0x00, 0x00, 0x10};
+        std::memset(out, 0, 12 + 28);
+        out[8] = 0x14;
+        out[9] = late_channel_;
+        out[0xA] = 28;
+        out[0xC] = 0x58;
+        out[0xD] = 0x01;
+        out[0xE] = 0xF0;
+        std::memcpy(out + 0xC + 4, late_bssid_, 6);
+        std::memcpy(out + 0xC + 10, late_client_mac_[aid], 6);
+        std::memcpy(out + 0xC + 16, kMpReplyMac, 6);
+        const uint16_t seq =
+            static_cast<uint16_t>((late_reply_seq_[aid] + 0x800u) & 0x0FFFu);
+        out[0xC + 22] = static_cast<uint8_t>((seq << 4) & 0xFF);
+        out[0xC + 23] = static_cast<uint8_t>(seq >> 4);
+        return true;
     }
 
     // The client hardware's automatic empty reply (Wifi::SendMPDefaultReply):
@@ -1228,6 +1317,20 @@ private:
                 stats_recv_host_timeouts_.fetch_add(
                     1, std::memory_order_relaxed);
                 RecordHostWait(start);
+                // The model calls this on every 8 us tick past NextSync
+                // until a host frame arrives, so a host that is gone would
+                // stall the client 25 ms per tick, i.e. forever. After a
+                // stretch with no host traffic at all, report it gone (< 0):
+                // the model leaves MP mode and the game sees the link drop.
+                if (last_host_frame_wall_.time_since_epoch().count() != 0 &&
+                    std::chrono::steady_clock::now() - last_host_frame_wall_ >
+                        kHostGoneAfter) {
+                    melonDS::Platform::Log(melonDS::Platform::Warn,
+                        "[local_mp] no host frame for %lld ms, host gone\n",
+                        static_cast<long long>(kHostGoneAfter.count()));
+                    last_host_frame_wall_ = {};
+                    return -1;
+                }
                 return 0;
             }
             if (tuning_.trace)
@@ -1338,6 +1441,7 @@ private:
                 }
             }
         }
+        if (low_type == 0u) NoteAssocResponse(data, len);
         if (tuning_.trace) TraceFrame("tx", type, data, len);
         // Per logical frame, not per fan-out target: on loopback every
         // send goes to all 15 other ports, but only real peers receive it.
@@ -1444,6 +1548,8 @@ private:
         const uint32_t low_type = frame.type & 0xFFFFu;
         stats_received_by_type_[low_type & 3u].fetch_add(
             1, std::memory_order_relaxed);
+        if (low_type != 2u)
+            last_host_frame_wall_ = std::chrono::steady_clock::now();
         if (low_type == 1u) {
             last_cmd_recv_wall_ = std::chrono::steady_clock::now();
         } else if (low_type == 2u &&
@@ -1585,6 +1691,14 @@ private:
     LocalMpFrameQueue reply_queue_{kQueueCapacity};
     std::deque<LocalMpFrame> late_queue_[16];
     std::chrono::steady_clock::time_point late_seen_[16]{};
+    std::chrono::steady_clock::time_point late_polled_since_[16]{};
+    uint16_t late_last_mask_ = 0;
+    std::chrono::steady_clock::time_point last_host_frame_wall_{};
+    uint8_t late_client_mac_[16][6]{};
+    uint8_t late_bssid_[6]{};
+    uint8_t late_channel_ = 0;
+    uint16_t late_known_macs_ = 0;
+    uint16_t late_reply_seq_[16]{};
     uint16_t late_ack_only_ = 0;
     int last_host_id_ = -1;
     uint32_t send_error_log_counter_ = 0;
@@ -2611,6 +2725,10 @@ NdsSavestateNetworkEligibility nds_wifi_savestate_eligibility() {
 
 bool nds_wifi_inhibit_power_down() {
     return g_bridge && g_bridge->local_mp.InhibitPowerDown();
+}
+
+bool nds_wifi_local_mp_trace_enabled() {
+    return g_bridge && g_bridge->local_mp.TraceEnabled();
 }
 
 uint16_t nds_wifi_local_mp_take_ack_only() {

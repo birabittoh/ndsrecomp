@@ -237,6 +237,7 @@ private:
     int MPReplyTimer;
     u16 MPClientMask, MPClientFail;
     u16 MPClientNoFrame; // answered without a frame (patch 0027)
+    u32 MPClientMissStreak = 0; // latency trace only
 
     u8 MPClientReplies[15*1024];
 

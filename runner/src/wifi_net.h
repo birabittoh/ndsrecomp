@@ -291,6 +291,10 @@ bool nds_wifi_inhibit_power_down();
 // guest (late-reply mode; their reply is still in flight). Read-and-clear.
 uint16_t nds_wifi_local_mp_take_ack_only();
 
+// NDS_LOCAL_MP_TRACE=1 with the transport open: the vendored Wifi model
+// logs MP client timing (diagnostics only).
+bool nds_wifi_local_mp_trace_enabled();
+
 // Transaction-boundary query installed into the core savestate layer when
 // the bridge attaches. A configured/idle backend does not block. Association,
 // local peers, lifecycle transitions, and currently-unserialized powered
