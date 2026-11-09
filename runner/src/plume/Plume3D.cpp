@@ -106,8 +106,13 @@ struct GxVertex {
     uint8_t r, g, b, a;
     int16_t s, t;
     uint32_t texpal;
+    // Barycentric-like weights, 0 or 255: each component is zero along the
+    // polygon's outer edges it stands for, so the opaque pass can tell the
+    // pixels on the polygon's outline (the hardware's edge flags) from the
+    // rest. 255 everywhere is no edge.
+    uint8_t edge[4];
 };
-static_assert(sizeof(GxVertex) == 36);
+static_assert(sizeof(GxVertex) == 40);
 
 // Mirrors GxConfig in gx.hlsl.
 struct GxConfig {
@@ -325,6 +330,7 @@ RenderPipeline* pipeline_for(Renderer& r, const DrawState& s, bool in_frame = tr
         RenderInputElement("COLOR", 0, 2, RenderFormat::R8G8B8A8_UINT, 0, 24),
         RenderInputElement("TEXCOORD", 1, 3, RenderFormat::R16G16_SINT, 0, 28),
         RenderInputElement("TEXCOORD", 2, 4, RenderFormat::R32_UINT, 0, 32),
+        RenderInputElement("TEXCOORD", 3, 5, RenderFormat::R8G8B8A8_UNORM, 0, 36),
     };
 
     RenderGraphicsPipelineDesc desc;
@@ -507,6 +513,7 @@ GxVertex make_vertex(const Polygon* poly, int vid, const Vertex* vtx, uint32_t v
     v.attr = vtxattr;
     v.texparam = poly->TexParam;
     v.texpal = poly->TexPalette;
+    v.edge[0] = v.edge[1] = v.edge[2] = v.edge[3] = 255;
     return v;
 }
 
@@ -552,6 +559,8 @@ void build_polygons(Renderer& r, Scale scale) {
             const float len = std::sqrt(dx * dx + dy * dy);
             if (len <= 0.0f) continue;
             const float nx = -dy / len * pixel * 0.5f, ny = dx / len * pixel * 0.5f;
+            // One DS pixel thick, it is all edge.
+            a.edge[0] = b.edge[0] = 0;
             GxVertex q[4] = {a, a, b, b};
             q[0].x += nx; q[0].y += ny;
             q[1].x -= nx; q[1].y -= ny;
@@ -561,8 +570,12 @@ void build_polygons(Renderer& r, Scale scale) {
             push_triangle(first, first + 1, first + 2, rp);
             push_triangle(first, first + 2, first + 3, rp);
         } else if (poly->NumVertices == 3) {
-            for (int j = 0; j < 3; ++j)
-                push_vertex(make_vertex(poly, j, poly->Vertices[j], vtxattr, scale));
+            // Barycentrics: component j is zero on the edge opposite vertex j.
+            for (int j = 0; j < 3; ++j) {
+                GxVertex v = make_vertex(poly, j, poly->Vertices[j], vtxattr, scale);
+                for (int k = 0; k < 3; ++k) v.edge[k] = j == k ? 255 : 0;
+                push_vertex(v);
+            }
             push_triangle(first, first + 1, first + 2, rp);
         } else {
             // GLRenderer's "better polygons": a fan around a perspective
@@ -597,8 +610,12 @@ void build_polygons(Renderer& r, Scale scale) {
             c.s = int16_t(cs * cw);
             c.t = int16_t(ct * cw);
             push_vertex(c);
+            // The outline is the rim of the fan, the spokes are not edges:
+            // one weight, 1 at the centre and 0 on the rim.
             for (uint32_t j = 0; j < n; ++j) {
-                push_vertex(make_vertex(poly, int(j), poly->Vertices[j], vtxattr, scale));
+                GxVertex v = make_vertex(poly, int(j), poly->Vertices[j], vtxattr, scale);
+                v.edge[0] = 0;
+                push_vertex(v);
                 if (j >= 1) push_triangle(first, vidx - 2, vidx - 1, rp);
             }
             push_triangle(first, vidx - 1, first + 1, rp);

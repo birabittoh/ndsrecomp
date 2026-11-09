@@ -13,7 +13,7 @@
 //
 // Render targets (all raster sized):
 //   0 colour, RGBA8_UNORM, natural RGBA order (the GL renderer stores BGRA)
-//   1 attributes, RGBA8_UNORM: r opaque polygon ID / 63, g opaque coverage,
+//   1 attributes, RGBA8_UNORM: r opaque polygon ID / 63, g opaque edge flag,
 //     b fog flag, a 1
 //   2 depth copy, R32_FLOAT, written wherever depth is, read by the final
 //     pass (the depth/stencil target itself is never sampled)
@@ -66,6 +66,7 @@ struct VSInput {
     [[vk::location(2)]] uint4 color : COLOR0;         // RGB 0..255, alpha 0..31
     [[vk::location(3)]] int2 texcoord : TEXCOORD1;    // 1/16 texel
     [[vk::location(4)]] uint texpal : TEXCOORD2;      // TexPalette
+    [[vk::location(5)]] float4 edge : TEXCOORD3;      // zero along the outer edges
 };
 
 struct VSOutput {
@@ -74,6 +75,7 @@ struct VSOutput {
     float2 texcoord : TEXCOORD0;
     nointerpolation uint3 attr : TEXCOORD1;
     float z : TEXCOORD2;   // W-buffer depth, interpolated perspective correct
+    noperspective float3 edge : TEXCOORD3;
 };
 
 VSOutput RenderVertex(VSInput input, bool wbuffer) {
@@ -90,6 +92,7 @@ VSOutput RenderVertex(VSInput input, bool wbuffer) {
     output.texcoord = float2(input.texcoord) / 16.0;
     output.attr = uint3(input.words.zw, input.texpal);
     output.z = depth;
+    output.edge = input.edge.xyz;
     return output;
 }
 
@@ -258,12 +261,25 @@ struct PSOutputW {
     float fragDepth : SV_Depth;
 };
 
+// The hardware's edge flags: whether the pixel lies on the polygon's outline,
+// within one outline width (edgeDistance raster pixels) of an outer edge. The
+// weights are affine in screen space, so weight over gradient is the distance
+// in pixels; a weight that is zero throughout (a line polygon) is all edge.
+// Texels inside the polygon that border its transparent holes are not edges,
+// so a font quad's glyphs are not outlined.
+bool OnOutline(float3 edge) {
+    const float3 grad = sqrt(ddx(edge) * ddx(edge) + ddy(edge) * ddy(edge));
+    const float width = float(max(config.edgeDistance, 1u));
+    return any(edge <= 0.0) || any(edge < grad * width);
+}
+
 PSOutput Opaque(VSOutput input, float depth) {
+    const bool outline = OnOutline(input.edge);
     const float4 col = FinalColor(input);
     if (col.a < 30.5 / 31.0 || AlphaTested(col.a)) discard;
     PSOutput output;
     output.color = col;
-    output.attr = float4(float((input.attr.x >> 24) & 0x3Fu) / 63.0, 1.0,
+    output.attr = float4(float((input.attr.x >> 24) & 0x3Fu) / 63.0, outline ? 1.0 : 0.0,
                          float((input.attr.x >> 15) & 1u), 1.0);
     output.depth = depth;
     return output;
@@ -355,8 +371,8 @@ float4 PSFinal(FullscreenOutput input) : SV_Target {
     const uint depth = DepthAt(p);
 
     if ((config.dispCnt & (1u << 5)) != 0u && attr.g > 0.5) {
-        // Edge marking: an opaque pixel whose neighbour one DS pixel away has
-        // another polygon ID and lies behind it.
+        // Edge marking: an opaque pixel on its polygon's outline whose
+        // neighbour one DS pixel away has another polygon ID and lies behind it.
         const uint polyid = uint(round(attr.r * 63.0));
         const int d = int(max(config.edgeDistance, 1u));
         if (EdgeAgainst(p + int2(-d, 0), polyid, depth) ||
