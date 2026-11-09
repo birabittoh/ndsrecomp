@@ -64,6 +64,7 @@ struct NdsOnlineStatus {
     NdsOnlineState state = NdsOnlineState::Off;
     std::string text;     // one line for the menu and the log
     std::string account;  // Discord handle when signed in
+    std::string lobby_id;  // the lobby this runner sits in, or empty
     std::string lobby_name;
     int players = 0;
     int max_slots = 0;
@@ -80,10 +81,13 @@ struct NdsOnlineLobbyRow {
 
 void nds_online_start(const NdsOnlineConfig& config);
 void nds_online_stop();
+// True between nds_online_start and nds_online_stop.
+bool nds_online_available();
 
 void nds_online_set_enabled(bool enabled);
 bool nds_online_enabled();
 void nds_online_set_lobby_name(const std::string& name);
+std::string nds_online_lobby_name();
 void nds_online_sign_in();
 void nds_online_sign_out();
 // While browsing, the lobby list is refreshed every few seconds.

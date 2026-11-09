@@ -133,6 +133,16 @@ public:
         lobby_name_ = name;
     }
 
+    std::string LobbyName() {
+        std::lock_guard<std::mutex> lock(mu_);
+        return lobby_name_;
+    }
+
+    bool Running() {
+        std::lock_guard<std::mutex> lock(mu_);
+        return thread_.joinable();
+    }
+
     void SignIn() {
         {
             std::lock_guard<std::mutex> lock(mu_);
@@ -825,6 +835,7 @@ private:
         const char* handle = rnet_account_handle();
         if (rnet_account_state() == RNET_ACCOUNT_SIGNED_IN && handle)
             s.account = handle;
+        s.lobby_id = room_.lobby_id;
         s.lobby_name = room_.name;
         s.players = players;
         s.max_slots = room_.max_slots;
@@ -903,11 +914,13 @@ void nds_online_start(const NdsOnlineConfig& config) {
     Instance().Start(config);
 }
 void nds_online_stop() { Instance().Stop(); }
+bool nds_online_available() { return Instance().Running(); }
 void nds_online_set_enabled(bool enabled) { Instance().SetEnabled(enabled); }
 bool nds_online_enabled() { return Instance().Enabled(); }
 void nds_online_set_lobby_name(const std::string& name) {
     Instance().SetLobbyName(name);
 }
+std::string nds_online_lobby_name() { return Instance().LobbyName(); }
 void nds_online_sign_in() { Instance().SignIn(); }
 void nds_online_sign_out() { Instance().SignOut(); }
 void nds_online_set_browsing(bool browsing) {

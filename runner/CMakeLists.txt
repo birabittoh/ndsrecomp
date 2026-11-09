@@ -904,7 +904,8 @@ if(NDS_ONLINE)
         src/net/ice_link.cpp
         src/net/lobby_json.cpp
         src/net/lobby_ws.cpp
-        src/net/online_lobby.cpp)
+        src/net/online_lobby.cpp
+        src/netplay_menu.cpp)
     target_link_libraries(nds_runner PRIVATE recomp_net Libjuice::Libjuice)
     target_include_directories(nds_runner PRIVATE
         "${NDS_RECOMP_NET_ROOT}/include")

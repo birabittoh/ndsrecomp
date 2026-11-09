@@ -217,6 +217,9 @@ void observe_top_black_bands(const uint32_t* pixels, uint64_t frame,
 #include <SDL.h>
 #endif
 #include "recomp_runtime_ui.h"
+#if NDS_ONLINE
+#include "netplay_menu.h"
+#endif
 
 #include "frontend_latency.h"
 
@@ -1248,6 +1251,7 @@ struct RuntimeMenuState {
     bool resolution_scale_available = false;
     const NdsAudioDevice* audio = nullptr;
     AudioQueue* audio_queue = nullptr;
+    RecompRuntimeUi* ui = nullptr;  // for confirm prompts and status text
 };
 
 // Rewrites (or appends) each key=value pair in the launcher-owned settings
@@ -1301,6 +1305,10 @@ int runtime_menu_get_value(void* context, const RecompRuntimeUiItem* item,
                            int* value_out) {
     auto* state = static_cast<RuntimeMenuState*>(context);
     if (!state || !state->options || !item || !value_out) return 0;
+#if NDS_ONLINE
+    if (nds_netplay_menu_owns(item))
+        return nds_netplay_menu_get_value(item, value_out);
+#endif
     if (std::strcmp(item->key, kRuntimeMouseSensitivityKey) == 0) {
         *value_out = state->options->relative_mouse_sensitivity;
         return 1;
@@ -1361,6 +1369,10 @@ int runtime_menu_set_value(void* context, const RecompRuntimeUiItem* item,
                            int value) {
     auto* state = static_cast<RuntimeMenuState*>(context);
     if (!state || !state->options || !item) return 0;
+#if NDS_ONLINE
+    if (nds_netplay_menu_owns(item))
+        return nds_netplay_menu_set_value(item, value);
+#endif
     if (std::strcmp(item->key, kRuntimeMouseSensitivityKey) == 0) {
         if (value < 10 || value > 400) return 0;
         state->options->relative_mouse_sensitivity =
@@ -1445,6 +1457,10 @@ int runtime_menu_set_value(void* context, const RecompRuntimeUiItem* item,
 int runtime_menu_run_action(void* context, const RecompRuntimeUiItem* item) {
     auto* state = static_cast<RuntimeMenuState*>(context);
     if (!state || !item) return 0;
+#if NDS_ONLINE
+    if (nds_netplay_menu_owns(item))
+        return nds_netplay_menu_run_action(state->ui, item);
+#endif
     if (std::strcmp(item->key, kRuntimeResumeKey) == 0) {
         state->close_requested = true;
         return 1;
@@ -1459,6 +1475,9 @@ int runtime_menu_run_action(void* context, const RecompRuntimeUiItem* item) {
 int runtime_menu_is_enabled(void* context, const RecompRuntimeUiItem* item) {
     auto* state = static_cast<RuntimeMenuState*>(context);
     if (!state || !state->options || !item) return 0;
+#if NDS_ONLINE
+    if (nds_netplay_menu_owns(item)) return nds_netplay_menu_is_enabled(item);
+#endif
     if (std::strcmp(item->key, kRuntimeMouseSensitivityKey) == 0)
         return state->options->relative_mouse_touch ? 1 : 0;
     if (std::strcmp(item->key, kRuntimeGamepadLayoutKey) == 0)
@@ -1522,6 +1541,14 @@ void runtime_menu_save(void* context) {
     if (options.relative_mouse_touch)
         updates.push_back({"controls", "mouse_sensitivity",
                            std::to_string(options.relative_mouse_sensitivity)});
+#if NDS_ONLINE
+    bool netplay = false;
+    std::string lobby_name;
+    if (nds_netplay_menu_settings(&netplay, &lobby_name)) {
+        updates.push_back({"online", "enabled", netplay ? "true" : "false"});
+        updates.push_back({"online", "lobby_name", quoted(lobby_name.c_str())});
+    }
+#endif
     std::string error;
     if (!nds_update_settings_file(options.settings_path, updates, &error))
         std::fprintf(stderr, "[settings] could not save %s: %s\n",
@@ -1594,8 +1621,10 @@ const uint32_t* runtime_menu_overlay(RecompRuntimeUi* ui,
                                      const uint32_t* pixels,
                                      int width,
                                      int height) {
-    if (!ui || !recomp_runtime_ui_is_open(ui) || !pixels ||
-        width <= 0 || height <= 0) {
+    // A toast shows over the game with the menu closed too.
+    if (!ui ||
+        (!recomp_runtime_ui_is_open(ui) && !recomp_runtime_ui_toast_visible(ui)) ||
+        !pixels || width <= 0 || height <= 0) {
         return pixels;
     }
     static std::vector<uint32_t> surface;
@@ -3250,6 +3279,8 @@ int nds_run_interactive_frontend(const NdsFrontendOptions& initial_options) {
         {kRuntimeMouseSensitivityKey, "Input", "Mouse sensitivity",
          "Prime Controls relative aim speed.",
          RECOMP_RUNTIME_UI_INT, 10, 400, 1, nullptr, 0, nullptr},
+    };
+    static const RecompRuntimeUiItem runtime_menu_system_items[] = {
         {kRuntimeResumeKey, "System", "Resume game",
          "Close settings and return to the game.",
          RECOMP_RUNTIME_UI_ACTION, 0, 0, 0, nullptr, 0, nullptr},
@@ -3257,21 +3288,35 @@ int nds_run_interactive_frontend(const NdsFrontendOptions& initial_options) {
          "Close the runner.",
          RECOMP_RUNTIME_UI_ACTION, 0, 0, 0, nullptr, 0, nullptr},
     };
+    // Netplay, when the lobby thread runs, goes before System.
+    std::vector<RecompRuntimeUiItem> runtime_menu_list(
+        std::begin(runtime_menu_items), std::end(runtime_menu_items));
+#if NDS_ONLINE
+    const bool netplay_menu = nds_netplay_menu_available();
+    if (netplay_menu) nds_netplay_menu_append_items(&runtime_menu_list);
+#endif
+    runtime_menu_list.insert(runtime_menu_list.end(),
+                             std::begin(runtime_menu_system_items),
+                             std::end(runtime_menu_system_items));
     RecompRuntimeUiConfig runtime_menu_config{};
     // Title from the game config's [game].name; this menu used to say
     // "Metroid Prime Hunters" for every title.
     runtime_menu_config.title = options.game_name.empty()
         ? "Nintendo DS" : options.game_name.c_str();
     runtime_menu_config.subtitle = "Runtime Settings";
-    runtime_menu_config.items = runtime_menu_items;
-    runtime_menu_config.item_count =
-        sizeof(runtime_menu_items) / sizeof(runtime_menu_items[0]);
+    runtime_menu_config.items = runtime_menu_list.data();
+    runtime_menu_config.item_count = runtime_menu_list.size();
     runtime_menu_config.callbacks.context = &runtime_menu_state;
     runtime_menu_config.callbacks.get_value = runtime_menu_get_value;
     runtime_menu_config.callbacks.set_value = runtime_menu_set_value;
     runtime_menu_config.callbacks.run_action = runtime_menu_run_action;
     runtime_menu_config.callbacks.is_enabled = runtime_menu_is_enabled;
     runtime_menu_config.callbacks.save = runtime_menu_save;
+#if NDS_ONLINE
+    if (netplay_menu)
+        runtime_menu_config.callbacks.visibility_changed =
+            [](void*, int open) { nds_netplay_menu_visibility(open != 0); };
+#endif
     runtime_menu_config.theme = "nds";
     runtime_menu_config.accept_label = "A / Enter";
     runtime_menu_config.back_label = "B / Backspace";
@@ -3280,6 +3325,10 @@ int nds_run_interactive_frontend(const NdsFrontendOptions& initial_options) {
     if (!runtime_ui) {
         std::fprintf(stderr, "[sdl] runtime menu unavailable\n");
     }
+    runtime_menu_state.ui = runtime_ui;
+#if NDS_ONLINE
+    bool netplay_text_input = false;
+#endif
     bool compute_failed = false;
     bool mouse_down = false;
     bool touch_release_pending = false;
@@ -3989,6 +4038,26 @@ int nds_run_interactive_frontend(const NdsFrontendOptions& initial_options) {
                 relative_mouse_selftest_stage = 10;
             }
         }
+#if NDS_ONLINE
+        if (netplay_menu) {
+            nds_netplay_menu_tick(runtime_ui);
+            const bool editing = nds_netplay_menu_editing();
+            if (editing != netplay_text_input) {
+                netplay_text_input = editing;
+                for (SDL_Window* window : presentation.windows) {
+                    if (!window) continue;
+#if defined(NDS_HAVE_SDL3)
+                    if (editing) SDL_StartTextInput(window);
+                    else SDL_StopTextInput(window);
+#endif
+                }
+#if !defined(NDS_HAVE_SDL3)
+                if (editing) SDL_StartTextInput();
+                else SDL_StopTextInput();
+#endif
+            }
+        }
+#endif
         SDL_Event event{};
         while (SDL_PollEvent(&event)) {
             convert_mouse_event_to_logical_coordinates(event, presentation);
@@ -4021,6 +4090,44 @@ int nds_run_interactive_frontend(const NdsFrontendOptions& initial_options) {
                     presentation_window_focused[index] = true;
                 focus_release_pending = false;
             }
+#if NDS_ONLINE
+            // The lobby name editor has the keyboard (and A / B) to itself.
+            if (nds_netplay_menu_editing()) {
+#if defined(NDS_HAVE_SDL3)
+                const bool text_event = event.type == SDL_EVENT_TEXT_INPUT;
+#else
+                const bool text_event = event.type == SDL_TEXTINPUT;
+#endif
+                bool consumed = true;
+                if (text_event) {
+                    nds_netplay_menu_edit_text(event.text.text);
+                } else if (event.type == SDL_KEYDOWN) {
+                    const SDL_Scancode key = sdl_event_scancode(event);
+                    if (key == SDL_SCANCODE_RETURN ||
+                        key == SDL_SCANCODE_KP_ENTER) {
+                        if (nds_netplay_menu_edit_key(NdsNetplayEditKey::Commit))
+                            runtime_menu_save(&runtime_menu_state);
+                    } else if (key == SDL_SCANCODE_ESCAPE) {
+                        nds_netplay_menu_edit_key(NdsNetplayEditKey::Cancel);
+                    } else if (key == SDL_SCANCODE_BACKSPACE) {
+                        nds_netplay_menu_edit_key(NdsNetplayEditKey::Erase);
+                    }
+                } else if (event.type == SDL_CONTROLLERBUTTONDOWN) {
+                    const auto button = static_cast<SDL_GameControllerButton>(
+                        sdl_controller_button(event));
+                    if (button == SDL_CONTROLLER_BUTTON_A) {
+                        if (nds_netplay_menu_edit_key(NdsNetplayEditKey::Commit))
+                            runtime_menu_save(&runtime_menu_state);
+                    } else if (button == SDL_CONTROLLER_BUTTON_B) {
+                        nds_netplay_menu_edit_key(NdsNetplayEditKey::Cancel);
+                    }
+                } else {
+                    consumed = event.type == SDL_KEYUP ||
+                               event.type == SDL_CONTROLLERBUTTONUP;
+                }
+                if (consumed) continue;
+            }
+#endif
             // NDS_DEBUG_KEYEV=1: trace every polled keyboard event to stderr.
             // Exists because an injected key that vanishes between
             // SDL_PushEvent (debug pump, counted) and this loop is otherwise
