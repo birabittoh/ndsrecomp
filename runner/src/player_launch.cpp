@@ -403,6 +403,50 @@ bool resolve_bios(const fs::path& root, const fs::path& settings,
     }
 }
 
+// `--instance N`: one of several copies of the game on this machine,
+// linked by local wireless. Each instance is its own console: its own guest
+// MAC and UDP port (both derived from N), and from instance 1 on its own
+// save, savestates and logs, so two processes never write the same file.
+// The save starts as a copy of the main one.
+bool apply_instance(int instance, const fs::path& main_save,
+                    NdsFrontendOptions* options, NdsPlayerLaunch* out) {
+    options->instance_index = static_cast<uint32_t>(instance);
+    options->local_wireless.enabled = true;
+    std::fprintf(stderr, "[player] instance %d, local wireless on\n",
+                 instance);
+    if (instance == 0) return true;
+
+    const std::string suffix = "instance-" + std::to_string(instance);
+    fs::path save = main_save;
+    save.replace_filename(main_save.stem().string() + "." + suffix +
+                          main_save.extension().string());
+    std::error_code error;
+    if (!fs::exists(save) && fs::exists(main_save)) {
+        fs::copy_file(main_save, save, error);
+        if (error) {
+            nds_player_error("Cannot copy " + main_save.string() + " to " +
+                             save.string() + ": " + error.message());
+            return false;
+        }
+        std::fprintf(stderr, "[player] copied %s to %s\n",
+                     main_save.string().c_str(), save.string().c_str());
+    }
+    const fs::path savestates = fs::path(out->savestate_dir) / suffix;
+    const fs::path logs = fs::path(out->log_dir) / suffix;
+    fs::create_directories(savestates, error);
+    fs::create_directories(logs, error);
+    if (error) {
+        nds_player_error("Cannot create " + savestates.string() + ": " +
+                         error.message());
+        return false;
+    }
+    out->save = save.string();
+    out->savestate_dir = savestates.string();
+    out->log_dir = logs.string();
+    std::fprintf(stderr, "[player] instance save: %s\n", out->save.c_str());
+    return true;
+}
+
 }  // namespace
 
 bool nds_player_embedded_dumps(std::vector<uint8_t>* arm9_bios,
@@ -420,16 +464,48 @@ bool nds_player_embedded_dumps(std::vector<uint8_t>* arm9_bios,
 #endif
 }
 
-bool nds_player_requested(int argc, char** argv) {
-    if (sizeof(kTitleConfig) <= 1u) return false;
-    if (argc == 1) return true;
-    if (argc != 2 || argv[1][0] == '-') return false;
-    std::string extension = fs::path(argv[1]).extension().string();
+namespace {
+
+// Player-mode command line: an optional .nds path and an optional
+// `--instance N`, in any order. `instance` stays -1 without the flag.
+struct PlayerArgs {
+    const char* rom = nullptr;
+    int instance = -1;
+};
+
+bool is_nds_path(const char* arg) {
+    std::string extension = fs::path(arg).extension().string();
     std::transform(extension.begin(), extension.end(), extension.begin(),
                    [](unsigned char c) {
                        return static_cast<char>(std::tolower(c));
                    });
     return extension == ".nds";
+}
+
+bool parse_player_args(int argc, char** argv, PlayerArgs* out) {
+    for (int i = 1; i < argc; ++i) {
+        const std::string arg = argv[i];
+        if (arg == "--instance" && i + 1 < argc) {
+            char* end = nullptr;
+            const long value = std::strtol(argv[++i], &end, 10);
+            if (end == argv[i] || *end != '\0' || value < 0 || value > 15)
+                return false;
+            out->instance = static_cast<int>(value);
+        } else if (arg[0] != '-' && !out->rom && is_nds_path(argv[i])) {
+            out->rom = argv[i];
+        } else {
+            return false;
+        }
+    }
+    return true;
+}
+
+}  // namespace
+
+bool nds_player_requested(int argc, char** argv) {
+    if (sizeof(kTitleConfig) <= 1u) return false;
+    PlayerArgs args;
+    return parse_player_args(argc, argv, &args);
 }
 
 void nds_player_error(const std::string& message) {
@@ -492,8 +568,9 @@ bool nds_player_prepare(int argc, char** argv, NdsFrontendOptions* options,
     const bool have_bios = !dump_needs(*options).any();
     if (have_bios) bios = root;
 #endif
-    if (!resolve_rom(root, settings, *options, argc == 2 ? argv[1] : nullptr,
-                     &rom, &cancelled) ||
+    PlayerArgs args;
+    parse_player_args(argc, argv, &args);
+    if (!resolve_rom(root, settings, *options, args.rom, &rom, &cancelled) ||
         (!have_bios &&
          !resolve_bios(root, settings, *options, &bios, &cancelled))) {
         if (cancelled) out->exit_code = 0;
@@ -507,10 +584,15 @@ bool nds_player_prepare(int argc, char** argv, NdsFrontendOptions* options,
         ? std::string()
         : (bios / "firmware.bin").string();
     out->embedded_dumps = embedded;
-    out->save = options->paths.save.empty()
-        ? (root / "saves" / (app + ".sav")).string()
-        : resolve_stored(root, options->paths.save).string();
+    const fs::path save = options->paths.save.empty()
+        ? root / "saves" / (app + ".sav")
+        : resolve_stored(root, options->paths.save);
+    out->save = save.string();
     out->savestate_dir = (root / "savestates").string();
     out->log_dir = (root / "logs").string();
+    if (args.instance >= 0 && !apply_instance(args.instance, save, options,
+                                              out)) {
+        return false;
+    }
     return true;
 }

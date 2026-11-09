@@ -24,6 +24,13 @@
 // A file called portable.txt next to the executable selects the executable's
 // own directory instead.
 //
+// `--instance N` (0..15) also counts as player mode and turns on local
+// wireless, so several copies of the game on one machine can play together:
+// start one with `--instance 0` and another with `--instance 1`. Instance N
+// gets its own guest MAC, and from 1 on its own save (a copy of the main
+// one, made on first launch: saves/<app>.instance-N.sav), savestates and
+// logs.
+//
 // Any other command line keeps its explicit behaviour: scripted and headless
 // runs never read settings.toml.
 
