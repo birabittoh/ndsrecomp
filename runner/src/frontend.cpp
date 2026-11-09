@@ -2119,6 +2119,9 @@ struct DsTarget {
         const int top = std::max(rect.y, 0);
         const int right = std::min(rect.x + rect.w, pixels_width);
         const int bottom = std::min(rect.y + rect.h, pixels_height);
+        // Wholly off the buffer: left > right would make std::fill below
+        // write backwards through memory.
+        if (left >= right || top >= bottom) return;
         for (int py = top; py < bottom; ++py)
             std::fill(pixels + size_t(py) * pixels_width + left,
                       pixels + size_t(py) * pixels_width + right, color);
