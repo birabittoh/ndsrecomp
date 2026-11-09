@@ -1158,6 +1158,17 @@ static bool apply_frontend_config(toml::table& root,
                 return false;
             }
         }
+        if (const auto value =
+                (*display)["performance_governor"].value<std::string>()) {
+            if (!nds_parse_perf_governor_mode(
+                    value->c_str(), &options->perf_governor_mode)) {
+                if (error) {
+                    *error = "display.performance_governor must be auto, off, "
+                             "stage1 or stage2";
+                }
+                return false;
+            }
+        }
         const auto internal_resolution =
             (*display)["internal_resolution"].value<int64_t>();
         const auto resolution_scale =

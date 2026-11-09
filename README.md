@@ -334,7 +334,9 @@ runtime menu, and has `NDS_RESOLUTION_SCALE` / `--resolution-scale`
 overrides. `internal_resolution` (1..16) instead pins the multiplier; the two
 are exclusive within one source, and the later source (TOML < env < CLI)
 wins. The performance governor drops 3D to 1x when frames wait on the GPU, and
-restores it once that wait falls again.
+restores it once that wait falls again. `[display] performance_governor`
+(`auto`, the default, `off`, `stage1` or `stage2`) sets its mode;
+`NDS_PERFORMANCE_GOVERNOR` and `--performance-governor` override it.
 
 `[controls] gamepad_layout` picks how the pad's face buttons reach the DS:
 `labels` (the default) matches names, so a pad's A is DS A; `positional`
