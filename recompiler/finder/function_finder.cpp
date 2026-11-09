@@ -2347,6 +2347,10 @@ bool FunctionFinder::validate_candidate(
             target = ins.branch_target & ~uint32_t{1};
             have_target = true;
         }
+        // A callee can return its result in the flags (`bl f; strcs ...`),
+        // so the instruction after a call may be conditional.
+        if (ins.is_call || (thumb && ins.op == armv4t::IrOp::BL_prefix))
+            flags_set = true;
         if (have_target) {
             if (addr_in_data_range(target)) REJECT("target-data");
             if (!can_read_at(target, 2)) {
