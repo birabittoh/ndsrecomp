@@ -16,7 +16,7 @@
 #include <memory>
 #include <vector>
 
-#include "GPU3D.h"
+#include "../vendor/melonds/GPU3D.h"
 
 namespace melonDS {
 class NDS;

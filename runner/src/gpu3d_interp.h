@@ -4,7 +4,7 @@
 #include <cstdint>
 #include <cstdio>
 
-#include "GPU3D.h"
+#include "../vendor/melonds/GPU3D.h"
 
 namespace melonDS {
 class NDS;
