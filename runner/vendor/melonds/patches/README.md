@@ -61,6 +61,16 @@ stays on as `W_PowerDownCtrl` bit 0 would. Opt-in via
 a link with latency the auth/assoc handshake no longer fits in one
 post-beacon wake window. Off by default; behaviour is otherwise unchanged.
 
+## 0027-wifi-mp-ack-without-frame.patch
+
+2026-11-09: `Wifi.cpp`/`Wifi.h`: right after `MP_RecvReplies` the MP host
+asks the runner hook `nds_wifi_local_mp_take_ack_only()` for clients whose
+reply is still in flight. They count as answered (no fail bit, so no WM
+retransmission on either side) but no reply frame is received for them.
+Only `--local-wireless-late-replies on` returns a non-zero mask: there the
+runner delivers each client's replies FIFO, one per cmd, so every reply
+reaches the guest exactly once. Behaviour is otherwise unchanged.
+
 ## 0001-wifi-ap-identity.patch
 
 `src/WifiAP.cpp`: changes the hardcoded AP identity from melonDS's default

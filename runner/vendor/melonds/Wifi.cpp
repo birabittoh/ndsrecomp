@@ -34,6 +34,7 @@
 // patches/0019-wifi-local-mp-disconnect-hook.patch.
 void nds_wifi_on_local_mp_disconnected();
 bool nds_wifi_inhibit_power_down();
+uint16_t nds_wifi_local_mp_take_ack_only();
 
 namespace melonDS
 {
@@ -235,6 +236,7 @@ void Wifi::Reset()
     MPReplyTimer = 0;
     MPClientMask = 0;
     MPClientFail = 0;
+    MPClientNoFrame = 0;
     memset(MPClientReplies, 0, sizeof(MPClientReplies));
 
     MPLastSeqno = 0xFFFF;
@@ -986,7 +988,7 @@ bool Wifi::ProcessTX(TXSlot* slot, int num)
 
                 u32 curclient = 1 << nclient;
 
-                if (!(MPClientFail & curclient))
+                if (!(MPClientFail & curclient) && !(MPClientNoFrame & curclient))
                     MPClientReplyRX(nclient);
 
                 MPReplyTimer += 10 + IOPORT(W_CmdReplyTime);
@@ -1085,9 +1087,16 @@ bool Wifi::ProcessTX(TXSlot* slot, int num)
                 MPReplyTimer = 16 + PreambleLen(slot->Rate);
 
                 u16 res = 0;
+                MPClientNoFrame = 0;
                 if (MPClientMask)
+                {
                     res = Platform::MP_RecvReplies(MPClientReplies, USTimestamp, MPClientMask, NDS.UserData);
-                MPClientFail &= ~res;
+                    // ndsrecomp: clients whose reply is still in flight over
+                    // a slow link count as answered, but no frame is received
+                    // for them (patch 0027)
+                    MPClientNoFrame = ::nds_wifi_local_mp_take_ack_only() & MPClientMask & ~res;
+                }
+                MPClientFail &= ~(res | MPClientNoFrame);
 
                 // TODO: 112 likely includes the ack preamble, which needs adjusted
                 // for long-preamble settings

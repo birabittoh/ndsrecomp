@@ -931,6 +931,9 @@ public:
         g_savestate_network_guard.SetLocalMpListening(false);
         packet_queue_.Clear();
         reply_queue_.Clear();
+        for (auto& q : late_queue_) q.clear();
+        for (auto& t : late_seen_) t = {};
+        late_ack_only_ = 0;
         delayed_.clear();
         last_release_ = {};
         last_host_id_ = -1;
@@ -964,15 +967,11 @@ public:
     }
 
     uint16_t RecvReplies(uint8_t* data, uint64_t timestamp, uint16_t aidmask) {
+        if (tuning_.late_replies)
+            return RecvRepliesLate(data, timestamp, aidmask);
         uint16_t received = 0;
         const auto start = std::chrono::steady_clock::now();
-        // Late-reply mode: the host gives the clients only a short budget,
-        // then carries on. A reply that misses it stays queued and is taken
-        // as the reply to a later cmd -- to the guest this looks like a
-        // lossy radio that keeps missing reply windows, not a stall.
-        const auto deadline = tuning_.late_replies
-            ? start + std::chrono::microseconds(tuning_.reply_budget_us)
-            : start + std::chrono::milliseconds(25);
+        const auto deadline = start + std::chrono::milliseconds(25);
         stats_recv_replies_calls_.fetch_add(1, std::memory_order_relaxed);
         for (;;) {
             DrainSocket();
@@ -995,16 +994,9 @@ public:
                 continue;
             }
             if (frame.timestamp + 32u < timestamp) {
-                // Late mode still refuses replies from far in the past (a
-                // previous session); 1 s of guest time is far beyond any
-                // round trip the lab or a relay produces.
-                if (!tuning_.late_replies ||
-                    frame.timestamp + kLateReplyWindowUs < timestamp) {
-                    stats_stale_reply_drops_.fetch_add(
-                        1, std::memory_order_relaxed);
-                    continue;
-                }
-                stats_late_replies_.fetch_add(1, std::memory_order_relaxed);
+                stats_stale_reply_drops_.fetch_add(
+                    1, std::memory_order_relaxed);
+                continue;
             }
             const uint16_t aid = static_cast<uint16_t>(frame.type >> 16u);
             if (aid == 0 || aid > 15) continue;
@@ -1014,11 +1006,7 @@ public:
                             frame.payload.data(), frame.payload.size());
             }
             received |= static_cast<uint16_t>(1u << aid);
-            // Strict mode stops at the first full set, as before. Late mode
-            // keeps popping so a backlog collapses to the newest reply per
-            // client instead of lagging further behind with every cmd.
-            if (!tuning_.late_replies && (received & aidmask) == aidmask)
-                break;
+            if ((received & aidmask) == aidmask) break;
         }
         stats_recv_replies_wait_us_.fetch_add(
             static_cast<uint64_t>(
@@ -1027,6 +1015,96 @@ public:
             std::memory_order_relaxed);
         MaybeLogStats();
         return received;
+    }
+
+    // Late-reply mode: the radio-level MP exchange is answered locally and
+    // the data behind it travels with the link's latency, like a split
+    // proxy. The host waits at most the budget, then hands the guest the
+    // OLDEST queued reply of each client, one per cmd, so every reply a
+    // client sent is delivered exactly once and in order. A client with
+    // nothing queued yet but heard from recently is reported as having
+    // answered without a frame (TakeLateAckOnly; vendored patch 0027): it
+    // did get the cmd, and its reply is still in flight. Reporting it
+    // failed instead makes both WM ends retransmit data that is going to
+    // arrive anyway, and collapsing a backlog to the newest reply loses
+    // data that the ACK already confirmed; together those kept DQ9 on
+    // "connecting" forever.
+    uint16_t RecvRepliesLate(uint8_t* data, uint64_t timestamp,
+                             uint16_t aidmask) {
+        const auto start = std::chrono::steady_clock::now();
+        const auto deadline =
+            start + std::chrono::microseconds(tuning_.reply_budget_us);
+        stats_recv_replies_calls_.fetch_add(1, std::memory_order_relaxed);
+        for (;;) {
+            DrainSocket();
+            SortLateReplies(timestamp);
+            uint16_t ready = 0;
+            for (uint32_t aid = 1; aid < 16; ++aid) {
+                if (!late_queue_[aid].empty())
+                    ready |= static_cast<uint16_t>(1u << aid);
+            }
+            if ((ready & aidmask) == aidmask) break;
+            if (!WaitForData(deadline)) {
+                stats_recv_replies_timeouts_.fetch_add(
+                    1, std::memory_order_relaxed);
+                break;
+            }
+        }
+        const auto now = std::chrono::steady_clock::now();
+        uint16_t received = 0;
+        uint16_t ack_only = 0;
+        for (uint32_t aid = 1; aid < 16; ++aid) {
+            const uint16_t bit = static_cast<uint16_t>(1u << aid);
+            if ((aidmask & bit) == 0) continue;
+            auto& q = late_queue_[aid];
+            // A reply from a previous session (or a client that went
+            // quiet for a second of guest time) is not this exchange's.
+            while (!q.empty() &&
+                   q.front().timestamp + kLateReplyWindowUs < timestamp) {
+                q.pop_front();
+                stats_stale_reply_drops_.fetch_add(
+                    1, std::memory_order_relaxed);
+            }
+            // Jitter can leave a standing backlog, and every queued reply
+            // is one more cmd of delay. Empty default replies carry no
+            // data, so they are the ones to shed.
+            while (q.size() > kLateBacklogTarget && IsDefaultReply(q.front())) {
+                q.pop_front();
+                stats_late_trimmed_.fetch_add(1, std::memory_order_relaxed);
+            }
+            if (!q.empty()) {
+                LocalMpFrame& frame = q.front();
+                if (!frame.payload.empty()) {
+                    std::memcpy(&data[(aid - 1u) * 1024u],
+                                frame.payload.data(), frame.payload.size());
+                }
+                if (frame.timestamp + 32u < timestamp)
+                    stats_late_replies_.fetch_add(
+                        1, std::memory_order_relaxed);
+                q.pop_front();
+                received |= bit;
+            } else if (late_seen_[aid].time_since_epoch().count() != 0 &&
+                       now - late_seen_[aid] < kLateAliveWindow) {
+                ack_only |= bit;
+                stats_late_ack_only_.fetch_add(1, std::memory_order_relaxed);
+            }
+        }
+        late_ack_only_ = ack_only;
+        stats_recv_replies_wait_us_.fetch_add(
+            static_cast<uint64_t>(
+                std::chrono::duration_cast<std::chrono::microseconds>(
+                    now - start).count()),
+            std::memory_order_relaxed);
+        MaybeLogStats();
+        return received;
+    }
+
+    // Clients the last RecvReplies reported as answered without a frame.
+    // Read once per exchange by the vendored Wifi model.
+    uint16_t TakeLateAckOnly() {
+        const uint16_t mask = late_ack_only_;
+        late_ack_only_ = 0;
+        return mask;
     }
 
     bool InhibitPowerDown() const {
@@ -1055,6 +1133,10 @@ public:
             stats_stale_reply_drops_.load(std::memory_order_relaxed);
         out->late_replies =
             stats_late_replies_.load(std::memory_order_relaxed);
+        out->late_ack_only =
+            stats_late_ack_only_.load(std::memory_order_relaxed);
+        out->late_trimmed =
+            stats_late_trimmed_.load(std::memory_order_relaxed);
         out->injected_drops =
             stats_injected_drops_.load(std::memory_order_relaxed);
         out->bytes_sent = stats_bytes_sent_.load(std::memory_order_relaxed);
@@ -1083,6 +1165,44 @@ private:
     static constexpr size_t kQueueCapacity = 1024;
     static constexpr size_t kDelayedCapacity = 8192;
     static constexpr uint64_t kLateReplyWindowUs = 1000000;
+    static constexpr size_t kLateQueueCapacity = 256;
+    static constexpr size_t kLateBacklogTarget = 2;
+    // How long after its last reply a client still counts as present for
+    // TakeLateAckOnly. Well above any relay round trip, well below WM's
+    // own MP lifetime, so a client that really left is still reported.
+    static constexpr std::chrono::milliseconds kLateAliveWindow{500};
+
+    // Moves arrived replies into per-client FIFOs (late mode only).
+    void SortLateReplies(uint64_t timestamp) {
+        const auto now = std::chrono::steady_clock::now();
+        LocalMpFrame frame;
+        while (reply_queue_.TryPop(&frame)) {
+            const uint32_t aid = frame.type >> 16u;
+            // aid 0 is the blank a client sends when the cmd did not poll
+            // it; it answers nothing.
+            if (aid == 0 || aid > 15) continue;
+            if (frame.timestamp + kLateReplyWindowUs < timestamp) {
+                stats_stale_reply_drops_.fetch_add(
+                    1, std::memory_order_relaxed);
+                continue;
+            }
+            late_seen_[aid] = now;
+            auto& q = late_queue_[aid];
+            if (q.size() >= kLateQueueCapacity) {
+                q.pop_front();
+                stats_stale_reply_drops_.fetch_add(
+                    1, std::memory_order_relaxed);
+            }
+            q.push_back(std::move(frame));
+        }
+    }
+
+    // The client hardware's automatic empty reply (Wifi::SendMPDefaultReply):
+    // frame control 0x0158 and a bare 24-byte header + FCS, no data.
+    static bool IsDefaultReply(const LocalMpFrame& frame) {
+        return frame.payload.size() == 12u + 28u &&
+               (frame.payload[12] | (frame.payload[13] << 8)) == 0x0158;
+    }
 
     struct DelayedFrame {
         std::chrono::steady_clock::time_point release;
@@ -1415,7 +1535,7 @@ private:
                 "tx/s pkt=%.0f cmd=%.0f reply=%.0f ack=%.0f kB=%.1f | "
                 "rx/s pkt=%.0f cmd=%.0f reply=%.0f ack=%.0f kB=%.1f | "
                 "host replies calls=%.0f timeouts=%.0f wait_ms=%.1f "
-                "late=%.0f stale=%.0f | "
+                "late=%.0f ack_only=%.0f trimmed=%.0f stale=%.0f | "
                 "client host-wait calls=%.0f timeouts=%.0f wait_ms=%.1f | "
                 "lab_drops=%.0f held=%zu | "
                 "reply_lat_ms[<1/2/4/8/16/32/32+]=%s turnaround=%s\n",
@@ -1435,6 +1555,8 @@ private:
                 rate(cur.recv_replies_wait_us, p.recv_replies_wait_us) /
                     1000.0,
                 rate(cur.late_replies, p.late_replies),
+                rate(cur.late_ack_only, p.late_ack_only),
+                rate(cur.late_trimmed, p.late_trimmed),
                 rate(cur.stale_reply_drops, p.stale_reply_drops),
                 rate(cur.recv_host_calls, p.recv_host_calls),
                 rate(cur.recv_host_timeouts, p.recv_host_timeouts),
@@ -1461,6 +1583,9 @@ private:
     std::chrono::steady_clock::time_point last_release_{};
     LocalMpFrameQueue packet_queue_{kQueueCapacity};
     LocalMpFrameQueue reply_queue_{kQueueCapacity};
+    std::deque<LocalMpFrame> late_queue_[16];
+    std::chrono::steady_clock::time_point late_seen_[16]{};
+    uint16_t late_ack_only_ = 0;
     int last_host_id_ = -1;
     uint32_t send_error_log_counter_ = 0;
     // Always-on wait/traffic counters (see NdsLocalMpStats in wifi_net.h).
@@ -1476,6 +1601,8 @@ private:
     std::atomic<uint64_t> stats_recv_host_wait_us_{0};
     std::atomic<uint64_t> stats_stale_reply_drops_{0};
     std::atomic<uint64_t> stats_late_replies_{0};
+    std::atomic<uint64_t> stats_late_ack_only_{0};
+    std::atomic<uint64_t> stats_late_trimmed_{0};
     std::atomic<uint64_t> stats_injected_drops_{0};
     std::atomic<uint64_t> stats_bytes_sent_{0};
     std::atomic<uint64_t> stats_bytes_received_{0};
@@ -2484,6 +2611,10 @@ NdsSavestateNetworkEligibility nds_wifi_savestate_eligibility() {
 
 bool nds_wifi_inhibit_power_down() {
     return g_bridge && g_bridge->local_mp.InhibitPowerDown();
+}
+
+uint16_t nds_wifi_local_mp_take_ack_only() {
+    return g_bridge ? g_bridge->local_mp.TakeLateAckOnly() : 0;
 }
 
 bool nds_wifi_local_mp_stats(NdsLocalMpStats* out) {

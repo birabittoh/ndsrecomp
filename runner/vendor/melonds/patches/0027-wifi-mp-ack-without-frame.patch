@@ -1,0 +1,42 @@
+Subject: Wifi: MP host may count a client as answered without a frame
+
+ndsrecomp modification to vendored melonDS src/Wifi.cpp and src/Wifi.h
+(GPLv3 5(a) notice; see patches/README.md for the convention).
+
+After MP_RecvReplies the host asks the runner-owned hook
+nds_wifi_local_mp_take_ack_only() for clients that answered the cmd but
+whose reply frame has not arrived yet. Those clients are cleared from
+MPClientFail (so the ACK and the cmd slot status report success and
+neither side retransmits) and kept in MPClientNoFrame, which skips
+MPClientReplyRX for them (so no stale MPClientReplies slot is handed to
+the guest as a duplicate). The runner only returns a non-zero mask in
+--local-wireless-late-replies mode, where it queues each client's replies
+FIFO and delivers them one per later cmd; otherwise behaviour is
+unchanged.
+
+--- a/src/Wifi.h
++++ b/src/Wifi.h
+@@ class Wifi, MP host state
+     u16 MPClientMask, MPClientFail;
++    u16 MPClientNoFrame; // answered without a frame (patch 0027)
+--- a/src/Wifi.cpp
++++ b/src/Wifi.cpp
+@@ (runner hook declarations)
++uint16_t nds_wifi_local_mp_take_ack_only();
+@@ Wifi::Reset
+     MPClientFail = 0;
++    MPClientNoFrame = 0;
+@@ Wifi::ProcessTX, MP reply window
+-                if (!(MPClientFail & curclient))
++                if (!(MPClientFail & curclient) && !(MPClientNoFrame & curclient))
+                     MPClientReplyRX(nclient);
+@@ Wifi::ProcessTX, MP cmd transmit done
+                 u16 res = 0;
++                MPClientNoFrame = 0;
+                 if (MPClientMask)
++                {
+                     res = Platform::MP_RecvReplies(MPClientReplies, USTimestamp, MPClientMask, NDS.UserData);
+-                MPClientFail &= ~res;
++                    MPClientNoFrame = ::nds_wifi_local_mp_take_ack_only() & MPClientMask & ~res;
++                }
++                MPClientFail &= ~(res | MPClientNoFrame);

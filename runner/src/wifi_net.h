@@ -215,6 +215,8 @@ struct NdsLocalMpStats {
     uint64_t recv_host_wait_us = 0;     // client: total wall-clock inside calls
     uint64_t stale_reply_drops = 0;  // replies older than the freshness window
     uint64_t late_replies = 0;       // late-reply mode: stale but accepted
+    uint64_t late_ack_only = 0;      // late-reply mode: answered, frame in flight
+    uint64_t late_trimmed = 0;       // late-reply mode: backlogged empty replies shed
     uint64_t injected_drops = 0;     // latency lab: --local-wireless-loss-pct
     uint64_t bytes_sent = 0;         // per logical frame, header included
     uint64_t bytes_received = 0;
@@ -283,6 +285,11 @@ void nds_wifi_on_local_mp_disconnected();
 // NdsWifiNetworkConfig::local_wireless_stay_awake while the local MP
 // transport is open.
 bool nds_wifi_inhibit_power_down();
+
+// Called by the vendored Wifi model right after MP_RecvReplies: clients to
+// treat as having answered the cmd although no reply frame is handed to the
+// guest (late-reply mode; their reply is still in flight). Read-and-clear.
+uint16_t nds_wifi_local_mp_take_ack_only();
 
 // Transaction-boundary query installed into the core savestate layer when
 // the bridge attaches. A configured/idle backend does not block. Association,

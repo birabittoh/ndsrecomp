@@ -236,6 +236,7 @@ private:
 
     int MPReplyTimer;
     u16 MPClientMask, MPClientFail;
+    u16 MPClientNoFrame; // answered without a frame (patch 0027)
 
     u8 MPClientReplies[15*1024];
 
