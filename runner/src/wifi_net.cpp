@@ -881,6 +881,7 @@ struct LocalMpTuning {
     // NDS_LOCAL_MP_TRACE=1: one line per non-beacon management frame at
     // send, socket arrival, release to the guest, and guest pickup.
     bool trace = false;
+    bool stay_awake = false;
 };
 
 class LocalMpTransport {
@@ -910,15 +911,16 @@ public:
             static_cast<unsigned>(instance_),
             static_cast<unsigned>(base_port_ + instance_));
         if (tuning_.delay_ms || tuning_.jitter_ms || tuning_.loss_pct ||
-            tuning_.late_replies) {
+            tuning_.late_replies || tuning_.stay_awake) {
             std::fprintf(stderr,
                 "[local_mp] latency lab: delay=%u ms jitter=%u ms loss=%u%% "
-                "late_replies=%s reply_budget=%u us\n",
+                "late_replies=%s reply_budget=%u us stay_awake=%s\n",
                 static_cast<unsigned>(tuning_.delay_ms),
                 static_cast<unsigned>(tuning_.jitter_ms),
                 static_cast<unsigned>(tuning_.loss_pct),
                 tuning_.late_replies ? "on" : "off",
-                static_cast<unsigned>(tuning_.reply_budget_us));
+                static_cast<unsigned>(tuning_.reply_budget_us),
+                tuning_.stay_awake ? "on" : "off");
         }
         g_savestate_network_guard.SetLocalMpListening(true);
         stats_log_last_ = std::chrono::steady_clock::now();
@@ -1025,6 +1027,10 @@ public:
             std::memory_order_relaxed);
         MaybeLogStats();
         return received;
+    }
+
+    bool InhibitPowerDown() const {
+        return tuning_.stay_awake && socket_ != kInvalidLocalSocket;
     }
 
     void SnapshotStats(NdsLocalMpStats* out) const {
@@ -2152,6 +2158,7 @@ melonDS::Wifi* nds_wifi3d_attach() {
             g_network_config.local_wireless_reply_budget_us;
         tuning.stats_log = g_network_config.local_wireless_stats_log;
         tuning.trace = g_network_config.local_wireless_trace;
+        tuning.stay_awake = g_network_config.local_wireless_stay_awake;
         g_bridge->local_mp.Configure(
             g_network_config.local_wireless_enabled,
             g_network_config.local_wireless_instance,
@@ -2473,6 +2480,10 @@ bool nds_wifi_savestate_allowed(std::string* error) {
 
 NdsSavestateNetworkEligibility nds_wifi_savestate_eligibility() {
     return g_savestate_network_guard.Evaluate();
+}
+
+bool nds_wifi_inhibit_power_down() {
+    return g_bridge && g_bridge->local_mp.InhibitPowerDown();
 }
 
 bool nds_wifi_local_mp_stats(NdsLocalMpStats* out) {

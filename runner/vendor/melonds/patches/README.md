@@ -52,6 +52,15 @@ NDS; `ExecuteCommand` now reads the FIFO and hands the entry to the shared
 `ExecuteEntry`. Neither hook is hardware state or enters the serializer, and
 with no observer set the engine behaves exactly as before.
 
+## 0026-wifi-inhibit-power-down-hook.patch
+
+2026-11-09: `Wifi.cpp`'s `UpdatePowerStatus` asks the runner hook
+`nds_wifi_inhibit_power_down()` before powering the radio down and, on true,
+stays on as `W_PowerDownCtrl` bit 0 would. Opt-in via
+`--local-wireless-stay-awake on` while the local MP transport is open: over
+a link with latency the auth/assoc handshake no longer fits in one
+post-beacon wake window. Off by default; behaviour is otherwise unchanged.
+
 ## 0001-wifi-ap-identity.patch
 
 `src/WifiAP.cpp`: changes the hardcoded AP identity from melonDS's default

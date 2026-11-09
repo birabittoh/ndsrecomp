@@ -33,6 +33,7 @@
 // ndsrecomp: save-state local-peer lifecycle hook. See
 // patches/0019-wifi-local-mp-disconnect-hook.patch.
 void nds_wifi_on_local_mp_disconnected();
+bool nds_wifi_inhibit_power_down();
 
 namespace melonDS
 {
@@ -502,6 +503,12 @@ void Wifi::UpdatePowerStatus(int power) // 1=on 0=no change -1=off
         // * bit 1 forces a wakeup, atleast partial
 
         if ((power == -1) && (IOPORT(W_PowerDownCtrl) & (1<<0)))
+            power = 0;
+
+        // ndsrecomp: the runner can inhibit power-down the same way
+        // W_PowerDownCtrl bit 0 does, for links with real latency (see
+        // nds_wifi_inhibit_power_down in runner/src/wifi_net.h)
+        if ((power == -1) && ::nds_wifi_inhibit_power_down())
             power = 0;
 
         /*if (power == 1)

@@ -802,6 +802,7 @@ int main(int argc, char** argv) {
                 "[--local-wireless-loss-pct PCT] "
                 "[--local-wireless-late-replies on|off] "
                 "[--local-wireless-reply-budget-us US] "
+                "[--local-wireless-stay-awake on|off] "
                 "[--net-capture-out FILE] [--net-capture-in FILE] "
                 "[--net-capture-raw] [--net-capture-no-pcap] "
                 "[--net-capture-scenario NAME] "
@@ -1492,6 +1493,8 @@ int main(int argc, char** argv) {
         frontend_options.local_wireless.late_replies;
     resolved_network.local_wireless_reply_budget_us =
         frontend_options.local_wireless.reply_budget_us;
+    resolved_network.local_wireless_stay_awake =
+        frontend_options.local_wireless.stay_awake;
     {
         const char* stats = std::getenv("NDS_LOCAL_MP_STATS");
         resolved_network.local_wireless_stats_log =

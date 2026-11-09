@@ -561,7 +561,8 @@ bool nds_is_local_wireless_tuning_flag(const std::string& flag) {
            flag == "--local-wireless-jitter-ms" ||
            flag == "--local-wireless-loss-pct" ||
            flag == "--local-wireless-late-replies" ||
-           flag == "--local-wireless-reply-budget-us";
+           flag == "--local-wireless-reply-budget-us" ||
+           flag == "--local-wireless-stay-awake";
 }
 
 bool nds_parse_local_wireless_tuning(const std::string& flag,
@@ -586,6 +587,9 @@ bool nds_parse_local_wireless_tuning(const std::string& flag,
                fail("0..25000");
     if (flag == "--local-wireless-late-replies")
         return nds_parse_on_off(value, &out->late_replies) ||
+               fail("on or off");
+    if (flag == "--local-wireless-stay-awake")
+        return nds_parse_on_off(value, &out->stay_awake) ||
                fail("on or off");
     if (error) *error = "unknown flag " + flag;
     return false;

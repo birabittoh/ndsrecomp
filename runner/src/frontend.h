@@ -174,6 +174,12 @@ struct NdsLocalWirelessOptions {
     // and accept a reply that arrives late as the reply to a later MP cmd.
     bool late_replies = false;
     uint32_t reply_budget_us = 2000;
+    // Keep the guest radio powered while the transport is open: a DS host
+    // sleeps between beacons and a station after its post-beacon window,
+    // and the auth/assoc handshake only fits inside one wake window when
+    // replies take microseconds. With real latency, frames wait for the
+    // next wake-up and the join times out.
+    bool stay_awake = false;
 };
 
 struct NdsMphPrimeControlBindings {
@@ -514,7 +520,8 @@ bool nds_parse_local_wireless_base_port(const std::string& value,
 // The latency-lab flags shared by the dev CLI and player mode:
 // --local-wireless-delay-ms 0..2000, --local-wireless-jitter-ms 0..2000,
 // --local-wireless-loss-pct 0..100, --local-wireless-late-replies on|off,
-// --local-wireless-reply-budget-us 0..25000. True if `flag` is one of them.
+// --local-wireless-reply-budget-us 0..25000,
+// --local-wireless-stay-awake on|off. True if `flag` is one of them.
 bool nds_is_local_wireless_tuning_flag(const std::string& flag);
 // Parses one of those flags into `out`. On failure *error names the range.
 bool nds_parse_local_wireless_tuning(const std::string& flag,

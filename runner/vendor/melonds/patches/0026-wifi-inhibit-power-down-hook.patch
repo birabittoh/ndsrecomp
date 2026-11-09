@@ -1,0 +1,22 @@
+Subject: Wifi: let the runner inhibit radio power-down
+
+ndsrecomp modification to vendored melonDS src/Wifi.cpp (GPLv3 5(a)
+notice; see patches/README.md for the convention).
+
+UpdatePowerStatus asks the runner-owned nds_wifi_inhibit_power_down hook
+before a power-down and, when it returns true, keeps the transceiver on
+exactly as W_PowerDownCtrl bit 0 does. A DS MP host sleeps between beacons
+and a station after its post-beacon window; the auth/assoc handshake
+assumes replies within microseconds and fits in one wake window. Over a
+link with real latency (the local wireless latency lab, later online play)
+frames wait for the next wake-up and the join times out. The runner only
+returns true when --local-wireless-stay-awake is on and the local MP
+transport is open; otherwise behaviour is unchanged.
+
+--- a/src/Wifi.cpp
++++ b/src/Wifi.cpp
+@@ (runner hook declarations)
++bool nds_wifi_inhibit_power_down();
+@@ Wifi::UpdatePowerStatus, after the W_PowerDownCtrl bit 0 check
++        if ((power == -1) && ::nds_wifi_inhibit_power_down())
++            power = 0;
