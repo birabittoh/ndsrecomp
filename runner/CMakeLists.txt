@@ -780,6 +780,7 @@ add_executable(nds_runner
     src/debug_server.cpp
     src/frontend_config.cpp
     src/player_launch.cpp
+    src/log_file.cpp
     src/relative_mouse_touch.cpp
     "${NDS_RECOMP_UI_ROOT}/src/common/recomp_runtime_ui.c"
     src/frontend.cpp

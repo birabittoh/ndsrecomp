@@ -64,6 +64,7 @@
 #include "title_banks.h"
 #include "execution_model.h"
 #include "coverage_manifest.h"
+#include "log_file.h"
 #include "player_launch.h"
 #include "title_patches.h"
 #if defined(NDS_HAVE_COMPUTE_RENDERER)
@@ -363,6 +364,9 @@ int main(int argc, char** argv) {
     // cost the session an hour of phantom debugging. Unbuffered is what the C
     // standard promises for stderr anyway; pay the syscall per line.
     setvbuf(stderr, nullptr, _IONBF, 0);
+    // A copy of stderr goes to logs/<app>_NNN.log (log_file.h), opened once
+    // the arguments and config say where; lines before that are held.
+    nds_log_capture_begin();
     // Calibrate the dispatch-cost tick source before anything can dispatch.
     // It is lazily self-calibrating as a fallback, but the lazy path would
     // spend its calibration spin inside whichever dispatch happened to be
@@ -448,6 +452,8 @@ int main(int argc, char** argv) {
     std::string cli_execution_model = "faithful";
     std::string cli_diagnostics;
     std::string cli_diagnostics_dir;
+    std::string cli_log_file;
+    std::string player_log_dir;
     std::string cli_diagnostics_interval_ms;
     std::string cli_runtime_settings_path;
     // beads-yjp.28: where the Tier-3 coverage manifest lands. Empty means
@@ -520,6 +526,7 @@ int main(int argc, char** argv) {
         cli_save_path = launch.save;
         cli_savestate_dir = launch.savestate_dir;
         cli_diagnostics_dir = launch.log_dir;
+        player_log_dir = launch.log_dir;
     }
     const auto startup_failure = [&](const std::string& message) {
         if (player_mode) nds_player_error(message);
@@ -551,6 +558,8 @@ int main(int argc, char** argv) {
             cli_diagnostics = argv[++i];
         } else if (a == "--diagnostics-dir" && i + 1 < argc) {
             cli_diagnostics_dir = argv[++i];
+        } else if (a == "--log-file" && i + 1 < argc) {
+            cli_log_file = argv[++i];
         } else if (a == "--diagnostics-interval-ms" && i + 1 < argc) {
             cli_diagnostics_interval_ms = argv[++i];
         } else if (a == "--runtime-settings-path" && i + 1 < argc) {
@@ -746,7 +755,7 @@ int main(int argc, char** argv) {
                 "[--save-path game.sav|--no-save] "
                 "[--execution-model faithful|performance] "
                 "[--diagnostics on|off] [--diagnostics-dir dir] "
-                "[--diagnostics-interval-ms ms] "
+                "[--diagnostics-interval-ms ms] [--log-file FILE] "
                 "[--runtime-settings-path FILE] "
                 "[--coverage-manifest out.json|--no-coverage-manifest] "
                 "[--firmware-path firmware.bin] "
@@ -848,6 +857,18 @@ int main(int argc, char** argv) {
                          config_path.c_str(), config_error.c_str());
             return 2;
         }
+    }
+    {
+        // As in rexglue: <settings folder>/logs, which for a player is the
+        // data directory and otherwise the executable's directory.
+        const auto exe_dir = exe_dir_from_argv(argv[0]);
+        const std::filesystem::path log_dir = player_log_dir.empty()
+            ? exe_dir / "logs"
+            : std::filesystem::path(player_log_dir);
+        const std::string log_app = frontend_options.app_name.empty()
+            ? std::filesystem::path(argv[0]).stem().string()
+            : frontend_options.app_name;
+        nds_log_file_open(cli_log_file, log_dir, log_app);
     }
     NdsFullscreenOverrideError fullscreen_error =
         NdsFullscreenOverrideError::None;
