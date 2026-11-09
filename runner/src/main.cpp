@@ -67,6 +67,9 @@
 #include "log_file.h"
 #include "player_launch.h"
 #include "title_patches.h"
+#if NDS_ONLINE
+#include "net/online_lobby.h"
+#endif
 #if defined(NDS_HAVE_COMPUTE_RENDERER)
 #include "melonds_compute/ComputeHost.h"
 #endif
@@ -454,6 +457,7 @@ int main(int argc, char** argv) {
     std::string cli_diagnostics_dir;
     std::string cli_log_file;
     std::string player_log_dir;
+    std::string player_data_dir;
     std::string cli_diagnostics_interval_ms;
     std::string cli_runtime_settings_path;
     // beads-yjp.28: where the Tier-3 coverage manifest lands. Empty means
@@ -527,6 +531,7 @@ int main(int argc, char** argv) {
         cli_savestate_dir = launch.savestate_dir;
         cli_diagnostics_dir = launch.log_dir;
         player_log_dir = launch.log_dir;
+        player_data_dir = launch.data_dir;
     }
     const auto startup_failure = [&](const std::string& message) {
         if (player_mode) nds_player_error(message);
@@ -2006,6 +2011,40 @@ int main(int argc, char** argv) {
     nds_diagnostics_set_identity(rom_sha1.c_str(), rom_name.c_str(),
                                  execution_build_id.c_str());
     debug_set_savestate_identity(execution_build_id, rom_sha1);
+    {
+        const NdsOnlineOptions& online = frontend_options.local_wireless.online;
+#if NDS_ONLINE
+        if (interactive && !rom.empty() &&
+            frontend_options.local_wireless.enabled) {
+            NdsOnlineConfig config;
+            if (!online.lobby_url.empty()) config.lobby_url = online.lobby_url;
+            config.game_name = online.game_name;
+            if (config.game_name.empty())
+                config.game_name = std::string(
+                    reinterpret_cast<const char*>(rom.data()) + 0x0C, 4);
+            // Only the same ROM with the same MP wire format may meet.
+            config.game_version = "nif2-" + rom_sha1.substr(0, 12);
+            config.lobby_name = online.lobby_name;
+            // The player's data folder; next to the exe for scripted runs.
+            config.secret_path =
+                ((player_data_dir.empty()
+                      ? exe_dir_from_argv(argv[0])
+                      : std::filesystem::path(player_data_dir)) /
+                 "netplay_secret")
+                    .string();
+            config.enabled = online.enabled;
+            config.sign_in = online.sign_in;
+            config.join = online.join;
+            nds_online_start(config);
+            std::atexit(nds_online_stop);
+        }
+#else
+        if (online.enabled)
+            std::fprintf(stderr,
+                         "[online] Netplay needs a build with NDS_ONLINE=ON; "
+                         "local wireless stays on the LAN\n");
+#endif
+    }
     nds_arm9_native_prepare_initialize(rom_sha1);
 #if defined(NDS_MPH_SUBMIT_HLE)
     if (mph_submit::initialize(rom_sha1.c_str()))

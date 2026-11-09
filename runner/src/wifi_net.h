@@ -301,6 +301,10 @@ void nds_wifi_on_local_mp_disconnected();
 // transport is open.
 bool nds_wifi_inhibit_power_down();
 
+// True while the guest's radio is powered on (the vendored Wifi model's
+// MP_Begin..MP_End). Any thread.
+bool nds_wifi_local_mp_radio_on();
+
 // Called by the vendored Wifi model right after MP_RecvReplies: clients to
 // treat as having answered the cmd although no reply frame is handed to the
 // guest (late-reply mode; their reply is still in flight). Read-and-clear.

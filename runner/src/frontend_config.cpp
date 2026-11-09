@@ -566,7 +566,10 @@ bool nds_is_local_wireless_tuning_flag(const std::string& flag) {
            flag == "--local-wireless-reply-budget-us" ||
            flag == "--local-wireless-stay-awake" ||
            flag == "--local-wireless-link" ||
-           flag == "--local-wireless-peer";
+           flag == "--local-wireless-peer" ||
+           flag == "--netplay" || flag == "--netplay-sign-in" ||
+           flag == "--netplay-join" || flag == "--netplay-lobby-name" ||
+           flag == "--netplay-lobby-url";
 }
 
 bool nds_parse_local_wireless_tuning(const std::string& flag,
@@ -605,6 +608,26 @@ bool nds_parse_local_wireless_tuning(const std::string& flag,
         if (value.empty() || out->peers.size() >= kMaxLocalWirelessPeers)
             return fail("HOST or HOST:PORT, at most 8 peers");
         out->peers.push_back(value);
+        return true;
+    }
+    if (flag == "--netplay")
+        return nds_parse_on_off(value, &out->online.enabled) ||
+               fail("on or off");
+    if (flag == "--netplay-sign-in")
+        return nds_parse_on_off(value, &out->online.sign_in) ||
+               fail("on or off");
+    if (flag == "--netplay-join") {
+        if (value.empty()) return fail("a lobby id or first");
+        out->online.join = value;
+        return true;
+    }
+    if (flag == "--netplay-lobby-name") {
+        out->online.lobby_name = value;
+        return true;
+    }
+    if (flag == "--netplay-lobby-url") {
+        if (value.rfind("ws://", 0) != 0) return fail("a ws:// URL");
+        out->online.lobby_url = value;
         return true;
     }
     if (error) *error = "unknown flag " + flag;
@@ -1346,6 +1369,22 @@ static bool apply_frontend_config(toml::table& root,
                 options->local_wireless.peers.push_back(*text);
             }
         }
+    }
+    if (const toml::table* online = root["online"].as_table()) {
+        NdsOnlineOptions& o = options->local_wireless.online;
+        if (const auto value = (*online)["enabled"].value<bool>())
+            o.enabled = *value;
+        if (const auto value = (*online)["lobby_url"].value<std::string>()) {
+            if (!value->empty() && value->rfind("ws://", 0) != 0) {
+                if (error) *error = "online.lobby_url must be a ws:// URL";
+                return false;
+            }
+            o.lobby_url = *value;
+        }
+        if (const auto value = (*online)["game_name"].value<std::string>())
+            o.game_name = *value;
+        if (const auto value = (*online)["lobby_name"].value<std::string>())
+            o.lobby_name = *value;
     }
 
     if (const toml::table* controls = root["controls"].as_table()) {

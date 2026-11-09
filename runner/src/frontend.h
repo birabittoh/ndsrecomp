@@ -160,6 +160,18 @@ struct NdsNetworkOptions {
                                      // header, e.g. "dhcp"
 };
 
+// Netplay (net/online_lobby.h): local wireless with the members of an
+// online lobby. [online] in game.toml, --netplay* flags. Builds without
+// NDS_ONLINE ignore it.
+struct NdsOnlineOptions {
+    bool enabled = false;
+    std::string lobby_url;   // empty = the public lobby server
+    std::string game_name;   // lobby list filter; empty = the ROM game code
+    std::string lobby_name;  // empty = "<host's name>'s lobby"
+    bool sign_in = false;    // --netplay-sign-in on: sign in at startup
+    std::string join;        // --netplay-join ID|first
+};
+
 struct NdsLocalWirelessOptions {
     bool enabled = false;
     uint16_t base_port = 26710;
@@ -186,6 +198,7 @@ struct NdsLocalWirelessOptions {
     // Runners to contact directly (host or host:port, port defaulting to
     // base_port), for networks that drop broadcast. Lan link only.
     std::vector<std::string> peers;
+    NdsOnlineOptions online;
 };
 
 struct NdsMphPrimeControlBindings {

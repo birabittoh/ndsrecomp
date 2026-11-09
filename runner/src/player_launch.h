@@ -43,6 +43,9 @@ struct NdsPlayerLaunch {
     std::string save;
     std::string savestate_dir;
     std::string log_dir;
+    // The data directory itself, shared by every instance (the Netplay
+    // sign-in key lives here).
+    std::string data_dir;
     // Exit status when nds_player_prepare returns false.
     int exit_code = 0;
 };

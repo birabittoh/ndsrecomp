@@ -21,6 +21,10 @@
 #include "emu_profile.h"
 #include "network_savestate_guard.h"
 #include "savestate.h"
+#if NDS_ONLINE
+#include "net/ice_link.h"
+#include "net/online_lobby.h"
+#endif
 
 #include <atomic>
 #include <chrono>
@@ -762,6 +766,9 @@ struct LocalMpTuning {
 // Set once from a title's static initializer (nds_netplay_set_host_decoder).
 std::atomic<NdsNetplayHostDecoder> g_netplay_host_decoder{nullptr};
 
+// Between the radio model's MP_Begin and MP_End (Wifi power on / off).
+std::atomic<bool> g_local_mp_radio_on{false};
+
 class LocalMpTransport {
 public:
     void Configure(bool enabled, uint32_t instance, uint16_t base_port,
@@ -770,6 +777,7 @@ public:
         instance_ = instance;
         base_port_ = base_port;
         tuning_ = tuning;
+        base_tuning_ = tuning;
         rng_.seed(0x9E3779B9u ^ instance ^
                   static_cast<uint32_t>(std::chrono::steady_clock::now()
                                             .time_since_epoch()
@@ -780,12 +788,26 @@ public:
         if (!enabled_) return;
         if (LinkOpen()) return;
 
-        mpnet::UdpLinkConfig link_config;
-        link_config.lan = tuning_.lan;
-        link_config.instance = instance_;
-        link_config.base_port = base_port_;
-        link_config.peers = tuning_.peers;
-        link_ = mpnet::MakeUdpLink(link_config);
+        tuning_ = base_tuning_;
+#if NDS_ONLINE
+        // Netplay on: the lobby's members are the only ones in range, and
+        // internet latency needs late replies and a radio that stays awake
+        // (HANDOFF_ONLINE_LOBBY.md Phase 0).
+        online_epoch_ = nds_online_link_epoch();
+        if (std::shared_ptr<mpnet::IceLink> online = nds_online_link()) {
+            link_ = mpnet::MakeLinkView(std::move(online));
+            tuning_.late_replies = true;
+            tuning_.stay_awake = true;
+        } else
+#endif
+        {
+            mpnet::UdpLinkConfig link_config;
+            link_config.lan = tuning_.lan;
+            link_config.instance = instance_;
+            link_config.base_port = base_port_;
+            link_config.peers = tuning_.peers;
+            link_ = mpnet::MakeUdpLink(link_config);
+        }
         if (!link_->Open()) {
             link_.reset();
             return;
@@ -1437,6 +1459,17 @@ private:
     }
 
     void DrainSocket() {
+#if NDS_ONLINE
+        // Netplay switched on or off while the radio is on: move to the
+        // other link. Peers vanish, as if they went out of range.
+        if (link_ && nds_online_link_epoch() != online_epoch_) {
+            std::fprintf(stderr, "[local_mp] inst=%u Netplay %s: new link\n",
+                         static_cast<unsigned>(instance_),
+                         nds_online_enabled() ? "on" : "off");
+            End();
+            Begin();
+        }
+#endif
         if (!enabled_ || !LinkOpen()) return;
         for (;;) {
             uint8_t datagram[mpnet::kMaxDatagramBytes];
@@ -1856,6 +1889,8 @@ private:
     uint32_t late_node_[16]{};  // node each AID's replies come from
     uint16_t late_ack_only_ = 0;
     std::unique_ptr<mpnet::MpLink> link_;
+    LocalMpTuning base_tuning_;  // as configured; tuning_ is what Begin chose
+    uint32_t online_epoch_ = 0;
     mpnet::Reliable rel_;
     std::map<uint32_t, PeerInfo> peers_;
     std::chrono::steady_clock::time_point last_hello_{};
@@ -2458,12 +2493,15 @@ int Net_RecvPacket(u8* data, void* userdata) {
 void MP_Begin(void* userdata) {
     (void)userdata;
     g_savestate_network_guard.SetWifiDeviceActive(true);
+    g_local_mp_radio_on.store(true);
     if (g_bridge) g_bridge->local_mp.Begin();
 }
 
 void MP_End(void* userdata) {
     (void)userdata;
     if (g_bridge) g_bridge->local_mp.End();
+    if (g_local_mp_radio_on.exchange(false))
+        std::fprintf(stderr, "[local_mp] radio off\n");
     g_savestate_network_guard.SetWifiDeviceActive(false);
 }
 
@@ -2911,6 +2949,8 @@ NdsSavestateNetworkEligibility nds_wifi_savestate_eligibility() {
 bool nds_wifi_inhibit_power_down() {
     return g_bridge && g_bridge->local_mp.InhibitPowerDown();
 }
+
+bool nds_wifi_local_mp_radio_on() { return g_local_mp_radio_on.load(); }
 
 void nds_netplay_set_host_decoder(NdsNetplayHostDecoder decoder) {
     g_netplay_host_decoder.store(decoder, std::memory_order_release);

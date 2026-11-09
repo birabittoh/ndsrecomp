@@ -859,6 +859,58 @@ if(NDS_TITLE_HOOK_SOURCES)
     list(LENGTH NDS_TITLE_HOOK_SOURCES _hook_source_count)
     message(STATUS "Title hook sources: ${_hook_source_count}")
 endif()
+
+# Online lobbies for local wireless (HANDOFF_ONLINE_LOBBY.md in DQ9Recomp):
+# ICE through a TURN relay (libjuice) and Discord sign-in for the lobby
+# server (recomp-net's auth.h). recomp-net is a sibling checkout, found like
+# recomp-ui; only its account module and the libjuice it builds are used.
+option(NDS_ONLINE "Online lobbies for local wireless (needs recomp-net)" OFF)
+if(NDS_ONLINE)
+    if(DEFINED ENV{RECOMP_NET_ROOT})
+        set(NDS_RECOMP_NET_ROOT_DEFAULT "$ENV{RECOMP_NET_ROOT}")
+    else()
+        set(NDS_RECOMP_NET_ROOT_DEFAULT "${CMAKE_CURRENT_LIST_DIR}/../../../recomp-net")
+    endif()
+    set(NDS_RECOMP_NET_ROOT "${NDS_RECOMP_NET_ROOT_DEFAULT}" CACHE PATH
+        "Path to the recomp-net checkout (NDS_ONLINE)")
+    if(NOT EXISTS "${NDS_RECOMP_NET_ROOT}/include/recomp_net/auth.h")
+        message(FATAL_ERROR "NDS_ONLINE needs recomp-net at NDS_RECOMP_NET_ROOT "
+            "(${NDS_RECOMP_NET_ROOT}); clone "
+            "https://github.com/RetroPortingToolKit/recomp-net there")
+    endif()
+    # libjuice first, the release recomp-net pins, so that its TURN server
+    # stays in: ice_link_test relays through it on 127.0.0.1. recomp-net's
+    # own FetchContent of it (NO_SERVER forced on) then finds it populated.
+    include(FetchContent)
+    if(POLICY CMP0135)
+        cmake_policy(SET CMP0135 NEW)
+    endif()
+    set(BUILD_SHARED_LIBS OFF CACHE BOOL "" FORCE)
+    set(NO_TESTS ON CACHE BOOL "" FORCE)
+    set(NO_SERVER OFF CACHE BOOL "" FORCE)
+    set(USE_NETTLE OFF CACHE BOOL "" FORCE)
+    FetchContent_Declare(
+        libjuice
+        URL https://github.com/paullouisageneau/libjuice/archive/refs/tags/v1.7.2.tar.gz
+        URL_HASH SHA256=75159867c4a5a689a6559e11aa0d30c9eba12ce73a4ae3d898b521467e1f635d)
+    FetchContent_MakeAvailable(libjuice)
+    set(RNET_ENABLE_ICE ON CACHE BOOL "" FORCE)
+    set(RNET_BUILD_EXAMPLES OFF CACHE BOOL "" FORCE)
+    set(RNET_BUILD_TESTS OFF CACHE BOOL "" FORCE)
+    set(RNET_BUILD_MODULE OFF CACHE BOOL "" FORCE)
+    add_subdirectory("${NDS_RECOMP_NET_ROOT}" "${CMAKE_BINARY_DIR}/recomp-net"
+                     EXCLUDE_FROM_ALL)
+    target_sources(nds_runner PRIVATE
+        src/net/ice_link.cpp
+        src/net/lobby_json.cpp
+        src/net/lobby_ws.cpp
+        src/net/online_lobby.cpp)
+    target_link_libraries(nds_runner PRIVATE recomp_net Libjuice::Libjuice)
+    target_include_directories(nds_runner PRIVATE
+        "${NDS_RECOMP_NET_ROOT}/include")
+    target_compile_definitions(nds_runner PRIVATE NDS_ONLINE=1)
+    message(STATUS "Online lobbies: on (recomp-net ${NDS_RECOMP_NET_ROOT})")
+endif()
 ndsrecomp_limit_link(nds_runner)
 if(NDS_CORE_IPO)
     # Do not enable global IPO: imported banks, the native SDK and slirp keep
@@ -1354,6 +1406,49 @@ ndsrecomp_link_tomlpp(frontend_config_test)
     target_link_libraries(mp_link_test PRIVATE ws2_32 iphlpapi)
   endif()
   add_test(NAME mp_link_test COMMAND mp_link_test)
+
+  if(NDS_ONLINE)
+    add_executable(ice_link_test
+        tests/ice_link_test.cpp
+        src/net/mp_wire.cpp
+        src/net/ice_link.cpp)
+    target_include_directories(ice_link_test PRIVATE src)
+    target_link_libraries(ice_link_test PRIVATE Libjuice::Libjuice
+                          Threads::Threads)
+    if(WIN32)
+      target_link_libraries(ice_link_test PRIVATE ws2_32)
+    endif()
+    add_test(NAME ice_link_test COMMAND ice_link_test)
+
+    add_executable(lobby_json_test
+        tests/lobby_json_test.cpp
+        src/net/lobby_json.cpp
+        src/net/lobby_ws.cpp)
+    target_include_directories(lobby_json_test PRIVATE src
+                               "${NDS_RECOMP_NET_ROOT}/include")
+    target_link_libraries(lobby_json_test PRIVATE recomp_net)
+    if(WIN32)
+      target_link_libraries(lobby_json_test PRIVATE ws2_32)
+    endif()
+    add_test(NAME lobby_json_test COMMAND lobby_json_test)
+
+    # Two-process run against a lobby server; see the test's header. Not a
+    # ctest, since it needs that server.
+    add_executable(online_lobby_test
+        tests/online_lobby_test.cpp
+        src/net/online_lobby.cpp
+        src/net/ice_link.cpp
+        src/net/lobby_json.cpp
+        src/net/lobby_ws.cpp
+        src/net/mp_wire.cpp)
+    target_include_directories(online_lobby_test PRIVATE src
+                               "${NDS_RECOMP_NET_ROOT}/include")
+    target_link_libraries(online_lobby_test PRIVATE recomp_net
+                          Libjuice::Libjuice Threads::Threads)
+    if(WIN32)
+      target_link_libraries(online_lobby_test PRIVATE ws2_32)
+    endif()
+  endif()
 
   add_executable(net_ring_test
       tests/net_ring_test.cpp

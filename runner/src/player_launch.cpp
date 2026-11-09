@@ -604,6 +604,7 @@ bool nds_player_prepare(int argc, char** argv, NdsFrontendOptions* options,
     out->save = save.string();
     out->savestate_dir = (root / "savestates").string();
     out->log_dir = (root / "logs").string();
+    out->data_dir = root.string();
     if (args.instance >= 0 && !apply_instance(args.instance, save, options,
                                               out)) {
         return false;
