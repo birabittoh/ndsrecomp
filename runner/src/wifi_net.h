@@ -139,6 +139,7 @@ struct NdsWifiNetworkConfig {
     uint32_t local_wireless_loss_pct = 0;
     bool local_wireless_late_replies = false;
     uint32_t local_wireless_reply_budget_us = 2000;
+    bool local_wireless_stay_awake = false;
     // NDS_LOCAL_MP_STATS=1: one "[local_mp] stats" line per second on
     // stderr while the transport is open.
     bool local_wireless_stats_log = false;
@@ -275,6 +276,13 @@ void nds_wifi_on_client_state_changed(uint32_t status);
 // what proves that the peer session has ended without requiring radio power
 // to be cycled.
 void nds_wifi_on_local_mp_disconnected();
+
+// Called by the vendored Wifi model whenever the guest radio is about to
+// power down (auto-sleep after the post-beacon window, or a requested
+// sleep). True keeps it powered, exactly as W_PowerDownCtrl bit 0 would:
+// NdsWifiNetworkConfig::local_wireless_stay_awake while the local MP
+// transport is open.
+bool nds_wifi_inhibit_power_down();
 
 // Transaction-boundary query installed into the core savestate layer when
 // the bridge attaches. A configured/idle backend does not block. Association,
