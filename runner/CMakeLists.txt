@@ -739,6 +739,7 @@ add_executable(nds_runner
     src/net/mp_wire.cpp
     src/net/mp_reliable.cpp
     src/net/mp_link.cpp
+    src/net/mp_beacon.cpp
     src/spu.cpp
     src/vram.cpp
     src/gpu2d.cpp
@@ -1317,6 +1318,12 @@ ndsrecomp_link_tomlpp(frontend_config_test)
       src/net/mp_reliable.cpp)
   target_include_directories(mp_reliable_test PRIVATE src)
   add_test(NAME mp_reliable_test COMMAND mp_reliable_test)
+
+  add_executable(mp_beacon_test
+      tests/mp_beacon_test.cpp
+      src/net/mp_beacon.cpp)
+  target_include_directories(mp_beacon_test PRIVATE src)
+  add_test(NAME mp_beacon_test COMMAND mp_beacon_test)
 
   add_executable(mp_link_test
       tests/mp_link_test.cpp

@@ -38,6 +38,7 @@
 #include "savestate_slots.h"
 #include "spu.h"
 #include "title_patches.h"
+#include "wifi_net.h"
 #if defined(NDS_HAVE_COMPUTE_RENDERER)
 #include "melonds_compute/ComputeHost.h"
 #endif
@@ -5324,6 +5325,7 @@ int nds_run_interactive_frontend(const NdsFrontendOptions& initial_options) {
         g_live_stats.now_ticks = counter;
         g_live_stats.freq = frequency;
         nds_diagnostics_maybe_write_performance_sample(g_live_stats);
+        nds_wifi_frame_tick();
         if (counter - fps_start >= frequency) {
             const double seconds = static_cast<double>(counter - fps_start) /
                                    static_cast<double>(frequency);

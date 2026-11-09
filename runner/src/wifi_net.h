@@ -306,6 +306,34 @@ bool nds_wifi_inhibit_power_down();
 // guest (late-reply mode; their reply is still in flight). Read-and-clear.
 uint16_t nds_wifi_local_mp_take_ack_only();
 
+// What a title reads out of the game info its own MP host beacons carry
+// (net/mp_beacon.h), for the online lobby (HANDOFF_ONLINE_LOBBY.md Phase 1b).
+struct NdsNetplayHostInfo {
+    bool accepting = false;   // the game takes new players
+    int free_slots = 0;       // player slots still free
+    char host_name[64] = "";  // UTF-8, the hosting player's name
+};
+
+// Returns false when the beacon is not this title's (other GGID, malformed).
+// Called on the emulation thread with the transport's lock held: keep it a
+// pure function of its arguments.
+using NdsNetplayHostDecoder = bool (*)(uint32_t ggid, uint8_t attribute,
+                                       const uint8_t* user, size_t user_len,
+                                       NdsNetplayHostInfo* out);
+
+// Titles register their decoder from a static initializer. Without one, the
+// runner only logs the raw beacons.
+void nds_netplay_set_host_decoder(NdsNetplayHostDecoder decoder);
+
+// False while this instance is not beaconing as an MP host or the title's
+// decoder did not accept its beacon.
+bool nds_netplay_host_info(NdsNetplayHostInfo* out);
+
+// Once per presented frame (frontend thread): ends the "host beacon"
+// state when this instance stopped beaconing, and flushes rate-limited
+// stderr lines.
+void nds_wifi_frame_tick();
+
 // NDS_LOCAL_MP_TRACE=1 with the transport open: the vendored Wifi model
 // logs MP client timing (diagnostics only).
 bool nds_wifi_local_mp_trace_enabled();

@@ -68,6 +68,7 @@
 #include "net/net_classify.h"
 #include "net/net_capture.h"
 #include "net/net_replay.h"
+#include "net/mp_beacon.h"
 #include "net/mp_link.h"
 #include "net/mp_reliable.h"
 #include "net/mp_wire.h"
@@ -758,6 +759,9 @@ struct LocalMpTuning {
     std::vector<mpnet::PeerAddr> peers;
 };
 
+// Set once from a title's static initializer (nds_netplay_set_host_decoder).
+std::atomic<NdsNetplayHostDecoder> g_netplay_host_decoder{nullptr};
+
 class LocalMpTransport {
 public:
     void Configure(bool enabled, uint32_t instance, uint16_t base_port,
@@ -1038,6 +1042,35 @@ public:
 
     bool TraceEnabled() const {
         return tuning_.trace && LinkOpen();
+    }
+
+    // Once per presented frame, from the frontend thread.
+    void FrameTick() {
+        std::lock_guard<std::mutex> lock(beacon_mutex_);
+        const auto now = std::chrono::steady_clock::now();
+        if (beacon_watch_.Poll(now) == mpnet::BeaconWatch::Event::kStopped) {
+            std::fprintf(stderr,
+                "[local_mp] host beacon inst=%u stopped after %llu beacons\n",
+                static_cast<unsigned>(instance_),
+                static_cast<unsigned long long>(beacon_watch_.count()));
+            beacon_unlogged_ = 0;
+            if (host_valid_)
+                std::fprintf(stderr, "[netplay] host closed inst=%u\n",
+                             static_cast<unsigned>(instance_));
+            host_valid_ = false;
+            return;
+        }
+        if (tuning_.trace && beacon_unlogged_ != 0 &&
+            beacon_watch_.active() &&
+            now - beacon_logged_at_ >= kBeaconLogInterval)
+            LogBeacon("changed", now);
+    }
+
+    bool HostInfo(NdsNetplayHostInfo* out) {
+        std::lock_guard<std::mutex> lock(beacon_mutex_);
+        if (!host_valid_ || !beacon_watch_.active()) return false;
+        if (out) *out = host_info_;
+        return true;
     }
 
     bool InhibitPowerDown() const {
@@ -1363,6 +1396,8 @@ private:
 
     int SendGeneric(uint32_t type, uint8_t* data, int len,
                     uint64_t timestamp) {
+        if ((type & 0xFFFFu) == 0u && len > 0 && data)
+            ObserveBeacon(data, static_cast<size_t>(len));
         if (!enabled_) return 0;
         if (!LinkOpen()) return 0;
         if (len < 0 || static_cast<size_t>(len) > kMaxFrameBytes) return 0;
@@ -1706,6 +1741,94 @@ private:
         stats_log_last_ = now;
     }
 
+    // What this instance advertises as an MP host (Phase 1b of
+    // HANDOFF_ONLINE_LOBBY.md): one line when it starts beaconing, when
+    // the game info changes (at most every kBeaconLogInterval) and when
+    // the beacons stop.
+    void ObserveBeacon(const uint8_t* data, size_t len) {
+        mpnet::GameInfo info;
+        if (!mpnet::ParseBeaconGameInfo(data, len, &info)) return;
+        std::lock_guard<std::mutex> lock(beacon_mutex_);
+        const auto now = std::chrono::steady_clock::now();
+        switch (beacon_watch_.OnBeacon(info, now)) {
+        case mpnet::BeaconWatch::Event::kStarted:
+            LogBeacon("started", now);
+            DecodeHost();
+            break;
+        case mpnet::BeaconWatch::Event::kChanged:
+            // Raw changes only with NDS_LOCAL_MP_TRACE: games put counters
+            // in their user game info.
+            ++beacon_unlogged_;
+            if (tuning_.trace && now - beacon_logged_at_ >= kBeaconLogInterval)
+                LogBeacon("changed", now);
+            DecodeHost();
+            break;
+        default:
+            break;
+        }
+    }
+
+    // The title's view of the current beacon; one line whenever it changes.
+    void DecodeHost() {
+        const NdsNetplayHostDecoder decode =
+            g_netplay_host_decoder.load(std::memory_order_acquire);
+        if (!decode) return;
+        const mpnet::GameInfo& g = beacon_watch_.info();
+        NdsNetplayHostInfo info;
+        const bool valid =
+            decode(g.ggid, g.attribute, g.user, g.user_len, &info);
+        const bool same = valid == host_valid_ &&
+            (!valid || (info.accepting == host_info_.accepting &&
+                        info.free_slots == host_info_.free_slots &&
+                        std::strcmp(info.host_name,
+                                    host_info_.host_name) == 0));
+        const bool was_valid = host_valid_;
+        host_valid_ = valid;
+        if (valid) host_info_ = info;
+        if (same) return;
+        if (!valid) {
+            std::fprintf(stderr, "[netplay] host closed inst=%u "
+                         "(beacon not understood)\n",
+                         static_cast<unsigned>(instance_));
+            return;
+        }
+        std::fprintf(stderr,
+            "[netplay] host %s inst=%u accepting=%d free_slots=%d "
+            "name=\"%s\"\n",
+            was_valid ? "changed" : "open",
+            static_cast<unsigned>(instance_), info.accepting ? 1 : 0,
+            info.free_slots, info.host_name);
+    }
+
+    void LogBeacon(const char* what,
+                   std::chrono::steady_clock::time_point now) {
+        const mpnet::GameInfo& g = beacon_watch_.info();
+        char user[mpnet::kMaxUserGameInfo * 2 + 1] = "";
+        for (unsigned i = 0; i < g.user_len; ++i)
+            std::snprintf(user + i * 2, 3, "%02x", g.user[i]);
+        char skipped[48] = "";
+        if (beacon_unlogged_ > 1)
+            std::snprintf(skipped, sizeof(skipped), " (%u changes)",
+                          beacon_unlogged_);
+        std::fprintf(stderr,
+            "[local_mp] host beacon inst=%u %s%s ggid=%08x tgid=%04x "
+            "attr=%02x%s%s interval=%u parent_max=%u child_max=%u "
+            "user[%u]=%s\n",
+            static_cast<unsigned>(instance_), what, skipped,
+            static_cast<unsigned>(g.ggid), static_cast<unsigned>(g.tgid),
+            static_cast<unsigned>(g.attribute),
+            (g.attribute & mpnet::kAttrEntry) ? " entry" : "",
+            (g.attribute & mpnet::kAttrMultiboot) ? " mb" : "",
+            static_cast<unsigned>(g.beacon_interval),
+            static_cast<unsigned>(g.parent_max_size),
+            static_cast<unsigned>(g.child_max_size),
+            static_cast<unsigned>(g.user_len), user);
+        beacon_logged_at_ = now;
+        beacon_unlogged_ = 0;
+    }
+
+    static constexpr std::chrono::milliseconds kBeaconLogInterval{250};
+
     struct PeerInfo {
         mpnet::PeerAddr addr;
         std::chrono::steady_clock::time_point last_heard;
@@ -1736,6 +1859,14 @@ private:
     mpnet::Reliable rel_;
     std::map<uint32_t, PeerInfo> peers_;
     std::chrono::steady_clock::time_point last_hello_{};
+    // Beacon watch: written on the emulation thread, polled from the
+    // frontend thread.
+    std::mutex beacon_mutex_;
+    mpnet::BeaconWatch beacon_watch_;
+    std::chrono::steady_clock::time_point beacon_logged_at_{};
+    unsigned beacon_unlogged_ = 0;
+    bool host_valid_ = false;
+    NdsNetplayHostInfo host_info_;
     // Always-on wait/traffic counters (see NdsLocalMpStats in wifi_net.h).
     // Relaxed atomics: written on the emulation thread, snapshotted from
     // the debug-server thread.
@@ -2779,6 +2910,18 @@ NdsSavestateNetworkEligibility nds_wifi_savestate_eligibility() {
 
 bool nds_wifi_inhibit_power_down() {
     return g_bridge && g_bridge->local_mp.InhibitPowerDown();
+}
+
+void nds_netplay_set_host_decoder(NdsNetplayHostDecoder decoder) {
+    g_netplay_host_decoder.store(decoder, std::memory_order_release);
+}
+
+bool nds_netplay_host_info(NdsNetplayHostInfo* out) {
+    return g_bridge && g_bridge->local_mp.HostInfo(out);
+}
+
+void nds_wifi_frame_tick() {
+    if (g_bridge) g_bridge->local_mp.FrameTick();
 }
 
 bool nds_wifi_local_mp_trace_enabled() {
