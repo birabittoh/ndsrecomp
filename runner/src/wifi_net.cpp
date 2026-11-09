@@ -824,6 +824,7 @@ public:
         for (auto& q : late_queue_) q.clear();
         for (auto& t : late_seen_) t = {};
         for (auto& t : late_polled_since_) t = {};
+        for (auto& n : late_node_) n = 0;
         late_last_mask_ = 0;
         late_known_macs_ = 0;
         last_host_frame_wall_ = {};
@@ -931,6 +932,7 @@ public:
         const auto deadline =
             start + std::chrono::microseconds(tuning_.reply_budget_us);
         stats_recv_replies_calls_.fetch_add(1, std::memory_order_relaxed);
+        bool gap_waited = false;
         for (;;) {
             DrainSocket();
             SortLateReplies(timestamp);
@@ -940,7 +942,19 @@ public:
                     ready |= static_cast<uint16_t>(1u << aid);
             }
             if ((ready & aidmask) == aidmask) break;
-            if (!WaitForData(deadline)) {
+            // A client whose next reply sits behind a lost datagram gets
+            // waited for, not answered for: every reply fabricated below
+            // while its real one is in flight leaves one more reply
+            // queued for good (only the client's own empty replies can be
+            // shed), and at 3 % loss that backlog grew past
+            // kLateReplyWindowUs within seconds, so real replies were
+            // dropped as stale and DQ9 hung on "connecting".
+            const bool gap = LateGapPending(aidmask & ~ready);
+            if (gap && !gap_waited) {
+                gap_waited = true;
+                stats_late_gap_waits_.fetch_add(1, std::memory_order_relaxed);
+            }
+            if (!WaitForData(gap ? start + kLateGapWait : deadline)) {
                 stats_recv_replies_timeouts_.fetch_add(
                     1, std::memory_order_relaxed);
                 break;
@@ -1054,6 +1068,8 @@ public:
             stats_late_replies_.load(std::memory_order_relaxed);
         out->late_ack_only =
             stats_late_ack_only_.load(std::memory_order_relaxed);
+        out->late_gap_waits =
+            stats_late_gap_waits_.load(std::memory_order_relaxed);
         out->late_trimmed =
             stats_late_trimmed_.load(std::memory_order_relaxed);
         out->injected_drops =
@@ -1112,6 +1128,9 @@ private:
     // handshake. It gets this long to send its first reply.
     static constexpr std::chrono::milliseconds kLateJoinGrace{2000};
     static constexpr std::chrono::milliseconds kHostGoneAfter{2000};
+    // Longest the host waits for a client's reply held behind a lost
+    // datagram (a retransmission takes about RTO + one-way delay).
+    static constexpr std::chrono::milliseconds kLateGapWait{600};
 
     // Whether a polled client with nothing queued still counts as having
     // answered (TakeLateAckOnly): heard from recently, or newly polled
@@ -1123,6 +1142,16 @@ private:
         if (seen.time_since_epoch().count() != 0 && seen >= polled)
             return now - seen < kLateAliveWindow;
         return now - polled < kLateJoinGrace;
+    }
+
+    // Some client in `mask` has frames held behind a gap in its stream.
+    bool LateGapPending(uint16_t mask) const {
+        for (uint32_t aid = 1; aid < 16; ++aid) {
+            if ((mask & (1u << aid)) && late_node_[aid] &&
+                rel_.HasGap(late_node_[aid]))
+                return true;
+        }
+        return false;
     }
 
     // Moves arrived replies into per-client FIFOs (late mode only).
@@ -1140,6 +1169,7 @@ private:
                 continue;
             }
             late_seen_[aid] = now;
+            late_node_[aid] = frame.node;
             auto& q = late_queue_[aid];
             if (q.size() >= kLateQueueCapacity) {
                 q.pop_front();
@@ -1631,7 +1661,8 @@ private:
                 "tx/s pkt=%.0f cmd=%.0f reply=%.0f ack=%.0f kB=%.1f | "
                 "rx/s pkt=%.0f cmd=%.0f reply=%.0f ack=%.0f kB=%.1f | "
                 "host replies calls=%.0f timeouts=%.0f wait_ms=%.1f "
-                "late=%.0f ack_only=%.0f trimmed=%.0f stale=%.0f | "
+                "late=%.0f ack_only=%.0f trimmed=%.0f stale=%.0f "
+                "gap_waits=%.0f | "
                 "client host-wait calls=%.0f timeouts=%.0f wait_ms=%.1f | "
                 "lab_drops=%.0f held=%zu | "
                 "rel retx=%.0f dup=%.0f reorder=%.0f gap_skips=%.0f "
@@ -1656,6 +1687,7 @@ private:
                 rate(cur.late_ack_only, p.late_ack_only),
                 rate(cur.late_trimmed, p.late_trimmed),
                 rate(cur.stale_reply_drops, p.stale_reply_drops),
+                rate(cur.late_gap_waits, p.late_gap_waits),
                 rate(cur.recv_host_calls, p.recv_host_calls),
                 rate(cur.recv_host_timeouts, p.recv_host_timeouts),
                 rate(cur.recv_host_wait_us, p.recv_host_wait_us) / 1000.0,
@@ -1698,6 +1730,7 @@ private:
     uint8_t late_channel_ = 0;
     uint16_t late_known_macs_ = 0;
     uint16_t late_reply_seq_[16]{};
+    uint32_t late_node_[16]{};  // node each AID's replies come from
     uint16_t late_ack_only_ = 0;
     std::unique_ptr<mpnet::MpLink> link_;
     mpnet::Reliable rel_;
@@ -1718,6 +1751,7 @@ private:
     std::atomic<uint64_t> stats_late_replies_{0};
     std::atomic<uint64_t> stats_late_ack_only_{0};
     std::atomic<uint64_t> stats_late_trimmed_{0};
+    std::atomic<uint64_t> stats_late_gap_waits_{0};
     std::atomic<uint64_t> stats_injected_drops_{0};
     std::atomic<uint64_t> stats_bytes_sent_{0};
     std::atomic<uint64_t> stats_bytes_received_{0};

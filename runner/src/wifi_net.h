@@ -221,6 +221,7 @@ struct NdsLocalMpStats {
     uint64_t late_replies = 0;       // late-reply mode: stale but accepted
     uint64_t late_ack_only = 0;      // late-reply mode: answered, frame in flight
     uint64_t late_trimmed = 0;       // late-reply mode: backlogged empty replies shed
+    uint64_t late_gap_waits = 0;     // late-reply mode: waited for a reply behind a lost datagram
     uint64_t injected_drops = 0;     // latency lab: --local-wireless-loss-pct
     uint64_t bytes_sent = 0;         // per logical frame, header included
     uint64_t bytes_received = 0;

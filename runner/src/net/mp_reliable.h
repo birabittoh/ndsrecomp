@@ -83,6 +83,12 @@ public:
     void AddPeer(uint32_t node);
     void RemovePeer(uint32_t node);
     bool HasPeer(uint32_t node) const { return peers_.count(node) != 0; }
+    // Frames from `node` are held behind a gap: a retransmission of the
+    // missing one is on its way.
+    bool HasGap(uint32_t node) const {
+        const auto it = peers_.find(node);
+        return it != peers_.end() && !it->second.held.empty();
+    }
     std::vector<uint32_t> Peers() const;
 
     // Sends `frame` (type, timestamp, payload filled in) to every peer.
