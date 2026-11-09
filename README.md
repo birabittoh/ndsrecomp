@@ -109,7 +109,11 @@ An opt-in no-dump path also exists (`--freebios --generated-firmware
 (the DraStic BIOS replacement, BSD-2-Clause, vendored as the
 `third_party/freebios` submodule) plus a synthesized firmware image with a
 persisted per-install identity. The retail dumps remain the default and the
-oracle-diffed source of truth.
+oracle-diffed source of truth. A title that only uses this path can configure
+the runner with `-DNDS_RETAIL_BIOS_BANKS=OFF` (plus
+`-DNDS_BOOTSTRAP_FIRMWARE=ON`, which it needs): the retail BIOS banks are
+then left out, so building needs no `generated/arm{9,7}_bios.c` and no dumps,
+and the runner refuses to start without `--freebios`.
 
 Interactive frontends should also pass `--firmware-state-path <file>`. The
 runner seeds that mutable profile from the verified retail or generated image,

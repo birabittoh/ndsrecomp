@@ -71,10 +71,12 @@
 #endif
 
 // Generated per-CPU dispatch tables (C linkage).
+#ifdef NDS_HAVE_RETAIL_BIOS_BANKS
 extern "C" const DispatchEntry g_dispatch_arm9_bios[];
 extern "C" const unsigned g_dispatch_arm9_bios_len;
 extern "C" const DispatchEntry g_dispatch_arm7_bios[];
 extern "C" const unsigned g_dispatch_arm7_bios_len;
+#endif
 extern "C" const DispatchEntry g_dispatch_freebios_arm9[];
 extern "C" const unsigned g_dispatch_freebios_arm9_len;
 extern "C" const DispatchEntry g_dispatch_freebios_arm7[];
@@ -1788,6 +1790,17 @@ int main(int argc, char** argv) {
 
     if (cli_generated_firmware) frontend_options.generated_firmware = true;
     if (cli_freebios) frontend_options.freebios = true;
+#ifndef NDS_HAVE_RETAIL_BIOS_BANKS
+    if (!frontend_options.freebios) {
+        // Built with NDS_RETAIL_BIOS_BANKS=OFF: there is no compiled code for
+        // the retail BIOS, so its dumps could not run.
+        std::fprintf(stderr,
+            "refusing to start: this build has no retail BIOS banks; "
+            "use --freebios (system.freebios = true)\n");
+        startup_failure("This build only runs on FreeBIOS: set freebios = true.");
+        return 1;
+    }
+#endif
     if (frontend_options.freebios &&
         frontend_options.boot_mode != NdsBootMode::Direct) {
         // A reimplemented BIOS cannot boot the firmware menu (melonDS
@@ -2352,10 +2365,12 @@ int main(int argc, char** argv) {
             nds_register_dispatch(NDS_ARM7, g_dispatch_freebios_arm7,
                                   g_dispatch_freebios_arm7_len, 0x00000000u);
         } else {
+#ifdef NDS_HAVE_RETAIL_BIOS_BANKS
             nds_register_dispatch(NDS_ARM9, g_dispatch_arm9_bios,
                                   g_dispatch_arm9_bios_len, 0xFFFF0000u);
             nds_register_dispatch(NDS_ARM7, g_dispatch_arm7_bios,
                                   g_dispatch_arm7_bios_len, 0x00000000u);
+#endif
         }
 #ifndef NDS_BOOTSTRAP_FIRMWARE
         nds_register_dispatch(NDS_ARM9, g_dispatch_fw_arm9_early,

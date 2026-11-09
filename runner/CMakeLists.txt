@@ -31,6 +31,17 @@ arm_recomp_core_include_dirs(NDS_ARM_RECOMP_INCLUDE_DIRS armv4t)
 option(NDS_BOOTSTRAP_FIRMWARE
     "Build with BIOS banks only so guest-produced firmware RAM can be captured"
     OFF)
+# The retail BIOS banks are recompiled from the user's biosnds{7,9}.rom. A
+# title that only runs on FreeBIOS (system.freebios with --boot direct) can
+# leave them out, and then needs no dump to build or to run.
+option(NDS_RETAIL_BIOS_BANKS
+    "Link the retail BIOS banks (generated/arm{9,7}_bios.c, from the user's dumps)"
+    ON)
+if(NOT NDS_RETAIL_BIOS_BANKS AND NOT NDS_BOOTSTRAP_FIRMWARE)
+    message(FATAL_ERROR
+        "NDS_RETAIL_BIOS_BANKS=OFF requires NDS_BOOTSTRAP_FIRMWARE=ON: "
+        "the firmware banks run on the retail BIOS")
+endif()
 option(NDS_ENABLE_COMPUTE_RENDERER
     "Build the selected melonDS accelerated renderer (OpenGL 4.3 context)"
     ON)
@@ -287,6 +298,13 @@ else()
     file(GLOB FW_BANK_DISPATCH CONFIGURE_DEPENDS "${GEN}/fw_*_dispatch.c")
 endif()
 list(SORT FW_BANK_BODIES)
+if(NDS_RETAIL_BIOS_BANKS)
+    set(RETAIL_BIOS_ARM9_SOURCES ${GEN}/arm9_bios.c ${GEN}/arm9_bios_dispatch.c)
+    set(RETAIL_BIOS_ARM7_SOURCES ${GEN}/arm7_bios.c ${GEN}/arm7_bios_dispatch.c)
+else()
+    set(RETAIL_BIOS_ARM9_SOURCES)
+    set(RETAIL_BIOS_ARM7_SOURCES)
+endif()
 list(SORT FW_BANK_DISPATCH)
 set(SM64DS_BANK_SOURCES)
 if(NDS_SM64DS_BANK_DIR)
@@ -409,10 +427,8 @@ if(NDS_PREBUILT_BANK_ARCHIVE)
     message(STATUS "Reusing bank archive ${_bank_archive_sha256}; release inventory checks remain required")
 else()
 add_library(nds_banks STATIC
-    ${GEN}/arm9_bios.c
-    ${GEN}/arm9_bios_dispatch.c
-    ${GEN}/arm7_bios.c
-    ${GEN}/arm7_bios_dispatch.c
+    ${RETAIL_BIOS_ARM9_SOURCES}
+    ${RETAIL_BIOS_ARM7_SOURCES}
     ${GEN}/freebios_arm9.c
     ${GEN}/freebios_arm9_dispatch.c
     ${GEN}/freebios_arm7.c
@@ -430,8 +446,8 @@ target_include_directories(nds_banks PRIVATE
     ${TITLE_GROUP_DIRS})
 endif()
 set_source_files_properties(
-    ${GEN}/arm9_bios.c ${GEN}/arm9_bios_dispatch.c
-    ${GEN}/arm7_bios.c ${GEN}/arm7_bios_dispatch.c
+    ${RETAIL_BIOS_ARM9_SOURCES}
+    ${RETAIL_BIOS_ARM7_SOURCES}
     ${GEN}/freebios_arm9.c ${GEN}/freebios_arm9_dispatch.c
     ${GEN}/freebios_arm7.c ${GEN}/freebios_arm7_dispatch.c
     ${FW_BANK_BODIES}
@@ -454,9 +470,9 @@ endif()
 # Every immutable bank is CPU-specific even though both use one runtime ABI.
 # Tell the C compiler which core owns each source so it can fold the emitted
 # timing selection without changing generated C or the two-CPU scheduler.
-set(ARM9_BANK_SOURCES ${GEN}/arm9_bios.c ${GEN}/arm9_bios_dispatch.c
+set(ARM9_BANK_SOURCES ${RETAIL_BIOS_ARM9_SOURCES}
     ${GEN}/freebios_arm9.c ${GEN}/freebios_arm9_dispatch.c)
-set(ARM7_BANK_SOURCES ${GEN}/arm7_bios.c ${GEN}/arm7_bios_dispatch.c
+set(ARM7_BANK_SOURCES ${RETAIL_BIOS_ARM7_SOURCES}
     ${GEN}/freebios_arm7.c ${GEN}/freebios_arm7_dispatch.c)
 set(SM64DS_ARM9_BANK_SOURCES)
 set(SM64DS_HLE_PROFILE_SOURCES)
@@ -1204,6 +1220,9 @@ elseif(EXISTS "${GEN}/fw_arm9_calibration_save_dispatch.c")
     # boot.  Interaction-specific captures are optional and are registered
     # only when the complete extended set has been generated locally.
     target_compile_definitions(nds_runner PRIVATE NDS_HAVE_FW_EXTENDED_BANKS=1)
+endif()
+if(NDS_RETAIL_BIOS_BANKS)
+    target_compile_definitions(nds_runner PRIVATE NDS_HAVE_RETAIL_BIOS_BANKS=1)
 endif()
 if(SM64DS_BANK_SOURCES)
     target_compile_definitions(nds_runner PRIVATE NDS_HAVE_SM64DS_BANKS=1)
