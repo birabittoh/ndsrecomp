@@ -1916,6 +1916,27 @@ NdsPresentRect window_present_rect(const FrontendPresentation& presentation,
                             drawable_w, drawable_h, content_w, content_h);
 }
 
+// How tall window 0 shows the main DS screen, in window points
+// (nds_title_display_height). 0 when it cannot tell, e.g. minimized.
+int presented_screen_points(const FrontendPresentation& presentation) {
+    if (!presentation.windows[0]) return 0;
+    int drawable_w = 0, drawable_h = 0;
+    window_drawable_size(presentation, 0, &drawable_w, &drawable_h);
+    int content_w = 0, content_h = 0;
+    window_content_size(presentation, 0, &content_w, &content_h);
+    if (drawable_w <= 0 || drawable_h <= 0 || content_h <= 0) return 0;
+    const NdsPresentRect rect =
+        window_present_rect(presentation, 0, drawable_w, drawable_h);
+    double density = 1.0;
+#if defined(NDS_HAVE_SDL3)
+    const float window_density =
+        SDL_GetWindowPixelDensity(presentation.windows[0]);
+    if (window_density > 0) density = window_density;
+#endif
+    return static_cast<int>(std::lround(
+        static_cast<double>(rect.h) * kScreenHeight / content_h / density));
+}
+
 // The 3D multiplier the options ask for: with resolution_scale, that percent
 // of the GL window's presented rect (window_mode/scaling from the options, so
 // a menu change counts at once); otherwise the fixed internal_resolution.
@@ -5347,6 +5368,11 @@ int nds_run_interactive_frontend(const NdsFrontendOptions& initial_options) {
         governor_sample.headroom_valid =
             static_cast<bool>(audio) && audio_started && !turbo_active;
         governor_last_underruns = current_underruns;
+        // For title settings that follow the window size; a minimized
+        // window keeps the last size.
+        if (const int points = presented_screen_points(presentation);
+            points > 0)
+            nds_title_set_display_height(points);
 #if defined(NDS_HAVE_COMPUTE_RENDERER)
         // Auto scale. Runs here, with the producer joined, like the governor:
         // a renderer rebuild must not land between a frame's capture and its

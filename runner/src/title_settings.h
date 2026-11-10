@@ -42,6 +42,15 @@ int nds_title_setting_register(const NdsTitleSetting* setting);
 // Any thread.
 int nds_title_setting_value(int id);
 
+// How tall the frontend shows the main DS screen, in window points (logical
+// pixels, so a HiDPI display counts like a standard one), for settings that
+// follow the window size. 0 when no window shows it (headless). Host state:
+// a hook that reads it makes the guest depend on the window, like a setting.
+// Any thread.
+int nds_title_display_height();
+// For the frontend: once per presented frame.
+void nds_title_set_display_height(int points);
+
 // For the frontend.
 size_t nds_title_setting_count();
 const NdsTitleSetting* nds_title_setting_at(int id);

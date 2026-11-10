@@ -18,6 +18,8 @@ std::deque<Entry>& registry() {
     return entries;
 }
 
+std::atomic<int> g_display_height{0};
+
 bool accepts(const NdsTitleSetting& s, int value) {
     if (s.choices && s.choice_count) {
         for (size_t i = 0; i < s.choice_count; ++i) {
@@ -69,4 +71,13 @@ bool nds_title_setting_set(int id, int value) {
     registry()[static_cast<size_t>(id)].value.store(
         value, std::memory_order_relaxed);
     return true;
+}
+
+int nds_title_display_height() {
+    return g_display_height.load(std::memory_order_relaxed);
+}
+
+void nds_title_set_display_height(int points) {
+    g_display_height.store(points > 0 ? points : 0,
+                           std::memory_order_relaxed);
 }
