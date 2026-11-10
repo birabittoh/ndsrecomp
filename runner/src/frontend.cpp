@@ -1016,6 +1016,25 @@ void set_touch_from_mouse(float x, float y, bool down,
     nds_set_touch(touch_x, touch_y, true);
 }
 
+// The pointer position for nds_title_pointer_hover, from the same logical
+// coordinates and touchscreen rectangle as set_touch_from_mouse.
+void set_hover_from_mouse(float x, float y, bool hovering,
+                          NdsScreenLayout layout, int logical_width) {
+    const float bottom_origin =
+        layout == NdsScreenLayout::Separate ||
+                layout == NdsScreenLayout::Single
+            ? 0.0f : kScreenHeight;
+    const float left =
+        static_cast<float>((logical_width - kScreenWidth) / 2);
+    if (!hovering || x < left || x >= left + kScreenWidth ||
+        y < bottom_origin || y >= bottom_origin + kScreenHeight) {
+        nds_title_set_pointer_hover(0, 0, false);
+        return;
+    }
+    nds_title_set_pointer_hover(static_cast<int>(x - left),
+                                static_cast<int>(y - bottom_origin), true);
+}
+
 uint32_t audio_queue_count(const NdsAudioDevice& device, AudioQueue& queue) {
     if (!device) return 0;
 #if defined(NDS_HAVE_SDL3)
@@ -4595,6 +4614,30 @@ int nds_run_interactive_frontend(const NdsFrontendOptions& initial_options) {
                 set_touch_from_mouse(event.motion.x, event.motion.y, true,
                                      options.screen_layout,
                                      bottom_logical_width);
+            // The pointer over the touchscreen with no button held, for
+            // titles that highlight the menu entry under it.
+            if (event.type == SDL_MOUSEMOTION ||
+                event.type == SDL_MOUSEBUTTONDOWN ||
+                event.type == SDL_MOUSEBUTTONUP) {
+                const bool motion = event.type == SDL_MOUSEMOTION;
+                const uint32_t window = motion ? event.motion.windowID
+                                               : event.button.windowID;
+                const bool touchscreen_shown =
+                    !presentation.single || presentation.shown_screen == 1 ||
+                    presentation.inset_percent > 0;
+                const bool hovering =
+                    window == presentation.window_ids[1] &&
+                    touchscreen_shown && !mouse_down &&
+                    !touch_release_pending && !relative_mouse.captured() &&
+                    !virtual_stylus_active() &&
+                    (motion ? event.motion.state == 0
+                            : event.type == SDL_MOUSEBUTTONUP &&
+                                  SDL_GetMouseState(nullptr, nullptr) == 0);
+                set_hover_from_mouse(
+                    motion ? event.motion.x : event.button.x,
+                    motion ? event.motion.y : event.button.y, hovering,
+                    options.screen_layout, bottom_logical_width);
+            }
             if (event.type == SDL_MOUSEMOTION &&
                 virtual_stylus_active() &&
                 (event.motion.windowID == presentation.window_ids[0] ||
@@ -4645,6 +4688,9 @@ int nds_run_interactive_frontend(const NdsFrontendOptions& initial_options) {
                 else
                     nds_set_touch(0, 0, false);
             }
+            if (sdl_window_event_is(event, SDL_EVENT_WINDOW_MOUSE_LEAVE) &&
+                event.window.windowID == presentation.window_ids[1])
+                nds_title_set_pointer_hover(0, 0, false);
         }
         if (focus_release_pending) {
             if (!any_presentation_window_focused()) {
