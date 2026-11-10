@@ -1671,23 +1671,36 @@ uint64_t ns_since(std::chrono::steady_clock::time_point a,
 // host will decide after the frame, from what is known now; a frame that
 // stands HD down anyway shows a fallback without 3D once, after which the
 // present counter stops the skipping. Capture never goes through here.
-bool hd_presents_3d_line(const LineJob& job) {
+// Frames by the first reason a line of theirs read the CPU raster instead:
+// 1 HD emit off or skybox fill, 2 no recent HD present, 3 wide output,
+// 4 engine A not on the HD screen, 5 capture, 6 display mode, 7 3D scroll,
+// 8 title policy, 9 a BG that is not text. Logged by nds_gpu2d_start_frame.
+uint32_t g_cpu_3d_reason_frames[10] = {};
+int g_frame_cpu_3d_reason = 0;
+
+int hd_line_reject(const LineJob& job) {
     const Unit& u = job.unit[0];
-    if (!g_hd_emit_enabled || g_adaptive_skybox_fill ||
-        g_frames_since_hd_present > 2u ||
-        nds_gpu3d_output_width() != 256u ||
-        g_route_main_screen[job.buffer] != static_cast<uint8_t>(g_hd_screen))
-        return false;
+    if (!g_hd_emit_enabled || g_adaptive_skybox_fill) return 1;
+    if (g_frames_since_hd_present > 2u) return 2;
+    if (nds_gpu3d_output_width() != 256u) return 3;
+    if (g_route_main_screen[job.buffer] != static_cast<uint8_t>(g_hd_screen))
+        return 4;
     if (job.cap || g_frame_capture_active || u.capture_latch ||
         (u.capture & 0x80000000u))
-        return false;
-    if (((u.dispcnt >> 16) & 3u) != 1u || nds_gpu3d_render_xpos() != 0u ||
-        nds_title_patches_mph_adaptive_centered_native())
-        return false;
+        return 5;
+    if (((u.dispcnt >> 16) & 3u) != 1u) return 6;
+    if (nds_gpu3d_render_xpos() != 0u) return 7;
+    if (nds_title_patches_mph_adaptive_centered_native()) return 8;
     for (int bg = 1; bg < 4; ++bg)
         if ((u.dispcnt & (0x100u << bg)) && bg_kind(u, bg) != BgKind::Text)
-            return false;
-    return true;
+            return 9;
+    return 0;
+}
+
+bool hd_presents_3d_line(const LineJob& job) {
+    const int reject = hd_line_reject(job);
+    if (reject && !g_frame_cpu_3d_reason) g_frame_cpu_3d_reason = reject;
+    return reject == 0;
 }
 
 // Scheduler-thread latch. Everything a line render reads that a later guest
@@ -1771,7 +1784,11 @@ void latch_line(int y, LineJob& job) {
     // layer, or one the presenter shows from the HD raster, asks for
     // nothing, and the frame stays undrawn.
     bool wants_3d = true;
-    if (y == 0) g_frame_reads_cpu_3d = false;
+    if (y == 0) {
+        g_frame_reads_cpu_3d = false;
+        ++g_cpu_3d_reason_frames[g_frame_cpu_3d_reason];
+        g_frame_cpu_3d_reason = 0;
+    }
     if (engine_a_renders && (capture_uses_3d || job.bg0_3d)) {
         const bool hd_line = !capture_uses_3d && hd_presents_3d_line(job);
         if (!hd_line) g_frame_reads_cpu_3d = true;
@@ -2508,6 +2525,16 @@ void nds_gpu2d_start_frame(){
     g_direct_present_frame = g_direct_current_frame;
     g_present_capture_active = g_frame_capture_active;
     {
+        static uint32_t frames = 0;
+        if (g_hd_emit_enabled && ++frames % 1800u == 0u) {
+            const uint32_t* const r = g_cpu_3d_reason_frames;
+            std::fprintf(stderr,
+                "[gpu2d] frames reading CPU 3D, by reason: emit %u, no HD "
+                "present %u, wide %u, screen %u, capture %u, mode %u, "
+                "scroll %u, title %u, BG kind %u (none: %u)\n",
+                r[1], r[2], r[3], r[4], r[5], r[6], r[7], r[8], r[9], r[0]);
+            std::fill_n(g_cpu_3d_reason_frames, 10, 0u);
+        }
         const uint64_t serial =
             g_hd_present_serial.load(std::memory_order_relaxed);
         if (serial != g_hd_present_serial_seen)

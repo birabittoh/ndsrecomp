@@ -506,6 +506,7 @@ void plume_render_frame() {
 // renderer's own flag is the authority; this only keeps the line calls from
 // looking the renderer up.
 bool g_cpu_frame_deferred = false;
+uint32_t g_plume_zero_line[448] = {};
 
 melonDS::SoftRenderer* deferred_soft_renderer() {
     if (!g_cpu_frame_deferred) return nullptr;
@@ -1810,7 +1811,12 @@ bool nds_gpu3d_projection_has_perspective() {
 }
 
 const uint32_t* nds_gpu3d_wide_line(int line) {
-    nds_gpu3d_draw_deferred_frame(false);
+#if defined(NDS_USE_PLUME)
+    // Also read while a frame is presented, which is after the NEXT frame's
+    // VCount215: that must not start the next frame's draw. The line latch
+    // reads nds_gpu3d_line first, so a deferred frame here has no consumer.
+    if (deferred_soft_renderer()) return g_plume_zero_line;
+#endif
 #if defined(NDS_GPU3D_GL_BRIDGE)
     if (g_nds.GPU.GPU3D.IsRendererAccelerated()) {
         const uint32_t width = g_nds.GPU.GPU3D.GetRenderWidth();
@@ -1842,7 +1848,12 @@ const uint32_t* nds_gpu3d_wide_line(int line) {
 }
 
 const uint32_t* nds_gpu3d_wide_attr_line(int line) {
-    nds_gpu3d_draw_deferred_frame(false);
+#if defined(NDS_USE_PLUME)
+    // Also read while a frame is presented, which is after the NEXT frame's
+    // VCount215: that must not start the next frame's draw. The line latch
+    // reads nds_gpu3d_line first, so a deferred frame here has no consumer.
+    if (deferred_soft_renderer()) return g_plume_zero_line;
+#endif
 #if defined(NDS_GPU3D_GL_BRIDGE)
     if (g_nds.GPU.GPU3D.IsRendererAccelerated()) {
         const uint32_t width = g_nds.GPU.GPU3D.GetRenderWidth();
