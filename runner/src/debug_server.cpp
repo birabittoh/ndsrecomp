@@ -1718,6 +1718,11 @@ std::string handle(const std::string& line) {
                std::to_string(gpu3d.vcount215_calls) +
                ",\"getline_ns\":" + std::to_string(gpu3d.getline_ns) +
                ",\"getline_calls\":" + std::to_string(gpu3d.getline_calls) +
+               ",\"cpu3d_drawn\":" + std::to_string(gpu3d.cpu3d_drawn) +
+               ",\"cpu3d_skipped\":" + std::to_string(gpu3d.cpu3d_skipped) +
+               ",\"cpu3d_on_demand\":" +
+               std::to_string(gpu3d.cpu3d_on_demand) +
+               ",\"cpu3d_capture\":" + std::to_string(gpu3d.cpu3d_capture) +
                ",\"vcount144_ns\":" + std::to_string(gpu3d.vcount144_ns) +
                ",\"vcount144_calls\":" +
                std::to_string(gpu3d.vcount144_calls) +

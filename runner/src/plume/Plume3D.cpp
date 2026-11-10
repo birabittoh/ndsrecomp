@@ -1075,6 +1075,10 @@ void nds_plume3d_invalidate() {
     if (g_renderer) g_renderer->valid = false;
 }
 
+bool nds_plume3d_drawn() {
+    return g_renderer && g_renderer->valid && g_renderer->targets.output;
+}
+
 RenderTexture* nds_plume3d_output(uint32_t* width, uint32_t* height) {
     if (!g_renderer || !g_renderer->valid || !g_renderer->targets.output) return nullptr;
     if (width) *width = g_renderer->targets.width;

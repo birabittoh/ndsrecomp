@@ -40,3 +40,5 @@ void nds_plume3d_render(const melonDS::GPU& gpu, melonDS::Polygon* const* polygo
 // The 3D layer is empty (AbortFrame) or not ours to draw: the presenter
 // falls back to the CPU composite until the next nds_plume3d_render.
 void nds_plume3d_invalidate();
+// Whether the last nds_plume3d_render left a raster the presenter can use.
+bool nds_plume3d_drawn();

@@ -501,6 +501,71 @@ void plume_render_frame() {
     nds_plume3d_render(g_nds.GPU, list, count,
                        g_texture_flat_gen * 0x9E3779B97F4A7C15ull ^ g_texpal_flat_gen);
 }
+
+// True from a deferred VCount215 until the frame is drawn or dropped. The
+// renderer's own flag is the authority; this only keeps the line calls from
+// looking the renderer up.
+bool g_cpu_frame_deferred = false;
+
+melonDS::SoftRenderer* deferred_soft_renderer() {
+    if (!g_cpu_frame_deferred) return nullptr;
+    auto* soft = dynamic_cast<melonDS::SoftRenderer*>(
+        &g_nds.GPU.GPU3D.GetCurrentRenderer());
+    if (soft && soft->FrameDeferred()) return soft;
+    g_cpu_frame_deferred = false;  // drawn or replaced behind our back
+    return nullptr;
+}
+
+// VCount215 for the Plume build. When the Plume raster is what gets
+// presented, the soft renderer only latches its frame (flat texture views
+// included, which the Plume draw needs as well) and draws it if a consumer
+// that has to match the hardware turns up: see nds_gpu3d_cpu_frame_deferred.
+void plume_vcount215() {
+    auto& g3 = g_nds.GPU.GPU3D;
+    auto* soft = dynamic_cast<melonDS::SoftRenderer*>(&g3.GetCurrentRenderer());
+    g_cpu_frame_deferred = false;
+    if (!soft || !nds_plume3d_ready() || g_internal_scale <= 1u || g3.AbortFrame) {
+        ++g_gpu3d_profile.cpu3d_drawn;
+        g3.VCount215(g_nds.GPU);
+        plume_render_frame();
+        return;
+    }
+    soft->DeferFrame(g_nds.GPU);
+    plume_render_frame();
+    if (nds_plume3d_drawn()) {
+        g_cpu_frame_deferred = true;
+        return;
+    }
+    // No raster to present (a mode the Plume passes do not draw, a rebuild):
+    // the CPU composite is shown, so it gets its 3D now.
+    soft->RenderDeferredFrame(g_nds.GPU);
+    ++g_gpu3d_profile.cpu3d_drawn;
+}
+
+// Before GPU3D::VBlank latches the next list: a deferred frame nobody read
+// can no longer be drawn.
+void plume_drop_deferred_frame() {
+    if (auto* soft = deferred_soft_renderer()) {
+        soft->DropDeferredFrame();
+        ++g_gpu3d_profile.cpu3d_skipped;
+    }
+    g_cpu_frame_deferred = false;
+    // How often the game really needs the CPU raster, without a profiler.
+    static uint64_t vblanks = 0;
+    static NdsGpu3dProfile last{};
+    if (++vblanks % 1800u != 0u) return;
+    const NdsGpu3dProfile& now = g_gpu3d_profile;
+    if (now.cpu3d_skipped != last.cpu3d_skipped ||
+        now.cpu3d_on_demand != last.cpu3d_on_demand)
+        std::fprintf(stderr,
+            "[gpu3d] CPU 3D over 1800 frames: %llu skipped, %llu drawn at "
+            "VCount215, %llu drawn on demand (%llu for capture)\n",
+            (unsigned long long)(now.cpu3d_skipped - last.cpu3d_skipped),
+            (unsigned long long)(now.cpu3d_drawn - last.cpu3d_drawn),
+            (unsigned long long)(now.cpu3d_on_demand - last.cpu3d_on_demand),
+            (unsigned long long)(now.cpu3d_capture - last.cpu3d_capture));
+    last = now;
+}
 #endif
 
 void profile_add(uint64_t& dst, ProfileClock::time_point start) {
@@ -1564,6 +1629,9 @@ void nds_gpu3d_vblank() {
     auto& g3 = g_nds.GPU.GPU3D;
     // VBlank consumes a SWAP_BUFFERS whenever geometry is on, shown or not.
     const bool flushed = g3.GeometryEnabled && g3.FlushRequest;
+#if defined(NDS_USE_PLUME)
+    plume_drop_deferred_frame();
+#endif
     g3.VBlank();
 #if defined(NDS_USE_PLUME)
     // The soft renderer stays faithful; only the Plume raster shows the
@@ -1596,12 +1664,13 @@ void nds_gpu3d_vcount215() {
         compute_finish_readback();
 #endif
     if (!profiling()) {
+#if defined(NDS_USE_PLUME)
+        plume_vcount215();
+#else
         g_nds.GPU.GPU3D.VCount215(g_nds.GPU);
+#endif
 #if defined(NDS_USE_NATIVE_GL)
         latch_capture_reference();
-#endif
-#if defined(NDS_USE_PLUME)
-        plume_render_frame();
 #endif
 #if defined(NDS_GPU3D_GL_BRIDGE)
         if (g_nds.GPU.GPU3D.IsRendererAccelerated() &&
@@ -1616,12 +1685,13 @@ void nds_gpu3d_vcount215() {
         return;
     }
     const auto start = ProfileClock::now();
+#if defined(NDS_USE_PLUME)
+    plume_vcount215();
+#else
     g_nds.GPU.GPU3D.VCount215(g_nds.GPU);
+#endif
 #if defined(NDS_USE_NATIVE_GL)
     latch_capture_reference();
-#endif
-#if defined(NDS_USE_PLUME)
-    plume_render_frame();
 #endif
 #if defined(NDS_GPU3D_GL_BRIDGE)
     if (g_nds.GPU.GPU3D.IsRendererAccelerated() &&
@@ -1638,6 +1708,27 @@ void nds_gpu3d_vcount215() {
 #endif
 }
 
+bool nds_gpu3d_cpu_frame_deferred() {
+#if defined(NDS_USE_PLUME)
+    return deferred_soft_renderer() != nullptr;
+#else
+    return false;
+#endif
+}
+
+void nds_gpu3d_draw_deferred_frame(bool for_capture) {
+#if defined(NDS_USE_PLUME)
+    auto* soft = deferred_soft_renderer();
+    if (!soft) return;
+    g_cpu_frame_deferred = false;
+    soft->RenderDeferredFrame(g_nds.GPU);
+    ++g_gpu3d_profile.cpu3d_on_demand;
+    if (for_capture) ++g_gpu3d_profile.cpu3d_capture;
+#else
+    (void)for_capture;
+#endif
+}
+
 const uint32_t* nds_gpu3d_capture_line(int line) {
 #if defined(NDS_USE_NATIVE_GL)
     // Keep using the latched reference across a host-only fallback or HD
@@ -1650,6 +1741,7 @@ const uint32_t* nds_gpu3d_capture_line(int line) {
 }
 
 const uint32_t* nds_gpu3d_line(int line) {
+    nds_gpu3d_draw_deferred_frame(false);
 #if defined(NDS_GPU3D_GL_BRIDGE)
     if (g_nds.GPU.GPU3D.IsRendererAccelerated()) {
         const uint32_t width = g_nds.GPU.GPU3D.GetRenderWidth();
@@ -1714,6 +1806,7 @@ bool nds_gpu3d_projection_has_perspective() {
 }
 
 const uint32_t* nds_gpu3d_wide_line(int line) {
+    nds_gpu3d_draw_deferred_frame(false);
 #if defined(NDS_GPU3D_GL_BRIDGE)
     if (g_nds.GPU.GPU3D.IsRendererAccelerated()) {
         const uint32_t width = g_nds.GPU.GPU3D.GetRenderWidth();
@@ -1745,6 +1838,7 @@ const uint32_t* nds_gpu3d_wide_line(int line) {
 }
 
 const uint32_t* nds_gpu3d_wide_attr_line(int line) {
+    nds_gpu3d_draw_deferred_frame(false);
 #if defined(NDS_GPU3D_GL_BRIDGE)
     if (g_nds.GPU.GPU3D.IsRendererAccelerated()) {
         const uint32_t width = g_nds.GPU.GPU3D.GetRenderWidth();
