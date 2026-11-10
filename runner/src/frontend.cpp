@@ -3392,7 +3392,7 @@ int nds_run_interactive_frontend(const NdsFrontendOptions& initial_options) {
          "New 3D images per second in the corner of the screen, updated "
          "once a second. Reads 0 when nothing 3D is moving.",
          RECOMP_RUNTIME_UI_BOOL, 0, 1, 1, nullptr, 0, nullptr},
-        {kRuntimeSmooth3dKey, "Display", "Smooth 3D (experimental)",
+        {kRuntimeSmooth3dKey, "Display", "Smooth 3D",
          "Blends in-between 3D images for games that draw below 60. Shows 3D "
          "one frame later; may glitch.",
          RECOMP_RUNTIME_UI_BOOL, 0, 1, 1, nullptr, 0, nullptr},
