@@ -28,6 +28,7 @@
 #include "ComputeHost.h"
 
 #include <algorithm>
+#include <cmath>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -115,8 +116,9 @@ constexpr uint32_t kHdRowPitch = kMaxWidth * 16u;   // 7168, a multiple of 256
 constexpr uint64_t kHdImageBytes = uint64_t(kHdRowPitch) * kHeight;
 
 // The images one present uploads: the shown LCD, the other one as the
-// single-screen inset, and the frontend overlay (stylus, notices, FPS).
-enum Image : uint32_t { kMain, kInset, kOverlay, kImageCount };
+// single-screen inset, the frontend overlay (stylus, notices, FPS), and an
+// optional layer image drawn into a sub-rect of the main one.
+enum Image : uint32_t { kMain, kInset, kOverlay, kLayer, kImageCount };
 
 struct ImageSlot {
     std::unique_ptr<RenderTexture> texture;
@@ -185,6 +187,12 @@ NdsWindowMode g_window_mode = NdsWindowMode::Letterbox;
 NdsScalingFilter g_scaling = NdsScalingFilter::Integer;
 const uint32_t* g_overlay_pixels = nullptr;
 unsigned g_overlay_width = 0;
+// nds_compute_host_set_layer: the layer, the image without it, and where
+// the layer goes, as fractions of the main rect.
+const uint32_t* g_layer_pixels = nullptr;
+const uint32_t* g_layer_base = nullptr;
+unsigned g_layer_width = 0;
+float g_layer_rect[4] = {};
 const uint32_t* g_inset_pixels = nullptr;
 unsigned g_inset_width = 0;
 int g_inset_percent = 0;
@@ -908,6 +916,26 @@ void nds_compute_host_set_overlay(const uint32_t* argb, unsigned width)
     g_overlay_width = g_overlay_pixels ? width : 0;
 }
 
+bool nds_compute_host_supports_layer()
+{
+    return true;
+}
+
+void nds_compute_host_set_layer(const uint32_t* layer, const uint32_t* base,
+                                unsigned width, float x, float y, float w,
+                                float h)
+{
+    const bool shown = layer && base && width > 0 && width <= kMaxWidth &&
+                       w > 0.0f && h > 0.0f;
+    g_layer_pixels = shown ? layer : nullptr;
+    g_layer_base = shown ? base : nullptr;
+    g_layer_width = shown ? width : 0;
+    g_layer_rect[0] = x;
+    g_layer_rect[1] = y;
+    g_layer_rect[2] = w;
+    g_layer_rect[3] = h;
+}
+
 void nds_compute_host_set_inset(const uint32_t* argb, unsigned width,
                                 int percent)
 {
@@ -979,7 +1007,12 @@ bool nds_compute_host_present_top(const unsigned int* fallback_pixels,
     if (!staging) return false;
     const bool inset = g_inset_pixels != nullptr;
     const bool overlay = g_overlay_pixels != nullptr;
-    bool staged = hd_active || stage_image(slot, staging, kMain, fallback_pixels, width);
+    // The layer goes with an image of the same width that lacks it.
+    const bool layer = g_layer_pixels != nullptr && int(g_layer_width) == width;
+    const uint32_t* main_pixels = layer ? g_layer_base : fallback_pixels;
+    bool staged = hd_active || stage_image(slot, staging, kMain, main_pixels, width);
+    if (staged && layer)
+        staged = stage_image(slot, staging, kLayer, g_layer_pixels, width);
     if (staged && inset)
         staged = stage_image(slot, staging, kInset, g_inset_pixels, int(g_inset_width));
     if (staged && overlay)
@@ -1021,6 +1054,7 @@ bool nds_compute_host_present_top(const unsigned int* fallback_pixels,
     if (!hd_active) record_upload(slot, kMain);
     if (inset) record_upload(slot, kInset);
     if (overlay) record_upload(slot, kOverlay);
+    if (layer) record_upload(slot, kLayer);
     if (hd_active) record_hd_upload(slot);
     if (compose_offscreen) {
         RenderTexture* target = slot.compose.texture.get();
@@ -1068,6 +1102,23 @@ bool nds_compute_host_present_top(const unsigned int* fallback_pixels,
              int(kHeight) >= 2 * rect.h);
         record_blit(slot, kMain, rect, bilinear && !box_resolve,
                     box_resolve ? kBlitBoxResolve : 0u, fb_width, fb_height);
+    }
+    if (layer) {
+        // Size and position each rounded to whole drawable pixels, so a
+        // layer drawn at an integer magnification stays pixel exact
+        // wherever it sits.
+        const auto pixels = [](int size, float fraction) {
+            return int(std::lround(double(size) * fraction));
+        };
+        const NdsPresentRect layer_rect{
+            rect.x + pixels(rect.w, g_layer_rect[0]),
+            rect.y + pixels(rect.h, g_layer_rect[1]),
+            std::max(pixels(rect.w, g_layer_rect[2]), 1),
+            std::max(pixels(rect.h, g_layer_rect[3]), 1)};
+        // The main filter. No box resolve: it would average the colour of
+        // transparent texels into the edges of a straight-alpha image.
+        record_blit(slot, kLayer, layer_rect, bilinear, kBlitKeepAlpha,
+                    fb_width, fb_height);
     }
     if (inset && layout.inset.w > 0 && layout.inset.h > 0) {
         // Point sampling a shrunk inset drops whole rows of text.

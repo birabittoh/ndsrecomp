@@ -2607,6 +2607,22 @@ struct OwnedPresentationFrame {
 };
 #endif
 
+#if defined(NDS_HAVE_COMPUTE_RENDERER)
+// Hands the presenter this frame's fixed-size layers, if gpu2d split them:
+// the layer at its scale about its native anchor, and the image without it.
+// Returns whether it did; the caller clears it after the present.
+bool set_fixed_layers(int width) {
+    NdsGpu2dFixedLayersFrame fixed{};
+    if (width != 256 || !nds_gpu2d_fixed_layers_frame(&fixed)) return false;
+    const float s = fixed.scale;
+    nds_compute_host_set_layer(fixed.layer, fixed.base, 256u,
+                               float(fixed.anchor_x) / 256.0f * (1.0f - s),
+                               float(fixed.anchor_y) / 192.0f * (1.0f - s),
+                               s, s);
+    return true;
+}
+#endif
+
 // One separate-layout window: clear, draw its screen into the presentation
 // rect, then the overlays that belong to it. Does not present.
 void draw_separate_screen(FrontendPresentation& presentation, int screen,
@@ -2694,12 +2710,16 @@ PresentationTicks present_single_screen(FrontendPresentation& presentation,
         nds_compute_host_set_inset(other_pixels,
                                    static_cast<unsigned>(other_width),
                                    presentation.inset_percent);
+        // An open menu is drawn into `pixels`, the full composite, and has
+        // already dropped the split along with the HD surfaces.
+        if (!menu_open && !direct) set_fixed_layers(width);
         const bool ok = nds_compute_host_present_top(
             pixels, static_cast<uint16_t>(width),
             direct ? &direct_frame : nullptr, &gl_ticks,
             presentation.antialiasing);
         nds_compute_host_set_overlay(nullptr, 0);
         nds_compute_host_set_inset(nullptr, 0, 0);
+        nds_compute_host_set_layer(nullptr, nullptr, 0, 0, 0, 0, 0);
         if (!ok) {
             std::fprintf(stderr, "[gpu3d] single-screen presentation failed\n");
             ticks.ok = false;
@@ -2784,10 +2804,13 @@ PresentationTicks present_screens(FrontendPresentation& presentation,
                                           presentation.scaling);
         nds_compute_host_set_raster_request(presentation.resolution_scale,
                                             presentation.internal_resolution);
-        if (!nds_compute_host_present_top(
+        if (!owned && !direct) set_fixed_layers(top_width);
+        const bool top_ok = nds_compute_host_present_top(
                 top_pixels, static_cast<uint16_t>(top_width),
                 direct ? &direct_frame : nullptr, &gl_ticks,
-                presentation.antialiasing,owned)) {
+                presentation.antialiasing,owned);
+        nds_compute_host_set_layer(nullptr, nullptr, 0, 0, 0, 0, 0);
+        if (!top_ok) {
             std::fprintf(stderr, "[gpu3d] direct top presentation failed\n");
             ticks.ok = false;
             return ticks;
@@ -5134,12 +5157,20 @@ int nds_run_interactive_frontend(const NdsFrontendOptions& initial_options) {
             const bool native_hd=presentation.gl_top && nds_gpu3d_internal_scale()>1u &&
                                  nds_gpu3d_output_width()==256u;
             direct_present=nds_gpu2d_direct_present_frame_active();
+            // Fixed-size layers are split only for a presenter that draws
+            // them: the GPU host's window, for engine A's LCD (hd_screen,
+            // also at 1x, without HD).
+#if defined(NDS_HAVE_COMPUTE_RENDERER)
+            nds_gpu2d_set_fixed_layers_consumer(
+                presentation.gl_top && nds_compute_host_supports_layer());
+#endif
+            const bool fixed_layers=nds_gpu2d_fixed_layers_requested();
             if (((options.adaptive_screens & NDS_ADAPTIVE_TOP) ||
-                 (native_hd && hd_screen == 0)) && !direct_present)
+                 ((native_hd || fixed_layers) && hd_screen == 0)) && !direct_present)
                 top_pixels=nds_gpu2d_adaptive_framebuffer(0,&top_width);
             else if (direct_present) top_width=nds_gpu3d_output_width();
             if ((options.adaptive_screens & NDS_ADAPTIVE_BOTTOM) ||
-                (native_hd && hd_screen == 1))
+                ((native_hd || fixed_layers) && hd_screen == 1))
                 bottom_pixels=nds_gpu2d_adaptive_framebuffer(1,&bottom_width);
             phase_adaptive_ticks+=SDL_GetPerformanceCounter()-adaptive_start;
             observe_top_black_bands(native_top,shown_frames);

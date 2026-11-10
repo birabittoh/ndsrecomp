@@ -487,6 +487,17 @@ void nds_compute_host_set_overlay(const uint32_t* argb, unsigned width)
     g_overlay_width = g_overlay_pixels ? width : 0;
 }
 
+// The GL presenter has no layer pass; the frontend keeps the full composite.
+bool nds_compute_host_supports_layer()
+{
+    return false;
+}
+
+void nds_compute_host_set_layer(const uint32_t*, const uint32_t*, unsigned,
+                                float, float, float, float)
+{
+}
+
 void nds_compute_host_set_inset(const uint32_t* argb, unsigned width,
                                 int percent)
 {

@@ -176,6 +176,48 @@ void nds_gpu2d_note_owned_hd_presented();
 // 3D against a stale 2D stack and stale blend registers.
 void nds_gpu2d_invalidate_hd_frame();
 
+// Fixed-size 2D layers (presentation only, never guest-visible).
+//
+// A title names engine A text BGs (bg_mask bit n = BGn, n = 1..3) that hold
+// its windows. On a presenter that can draw a layer image, engine A's LCD
+// (the HD screen, nds_gpu2d_set_hd_screen) is then presented split: those
+// BGs alone into a straight-alpha image, shown at `scale` of the game rect
+// about the native point
+// (anchor_x, anchor_y), and the rest of the stack without them (the CPU
+// image and the HD surfaces alike). The guest framebuffer, display capture
+// and nds_gpu2d_framebuffer() keep the full composite.
+//
+// The split is exact for alpha blending only when EVA + EVB = 16 (then
+// EVA*A + EVB*B is A at alpha EVA/16 over B); a frame whose masked BGs
+// would need another blend is presented unsplit. A masked BG is drawn over
+// every unmasked layer, so an unmasked layer above it (an OBJ) would be
+// hidden where they overlap. Native aspect only (output width 256), and
+// not combined with the adaptive HUD anchor.
+//
+// bg_mask 0 or scale >= 1 turns it off. Title thread; latched by the
+// adaptive compositor when it runs for the frame.
+void nds_gpu2d_set_fixed_size_layers(uint8_t bg_mask, float scale,
+                                     uint16_t anchor_x, uint16_t anchor_y);
+// Frontend: whether this frame's presenter will draw the layer image
+// (nds_compute_host_supports_layer() on the path that presents engine A's
+// LCD). Without a consumer nothing is split.
+void nds_gpu2d_set_fixed_layers_consumer(bool enabled);
+// True when the next adaptive composite of the HD screen would split, so the
+// frontend has to run nds_gpu2d_adaptive_framebuffer() even at 1x.
+bool nds_gpu2d_fixed_layers_requested();
+struct NdsGpu2dFixedLayersFrame {
+    const uint32_t* base;   // 256 x 192, 0xFFRRGGBB: the stack without them
+    const uint32_t* layer;  // 256 x 192, straight alpha ARGB: them alone
+    float scale;
+    uint16_t anchor_x;      // native pixels
+    uint16_t anchor_y;
+};
+// Valid only after nds_gpu2d_adaptive_framebuffer() has run for this
+// frame; cleared by nds_gpu2d_invalidate_hd_frame(). When valid, the HD
+// surfaces of the same frame lack the masked BGs too, so a presenter that
+// uses either must draw the layer.
+bool nds_gpu2d_fixed_layers_frame(NdsGpu2dFixedLayersFrame* out);
+
 void nds_gpu2d_set_direct_present(bool enabled);
 void nds_gpu2d_set_direct_windows(bool enabled);
 bool nds_gpu2d_direct_frame_active();
