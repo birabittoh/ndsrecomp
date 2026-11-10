@@ -995,6 +995,42 @@ SDL_GameController* open_first_controller() {
 #endif
 }
 
+// The fixed-size layers (a title's UI shrunk by nds_gpu2d_set_fixed_size_layers)
+// as the touchscreen last showed them: scale 1 when it showed none. The
+// shrunken layer is where the player sees (and points at) the menus, so the
+// mouse has to be mapped back through it to reach the DS coordinates the
+// guest's UI uses. Written by the presenter, read by the event loop.
+std::atomic<float> g_touch_ui_scale{1.0f};
+std::atomic<float> g_touch_ui_anchor_x{0.0f};
+std::atomic<float> g_touch_ui_anchor_y{0.0f};
+
+// Maps a point on the touchscreen (DS pixels, as displayed) back to the DS
+// pixel of the unscaled layer under it. False when the point is outside the
+// DS screen after the mapping, which is where the shrunken UI has nothing.
+bool touch_ui_unscale(float* x, float* y) {
+    const float s = g_touch_ui_scale.load(std::memory_order_relaxed);
+    if (s >= 1.0f || s <= 0.0f) return true;
+    const float ax = g_touch_ui_anchor_x.load(std::memory_order_relaxed);
+    const float ay = g_touch_ui_anchor_y.load(std::memory_order_relaxed);
+    // Something the title draws at its native place (DQ9's Menu button) is
+    // hit where it is shown, unless the shrunken UI is shown there too.
+    int rx0, ry0, rx1, ry1;
+    if (nds_title_unscaled_touch_rect(&rx0, &ry0, &rx1, &ry1) &&
+        *x >= float(rx0) && *x < float(rx1) &&
+        *y >= float(ry0) && *y < float(ry1)) {
+        const float inside_x0 = ax * (1.0f - s);
+        const float inside_y0 = ay * (1.0f - s);
+        const bool in_scaled = *x >= inside_x0 &&
+            *x < inside_x0 + kScreenWidth * s && *y >= inside_y0 &&
+            *y < inside_y0 + kScreenHeight * s;
+        if (!in_scaled) return true;
+    }
+    *x = ax + (*x - ax) / s;
+    *y = ay + (*y - ay) / s;
+    return *x >= 0.0f && *x < kScreenWidth && *y >= 0.0f &&
+           *y < kScreenHeight;
+}
+
 void set_touch_from_mouse(float x, float y, bool down,
                           NdsScreenLayout layout, int logical_width) {
     // Coordinates are expected in the renderer's logical DS-space.
@@ -1009,10 +1045,16 @@ void set_touch_from_mouse(float x, float y, bool down,
         nds_set_touch(0, 0, false);
         return;
     }
+    float ds_x = x - left;
+    float ds_y = y - bottom_origin;
+    if (!touch_ui_unscale(&ds_x, &ds_y)) {
+        nds_set_touch(0, 0, false);
+        return;
+    }
     const auto touch_x = static_cast<uint16_t>(std::clamp<int>(
-        static_cast<int>(x - left), 0, kScreenWidth - 1));
+        static_cast<int>(ds_x), 0, kScreenWidth - 1));
     const auto touch_y = static_cast<uint16_t>(std::clamp<int>(
-        static_cast<int>(y - bottom_origin), 0, kScreenHeight - 1));
+        static_cast<int>(ds_y), 0, kScreenHeight - 1));
     nds_set_touch(touch_x, touch_y, true);
 }
 
@@ -1031,8 +1073,14 @@ void set_hover_from_mouse(float x, float y, bool hovering,
         nds_title_set_pointer_hover(0, 0, false);
         return;
     }
-    nds_title_set_pointer_hover(static_cast<int>(x - left),
-                                static_cast<int>(y - bottom_origin), true);
+    float ds_x = x - left;
+    float ds_y = y - bottom_origin;
+    if (!touch_ui_unscale(&ds_x, &ds_y)) {
+        nds_title_set_pointer_hover(0, 0, false);
+        return;
+    }
+    nds_title_set_pointer_hover(static_cast<int>(ds_x),
+                                static_cast<int>(ds_y), true);
 }
 
 uint32_t audio_queue_count(const NdsAudioDevice& device, AudioQueue& queue) {
@@ -2720,7 +2768,16 @@ PresentationTicks present_single_screen(FrontendPresentation& presentation,
                                    presentation.inset_percent);
         // An open menu is drawn into `pixels`, the full composite, and has
         // already dropped the split along with the HD surfaces.
-        if (!menu_open && !direct) set_fixed_layers(width);
+        const bool layer_set = !menu_open && !direct && set_fixed_layers(width);
+        NdsGpu2dFixedLayersFrame fixed_shown{};
+        if (layer_set && shown == 1 &&
+            nds_gpu2d_fixed_layers_frame(&fixed_shown)) {
+            g_touch_ui_anchor_x.store(float(fixed_shown.anchor_x));
+            g_touch_ui_anchor_y.store(float(fixed_shown.anchor_y));
+            g_touch_ui_scale.store(fixed_shown.scale);
+        } else {
+            g_touch_ui_scale.store(1.0f);
+        }
         const bool ok = nds_compute_host_present_top(
             pixels, static_cast<uint16_t>(width),
             direct ? &direct_frame : nullptr, &gl_ticks,
@@ -2812,6 +2869,7 @@ PresentationTicks present_screens(FrontendPresentation& presentation,
                                           presentation.scaling);
         nds_compute_host_set_raster_request(presentation.resolution_scale,
                                             presentation.internal_resolution);
+        g_touch_ui_scale.store(1.0f);  // the touchscreen has its own window
         if (!owned && !direct) set_fixed_layers(top_width);
         const bool top_ok = nds_compute_host_present_top(
                 top_pixels, static_cast<uint16_t>(top_width),

@@ -61,6 +61,14 @@ bool nds_title_pointer_hover(int* x, int* y);
 // For the frontend: on mouse motion and button changes.
 void nds_title_set_pointer_hover(int x, int y, bool hovering);
 
+// A rectangle of the touchscreen (DS pixels, x0..x1 and y0..y1 exclusive)
+// that a title draws at its native place while it scales the rest of its UI
+// down (nds_gpu2d_set_fixed_size_layers): a touch there is not mapped back
+// through the scale, and only where the scaled UI is not. An empty rectangle
+// (the default) is none. The title thread sets it, the frontend reads it.
+void nds_title_set_unscaled_touch_rect(int x0, int y0, int x1, int y1);
+bool nds_title_unscaled_touch_rect(int* x0, int* y0, int* x1, int* y1);
+
 // For the frontend.
 size_t nds_title_setting_count();
 const NdsTitleSetting* nds_title_setting_at(int id);
