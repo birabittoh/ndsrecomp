@@ -96,3 +96,25 @@ void nds_title_set_pointer_hover(int x, int y, bool hovering) {
     g_pointer_hover.store(hovering ? (y << 16 | x) : -1,
                           std::memory_order_relaxed);
 }
+
+namespace {
+std::atomic<uint64_t> g_unscaled_touch_rect{0};
+}  // namespace
+
+void nds_title_set_unscaled_touch_rect(int x0, int y0, int x1, int y1) {
+    auto clamp = [](int v) {
+        return static_cast<uint64_t>(v < 0 ? 0 : v > 0xFFFF ? 0xFFFF : v);
+    };
+    g_unscaled_touch_rect.store(
+        clamp(x0) | clamp(y0) << 16 | clamp(x1) << 32 | clamp(y1) << 48,
+        std::memory_order_relaxed);
+}
+
+bool nds_title_unscaled_touch_rect(int* x0, int* y0, int* x1, int* y1) {
+    const uint64_t p = g_unscaled_touch_rect.load(std::memory_order_relaxed);
+    *x0 = static_cast<int>(p & 0xFFFF);
+    *y0 = static_cast<int>(p >> 16 & 0xFFFF);
+    *x1 = static_cast<int>(p >> 32 & 0xFFFF);
+    *y1 = static_cast<int>(p >> 48 & 0xFFFF);
+    return *x1 > *x0 && *y1 > *y0;
+}
