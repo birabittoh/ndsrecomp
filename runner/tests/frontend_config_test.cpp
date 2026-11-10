@@ -78,6 +78,23 @@ static bool settings_file_test() {
     options.expected_rom_sha1 = "kept";
     ok = ok && nds_load_settings_file(path.string(), &options, &error) &&
          options.expected_rom_sha1 == "kept";
+
+    // [title] values layer in file order; the frontend applies them.
+    {
+        std::ofstream out(path);
+        out << "[title]\ncamera_distance = 150\nflag = true\n";
+    }
+    options.title_settings = {{"camera_distance", 100}};
+    ok = ok && nds_load_settings_file(path.string(), &options, &error) &&
+         options.title_settings.size() == 3 &&
+         options.title_settings[1].first == "camera_distance" &&
+         options.title_settings[1].second == 150 &&
+         options.title_settings[2].second == 1;
+    {
+        std::ofstream out(path);
+        out << "[title]\ncamera_distance = \"far\"\n";
+    }
+    ok = ok && !nds_load_settings_file(path.string(), &options, &error);
     std::filesystem::remove(path);
     return ok;
 }

@@ -39,6 +39,7 @@
 #include "savestate_slots.h"
 #include "spu.h"
 #include "title_patches.h"
+#include "title_settings.h"
 #include "wifi_net.h"
 #if defined(NDS_HAVE_COMPUTE_RENDERER)
 #include "melonds_compute/ComputeHost.h"
@@ -1241,6 +1242,8 @@ constexpr const char* kRuntimeShowFpsKey = "display.show_fps";
 constexpr const char* kRuntimeSmooth3dKey = "display.smooth_3d";
 constexpr const char* kRuntimeVolumeKey = "audio.volume";
 constexpr const char* kRuntimeMuteKey = "audio.mute";
+// Rows for the title's own settings (title_settings.h): "title.<key>".
+constexpr const char* kRuntimeTitlePrefix = "title.";
 constexpr const char* kRuntimeResumeKey = "system.resume";
 constexpr const char* kRuntimeQuitKey = "system.quit";
 
@@ -1256,6 +1259,13 @@ struct RuntimeMenuState {
     AudioQueue* audio_queue = nullptr;
     RecompRuntimeUi* ui = nullptr;  // for confirm prompts and status text
 };
+
+// The title setting behind a "title.<key>" row, or -1.
+int runtime_menu_title_setting(const RecompRuntimeUiItem* item) {
+    const size_t prefix = std::strlen(kRuntimeTitlePrefix);
+    if (std::strncmp(item->key, kRuntimeTitlePrefix, prefix) != 0) return -1;
+    return nds_title_setting_find(item->key + prefix);
+}
 
 // Rewrites (or appends) each key=value pair in the launcher-owned settings
 // file, keeping every other line as it was.
@@ -1312,6 +1322,10 @@ int runtime_menu_get_value(void* context, const RecompRuntimeUiItem* item,
     if (nds_netplay_menu_owns(item))
         return nds_netplay_menu_get_value(item, value_out);
 #endif
+    if (const int title = runtime_menu_title_setting(item); title >= 0) {
+        *value_out = nds_title_setting_value(title);
+        return 1;
+    }
     if (std::strcmp(item->key, kRuntimeMouseSensitivityKey) == 0) {
         *value_out = state->options->relative_mouse_sensitivity;
         return 1;
@@ -1374,6 +1388,12 @@ int runtime_menu_set_value(void* context, const RecompRuntimeUiItem* item,
     if (nds_netplay_menu_owns(item))
         return nds_netplay_menu_set_value(item, value);
 #endif
+    if (const int title = runtime_menu_title_setting(item); title >= 0) {
+        if (!nds_title_setting_set(title, value)) return 0;
+        std::fprintf(stderr, "[title] %s -> %d\n",
+                     nds_title_setting_at(title)->key, value);
+        return 1;
+    }
     if (std::strcmp(item->key, kRuntimeMouseSensitivityKey) == 0) {
         if (value < 10 || value > 400) return 0;
         state->options->relative_mouse_sensitivity =
@@ -1534,6 +1554,11 @@ void runtime_menu_save(void* context) {
     // The two are exclusive in TOML unless the scale is off.
     if (options.resolution_scale != 0)
         updates.push_back({"display", "internal_resolution", "", true});
+    for (size_t i = 0; i < nds_title_setting_count(); ++i) {
+        const int id = static_cast<int>(i);
+        updates.push_back({"title", nds_title_setting_at(id)->key,
+                           std::to_string(nds_title_setting_value(id))});
+    }
     if (options.relative_mouse_touch)
         updates.push_back({"controls", "mouse_sensitivity",
                            std::to_string(options.relative_mouse_sensitivity)});
@@ -1893,6 +1918,27 @@ NdsPresentRect window_present_rect(const FrontendPresentation& presentation,
                                  presentation.inset_percent).main;
     return nds_present_rect(presentation.window_mode, presentation.scaling,
                             drawable_w, drawable_h, content_w, content_h);
+}
+
+// How tall window 0 shows the main DS screen, in window points
+// (nds_title_display_height). 0 when it cannot tell, e.g. minimized.
+int presented_screen_points(const FrontendPresentation& presentation) {
+    if (!presentation.windows[0]) return 0;
+    int drawable_w = 0, drawable_h = 0;
+    window_drawable_size(presentation, 0, &drawable_w, &drawable_h);
+    int content_w = 0, content_h = 0;
+    window_content_size(presentation, 0, &content_w, &content_h);
+    if (drawable_w <= 0 || drawable_h <= 0 || content_h <= 0) return 0;
+    const NdsPresentRect rect =
+        window_present_rect(presentation, 0, drawable_w, drawable_h);
+    double density = 1.0;
+#if defined(NDS_HAVE_SDL3)
+    const float window_density =
+        SDL_GetWindowPixelDensity(presentation.windows[0]);
+    if (window_density > 0) density = window_density;
+#endif
+    return static_cast<int>(std::lround(
+        static_cast<double>(rect.h) * kScreenHeight / content_h / density));
 }
 
 // The 3D multiplier the options ask for: with resolution_scale, that percent
@@ -3298,9 +3344,36 @@ int nds_run_interactive_frontend(const NdsFrontendOptions& initial_options) {
          "Close the runner.",
          RECOMP_RUNTIME_UI_ACTION, 0, 0, 0, nullptr, 0, nullptr},
     };
-    // Netplay, when the lobby thread runs, goes before System.
+    // The title's own settings, then Netplay when the lobby thread runs,
+    // go before System.
     std::vector<RecompRuntimeUiItem> runtime_menu_list(
         std::begin(runtime_menu_items), std::end(runtime_menu_items));
+    for (const auto& [key, value] : options.title_settings) {
+        const int id = nds_title_setting_find(key.c_str());
+        if (id < 0)
+            std::fprintf(stderr, "[title] ignoring unknown setting %s\n",
+                         key.c_str());
+        else if (!nds_title_setting_set(id, value))
+            std::fprintf(stderr, "[title] ignoring %s = %d (out of range)\n",
+                         key.c_str(), value);
+    }
+    static std::vector<std::string> title_menu_keys;
+    title_menu_keys.clear();
+    for (size_t i = 0; i < nds_title_setting_count(); ++i)
+        title_menu_keys.push_back(
+            std::string(kRuntimeTitlePrefix) +
+            nds_title_setting_at(static_cast<int>(i))->key);
+    for (size_t i = 0; i < nds_title_setting_count(); ++i) {
+        const NdsTitleSetting& setting =
+            *nds_title_setting_at(static_cast<int>(i));
+        const bool choice = setting.choices && setting.choice_count;
+        runtime_menu_list.push_back(
+            {title_menu_keys[i].c_str(), "Game", setting.label,
+             setting.description,
+             choice ? RECOMP_RUNTIME_UI_CHOICE : RECOMP_RUNTIME_UI_INT,
+             setting.minimum, setting.maximum, setting.step, setting.choices,
+             setting.choice_count, setting.choice_values});
+    }
 #if NDS_ONLINE
     const bool netplay_menu = nds_netplay_menu_available();
     if (netplay_menu) nds_netplay_menu_append_items(&runtime_menu_list);
@@ -5304,6 +5377,11 @@ int nds_run_interactive_frontend(const NdsFrontendOptions& initial_options) {
         governor_sample.headroom_valid =
             static_cast<bool>(audio) && audio_started && !turbo_active;
         governor_last_underruns = current_underruns;
+        // For title settings that follow the window size; a minimized
+        // window keeps the last size.
+        if (const int points = presented_screen_points(presentation);
+            points > 0)
+            nds_title_set_display_height(points);
 #if defined(NDS_HAVE_COMPUTE_RENDERER)
         // Auto scale. Runs here, with the producer joined, like the governor:
         // a renderer rebuild must not land between a frame's capture and its
