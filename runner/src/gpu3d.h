@@ -109,6 +109,14 @@ struct NdsGpu3dProfile {
     uint64_t gx_interp_units;
     uint64_t gx_interp_blended_units;
     uint64_t gx_interp_skipped;
+    // ALWAYS-ON, Plume HD only (nds_gpu3d_cpu_frame_deferred): 3D frames the
+    // soft renderer never drew, drew late because a line was read, and (of
+    // those) drew for a display capture. Frames drawn at VCount215 as usual
+    // are cpu3d_drawn.
+    uint64_t cpu3d_drawn;
+    uint64_t cpu3d_skipped;
+    uint64_t cpu3d_on_demand;
+    uint64_t cpu3d_capture;
 };
 void nds_gpu3d_profile(NdsGpu3dProfile* out);
 // Motion smoothing for games drawing 3D below the DS frame rate.
@@ -171,6 +179,16 @@ void nds_gpu3d_start_frame();
 const uint32_t* nds_gpu3d_line(int line);
 // Guest VRAM capture uses the portable raster in native-GL builds.
 const uint32_t* nds_gpu3d_capture_line(int line);
+
+// With the Plume raster drawn for HD presentation, the soft renderer latches
+// its frame at VCount215 without drawing it. The frame is drawn when one of
+// the line calls here is made before the next VBlank (exactly the frame an
+// undeferred draw gives), and dropped at that VBlank otherwise. The 2D
+// compositor asks for no line on frames whose 3D only the presenter shows;
+// `for_capture` only labels the draw in the counters. Always false in the
+// other builds.
+bool nds_gpu3d_cpu_frame_deferred();
+void nds_gpu3d_draw_deferred_frame(bool for_capture);
 
 // Opt-in host-only widened raster surface. The native line API above always
 // returns the centered 256-pixel hardware viewport for the faithful 2D

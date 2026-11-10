@@ -183,6 +183,17 @@ uint64_t g_render_scanlines = 0;
 uint64_t g_direct_frames = 0;
 uint64_t g_hd_frames = 0;
 uint64_t g_hd_presented = 0;
+// Counts HD presents for the scheduler thread (never reset, unlike the
+// profile counter above), and the frames started since it last moved.
+std::atomic<uint64_t> g_hd_present_serial{0};
+uint64_t g_hd_present_serial_seen = 0;
+uint32_t g_frames_since_hd_present = ~0u;
+// Per back buffer: engine A lines of this frame went without their 3D line
+// because the presenter was expected to show the HD raster instead.
+std::array<bool, 2> g_frame_3d_skipped{};
+// The frame being latched has a line that reads the CPU 3D raster (see
+// nds_gpu2d_expects_cpu_3d).
+bool g_frame_reads_cpu_3d = false;
 uint64_t g_direct_overlay_ns = 0;
 uint64_t g_direct_class_frames[NDS_GPU2D_DIRECT_CLASS_COUNT] = {};
 uint64_t g_adaptive_fallback_frames[NDS_GPU2D_ADAPTIVE_FALLBACK_COUNT] = {};
@@ -1644,6 +1655,44 @@ uint64_t ns_since(std::chrono::steady_clock::time_point a,
         std::chrono::duration_cast<std::chrono::nanoseconds>(b - a).count());
 }
 
+// Whether the presenter is expected to show this line's 3D from the HD
+// raster, so the native composite (only its fallback then) can go without
+// the CPU 3D line. It mirrors what nds_gpu2d_adaptive_framebuffer() and the
+// host will decide after the frame, from what is known now; a frame that
+// stands HD down anyway shows a fallback without 3D once, after which the
+// present counter stops the skipping. Capture never goes through here.
+// Frames by the first reason a line of theirs read the CPU raster instead:
+// 1 HD emit off or skybox fill, 2 no recent HD present, 3 wide output,
+// 4 engine A not on the HD screen, 5 capture, 6 display mode, 7 3D scroll,
+// 8 title policy, 9 a BG that is not text. Logged by nds_gpu2d_start_frame.
+uint32_t g_cpu_3d_reason_frames[10] = {};
+int g_frame_cpu_3d_reason = 0;
+
+int hd_line_reject(const LineJob& job) {
+    const Unit& u = job.unit[0];
+    if (!g_hd_emit_enabled || g_adaptive_skybox_fill) return 1;
+    if (g_frames_since_hd_present > 2u) return 2;
+    if (nds_gpu3d_output_width() != 256u) return 3;
+    if (g_route_main_screen[job.buffer] != static_cast<uint8_t>(g_hd_screen))
+        return 4;
+    if (job.cap || g_frame_capture_active || u.capture_latch ||
+        (u.capture & 0x80000000u))
+        return 5;
+    if (((u.dispcnt >> 16) & 3u) != 1u) return 6;
+    if (nds_gpu3d_render_xpos() != 0u) return 7;
+    if (nds_title_patches_mph_adaptive_centered_native()) return 8;
+    for (int bg = 1; bg < 4; ++bg)
+        if ((u.dispcnt & (0x100u << bg)) && bg_kind(u, bg) != BgKind::Text)
+            return 9;
+    return 0;
+}
+
+bool hd_presents_3d_line(const LineJob& job) {
+    const int reject = hd_line_reject(job);
+    if (reject && !g_frame_cpu_3d_reason) g_frame_cpu_3d_reason = reject;
+    return reject == 0;
+}
+
 // Scheduler-thread latch. Everything a line render reads that a later guest
 // write could change is captured here, and the two pieces of renderer-owned
 // mutable state -- the BG2/BG3 affine accumulators and the DISPCAPCNT enable
@@ -1716,11 +1765,36 @@ void latch_line(int y, LineJob& job) {
     // scanline-semaphore tokens, so no other thread may call it.
     const bool engine_a_renders =
         job.engine_active[0] && !line_forceblank(job, 0);
-    if (engine_a_renders &&
+    if (y == 0) g_frame_3d_skipped[job.buffer] = false;
+    const bool capture_uses_3d = job.cap &&
+        ((job.unit[0].capture >> 29) & 3u) != 1u &&
+        ((job.unit[0].capture & (1u << 24)) || job.bg0_3d);
+    // The soft renderer has not drawn this frame yet (gpu3d.h). A capture
+    // draws it now; so does any line read below. A line without the 3D
+    // layer, or one the presenter shows from the HD raster, asks for
+    // nothing, and the frame stays undrawn.
+    bool wants_3d = true;
+    if (y == 0) {
+        g_frame_reads_cpu_3d = false;
+        ++g_cpu_3d_reason_frames[g_frame_cpu_3d_reason];
+        g_frame_cpu_3d_reason = 0;
+    }
+    if (engine_a_renders && (capture_uses_3d || job.bg0_3d)) {
+        const bool hd_line = !capture_uses_3d && hd_presents_3d_line(job);
+        if (!hd_line) g_frame_reads_cpu_3d = true;
+        if (nds_gpu3d_cpu_frame_deferred()) {
+            if (capture_uses_3d) {
+                nds_gpu3d_draw_deferred_frame(true);
+            } else if (hd_line) {
+                wants_3d = false;
+                g_frame_3d_skipped[job.buffer] = true;
+            }
+        }
+    } else if (engine_a_renders && nds_gpu3d_cpu_frame_deferred()) {
+        wants_3d = false;
+    }
+    if (engine_a_renders && wants_3d &&
         line_general_path(job.unit[0], 0, job.bg0_3d, job.cap)) {
-        const bool capture_uses_3d = job.cap &&
-            ((job.unit[0].capture >> 29) & 3u) != 1u &&
-            ((job.unit[0].capture & (1u << 24)) || job.bg0_3d);
         const uint32_t* const line3d = capture_uses_3d
             ? nds_gpu3d_capture_line(y) : nds_gpu3d_line(y);
         if (line3d) {
@@ -2439,6 +2513,25 @@ void nds_gpu2d_start_frame(){
     g_direct_present_frame_active = g_direct_frame_active;
     g_direct_present_frame = g_direct_current_frame;
     g_present_capture_active = g_frame_capture_active;
+    {
+        static uint32_t frames = 0;
+        if (g_hd_emit_enabled && ++frames % 1800u == 0u) {
+            const uint32_t* const r = g_cpu_3d_reason_frames;
+            std::fprintf(stderr,
+                "[gpu2d] frames reading CPU 3D, by reason: emit %u, no HD "
+                "present %u, wide %u, screen %u, capture %u, mode %u, "
+                "scroll %u, title %u, BG kind %u (none: %u)\n",
+                r[1], r[2], r[3], r[4], r[5], r[6], r[7], r[8], r[9], r[0]);
+            std::fill_n(g_cpu_3d_reason_frames, 10, 0u);
+        }
+        const uint64_t serial =
+            g_hd_present_serial.load(std::memory_order_relaxed);
+        if (serial != g_hd_present_serial_seen)
+            g_frames_since_hd_present = 0;
+        else if (g_frames_since_hd_present != ~0u)
+            ++g_frames_since_hd_present;
+        g_hd_present_serial_seen = serial;
+    }
     const bool force_cpu = g_direct_force_cpu_frames != 0u;
     if (force_cpu) --g_direct_force_cpu_frames;
     g_direct_frame_class =
@@ -2526,6 +2619,8 @@ bool nds_gpu2d_direct_frame_active() {
 bool nds_gpu2d_direct_present_frame_active() {
     return g_direct_present_frame_active;
 }
+
+bool nds_gpu2d_expects_cpu_3d() { return g_frame_reads_cpu_3d; }
 
 bool nds_gpu2d_requires_3d_readback() {
     // Capture is tested LIVE, the same way direct_scene_class() does, not via
@@ -2615,6 +2710,9 @@ struct AdaptiveCtx {
     // Native-aspect HD returns the canonical scanline framebuffer, so only
     // the survivor layers are consumed; the adaptive RGB image is discarded.
     bool metadata_only = false;
+    // The frame's CPU 3D was never drawn (g_frame_3d_skipped): compose
+    // without the 3D layer instead of reading a raster that is not there.
+    bool no_3d = false;
     uint32_t front = 0;
 };
 
@@ -2651,12 +2749,13 @@ void composite_adaptive_line(const AdaptiveCtx& c, int y,
     for (size_t i = 0; i < hud_bg_count; ++i)
         decode_bg_line(u, 0, hud_bgs[i], y, palette, *vram,
                        hud_bg_lines[i]);
-    const uint32_t* const line3d = c.metadata_only ? nullptr : snapshot_matches
+    const uint32_t* const line3d = (c.metadata_only || c.no_3d) ? nullptr
+        : snapshot_matches
         ? g_wide_3d_frame[c.front].data() +
               static_cast<size_t>(y) * output_width
         : nds_gpu3d_wide_line(y);
     const uint32_t* const attr3d =
-        !g_adaptive_skybox_fill ? nullptr
+        !g_adaptive_skybox_fill || !line3d ? nullptr
         : snapshot_matches
             ? g_wide_3d_attr_frame[c.front].data() +
                   static_cast<size_t>(y) * output_width
@@ -2805,7 +2904,7 @@ void composite_adaptive_line(const AdaptiveCtx& c, int y,
         // even if enhanced presentation rejects this frame. Do not complete an
         // adaptive RGB image that neither success nor fallback will consume.
         if (c.metadata_only) continue;
-        const uint32_t c3 = composited_3d[x];
+        const uint32_t c3 = composited_3d ? composited_3d[x] : 0u;
         const uint8_t a3 =
             static_cast<uint8_t>((c3 >> 24) & 0x1Fu);
         if (a3 && (window_mask & 0x01u)) {
@@ -3022,6 +3121,16 @@ const uint32_t* nds_gpu2d_adaptive_framebuffer(int screen, uint16_t* width) {
     // (frontend_stats / profile) instead of by guessing.
     auto center_native = [&](NdsGpu2dAdaptiveFallback reason) {
         ++g_adaptive_fallback_frames[reason];
+        if (engine == 0 && g_frame_3d_skipped[g_front]) {
+            // Expected on the odd transition frame only; a run of these
+            // means hd_presents_3d_line() misses a stand-down reason.
+            static uint32_t logged = 0;
+            if (logged < 16u && ++logged)
+                std::fprintf(stderr,
+                    "[gpu2d] fallback frame without its 3D layer: the CPU "
+                    "draw was skipped and HD stood down (reason %d)\n",
+                    static_cast<int>(reason));
+        }
         for (int y = 0; y < 192; ++y)
             std::copy_n(native + y * 256, 256,
                         adaptive.data() + y * output_width + extra);
@@ -3138,6 +3247,7 @@ const uint32_t* nds_gpu2d_adaptive_framebuffer(int screen, uint16_t* width) {
     ctx.snapshot_matches = snapshot_matches;
     ctx.emit_hd = emit_hd;
     ctx.metadata_only = emit_hd && output_width == 256;
+    ctx.no_3d = g_frame_3d_skipped[g_front];
     ctx.front = g_front;
     composite_adaptive_frame(ctx);
     if (emit_hd) {
@@ -3189,9 +3299,13 @@ bool nds_gpu2d_hd_frame(NdsGpu2dHdFrame* out) {
     // Counted on consumption, not emission: emitting surfaces nobody reads
     // looks identical to working HD from an emit-side counter.
     ++g_hd_presented;
+    g_hd_present_serial.fetch_add(1, std::memory_order_relaxed);
     return true;
 }
-void nds_gpu2d_note_owned_hd_presented() { ++g_hd_presented; }
+void nds_gpu2d_note_owned_hd_presented() {
+    ++g_hd_presented;
+    g_hd_present_serial.fetch_add(1, std::memory_order_relaxed);
+}
 void nds_gpu2d_profile(NdsGpu2dProfile* out) {
     drain_pool(NDS_GPU2D_FENCE_PRESENT);
     if (!out) return;

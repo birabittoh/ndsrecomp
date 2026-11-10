@@ -66,6 +66,19 @@ faithful consumer (2D compositor lines, capture, readback). Above 1x,
 `nds_gpu3d_vcount215` also hands the same latched render list to the Plume
 renderer, which draws it for presentation only. Nothing is read back.
 
+On those frames the soft renderer only latches its frame at VCount215 (flat
+texture views, identical-frame test) and does not draw it. The frame is drawn
+when a 3D line is read before the next VBlank, which gives exactly the frame
+an undeferred draw gives, and dropped at that VBlank otherwise
+(`SoftRenderer::DeferFrame`, `nds_gpu3d_cpu_frame_deferred`). The 2D line
+latch reads no line when the presenter is expected to show the HD raster
+(`hd_presents_3d_line` in `gpu2d.cpp`); display capture, engine A on the LCD
+HD does not cover, skybox fill and any frame after HD stopped presenting
+still read theirs. The native CPU composite of a skipped frame has no 3D
+layer, so `top_hash` changes on those frames: compare `hd_hash`. stderr
+reports `[gpu3d] CPU 3D over 1800 frames: ...` (skipped, drawn at VCount215,
+drawn on demand, for capture).
+
 The raster has **any size**. The host sizes it from the rect it presents
 into (`resolution_scale` percent of it, or `internal_resolution` x native),
 so 3D lands 1:1 on screen pixels instead of at a whole multiple of 256x192.

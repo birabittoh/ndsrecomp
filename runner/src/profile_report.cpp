@@ -179,6 +179,14 @@ void nds_profile_report(std::FILE* out) {
             static_cast<double>(gpu3d_profile.compute_submit_ns) / 1.0e9,
             static_cast<double>(gpu3d_profile.compute_map_ns) / 1.0e9);
     }
+    if (gpu3d_profile.cpu3d_skipped || gpu3d_profile.cpu3d_on_demand)
+        std::fprintf(out,
+            "  CPU 3D frames: %llu skipped, %llu drawn at VCount215, "
+            "%llu drawn on demand (%llu for capture)\n",
+            (unsigned long long)gpu3d_profile.cpu3d_skipped,
+            (unsigned long long)gpu3d_profile.cpu3d_drawn,
+            (unsigned long long)gpu3d_profile.cpu3d_on_demand,
+            (unsigned long long)gpu3d_profile.cpu3d_capture);
     NdsSchedulerProfile sched{};
     scheduler_profile(&sched);
     if (sched.sampled_rounds != 0) {
