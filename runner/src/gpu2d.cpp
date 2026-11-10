@@ -201,6 +201,9 @@ uint32_t g_frames_since_hd_present = ~0u;
 // Per back buffer: engine A lines of this frame went without their 3D line
 // because the presenter was expected to show the HD raster instead.
 std::array<bool, 2> g_frame_3d_skipped{};
+// The frame being latched has a line that reads the CPU 3D raster (see
+// nds_gpu2d_expects_cpu_3d).
+bool g_frame_reads_cpu_3d = false;
 uint64_t g_direct_overlay_ns = 0;
 uint64_t g_direct_class_frames[NDS_GPU2D_DIRECT_CLASS_COUNT] = {};
 uint64_t g_adaptive_fallback_frames[NDS_GPU2D_ADAPTIVE_FALLBACK_COUNT] = {};
@@ -1768,15 +1771,20 @@ void latch_line(int y, LineJob& job) {
     // layer, or one the presenter shows from the HD raster, asks for
     // nothing, and the frame stays undrawn.
     bool wants_3d = true;
-    if (engine_a_renders && nds_gpu3d_cpu_frame_deferred()) {
-        if (capture_uses_3d) {
-            nds_gpu3d_draw_deferred_frame(true);
-        } else if (!job.bg0_3d) {
-            wants_3d = false;
-        } else if (hd_presents_3d_line(job)) {
-            wants_3d = false;
-            g_frame_3d_skipped[job.buffer] = true;
+    if (y == 0) g_frame_reads_cpu_3d = false;
+    if (engine_a_renders && (capture_uses_3d || job.bg0_3d)) {
+        const bool hd_line = !capture_uses_3d && hd_presents_3d_line(job);
+        if (!hd_line) g_frame_reads_cpu_3d = true;
+        if (nds_gpu3d_cpu_frame_deferred()) {
+            if (capture_uses_3d) {
+                nds_gpu3d_draw_deferred_frame(true);
+            } else if (hd_line) {
+                wants_3d = false;
+                g_frame_3d_skipped[job.buffer] = true;
+            }
         }
+    } else if (engine_a_renders && nds_gpu3d_cpu_frame_deferred()) {
+        wants_3d = false;
     }
     if (engine_a_renders && wants_3d &&
         line_general_path(job.unit[0], 0, job.bg0_3d, job.cap)) {
@@ -2595,6 +2603,8 @@ bool nds_gpu2d_direct_frame_active() {
 bool nds_gpu2d_direct_present_frame_active() {
     return g_direct_present_frame_active;
 }
+
+bool nds_gpu2d_expects_cpu_3d() { return g_frame_reads_cpu_3d; }
 
 bool nds_gpu2d_requires_3d_readback() {
     // Capture is tested LIVE, the same way direct_scene_class() does, not via

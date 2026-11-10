@@ -230,6 +230,11 @@ bool nds_gpu2d_direct_frame_active();
 bool nds_gpu2d_direct_present_frame_active();
 bool nds_gpu2d_direct_frame(NdsGpu2dDirectFrame* out);
 bool nds_gpu2d_requires_3d_readback();
+// Whether the frame whose lines were latched last read the CPU 3D raster
+// (capture, or 3D the presenter does not show from the HD raster). Asked at
+// VCount215: the next frame most likely does too, and is then drawn there,
+// with VBlank as a head start, instead of on demand at its first line.
+bool nds_gpu2d_expects_cpu_3d();
 void nds_gpu2d_force_cpu_frames(uint32_t frames);
 
 enum NdsGpu2dDirectClass : uint8_t {

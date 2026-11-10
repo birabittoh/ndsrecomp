@@ -524,7 +524,11 @@ void plume_vcount215() {
     auto& g3 = g_nds.GPU.GPU3D;
     auto* soft = dynamic_cast<melonDS::SoftRenderer*>(&g3.GetCurrentRenderer());
     g_cpu_frame_deferred = false;
-    if (!soft || !nds_plume3d_ready() || g_internal_scale <= 1u || g3.AbortFrame) {
+    // A frame drawn on demand starts at line 0 and holds the 2D latch up
+    // until it is done, so a scene that reads the raster every frame (3D on
+    // the LCD HD does not cover, captures) keeps the draw here.
+    if (!soft || !nds_plume3d_ready() || g_internal_scale <= 1u || g3.AbortFrame ||
+        nds_gpu2d_expects_cpu_3d()) {
         ++g_gpu3d_profile.cpu3d_drawn;
         g3.VCount215(g_nds.GPU);
         plume_render_frame();
