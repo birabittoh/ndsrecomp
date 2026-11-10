@@ -263,6 +263,10 @@ struct NdsFrontendOptions {
     std::string game_name;
     // [game].app_name: the per-title data directory's name (player_launch.h).
     std::string app_name;
+    // [title]: values for the title's own settings (title_settings.h), in
+    // file order; a later file's entry for the same key wins. Applied by the
+    // frontend, which knows which keys the title registered.
+    std::vector<std::pair<std::string, int>> title_settings;
     NdsSettingsPaths paths{};
     // [display] discrete_gpu: on hybrid-graphics laptops, run on the discrete
     // GPU. Consumed by the player launch only.

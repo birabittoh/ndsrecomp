@@ -763,6 +763,7 @@ add_executable(nds_runner
     src/gpu3d_interp.cpp
     src/gpu3d_gxstream.cpp
     src/title_patches.cpp
+    src/title_settings.cpp
     ${NDS_TIER3_SOURCE}
     src/coverage_manifest.cpp
     src/diagnostics.cpp

@@ -1570,5 +1570,24 @@ static bool apply_frontend_config(toml::table& root,
             }
         }
     }
+    if (const toml::table* title = root["title"].as_table()) {
+        for (const auto& item : *title) {
+            int value = 0;
+            if (const auto b = item.second.value_exact<bool>()) {
+                value = *b ? 1 : 0;
+            } else if (const auto n = item.second.value_exact<int64_t>()) {
+                if (*n < INT32_MIN || *n > INT32_MAX) {
+                    if (error) *error = "title values must be 32-bit integers";
+                    return false;
+                }
+                value = static_cast<int>(*n);
+            } else {
+                if (error) *error = "title values must be integers or booleans";
+                return false;
+            }
+            options->title_settings.emplace_back(std::string(item.first.str()),
+                                                 value);
+        }
+    }
     return true;
 }
