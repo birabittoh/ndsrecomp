@@ -159,6 +159,19 @@ std::vector<uint32_t> g_hd_top_pixels;
 std::vector<uint32_t> g_hd_below_pixels;
 NdsGpu2dHdFrame g_hd_frame{};
 
+// Fixed-size layers (see nds_gpu2d_set_fixed_size_layers in gpu2d.h).
+uint8_t g_fixed_mask = 0;
+// Native rect (x0, y0, x1, y1; exclusive) whose OBJs stay out of the layer.
+uint16_t g_fixed_obj_keep[4] = {0, 0, 0, 0};
+float g_fixed_scale = 1.0f;
+uint16_t g_fixed_anchor_x = 0;
+uint16_t g_fixed_anchor_y = 0;
+bool g_fixed_consumer = false;
+bool g_fixed_frame_valid = false;
+std::vector<uint32_t> g_fixed_base_pixels;
+std::vector<uint32_t> g_fixed_layer_pixels;
+NdsGpu2dFixedLayersFrame g_fixed_frame{};
+
 uint32_t hd_meta(const Pixel& p, uint8_t window_mask) {
     return static_cast<uint32_t>(p.target & 0x3Fu) |
            nds_gpu2d_hd_window_metadata(window_mask) |
@@ -2402,6 +2415,7 @@ bool gpu2d_savestate_import(const NdsGpu2dSaveState& in,
     g_direct_object_write = 0;
     g_direct_force_cpu_frames = std::max(g_direct_force_cpu_frames, 1u);
     g_hd_frame_valid = false;
+    g_fixed_frame_valid = false;
     g_hd_frame = {};
     for (auto& frame : g_adaptive_frame) frame.fill(0u);
     for (auto& frame : g_wide_3d_frame) frame.fill(0u);
@@ -2714,7 +2728,57 @@ struct AdaptiveCtx {
     // without the 3D layer instead of reading a raster that is not there.
     bool no_3d = false;
     uint32_t front = 0;
+    // Fixed-size layers: BGs in this mask (bit n = BGn) are left out of the
+    // stack and resolved into `layer` (256 x 192, straight alpha) instead.
+    uint8_t fixed_mask = 0;
+    uint32_t* layer = nullptr;
+    uint16_t obj_keep[4] = {0, 0, 0, 0};
 };
+
+// One fixed-size-layer pixel: the masked BGs at this position resolved on
+// their own, as straight-alpha ARGB (0 = nothing). `first` and `second` are
+// the top two masked pixels (second may be invalid), `rest` the top of the
+// remaining stack at the same native position, which decides whether a
+// first-target BG blends with what lies under it. The caller guarantees
+// EVA + EVB = 16 whenever such a blend can happen.
+uint32_t fixed_layer_pixel(const Unit& u, const Pixel& first,
+                           const Pixel& second, const Pixel& rest,
+                           bool effects, uint32_t mbmode, uint32_t mb) {
+    if (!first.valid) return 0u;
+    uint32_t color = first.color;
+    uint32_t alpha = 255u;
+    const uint32_t mode = (u.bldcnt >> 6) & 3u;
+    if (first.alpha) {
+        // A semi-transparent or bitmap OBJ: it blends with a second target
+        // under it whatever the color effect (see compose()).
+        if (second.valid) {
+            color = compose(u, first, second, effects);
+        } else if (u.bldcnt & (static_cast<uint16_t>(rest.target) << 8)) {
+            const uint32_t eva = first.alpha == 0xFFu ? u.eva : first.alpha;
+            alpha = (std::min<uint32_t>(16u, eva) * 255u + 8u) / 16u;
+        } else {
+            color = compose(u, first, rest, effects);
+        }
+    } else if (effects && (u.bldcnt & first.target)) {
+        if (mode == 1u) {
+            if (second.valid) {
+                // Both inside the layer: blend there, opaque.
+                color = compose(u, first, second, true);
+            } else if (u.bldcnt & (static_cast<uint16_t>(rest.target) << 8)) {
+                // Over the rest of the stack: EVA/16 of alpha does it in
+                // the presenter, wherever the shrunk pixel lands.
+                alpha = (std::min<uint32_t>(16u, u.eva) * 255u + 8u) / 16u;
+            }
+        } else {
+            color = compose(u, first, second.valid ? second : rest, true);
+        }
+    }
+    if (mbmode == 1u)
+        color = brighten(color, mb, 0u);
+    else if (mbmode == 2u)
+        color = darken(color, mb, 15u);
+    return (alpha << 24) | (to_rgb32(color) & 0x00FFFFFFu);
+}
 
 void composite_adaptive_line(const AdaptiveCtx& c, int y,
                              AdaptiveScratch& sc) {
@@ -2733,6 +2797,9 @@ void composite_adaptive_line(const AdaptiveCtx& c, int y,
     const size_t hud_bg_count = c.hud_bg_count;
     const bool snapshot_matches = c.snapshot_matches;
     const bool emit_hd = c.emit_hd;
+    const uint8_t c_fixed_mask = c.fixed_mask;
+    uint32_t* const fixed_layer =
+        c.layer ? c.layer + static_cast<size_t>(y) * 256u : nullptr;
     // Named to match the single-threaded body they replace: the scratch is
     // per-renderer, everything else is shared and read-only.
     auto& obj = sc.obj;
@@ -2870,6 +2937,9 @@ void composite_adaptive_line(const AdaptiveCtx& c, int y,
         const uint8_t window_mask = nds_gpu2d_window_mask(
             window_state, window_x, static_cast<uint8_t>(y),
             obj_window[x] != 0u);
+        // The masked BGs' own top two (fixed-size layers).
+        Pixel fixed_first{};
+        Pixel fixed_second{};
         const int bg_hud_x = g_adaptive_hud_gap_fill
             ? nds_gpu2d_adaptive_hud_x(x, output_width, g_adaptive_hud_anchor,
                                       g_adaptive_hud_center_width, true)
@@ -2886,12 +2956,40 @@ void composite_adaptive_line(const AdaptiveCtx& c, int y,
                     !(window_mask & (1u << hud_bgs[i])))
                     continue;
                 const BgLine& line = hud_bg_lines[i];
-                push(Pixel{
+                const Pixel pixel{
                     rgb6(static_cast<uint16_t>(c & 0x7FFFu)),
-                    line.target, 0, line.prio, line.order, true});
+                    line.target, 0, line.prio, line.order, true};
+                if (c_fixed_mask & (1u << hud_bgs[i])) {
+                    if (!fixed_first.valid || ahead(pixel, fixed_first)) {
+                        fixed_second = fixed_first;
+                        fixed_first = pixel;
+                    } else if (!fixed_second.valid ||
+                               ahead(pixel, fixed_second)) {
+                        fixed_second = pixel;
+                    }
+                    continue;
+                }
+                push(pixel);
             }
         }
-        if (obj[x].valid && (window_mask & 0x10u)) push(obj[x]);
+        if (obj[x].valid && (window_mask & 0x10u)) {
+            const int hx = hud_x, hy = y;
+            const bool keep = hx >= c.obj_keep[0] && hx < c.obj_keep[2] &&
+                              hy >= c.obj_keep[1] && hy < c.obj_keep[3];
+            if ((c_fixed_mask & 0x10u) && !keep) {
+                // Masked OBJs join the masked BGs (only over native
+                // columns; adaptive widths never split).
+                if (!fixed_first.valid || ahead(obj[x], fixed_first)) {
+                    fixed_second = fixed_first;
+                    fixed_first = obj[x];
+                } else if (!fixed_second.valid ||
+                           ahead(obj[x], fixed_second)) {
+                    fixed_second = obj[x];
+                }
+            } else {
+                push(obj[x]);
+            }
+        }
         if (emit_hd) {
             const size_t o = (static_cast<size_t>(y) * output_width + x)
                              * 2u;
@@ -2918,6 +3016,20 @@ void composite_adaptive_line(const AdaptiveCtx& c, int y,
         else if (mbmode == 2u)
             color = darken(color, mb, 15u);
         dst[x] = to_rgb32(color);
+        if (fixed_layer && hud_x >= 0) {
+            // A skipped frame has no 3D pixel in the stack, yet the
+            // presenter shows the HD raster under the layer: stand in for
+            // it (coverage unknown, so taken as full) so a BG that blends
+            // over the 3D still gets its EVA as alpha.
+            Pixel rest = top;
+            if (c.no_3d && (window_mask & 0x01u)) {
+                const Pixel stand_in{0u, 0x01u, 0, prio3d, 1, true, 31};
+                if (ahead(stand_in, rest)) rest = stand_in;
+            }
+            fixed_layer[hud_x] = fixed_layer_pixel(
+                u, fixed_first, fixed_second, rest,
+                (window_mask & 0x20u) != 0u, mbmode, mb);
+        }
     }
 }
 
@@ -3100,9 +3212,13 @@ const uint32_t* nds_gpu2d_adaptive_framebuffer(int screen, uint16_t* width) {
     // frame's surfaces. Guarded on engine A: this function is called once per
     // screen, and an unguarded reset here would let the engine-B call wipe
     // the flag the engine-A call just set, silently disabling HD entirely.
-    if (engine == 0) g_hd_frame_valid = false;
+    if (engine == 0) g_hd_frame_valid = g_fixed_frame_valid = false;
     const int output_width = nds_gpu3d_output_width();
-    if (output_width < 256 || (output_width == 256 && !g_hd_emit_enabled)) {
+    const bool fixed_wanted =
+        engine == 0 && screen == g_hd_screen &&
+        nds_gpu2d_fixed_layers_requested();
+    if (output_width < 256 ||
+        (output_width == 256 && !g_hd_emit_enabled && !fixed_wanted)) {
         if (width) *width = 256;
         return native;
     }
@@ -3227,6 +3343,27 @@ const uint32_t* nds_gpu2d_adaptive_framebuffer(int screen, uint16_t* width) {
             g_hd_below_pixels.resize(needed);
         }
     }
+    // Fixed-size layers: only the masked BGs that are on (and the OBJs when
+    // asked for), and only when their blend can be split exactly (see
+    // gpu2d.h). A semi-transparent OBJ blends with EVA/EVB in any mode.
+    uint8_t fixed_mask = 0;
+    if (fixed_wanted && output_width == 256) {
+        for (size_t i = 0; i < hud_bg_count; ++i)
+            fixed_mask |= static_cast<uint8_t>(
+                g_fixed_mask & (1u << hud_bgs[i]));
+        const bool exact = u.eva + u.evb == 16u;
+        // With BGs named, OBJs join only a frame that splits one of them;
+        // the OBJ bit alone splits the OBJs by themselves.
+        const bool obj_alone = (g_fixed_mask & 0x0Eu) == 0u;
+        if ((fixed_mask || obj_alone) && exact && (g_fixed_mask & 0x10u) &&
+            (u.dispcnt & 0x1000u))
+            fixed_mask |= 0x10u;
+        const bool alpha_mode = ((u.bldcnt >> 6) & 3u) == 1u;
+        if (fixed_mask && alpha_mode && (u.bldcnt & fixed_mask) && !exact)
+            fixed_mask = 0;
+    }
+    if (fixed_mask && g_fixed_layer_pixels.size() != 256u * 192u)
+        g_fixed_layer_pixels.resize(256u * 192u);
     AdaptiveCtx ctx{};
     ctx.u = &u;
     ctx.palette = palette;
@@ -3246,10 +3383,21 @@ const uint32_t* nds_gpu2d_adaptive_framebuffer(int screen, uint16_t* width) {
     ctx.hud_bg_count = hud_bg_count;
     ctx.snapshot_matches = snapshot_matches;
     ctx.emit_hd = emit_hd;
-    ctx.metadata_only = emit_hd && output_width == 256;
+    ctx.metadata_only = emit_hd && output_width == 256 && !fixed_mask;
     ctx.no_3d = g_frame_3d_skipped[g_front];
     ctx.front = g_front;
+    ctx.fixed_mask = fixed_mask;
+    for (int i = 0; i < 4; ++i) ctx.obj_keep[i] = g_fixed_obj_keep[i];
+    ctx.layer = fixed_mask ? g_fixed_layer_pixels.data() : nullptr;
     composite_adaptive_frame(ctx);
+    if (fixed_mask) {
+        g_fixed_frame.base = adaptive.data();
+        g_fixed_frame.layer = g_fixed_layer_pixels.data();
+        g_fixed_frame.scale = g_fixed_scale;
+        g_fixed_frame.anchor_x = g_fixed_anchor_x;
+        g_fixed_frame.anchor_y = g_fixed_anchor_y;
+        g_fixed_frame_valid = true;
+    }
     if (emit_hd) {
         g_hd_frame.top_pixels = g_hd_top_pixels.data();
         g_hd_frame.below_pixels = g_hd_below_pixels.data();
@@ -3272,6 +3420,38 @@ const uint32_t* nds_gpu2d_adaptive_framebuffer(int screen, uint16_t* width) {
 
 void nds_gpu2d_invalidate_hd_frame() {
     g_hd_frame_valid = false;
+    g_fixed_frame_valid = false;
+}
+
+void nds_gpu2d_set_fixed_size_layers(uint8_t bg_mask, float scale,
+                                     uint16_t anchor_x, uint16_t anchor_y) {
+    g_fixed_mask = static_cast<uint8_t>(bg_mask & 0x1Eu);
+    g_fixed_scale = scale > 0.0f && scale < 1.0f ? scale : 1.0f;
+    g_fixed_anchor_x = std::min<uint16_t>(anchor_x, 256);
+    g_fixed_anchor_y = std::min<uint16_t>(anchor_y, 192);
+}
+
+void nds_gpu2d_set_fixed_layers_obj_keep(uint16_t x0, uint16_t y0,
+                                         uint16_t x1, uint16_t y1) {
+    g_fixed_obj_keep[0] = x0;
+    g_fixed_obj_keep[1] = y0;
+    g_fixed_obj_keep[2] = x1;
+    g_fixed_obj_keep[3] = y1;
+}
+
+void nds_gpu2d_set_fixed_layers_consumer(bool enabled) {
+    g_fixed_consumer = enabled;
+}
+
+bool nds_gpu2d_fixed_layers_requested() {
+    return g_fixed_consumer && g_fixed_mask != 0 && g_fixed_scale < 1.0f &&
+           !g_adaptive_hud_anchor && nds_gpu3d_output_width() == 256;
+}
+
+bool nds_gpu2d_fixed_layers_frame(NdsGpu2dFixedLayersFrame* out) {
+    if (!out || !g_fixed_frame_valid) return false;
+    *out = g_fixed_frame;
+    return true;
 }
 
 void nds_gpu2d_set_hd_emit(bool enabled) {
@@ -3283,6 +3463,7 @@ void nds_gpu2d_set_hd_screen(int screen) {
     if (g_hd_screen == (screen & 1)) return;
     g_hd_screen = screen & 1;
     g_hd_frame_valid = false;
+    g_fixed_frame_valid = false;
 }
 
 bool nds_gpu2d_hd_frame_peek(NdsGpu2dHdFrame* out) {
