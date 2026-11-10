@@ -464,6 +464,70 @@ void thumb_halfword_switch_rejects_lookalike() {
     delete on;
 }
 
+void ptr_harvest_under_walked_body() {
+    // entry: cmp r0,#0 ; beq L ; <pointer word> ; L: bx lr
+    // The linear body runs over the pointer word (it decodes as an
+    // `andeq`), so the word is "walked". DQ9's spell-handler table sat
+    // under a THUMB false start the same way and its targets were lost.
+    Image img;
+    const uint32_t fn = kBase + 0x800;
+    img.put(kBase, kCmpR0_0);
+    img.put(kBase + 4, branch(0x0, false, kBase + 4, kBase + 12));
+    img.put(kBase + 8, fn);
+    img.put(kBase + 12, kBxLr);
+    img.put(fn, kMovR0_1);
+    img.put(fn + 4, kBxLr);
+    FunctionFinder* on = run(img, true);
+    expect("ptr_harvest_under_walked_body: pointer inside a body is read",
+           has(*on, fn, CpuMode::Arm));
+    delete on;
+}
+
+void terminator_sweep_local_branch() {
+    // entry: bx lr
+    // f:  cmp r0,#0 ; beq E ; mov r0,#1 ; b J ; E: mov r0,#1 ; J: bx lr
+    // `b J` is an if/else join inside f, not a tail call to an unknown
+    // function, so f is the entry (not E, the first slot that used to pass).
+    Image img = base_image();
+    const uint32_t f = kBase + 4;
+    img.put(f, kCmpR0_0);
+    img.put(f + 4, branch(0x0, false, f + 4, f + 16));
+    img.put(f + 8, kMovR0_1);
+    img.put(f + 12, branch(0xE, false, f + 12, f + 20));
+    img.put(f + 16, kMovR0_1);
+    img.put(f + 20, kBxLr);
+    FunctionFinder* on = run(img, true);
+    expect("terminator_sweep_local_branch: entry with an if/else join",
+           has(*on, f, CpuMode::Arm));
+    delete on;
+}
+
+void terminator_sweep_rejects_unknown_tail() {
+    // entry: bx lr ; mov r0,#1 ; b <far, unwalked, zero-filled>
+    Image img = base_image();
+    img.put(kBase + 4, kMovR0_1);
+    img.put(kBase + 8, branch(0xE, false, kBase + 8, kBase + 0x1800));
+    FunctionFinder* on = run(img, true);
+    expect("terminator_sweep_rejects_unknown_tail: no entry",
+           !has(*on, kBase + 4, CpuMode::Arm));
+    delete on;
+}
+
+void image_start_sweep() {
+    // The image's first function, called by nothing in the image (an
+    // overlay entered from another image), ahead of the first walked body.
+    Image img;
+    img.put(kBase, kMovR0_1);
+    img.put(kBase + 4, kBxLr);
+    img.put(kBase + 0x100, kBxLr);
+    FunctionFinder f(img.bytes.data(), img.bytes.size(), kBase);
+    f.add_seed(FunctionSeed{kBase + 0x100, CpuMode::Arm, "entry"});
+    f.set_static_scan(true);
+    f.run();
+    expect("image_start_sweep: first function of the image",
+           has(f, kBase, CpuMode::Arm));
+}
+
 }  // namespace
 
 int main() {
@@ -483,6 +547,10 @@ int main() {
     thumb_halfword_switch();
     thumb_halfword_switch_backward_case();
     thumb_halfword_switch_rejects_lookalike();
+    ptr_harvest_under_walked_body();
+    terminator_sweep_local_branch();
+    terminator_sweep_rejects_unknown_tail();
+    image_start_sweep();
     std::printf("%s (%d failure%s)\n", g_fail ? "FAILED" : "OK", g_fail,
                 g_fail == 1 ? "" : "s");
     return g_fail ? 1 : 0;

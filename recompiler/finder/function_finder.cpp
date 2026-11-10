@@ -2293,6 +2293,12 @@ bool FunctionFinder::validate_candidate(
     unsigned zero_run = 0;
     unsigned non_al = 0;
     bool flags_set = false;
+    // strict only: forward branch targets inside this candidate's own
+    // window. An unconditional branch to one of them is an if/else join,
+    // not a tail call, and the walk resumes at the nearest pending target
+    // (the else arm, or the join itself).
+    const uint32_t local_end = addr + kMaxWalk * step;
+    std::vector<uint32_t> local_targets;
     for (uint32_t n = 0; n < kMaxWalk; ++n) {
         bool inside = false;
         const uint8_t cov = cover_at(pc, &inside);
@@ -2375,11 +2381,26 @@ bool FunctionFinder::validate_candidate(
             if (strict) { REJECT("strict-indirect"); }
             return true;
         }
-        if (ins.is_branch && !ins.is_indirect && !ins.is_call &&
-            ins.cond == armv4t::Cond::AL && !(thumb && ins.op == armv4t::IrOp::BL_prefix)) {
+        const bool direct_jump = ins.is_branch && !ins.is_indirect &&
+            !ins.is_call && !(thumb && ins.op == armv4t::IrOp::BL_prefix);
+        const bool local = direct_jump && target >= pc && target < local_end;
+        if (direct_jump && ins.cond != armv4t::Cond::AL) {
+            if (strict && local) local_targets.push_back(target);
+            continue;
+        }
+        if (direct_jump) {
             if (!strict) return true;
-            if (visited_.count(visit_key(target, mode)) == 0) { REJECT("strict-tail"); }
-            return true;
+            if (visited_.count(visit_key(target, mode)) != 0) return true;
+            // A tail into the middle of a walked body of this mode.
+            bool tgt_inside = false;
+            if (cover_at(target, &tgt_inside) & (thumb ? 2u : 1u)) return true;
+            if (!local) { REJECT("strict-tail"); }
+            local_targets.push_back(target);
+            uint32_t next = 0;
+            for (uint32_t t : local_targets)
+                if (t >= pc && (next == 0 || t < next)) next = t;
+            if (next == 0) { REJECT("strict-tail"); }
+            pc = next;
         }
     }
     // kMaxWalk decoded instructions with every check above passing is a
@@ -2438,6 +2459,27 @@ std::vector<FunctionSeed> FunctionFinder::static_scan_candidates() {
             return 0;
         };
         constexpr uint32_t kPoolSkip = 64;  // words
+        auto sweep = [&](uint32_t a, CpuMode mode) {
+            const bool thumb = mode == CpuMode::Thumb;
+            const uint32_t step = thumb ? 2u : 4u;
+            for (uint32_t n = 0; n < kPoolSkip * (thumb ? 2u : 1u); ++n, a += step) {
+                bool in = false;
+                if (cover_of(a, &in) != 0 || !in) break;
+                if (addr_in_data_range(a)) break;
+                const uint64_t k = visit_key(a, mode);
+                if (visited_.count(k) || picked.count(k)) break;
+                if (thumb && (a & 3u)) continue;
+                if (validate_candidate(a, mode, regions, /*strict=*/true)) {
+                    picked.insert(k);
+                    char nm[64];
+                    std::snprintf(nm, sizeof nm, "gapt%c_%08X",
+                                  thumb ? 't' : 'a', a);
+                    out.push_back(FunctionSeed{a, mode, nm});
+                    ++stats_.gap_fill_seeds;
+                    break;
+                }
+            }
+        };
         for (const auto& fn : functions_) {
             const bool thumb = fn.mode == CpuMode::Thumb;
             const uint32_t step = thumb ? 2u : 4u;
@@ -2453,30 +2495,27 @@ std::vector<FunctionSeed> FunctionFinder::static_scan_candidates() {
                 (li.is_branch && !li.is_call && !li.is_indirect &&
                  li.cond == armv4t::Cond::AL);
             if (!term) continue;
-            uint32_t a = fn.end_addr;
-            for (uint32_t n = 0; n < kPoolSkip * (thumb ? 2u : 1u); ++n, a += step) {
-                bool in = false;
-                if (cover_of(a, &in) != 0 || !in) break;
-                if (addr_in_data_range(a)) break;
-                const uint64_t k = visit_key(a, fn.mode);
-                if (visited_.count(k) || picked.count(k)) break;
-                if (thumb && (a & 3u)) continue;
-                if (validate_candidate(a, fn.mode, regions, /*strict=*/true)) {
-                    picked.insert(k);
-                    char nm[64];
-                    std::snprintf(nm, sizeof nm, "gapt%c_%08X",
-                                  thumb ? 't' : 'a', a);
-                    out.push_back(FunctionSeed{a, fn.mode, nm});
-                    ++stats_.gap_fill_seeds;
-                    break;
-                }
-            }
+            sweep(fn.end_addr, fn.mode);
+        }
+        // The first function of an image has no body before it to end at
+        // a terminator, and nothing in its own image need call it (an
+        // overlay's first function is often reached only from outside).
+        for (const auto& r : regions) {
+            if (r.size >= 4 && r.cover[0] == 0 && (r.start & 3u) == 0)
+                sweep(r.start, CpuMode::Arm);
         }
     }
     for (const auto& r : regions) {
-        // PointerHarvest: aligned words outside any walked body.
+        // PointerHarvest: every aligned word, walked or not. A body
+        // seeded on weak evidence can lie over a pointer table (a THUMB
+        // false start in .data hid DQ9's spell-handler table), and literal
+        // pools sit inside linear bodies; the target is validated either
+        // way, so a word that is really an instruction costs one reject.
+        // A THUMB target read from a walked word gets strict validation:
+        // an odd word inside a body is weak evidence, and almost any
+        // halfword stream passes the lenient check.
         for (uint32_t off = (4u - (r.start & 3u)) & 3u; off + 4 <= r.size; off += 4) {
-            if (r.cover[off] | r.cover[off + 2]) continue;
+            const bool walked = (r.cover[off] | r.cover[off + 2]) != 0;
             const uint32_t a = r.start + off;
             if (addr_in_data_range(a)) continue;
             const uint32_t w = read_u32(a);
@@ -2486,7 +2525,8 @@ std::vector<FunctionSeed> FunctionFinder::static_scan_candidates() {
             if (m == CpuMode::Arm && (t & 3u)) continue;
             if (!in_exec_region(t)) continue;
             consider(t, m, "ptr", &stats_.ptr_harvest_seeds,
-                     &stats_.ptr_harvest_rejects);
+                     &stats_.ptr_harvest_rejects,
+                     /*strict=*/walked && m == CpuMode::Thumb);
         }
         // GapFill: function prologues in uncovered bytes.
         for (uint32_t off = (2u - (r.start & 1u)) & 1u; off + 2 <= r.size; off += 2) {
