@@ -51,6 +51,16 @@ int nds_title_display_height();
 // For the frontend: once per presented frame.
 void nds_title_set_display_height(int points);
 
+// Where the mouse points on the touchscreen, in DS pixels (0..255, 0..191),
+// while no mouse button is held: what a touchscreen cannot report and a
+// title's menus can use to highlight the entry under the pointer. False when
+// the pointer is elsewhere, a button is held (the touch itself reports that
+// position) or the mouse is captured. Host state, like the display height.
+// Any thread.
+bool nds_title_pointer_hover(int* x, int* y);
+// For the frontend: on mouse motion and button changes.
+void nds_title_set_pointer_hover(int x, int y, bool hovering);
+
 // For the frontend.
 size_t nds_title_setting_count();
 const NdsTitleSetting* nds_title_setting_at(int id);

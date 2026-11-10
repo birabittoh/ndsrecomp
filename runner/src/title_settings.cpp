@@ -19,6 +19,8 @@ std::deque<Entry>& registry() {
 }
 
 std::atomic<int> g_display_height{0};
+// -1, or y << 16 | x.
+std::atomic<int> g_pointer_hover{-1};
 
 bool accepts(const NdsTitleSetting& s, int value) {
     if (s.choices && s.choice_count) {
@@ -80,4 +82,17 @@ int nds_title_display_height() {
 void nds_title_set_display_height(int points) {
     g_display_height.store(points > 0 ? points : 0,
                            std::memory_order_relaxed);
+}
+
+bool nds_title_pointer_hover(int* x, int* y) {
+    const int packed = g_pointer_hover.load(std::memory_order_relaxed);
+    if (packed < 0) return false;
+    *x = packed & 0xFFFF;
+    *y = packed >> 16;
+    return true;
+}
+
+void nds_title_set_pointer_hover(int x, int y, bool hovering) {
+    g_pointer_hover.store(hovering ? (y << 16 | x) : -1,
+                          std::memory_order_relaxed);
 }
