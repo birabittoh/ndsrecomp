@@ -179,7 +179,10 @@ void nds_gpu2d_invalidate_hd_frame();
 // Fixed-size 2D layers (presentation only, never guest-visible).
 //
 // A title names engine A text BGs (bg_mask bit n = BGn, n = 1..3) that hold
-// its windows. On a presenter that can draw a layer image, engine A's LCD
+// its windows, and with bit 4 (the BLDCNT OBJ bit) all of engine A's OBJs
+// too (cursors, icons drawn over the windows); OBJs go into the layer only
+// on frames that also split a BG, and only when EVA + EVB = 16 (their
+// semi-transparency blends in any mode). On a presenter that can draw a layer image, engine A's LCD
 // (the HD screen, nds_gpu2d_set_hd_screen) is then presented split: those
 // BGs alone into a straight-alpha image, shown at `scale` of the game rect
 // about the native point
@@ -190,8 +193,8 @@ void nds_gpu2d_invalidate_hd_frame();
 // The split is exact for alpha blending only when EVA + EVB = 16 (then
 // EVA*A + EVB*B is A at alpha EVA/16 over B); a frame whose masked BGs
 // would need another blend is presented unsplit. A masked BG is drawn over
-// every unmasked layer, so an unmasked layer above it (an OBJ) would be
-// hidden where they overlap. Native aspect only (output width 256), and
+// every unmasked layer, so an unmasked layer above it (an OBJ left out of
+// the mask) would be hidden where they overlap. Native aspect only (output width 256), and
 // not combined with the adaptive HUD anchor.
 //
 // bg_mask 0 or scale >= 1 turns it off. Title thread; latched by the

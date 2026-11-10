@@ -2645,7 +2645,18 @@ uint32_t fixed_layer_pixel(const Unit& u, const Pixel& first,
     uint32_t color = first.color;
     uint32_t alpha = 255u;
     const uint32_t mode = (u.bldcnt >> 6) & 3u;
-    if (effects && (u.bldcnt & first.target)) {
+    if (first.alpha) {
+        // A semi-transparent or bitmap OBJ: it blends with a second target
+        // under it whatever the color effect (see compose()).
+        if (second.valid) {
+            color = compose(u, first, second, effects);
+        } else if (u.bldcnt & (static_cast<uint16_t>(rest.target) << 8)) {
+            const uint32_t eva = first.alpha == 0xFFu ? u.eva : first.alpha;
+            alpha = (std::min<uint32_t>(16u, eva) * 255u + 8u) / 16u;
+        } else {
+            color = compose(u, first, rest, effects);
+        }
+    } else if (effects && (u.bldcnt & first.target)) {
         if (mode == 1u) {
             if (second.valid) {
                 // Both inside the layer: blend there, opaque.
@@ -2848,7 +2859,21 @@ void composite_adaptive_line(const AdaptiveCtx& c, int y,
                 push(pixel);
             }
         }
-        if (obj[x].valid && (window_mask & 0x10u)) push(obj[x]);
+        if (obj[x].valid && (window_mask & 0x10u)) {
+            if (c_fixed_mask & 0x10u) {
+                // Masked OBJs join the masked BGs (only over native
+                // columns; adaptive widths never split).
+                if (!fixed_first.valid || ahead(obj[x], fixed_first)) {
+                    fixed_second = fixed_first;
+                    fixed_first = obj[x];
+                } else if (!fixed_second.valid ||
+                           ahead(obj[x], fixed_second)) {
+                    fixed_second = obj[x];
+                }
+            } else {
+                push(obj[x]);
+            }
+        }
         if (emit_hd) {
             const size_t o = (static_cast<size_t>(y) * output_width + x)
                              * 2u;
@@ -3182,16 +3207,20 @@ const uint32_t* nds_gpu2d_adaptive_framebuffer(int screen, uint16_t* width) {
             g_hd_below_pixels.resize(needed);
         }
     }
-    // Fixed-size layers: only the masked BGs that are on, and only when
-    // their blend can be split exactly (see gpu2d.h).
+    // Fixed-size layers: only the masked BGs that are on (and the OBJs when
+    // asked for), and only when their blend can be split exactly (see
+    // gpu2d.h). A semi-transparent OBJ blends with EVA/EVB in any mode.
     uint8_t fixed_mask = 0;
     if (fixed_wanted && output_width == 256) {
         for (size_t i = 0; i < hud_bg_count; ++i)
             fixed_mask |= static_cast<uint8_t>(
                 g_fixed_mask & (1u << hud_bgs[i]));
+        const bool exact = u.eva + u.evb == 16u;
+        if (fixed_mask && exact && (g_fixed_mask & 0x10u) &&
+            (u.dispcnt & 0x1000u))
+            fixed_mask |= 0x10u;
         const bool alpha_mode = ((u.bldcnt >> 6) & 3u) == 1u;
-        if (fixed_mask && alpha_mode && (u.bldcnt & fixed_mask) &&
-            u.eva + u.evb != 16u)
+        if (fixed_mask && alpha_mode && (u.bldcnt & fixed_mask) && !exact)
             fixed_mask = 0;
     }
     if (fixed_mask && g_fixed_layer_pixels.size() != 256u * 192u)
@@ -3255,7 +3284,7 @@ void nds_gpu2d_invalidate_hd_frame() {
 
 void nds_gpu2d_set_fixed_size_layers(uint8_t bg_mask, float scale,
                                      uint16_t anchor_x, uint16_t anchor_y) {
-    g_fixed_mask = static_cast<uint8_t>(bg_mask & 0x0Eu);
+    g_fixed_mask = static_cast<uint8_t>(bg_mask & 0x1Eu);
     g_fixed_scale = scale > 0.0f && scale < 1.0f ? scale : 1.0f;
     g_fixed_anchor_x = std::min<uint16_t>(anchor_x, 256);
     g_fixed_anchor_y = std::min<uint16_t>(anchor_y, 192);
