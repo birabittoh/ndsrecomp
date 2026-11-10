@@ -202,7 +202,6 @@ uint64_t g_dropped = 0;
 // internal_resolution (the fixed multiplier): what the 3D raster is sized by.
 unsigned g_raster_percent = 100;
 unsigned g_raster_fixed = 1;
-bool g_thin_outlines = true;
 std::string g_cache_directory;
 NdsPlumeContext g_context;
 bool g_logged_hd = false;
@@ -782,12 +781,11 @@ void request_raster(const NdsPresentRect& rect, int width) {
         raster_w = uint32_t(width) * g_raster_fixed;
         raster_h = kHeight * g_raster_fixed;
     }
-    // Thin outlines are one presented pixel wide: as many raster pixels as
-    // the raster has per pixel of the rect. Otherwise one DS pixel (0).
-    uint32_t edge = 0;
-    if (g_thin_outlines)
-        edge = std::max(1u, uint32_t((raster_h + uint32_t(std::max(rect.h, 1)) / 2) /
-                                     uint32_t(std::max(rect.h, 1))));
+    // Outlines are one presented pixel wide: as many raster pixels as the
+    // raster has per pixel of the rect. A DS pixel scaled up with the 3D is
+    // too wide for content the title draws below DS scale.
+    const uint32_t rect_h = uint32_t(std::max(rect.h, 1));
+    const uint32_t edge = std::max(1u, (raster_h + rect_h / 2) / rect_h);
     nds_plume3d_request_size(raster_w, raster_h, edge);
 }
 }  // namespace
@@ -882,11 +880,6 @@ bool nds_compute_host_presents_direct()
     // The OBJ-only direct path needs a native 3D surface on the GPU, which
     // this host never has: native 3D is the soft renderer's, on the CPU.
     return false;
-}
-
-void nds_compute_host_set_thin_outlines(bool thin)
-{
-    g_thin_outlines = thin;
 }
 
 void nds_compute_host_set_cache_directory(const char* directory)

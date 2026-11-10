@@ -26,7 +26,7 @@ void nds_plume3d_stop();
 bool nds_plume3d_ready();
 
 // The raster the next frame is drawn at, clamped to the device limit, and
-// the outline width in raster pixels (0: one DS pixel). A changed size is
+// the outline width in raster pixels. A changed size is
 // taken once it has been asked for over several frames.
 void nds_plume3d_request_size(uint32_t width, uint32_t height, uint32_t edge_pixels);
 

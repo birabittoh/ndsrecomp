@@ -379,10 +379,6 @@ struct NdsFrontendOptions {
     // Blends 3D images for games drawing below the DS frame rate, at the cost
     // of showing 3D one DS frame later. See gpu3d_interp.h.
     bool smooth_3d = false;
-    // 3D outlines (edge marking) one screen pixel wide, rather than one DS
-    // pixel scaled up with the 3D. Only the Plume renderer draws outlines
-    // above native resolution.
-    bool thin_outlines = true;
     // Texture upscaling factor, 1 (off), 2, or 4. Filters each decoded DS
     // texture once on a cache miss; independent of internal_resolution, but
     // only worth enabling alongside it.

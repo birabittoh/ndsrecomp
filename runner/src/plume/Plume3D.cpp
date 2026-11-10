@@ -892,8 +892,7 @@ void render_scene(Renderer& r, Scene& gl, uint32_t disp_cnt, uint32_t clear_attr
     }
 }
 
-void fill_config(GxConfig& c, const melonDS::GPU3D& g, const Targets& t, uint32_t render_width,
-                 uint32_t edge_pixels) {
+void fill_config(GxConfig& c, const melonDS::GPU3D& g, const Targets& t, uint32_t edge_pixels) {
     std::memset(&c, 0, sizeof(c));
     c.screen_size[0] = float(t.width);
     c.screen_size[1] = float(t.height);
@@ -906,11 +905,8 @@ void fill_config(GxConfig& c, const melonDS::GPU3D& g, const Targets& t, uint32_
     c.fog_offset = g.RenderFogOffset;
     c.fog_shift = g.RenderFogShift;
     // The outline width, as the neighbour distance it tests: what the host
-    // asked for (one presented pixel), or else one DS pixel.
-    const float per_pixel = std::min(float(t.width) / float(render_width),
-                                     float(t.height) / 192.0f);
-    c.edge_distance = edge_pixels ? edge_pixels
-                                  : std::max(1u, uint32_t(std::lround(per_pixel)));
+    // asked for (one presented pixel).
+    c.edge_distance = std::max(edge_pixels, 1u);
     c.clear_poly_id = (g.RenderClearAttr1 >> 24) & 0x3F;
     c.clear_depth = ((g.RenderClearAttr2 & 0x7FFF) * 0x200) + 0x1FF;
 }
@@ -1146,7 +1142,7 @@ void nds_plume3d_render(const melonDS::GPU& gpu, melonDS::Polygon* const* polygo
         slot.indices->unmap();
     }
     GxConfig config;
-    fill_config(config, g3, t, render_width, r.edge_pixels);
+    fill_config(config, g3, t, r.edge_pixels);
     if (void* p = slot.config->map()) {
         std::memcpy(p, &config, sizeof(config));
         slot.config->unmap();

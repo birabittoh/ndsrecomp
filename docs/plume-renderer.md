@@ -97,8 +97,8 @@ first playtest (untested in game since):
   `[plume3d] slow frame` with pipelines built and resizes. Raster resizes
   wait for the request to hold 15 frames. The host acquires a swap chain
   image only after every step that can fail.
-- Outlines: `[display] thin_outlines` (default on, Esc menu) draws them one
-  presented pixel wide; off gives one DS pixel.
+- Outlines are one presented pixel wide (no setting): a DS pixel scaled up
+  with the 3D is too wide for content a title draws below DS scale.
 - smooth_3d works: the soft renderer keeps the real list and only the Plume
   raster draws the halfway list (`nds_gx_interp_presented`). It needs HD
   (internal scale above 1).

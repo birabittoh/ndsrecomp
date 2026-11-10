@@ -1221,8 +1221,6 @@ static bool apply_frontend_config(toml::table& root,
             options->show_fps = *value;
         if (const auto value = (*display)["smooth_3d"].value<bool>())
             options->smooth_3d = *value;
-        if (const auto value = (*display)["thin_outlines"].value<bool>())
-            options->thin_outlines = *value;
     }
 
     if (const toml::table* cartridge = root["cartridge"].as_table()) {

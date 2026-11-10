@@ -51,9 +51,6 @@ bool nds_compute_host_presents_direct();
 // exact size rather than a whole multiple; the GL renderers' integer scale
 // comes from nds_gpu3d_set_internal_scale as before.
 void nds_compute_host_set_raster_request(unsigned percent, unsigned fixed_scale);
-// [display] thin_outlines: 3D outlines one presented pixel wide instead of one
-// DS pixel. Only the Plume host draws outlines above native.
-void nds_compute_host_set_thin_outlines(bool thin);
 // Where the host may keep files between runs (a pipeline cache). Before
 // nds_compute_host_start.
 void nds_compute_host_set_cache_directory(const char* directory);

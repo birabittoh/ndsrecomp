@@ -28,7 +28,7 @@ struct GxConfig {
     uint fogColor;       // RenderFogColor (BGR555 | alpha << 16)
     uint fogOffset;      // RenderFogOffset, already * 0x200
     uint fogShift;
-    uint edgeDistance;   // raster pixels per DS pixel, rounded, at least 1
+    uint edgeDistance;   // outline width in raster pixels, at least 1
     uint clearPolyId;    // the clear plane's, for the screen border
     uint clearDepth;     // 24 bit
     uint2 pad;
@@ -372,7 +372,7 @@ float4 PSFinal(FullscreenOutput input) : SV_Target {
 
     if ((config.dispCnt & (1u << 5)) != 0u && attr.g > 0.5) {
         // Edge marking: an opaque pixel on its polygon's outline whose
-        // neighbour one DS pixel away has another polygon ID and lies behind it.
+        // neighbour one outline width away has another polygon ID and lies behind it.
         const uint polyid = uint(round(attr.r * 63.0));
         const int d = int(max(config.edgeDistance, 1u));
         if (EdgeAgainst(p + int2(-d, 0), polyid, depth) ||
