@@ -3216,7 +3216,10 @@ const uint32_t* nds_gpu2d_adaptive_framebuffer(int screen, uint16_t* width) {
             fixed_mask |= static_cast<uint8_t>(
                 g_fixed_mask & (1u << hud_bgs[i]));
         const bool exact = u.eva + u.evb == 16u;
-        if (fixed_mask && exact && (g_fixed_mask & 0x10u) &&
+        // With BGs named, OBJs join only a frame that splits one of them;
+        // the OBJ bit alone splits the OBJs by themselves.
+        const bool obj_alone = (g_fixed_mask & 0x0Eu) == 0u;
+        if ((fixed_mask || obj_alone) && exact && (g_fixed_mask & 0x10u) &&
             (u.dispcnt & 0x1000u))
             fixed_mask |= 0x10u;
         const bool alpha_mode = ((u.bldcnt >> 6) & 3u) == 1u;

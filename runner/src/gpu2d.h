@@ -181,8 +181,8 @@ void nds_gpu2d_invalidate_hd_frame();
 // A title names engine A text BGs (bg_mask bit n = BGn, n = 1..3) that hold
 // its windows, and with bit 4 (the BLDCNT OBJ bit) all of engine A's OBJs
 // too (cursors, icons drawn over the windows); OBJs go into the layer only
-// on frames that also split a BG, and only when EVA + EVB = 16 (their
-// semi-transparency blends in any mode). On a presenter that can draw a layer image, engine A's LCD
+// on frames that also split a BG (or, with bit 4 alone, by themselves), and
+// only when EVA + EVB = 16 (their semi-transparency blends in any mode). On a presenter that can draw a layer image, engine A's LCD
 // (the HD screen, nds_gpu2d_set_hd_screen) is then presented split: those
 // BGs alone into a straight-alpha image, shown at `scale` of the game rect
 // about the native point
