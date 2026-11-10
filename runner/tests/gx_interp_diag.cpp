@@ -34,6 +34,7 @@
 #include <cstring>
 #include <functional>
 #include <map>
+#include <memory>
 #include <stdexcept>
 #include <string>
 #include <unordered_map>
@@ -501,7 +502,9 @@ int main(int argc, char** argv) {
         for (uint32_t m : image.marks) marks.push_back(m);
     std::printf("%zu images, %zu marks\n", images.size(), marks.size());
 
-    Engine engine;
+    // Heap: the engine holds a whole GPU3D, too big for the Windows stack.
+    const auto engine_storage = std::make_unique<Engine>();
+    Engine& engine = *engine_storage;
     std::vector<PairResult> results;
     size_t replay_bad = 0, pairs = 0, blended = 0;
     size_t totals[5] = {};
