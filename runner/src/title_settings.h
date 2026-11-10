@@ -69,6 +69,14 @@ void nds_title_set_pointer_hover(int x, int y, bool hovering);
 void nds_title_set_unscaled_touch_rect(int x0, int y0, int x1, int y1);
 bool nds_title_unscaled_touch_rect(int* x0, int* y0, int* x1, int* y1);
 
+// While set, touches (and hover) on the touchscreen are never mapped back
+// through the fixed-size layers' scale: the title shows nothing scaled that
+// takes touches, and the screen itself does (DQ9's field walks towards the
+// stylus anywhere on the screen). Off by default. The title thread sets it,
+// the frontend reads it.
+void nds_title_set_touch_unscaled(bool unscaled);
+bool nds_title_touch_unscaled();
+
 // For the frontend.
 size_t nds_title_setting_count();
 const NdsTitleSetting* nds_title_setting_at(int id);

@@ -1009,7 +1009,7 @@ std::atomic<float> g_touch_ui_anchor_y{0.0f};
 // DS screen after the mapping, which is where the shrunken UI has nothing.
 bool touch_ui_unscale(float* x, float* y) {
     const float s = g_touch_ui_scale.load(std::memory_order_relaxed);
-    if (s >= 1.0f || s <= 0.0f) return true;
+    if (s >= 1.0f || s <= 0.0f || nds_title_touch_unscaled()) return true;
     const float ax = g_touch_ui_anchor_x.load(std::memory_order_relaxed);
     const float ay = g_touch_ui_anchor_y.load(std::memory_order_relaxed);
     // Something the title draws at its native place (DQ9's Menu button) is

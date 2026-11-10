@@ -118,3 +118,15 @@ bool nds_title_unscaled_touch_rect(int* x0, int* y0, int* x1, int* y1) {
     *y1 = static_cast<int>(p >> 48 & 0xFFFF);
     return *x1 > *x0 && *y1 > *y0;
 }
+
+namespace {
+std::atomic<bool> g_touch_unscaled{false};
+}  // namespace
+
+void nds_title_set_touch_unscaled(bool unscaled) {
+    g_touch_unscaled.store(unscaled, std::memory_order_relaxed);
+}
+
+bool nds_title_touch_unscaled() {
+    return g_touch_unscaled.load(std::memory_order_relaxed);
+}
