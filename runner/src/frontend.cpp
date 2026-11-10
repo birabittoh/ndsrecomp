@@ -3077,10 +3077,6 @@ int nds_run_interactive_frontend(const NdsFrontendOptions& initial_options) {
             "presenter\n",
             static_cast<unsigned>(options.internal_resolution));
     }
-    // The adaptive compositor only pays for the extra per-pixel stores when
-    // something can consume them.
-    nds_gpu2d_set_hd_emit(initial_internal_resolution > 1 &&
-                          presenter_composes_3d(presentation));
     nds_texture_upscale_set_factor(options.texture_upscale);
 
 #if defined(NDS_HAVE_COMPUTE_RENDERER)
@@ -3125,6 +3121,13 @@ int nds_run_interactive_frontend(const NdsFrontendOptions& initial_options) {
             "automatic fallback to threaded soft\n");
     }
 #endif
+    // The adaptive compositor only pays for the extra per-pixel stores when
+    // something can consume them. Decided only now: whether the presenter
+    // composes 3D depends on the renderer having started, and before that it
+    // always reads false, which left the HD path off (a 1x, pixelated
+    // picture) until a resize changed the multiplier and asked again.
+    nds_gpu2d_set_hd_emit(initial_internal_resolution > 1 &&
+                          presenter_composes_3d(presentation));
 
     NdsPerfGovernorState perf_governor{};
     // Auto-scale controller state (see the frame loop's join point).
