@@ -632,9 +632,17 @@ std::string hook_call_expr(const ConfigHook& hook) {
 void emit_hook_declarations(std::FILE* f, const HookManifest& manifest,
                             const HookSites& sites,
                             const std::vector<Function>& funcs,
+                            const SuperblockPlan& superblocks,
                             std::size_t first, std::size_t last) {
     std::unordered_set<const ConfigHook*> used;
-    for (std::size_t index = first; index < last; ++index) {
+    // A shard emits whole superblocks, and one led from inside [first, last)
+    // can run past `last`: its trailing members call their hooks from this
+    // shard's body, so they need declaring here too.
+    std::size_t scan_last = last;
+    for (std::size_t index = first; index < last; ++index)
+        if (superblocks.leader[index] == index)
+            scan_last = std::max(scan_last, superblocks.end[index]);
+    for (std::size_t index = first; index < scan_last; ++index) {
         const Function& fn = funcs[index];
         const uint32_t step = fn.mode == CpuMode::Thumb ? 2u : 4u;
         for (uint32_t pc = fn.addr; pc < fn.end_addr; pc += step) {
@@ -1449,7 +1457,8 @@ void write_bank_body(const std::string& dir,
         "   runtime_unimplemented_op (PRINCIPLES.md). */\n"
         "#include \"runtime_arm.h\"\n\n");
     if (hook_manifest && hooks)
-        emit_hook_declarations(f, *hook_manifest, *hooks, funcs, first, last);
+        emit_hook_declarations(f, *hook_manifest, *hooks, funcs, superblocks,
+                               first, last);
     if (g_flat_execution)
         std::fputs("#define NDS_FLAT_GENERATED_BODY 1\n#include \"execution_region.h\"\n\n",f);
     std::unordered_set<std::string> shard_bodies;
