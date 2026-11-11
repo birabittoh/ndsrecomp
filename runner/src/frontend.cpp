@@ -38,6 +38,7 @@
 #include "savestate_slots.h"
 #include "spu.h"
 #include "title_patches.h"
+#include "title_menu.h"
 #include "title_settings.h"
 #include "wifi_net.h"
 #if defined(NDS_HAVE_COMPUTE_RENDERER)
@@ -1634,6 +1635,65 @@ void runtime_menu_save(void* context) {
     if (!nds_update_settings_file(options.settings_path, updates, &error))
         std::fprintf(stderr, "[settings] could not save %s: %s\n",
                      options.settings_path.c_str(), error.c_str());
+}
+
+// The menu's rows for title hooks (title_menu.h): publishes a copy with the
+// current values, then applies what the hooks asked for since last frame.
+void runtime_menu_serve_title(RuntimeMenuState* state,
+                              const std::vector<RecompRuntimeUiItem>& items) {
+    bool changed = false;
+    for (const NdsTitleMenuRequest& request : nds_title_menu_take_requests()) {
+        for (const RecompRuntimeUiItem& item : items) {
+            if (request.key != item.key) continue;
+            if (!runtime_menu_is_enabled(state, &item)) break;
+            if (request.run) {
+                if (item.type == RECOMP_RUNTIME_UI_ACTION)
+                    changed |= runtime_menu_run_action(state, &item) != 0;
+            } else if (item.type == RECOMP_RUNTIME_UI_BOOL ||
+                       item.type == RECOMP_RUNTIME_UI_INT ||
+                       item.type == RECOMP_RUNTIME_UI_CHOICE) {
+                changed |=
+                    runtime_menu_set_value(state, &item, request.value) != 0;
+            }
+            break;
+        }
+    }
+    if (changed) runtime_menu_save(state);
+
+    std::vector<NdsTitleMenuRow> rows;
+    rows.reserve(items.size());
+    for (const RecompRuntimeUiItem& item : items) {
+        NdsTitleMenuRow row;
+        row.key = item.key ? item.key : "";
+        row.section = item.section ? item.section : "";
+        row.label = item.label ? item.label : "";
+        row.description = item.description ? item.description : "";
+        switch (item.type) {
+        case RECOMP_RUNTIME_UI_BOOL:
+            row.type = NdsTitleMenuRowType::Bool; break;
+        case RECOMP_RUNTIME_UI_INT:
+            row.type = NdsTitleMenuRowType::Int; break;
+        case RECOMP_RUNTIME_UI_CHOICE:
+            row.type = NdsTitleMenuRowType::Choice; break;
+        case RECOMP_RUNTIME_UI_TEXT:
+            row.type = NdsTitleMenuRowType::Text; break;
+        default:
+            row.type = NdsTitleMenuRowType::Action; break;
+        }
+        row.minimum = item.minimum;
+        row.maximum = item.maximum;
+        row.step = item.step > 0 ? item.step : 1;
+        for (size_t i = 0; item.choices && i < item.choice_count; ++i) {
+            row.choices.emplace_back(item.choices[i] ? item.choices[i] : "");
+            row.choice_values.push_back(
+                item.choice_values ? item.choice_values[i]
+                                   : item.minimum + static_cast<int>(i));
+        }
+        runtime_menu_get_value(state, &item, &row.value);
+        row.enabled = runtime_menu_is_enabled(state, &item) != 0;
+        rows.push_back(std::move(row));
+    }
+    nds_title_menu_publish(std::move(rows));
 }
 
 bool runtime_menu_key_input(SDL_Scancode scancode,
@@ -4202,6 +4262,11 @@ int nds_run_interactive_frontend(const NdsFrontendOptions& initial_options) {
 #if NDS_ONLINE
         if (netplay_menu) {
             nds_netplay_menu_tick(runtime_ui);
+        }
+#endif
+        runtime_menu_serve_title(&runtime_menu_state, runtime_menu_list);
+#if NDS_ONLINE
+        if (netplay_menu) {
             const bool editing = nds_netplay_menu_editing();
             if (editing != netplay_text_input) {
                 netplay_text_input = editing;
