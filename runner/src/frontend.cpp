@@ -5200,7 +5200,7 @@ int nds_run_interactive_frontend(const NdsFrontendOptions& initial_options) {
             }
 
             // Right stick up/down -> a title's zoom (title_settings.h): up
-            // raises the value, down lowers it, at a speed that follows the
+            // lowers the value, down raises it, at a speed that follows the
             // deflection (up to 15 units, 1.5%, a frame). The stick belongs to the
             // virtual stylus while it is held (LT), to Prime's aim, and to
             // the runtime menu while that is open. The settings are saved
@@ -5217,8 +5217,8 @@ int nds_run_interactive_frontend(const NdsFrontendOptions& initial_options) {
                 if (mag > kZoomDeadzone) {
                     const float curved =
                         (mag - kZoomDeadzone) / (1.0f - kZoomDeadzone);
-                    // Stick up (negative Y) raises the value.
-                    zoom_stick_rem += (ry < 0.0f ? 1.0f : -1.0f) * curved *
+                    // Stick up (negative Y) lowers the value (zooms in).
+                    zoom_stick_rem += (ry < 0.0f ? -1.0f : 1.0f) * curved *
                                       15.0f;
                     const int delta = static_cast<int>(zoom_stick_rem);
                     zoom_stick_rem -= static_cast<float>(delta);
