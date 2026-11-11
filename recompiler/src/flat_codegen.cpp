@@ -54,7 +54,7 @@ bool admitted(const Instr& in,const std::string& body) {
     // A helper which can change architectural state behind the local registers
     // is not silently admitted. Add supported operations with semantic tests.
     const std::set<std::string> allowed{
-        "runtime_tick","runtime_should_yield","runtime_unwinding","runtime_slice_yield",
+        "runtime_tick","runtime_should_yield","runtime_insn_enter","runtime_unwinding","runtime_slice_yield",
         "runtime_insn_slow","runtime_trace_event","runtime_live_transfer",
         "runtime_call_push_return","runtime_call_cancel_return","runtime_call_should_return",
         "runtime_dispatch","runtime_dispatch_with_exchange","runtime_dispatch_literal_call",

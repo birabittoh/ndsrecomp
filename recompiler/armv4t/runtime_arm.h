@@ -589,10 +589,23 @@ NDS_HOT_INLINE uint32_t nds_code_numc(uint32_t pc, uint32_t k) {
     if (g_nds_active != NDS_ARM9) return runtime_code_cycles(pc);
     if (g_arm9_code_pub_gen != g_cp15_timing_generation)
         return runtime_code_cycles(pc);
-    g_last_code_pc[0] = pc;
+    // No g_last_code_pc[0] store: only the ARM7 slot is ever read
+    // (arm7_cycle_combine). runtime_code_cycles still records both.
     if (k == 0u) return 0u;                       // Thumb odd halfword
     if (pc < g_arm9_itcm_code_limit) return 1u;   // live ITCM mapping
     return (k >> g_arm9_code_class_shift) & 0xFFu;
+}
+// nds_code_numc() for an instruction entered below g_nds_fast_limit
+// (codegen version 4, the LC_ path). The runtime publishes a nonzero limit
+// on the ARM9 only while g_arm9_code_pub_gen == g_cp15_timing_generation,
+// and zeroes it wherever that can stop holding (a CP15 timing-generation
+// bump, a dropped publication), so below the limit the generation check
+// above is known to pass and is skipped. Same result as nds_code_numc().
+NDS_HOT_INLINE uint32_t nds_code_numc_entered(uint32_t pc, uint32_t k) {
+    if (g_nds_active != NDS_ARM9) return runtime_code_cycles(pc);
+    if (k == 0u) return 0u;                       // Thumb odd halfword
+    const uint32_t region = (k >> g_arm9_code_class_shift) & 0xFFu;
+    return pc < g_arm9_itcm_code_limit ? 1u : region;
 }
 
 // ── Inline condition evaluation (beads-yjp.70 phase 2A) ─────────────────
@@ -683,6 +696,75 @@ void arm_set_nzcv_add(uint32_t a, uint32_t b, uint32_t result);
 void arm_set_nzcv_adc(uint32_t a, uint32_t b, uint32_t c_in, uint32_t result);
 void arm_set_nzcv_sub(uint32_t a, uint32_t b, uint32_t result);
 void arm_set_nzcv_sbc(uint32_t a, uint32_t b, uint32_t c_in, uint32_t result);
+
+// Generated banks (built with NDS_STATIC_CPU) take these inline: each is a
+// few ALU ops on CPSR, and the cross-TU call was the cost (arm_set_nzcv_sub
+// alone ran at ~1% of the emulation thread in a CPU-bound title, 900+ sites a shard). The
+// bodies are runner/src/runtime_arm.cpp's, verbatim; the exported symbols
+// stay for everything else.
+#ifdef NDS_STATIC_CPU
+NDS_MACHINERY_INLINE void arm_set_nz_i(uint32_t r) {
+    uint32_t c = g_cpu.cpsr & ~(CPSR_N_BIT | CPSR_Z_BIT);
+    if (r & 0x80000000u) c |= CPSR_N_BIT;
+    if (r == 0) c |= CPSR_Z_BIT;
+    g_cpu.cpsr = c;
+}
+NDS_MACHINERY_INLINE void arm_set_nzc_logic_i(uint32_t r, uint32_t sh) {
+    uint32_t c = g_cpu.cpsr & ~(CPSR_N_BIT | CPSR_Z_BIT | CPSR_C_BIT);
+    if (r & 0x80000000u) c |= CPSR_N_BIT;
+    if (r == 0) c |= CPSR_Z_BIT;
+    if (sh) c |= CPSR_C_BIT;
+    g_cpu.cpsr = c;
+}
+NDS_MACHINERY_INLINE void arm_set_nzcv_add_i(uint32_t a, uint32_t b,
+                                             uint32_t r) {
+    uint32_t c = g_cpu.cpsr &
+                 ~(CPSR_N_BIT | CPSR_Z_BIT | CPSR_C_BIT | CPSR_V_BIT);
+    if (r & 0x80000000u) c |= CPSR_N_BIT;
+    if (r == 0) c |= CPSR_Z_BIT;
+    if (r < a) c |= CPSR_C_BIT;
+    if ((~(a ^ b) & (a ^ r)) & 0x80000000u) c |= CPSR_V_BIT;
+    g_cpu.cpsr = c;
+}
+NDS_MACHINERY_INLINE void arm_set_nzcv_adc_i(uint32_t a, uint32_t b,
+                                             uint32_t ci, uint32_t r) {
+    uint32_t c = g_cpu.cpsr &
+                 ~(CPSR_N_BIT | CPSR_Z_BIT | CPSR_C_BIT | CPSR_V_BIT);
+    uint64_t w = (uint64_t)a + b + ci;
+    if (r & 0x80000000u) c |= CPSR_N_BIT;
+    if (r == 0) c |= CPSR_Z_BIT;
+    if (w >> 32) c |= CPSR_C_BIT;
+    if ((~(a ^ b) & (a ^ r)) & 0x80000000u) c |= CPSR_V_BIT;
+    g_cpu.cpsr = c;
+}
+NDS_MACHINERY_INLINE void arm_set_nzcv_sub_i(uint32_t a, uint32_t b,
+                                             uint32_t r) {
+    uint32_t c = g_cpu.cpsr &
+                 ~(CPSR_N_BIT | CPSR_Z_BIT | CPSR_C_BIT | CPSR_V_BIT);
+    if (r & 0x80000000u) c |= CPSR_N_BIT;
+    if (r == 0) c |= CPSR_Z_BIT;
+    if (a >= b) c |= CPSR_C_BIT;
+    if (((a ^ b) & (a ^ r)) & 0x80000000u) c |= CPSR_V_BIT;
+    g_cpu.cpsr = c;
+}
+NDS_MACHINERY_INLINE void arm_set_nzcv_sbc_i(uint32_t a, uint32_t b,
+                                             uint32_t ci, uint32_t r) {
+    uint32_t c = g_cpu.cpsr &
+                 ~(CPSR_N_BIT | CPSR_Z_BIT | CPSR_C_BIT | CPSR_V_BIT);
+    uint64_t w = (uint64_t)a + (~b & 0xFFFFFFFFu) + ci;
+    if (r & 0x80000000u) c |= CPSR_N_BIT;
+    if (r == 0) c |= CPSR_Z_BIT;
+    if (w >> 32) c |= CPSR_C_BIT;
+    if (((a ^ b) & (a ^ r)) & 0x80000000u) c |= CPSR_V_BIT;
+    g_cpu.cpsr = c;
+}
+#define arm_set_nz arm_set_nz_i
+#define arm_set_nzc_logic arm_set_nzc_logic_i
+#define arm_set_nzcv_add arm_set_nzcv_add_i
+#define arm_set_nzcv_adc arm_set_nzcv_adc_i
+#define arm_set_nzcv_sub arm_set_nzcv_sub_i
+#define arm_set_nzcv_sbc arm_set_nzcv_sbc_i
+#endif
 
 // ── Dispatch ───────────────────────────────────────────────────────
 // `target_pc` is a guest PC. Low bit indicates THUMB on BX/BLX. The
@@ -952,6 +1034,43 @@ NDS_MACHINERY_INLINE bool runtime_unwinding(void) {
     return g_nds_unwinding != 0u;
 }
 #endif
+
+// ── Folded per-instruction entry (codegen version 4) ──────────────────
+// The emitted prologue used to be
+//
+//     if (runtime_should_yield()) return;
+//     ++g_insn_count[g_nds_active];
+//     if (g_insn_hook_armed) runtime_insn_slow();
+//
+// The runtime keeps g_nds_fast_limit at zero while g_insn_hook_armed is set
+// (publish_fast_limit, nds_insn_hook_recompute), so below the limit the
+// hook cannot be armed and the whole sequence is the counter bump. At or
+// over the limit runtime_insn_enter_slow() runs the three steps above in
+// that order and returns what the yield check returned.
+bool runtime_insn_enter_slow(void);
+NDS_MACHINERY_INLINE bool runtime_insn_due(void) {
+    return __builtin_expect(g_runtime_cycles >= g_nds_fast_limit, 0);
+}
+NDS_MACHINERY_INLINE bool runtime_insn_enter(void) {
+    if (runtime_insn_due()) return runtime_insn_enter_slow();
+    ++g_insn_count[g_nds_active];
+    return false;
+}
+// runtime_tick() that reports which path it took: true when the cycles fit
+// under the limit (g_runtime_cycles is now strictly below g_nds_fast_limit),
+// false after the faithful runtime_tick_slow(). A fall-through site uses a
+// true result to enter the next instruction past its entry check: with the
+// clock below the limit that check is provably the counter bump alone, and
+// R15 already holds the next pc.
+NDS_MACHINERY_INLINE bool runtime_tick_fast(uint32_t cycles) {
+    const unsigned long long next = g_runtime_cycles + cycles;
+    if (__builtin_expect(next < g_nds_fast_limit, 1)) {
+        g_runtime_cycles = next;
+        return true;
+    }
+    runtime_tick_slow(cycles);
+    return false;
+}
 
 // Cooperative slice-yield signal, checked ONLY at backward branches (loop
 // tops, which are dispatch entries). Lets the scheduler preempt a guest

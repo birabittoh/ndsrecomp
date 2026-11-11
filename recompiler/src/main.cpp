@@ -690,6 +690,9 @@ std::string emit_hook_outcome(HookAction action, const ConfigHook& hook,
     armv4t::CodegenCtx synth_ctx = ctx;
     synth_ctx.force_bx_c_return = false;
     synth_ctx.inline_leaves = nullptr;
+    // Same PC as the real instruction that follows: no entry labels.
+    synth_ctx.fast_entry_labels = false;
+    synth_ctx.fast_fallthrough = false;
     bool not_implemented = false;
     std::string text = armv4t::ArmCodegen::emit_instr(synth, synth_ctx,
                                                       &not_implemented);
@@ -1174,7 +1177,35 @@ void emit_function_body(std::FILE* f, const Function& fn,
         }
         bool ni = false;
         ctx.force_bx_c_return = bx_c_return_pcs.count(pc) != 0;
+        // Folded instruction entry (codegen version 4): this loop emits
+        // every PC once, so it may plant the LC_ entry labels. The
+        // fall-through tick may jump straight to the next instruction's LC_
+        // label only when the loop emits that instruction next with nothing
+        // in between: no after-hook here, no before-hook there.
+        ctx.fast_entry_labels = true;
+        {
+            const uint32_t next_pc = pc + step;
+            std::size_t next_off = 0;
+            bool fast = next_pc < fn.end_addr &&
+                        source_offset_for(next_pc, step, &next_off) &&
+                        !(site && site->after);
+            if (fast) {
+                // Undefined and condition-NV instructions have their own
+                // entry text and no LC_ label.
+                const armv4t::Instr next = decode_at(next_pc, next_off);
+                if (next.is_undefined || next.cond == armv4t::Cond::NV)
+                    fast = false;
+            }
+            if (fast && hooks) {
+                auto next_site = hooks->find(function_key(next_pc, fn.mode));
+                if (next_site != hooks->end() && next_site->second.before)
+                    fast = false;
+            }
+            ctx.fast_fallthrough = fast;
+        }
         std::fputs(armv4t::ArmCodegen::emit_instr(ins, ctx, &ni).c_str(), f);
+        ctx.fast_entry_labels = false;
+        ctx.fast_fallthrough = false;
         (void)ni;  // abort path is in the emit; tracked at audit time
         if (site && site->after) {
             emit_hook_site(f, *site->after, pc, ctx);

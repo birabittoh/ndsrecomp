@@ -656,6 +656,11 @@ void nds_insn_hook_recompute() {
     // Device event counters already check their own anchors. Only an
     // instruction-count anchor needs the per-instruction callback.
     g_insn_hook_armed = (g_runtime_deep_trace || g_brk_is_insn) ? 1u : 0u;
+    // Banks emitted at codegen version 4 skip the armed test while the clock
+    // is under g_nds_fast_limit (runtime_insn_enter), so an armed hook must
+    // force every instruction onto runtime_insn_enter_slow. publish_fast_limit
+    // keeps the limit at zero from here on.
+    if (g_insn_hook_armed) runtime_clear_fast_limit();
 }
 
 // Armed per-insn payload for new-emission banks: the deep-trace register
@@ -680,6 +685,15 @@ extern "C" void runtime_insn_slow(void) {
         std::memcpy(e.r, g_cpu.R, sizeof(e.r));
     }
     brk_check();
+}
+
+// Codegen version 4 instruction entry at or over g_nds_fast_limit: the
+// original yield check, counter bump and armed payload, in that order.
+extern "C" bool runtime_insn_enter_slow(void) {
+    if (runtime_should_yield_slow()) return true;
+    ++g_insn_count[(g_nds_active == NDS_ARM7) ? 1 : 0];
+    if (g_insn_hook_armed) runtime_insn_slow();
+    return false;
 }
 
 namespace {

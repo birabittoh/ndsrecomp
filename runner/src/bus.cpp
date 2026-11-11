@@ -1109,6 +1109,7 @@ static void arm9_code_fast_publish() {
     g_arm9_itcm_code_limit = g_cp15.itcm_enable ? g_cp15.itcm_size : 0u;
     if (!g_arm9_region_code_timing_valid) {
         g_arm9_code_pub_gen = 0u;
+        runtime_clear_fast_limit();   // see nds_code_numc_entered
         return;
     }
     // The latched region class is only ever Cached/MainRam/Other (ITCM is
@@ -1120,13 +1121,20 @@ static void arm9_code_fast_publish() {
     g_arm9_code_pub_gen = g_cp15_timing_generation;
 }
 
-extern "C" void arm9_code_fast_invalidate(void) { g_arm9_code_pub_gen = 0u; }
+// Dropping the publication also drops the fast limit: code entered below
+// the limit uses nds_code_numc_entered, which relies on the publication
+// being current (runtime_arm.h).
+extern "C" void arm9_code_fast_invalidate(void) {
+    g_arm9_code_pub_gen = 0u;
+    runtime_clear_fast_limit();
+}
 
 static void reset_arm9_code_timing() {
     g_arm9_code_timing = {};
     g_arm9_region_code_timing = Arm9CodeTiming::Other;
     g_arm9_region_code_timing_valid = false;
     g_arm9_code_pub_gen = 0u;
+    runtime_clear_fast_limit();   // see nds_code_numc_entered
 }
 
 Arm9CodeTiming arm9_code_timing(uint32_t addr) {
