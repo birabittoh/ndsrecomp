@@ -5,6 +5,7 @@
 #include "net/mp_reliable.h"
 #include "net/mp_wire.h"
 
+#include <algorithm>
 #include <cstdio>
 #include <cstring>
 #include <map>
@@ -69,6 +70,57 @@ bool TestWireRoundTrip() {
     ok = ok && require(!mpnet::Decode(bad.data(), bad.size(), &out),
                        "node 0 rejected");
 
+    // Bundled frames: appended behind the payload, decoded oldest first.
+    {
+        Frame first, second;
+        first.node = second.node = in.node;
+        first.type = 1;
+        first.timestamp = 111;
+        first.seq = 5;
+        first.payload = {9, 8, 7};
+        second.type = 2u | (1u << 16u);
+        second.timestamp = 222;
+        second.seq = 6;
+        std::vector<uint8_t> b1, b2, dg;
+        mpnet::Encode(first, &b1);
+        mpnet::Encode(second, &b2);
+        mpnet::Encode(in, &dg);
+        ok = ok && require(mpnet::AppendBundled(&dg, b1.data()) &&
+                               mpnet::AppendBundled(&dg, b2.data()),
+                           "bundles appended");
+        Frame got;
+        ok = ok && require(mpnet::Decode(dg.data(), dg.size(), &got) &&
+                               got.payload == in.payload &&
+                               got.seq == in.seq && got.bundled.size() == 2,
+                           "bundled datagram decodes") &&
+             require(got.bundled[0].seq == 5 && got.bundled[0].type == 1 &&
+                         got.bundled[0].timestamp == 111 &&
+                         got.bundled[0].node == in.node &&
+                         got.bundled[0].payload == first.payload &&
+                         got.bundled[1].seq == 6 &&
+                         got.bundled[1].type == second.type &&
+                         got.bundled[1].timestamp == 222 &&
+                         got.bundled[1].payload.empty(),
+                     "bundled frames round-trip") &&
+             require(!mpnet::Decode(dg.data(), dg.size() - 1, &got),
+                     "truncated bundle rejected");
+        std::vector<uint8_t> trailing = dg;
+        trailing.push_back(0);
+        ok = ok && require(!mpnet::Decode(trailing.data(), trailing.size(),
+                                          &got),
+                           "trailing bytes rejected");
+        Frame fat;
+        fat.node = in.node;
+        fat.seq = 9;
+        fat.payload.assign(mpnet::kBundleLimitBytes, 0);
+        std::vector<uint8_t> bf;
+        mpnet::Encode(fat, &bf);
+        const size_t before = dg.size();
+        ok = ok && require(!mpnet::AppendBundled(&dg, bf.data()) &&
+                               dg.size() == before,
+                           "a bundle past the size limit is refused");
+    }
+
     uint8_t beacon[12 + 24] = {};
     beacon[12] = 0x80;
     uint8_t auth[12 + 24] = {};
@@ -96,6 +148,11 @@ struct Sim {
     milliseconds delay{0};
     milliseconds jitter{0};
     bool reorder = false;
+    // Burst loss: per mille chance that a datagram starts a run of
+    // burst_len lost datagrams (all senders, as on a shared uplink).
+    uint32_t burst_pct = 0;
+    uint32_t burst_len = 0;
+    uint32_t burst_left = 0;
 
     std::mt19937 rng{12345};
     std::map<uint32_t, Reliable> nodes;
@@ -106,11 +163,26 @@ struct Sim {
     std::map<uint32_t, uint32_t> next_counter;
     uint64_t beacons_received = 0;
     uint64_t datagrams = 0;
+    uint64_t bytes = 0;
+    // How much later than the link's own delay each frame reached the
+    // guest: what a lost datagram costs the emulation thread waiting on it.
+    Time now_{};
+    std::map<std::pair<uint32_t, uint32_t>, Time> sent_at;
+    std::vector<int64_t> late_ms;
 
     Reliable::SendFn Sender(uint32_t from, Time now) {
         return [this, from, now](uint32_t to, const uint8_t* data,
                                  size_t len) {
             ++datagrams;
+            bytes += len;
+            if (burst_left) {
+                --burst_left;
+                return;
+            }
+            if (burst_pct && rng() % 1000u < burst_pct) {
+                burst_left = burst_len - 1;
+                return;
+            }
             if (loss_pct && rng() % 100u < loss_pct) return;
             auto at = now + delay;
             if (jitter.count())
@@ -132,6 +204,11 @@ struct Sim {
             uint32_t counter = 0;
             std::memcpy(&counter, f.payload.data(), 4);
             received[to][f.node].push_back(counter);
+            const auto it = sent_at.find({f.node, counter});
+            if (it != sent_at.end())
+                late_ms.push_back(
+                    std::chrono::duration_cast<milliseconds>(
+                        now_ - it->second - delay).count());
         }
         ready->clear();
     }
@@ -145,6 +222,7 @@ struct Sim {
         std::vector<Frame> ready;
         for (milliseconds t{0}; t < total; t += milliseconds(1)) {
             const Time now = t0 + t;
+            now_ = now;
             // Hellos for the first second, as the transport does.
             if (t < milliseconds(1000) && t.count() % 100 == 0) {
                 for (auto& [id, rel] : nodes)
@@ -167,6 +245,7 @@ struct Sim {
                     const uint32_t counter = next_counter[id]++;
                     frame.payload.resize(64);
                     std::memcpy(frame.payload.data(), &counter, 4);
+                    sent_at[{id, counter}] = now;
                     rel.Send(&frame, true, now, Sender(id, now));
                 }
             }
@@ -219,24 +298,56 @@ struct Sim {
         return ok;
     }
 
+    // Frames delivered more than `ms` later than the link's delay, per
+    // thousand.
+    double LatePerMille(int64_t ms) const {
+        if (late_ms.empty()) return 0.0;
+        size_t n = 0;
+        for (int64_t v : late_ms) n += v > ms;
+        return 1000.0 * static_cast<double>(n) /
+               static_cast<double>(late_ms.size());
+    }
+
+    int64_t LatePercentile(double pct) {
+        if (late_ms.empty()) return 0;
+        std::vector<int64_t> v = late_ms;
+        std::sort(v.begin(), v.end());
+        return v[static_cast<size_t>(pct / 100.0 *
+                                     static_cast<double>(v.size() - 1))];
+    }
+
     void Report(const char* label) {
-        uint64_t retx = 0, dup = 0, reord = 0;
+        uint64_t retx = 0, dup = 0, reord = 0, fast = 0, recovered = 0;
+        uint32_t redundancy = 0;
         size_t unacked = 0;
         for (auto& [id, rel] : nodes) {
             const auto st = rel.stats();
+            fast += st.fast_retransmits;
+            recovered += st.recovered;
+            redundancy = std::max(redundancy, st.redundancy);
             retx += st.retransmits;
             dup += st.duplicates;
             reord += st.reordered;
             unacked += st.unacked;
         }
+        std::printf("%s: fast_retx=%llu recovered=%llu redundancy=%u\n  ",
+                    label, static_cast<unsigned long long>(fast),
+                    static_cast<unsigned long long>(recovered), redundancy);
         std::printf("%s: datagrams=%llu retx=%llu dup=%llu reordered=%llu "
-                    "beacons=%llu unacked_left=%zu\n", label,
+                    "beacons=%llu unacked_left=%zu kB=%llu | late ms "
+                    "p50=%lld p99=%lld p99.9=%lld max=%lld >40ms=%.1f/1000\n",
+                    label,
                     static_cast<unsigned long long>(datagrams),
                     static_cast<unsigned long long>(retx),
                     static_cast<unsigned long long>(dup),
                     static_cast<unsigned long long>(reord),
                     static_cast<unsigned long long>(beacons_received),
-                    unacked);
+                    unacked, static_cast<unsigned long long>(bytes / 1024),
+                    static_cast<long long>(LatePercentile(50)),
+                    static_cast<long long>(LatePercentile(99)),
+                    static_cast<long long>(LatePercentile(99.9)),
+                    static_cast<long long>(LatePercentile(100)),
+                    LatePerMille(40));
     }
 };
 
@@ -261,18 +372,22 @@ bool TestLossyJitteryLink() {
     sim.Run({0x1111, 0x2222, 0x3333}, milliseconds(16), milliseconds(8000),
             milliseconds(14000));
     sim.Report("loss 5% D=50 jitter 10");
-    uint64_t retx = 0, dup = 0;
+    uint64_t retx = 0, dup = 0, recovered = 0;
     size_t unacked = 0;
     for (auto& [id, rel] : sim.nodes) {
         retx += rel.stats().retransmits;
         dup += rel.stats().duplicates;
+        recovered += rel.stats().recovered;
         unacked += rel.stats().unacked;
     }
-    // Selective acks: what arrived behind a gap is not sent again, so
-    // duplicates stay well below retransmissions.
+    // The next datagram carries a lost frame again, so loss costs the
+    // guest about one send period (16 ms) plus jitter, not a timeout,
+    // and hardly anything is left to retransmit.
     return sim.CheckExactlyOnceInOrder("lossy") &&
-           require(retx > 0, "lossy link retransmits") &&
-           require(dup * 2 < retx, "few duplicate deliveries") &&
+           require(recovered > 0, "lost frames recovered from bundles") &&
+           require(dup <= retx, "no duplicates beyond retransmissions") &&
+           require(sim.LatePercentile(100) <= 40,
+                   "5 % loss never stalls delivery past 40 ms") &&
            require(unacked == 0, "everything acknowledged and retired");
 }
 
@@ -298,7 +413,118 @@ bool TestHeavyLoss() {
     sim.Run({0x1111, 0x2222}, milliseconds(16), milliseconds(5000),
             milliseconds(12000));
     sim.Report("loss 20%");
-    return sim.CheckExactlyOnceInOrder("heavy loss");
+    // Before redundancy and fast retransmit: 852 of 1000 frames more than
+    // 40 ms late, the worst 3 s.
+    return sim.CheckExactlyOnceInOrder("heavy loss") &&
+           require(sim.LatePerMille(40) < 100.0,
+                   "20 % loss: under 10 % of frames over 40 ms late") &&
+           require(sim.LatePercentile(100) < 500,
+                   "20 % loss: no stall of half a second");
+}
+
+// Loss in runs of 4 datagrams, as on Wi-Fi or a congested uplink: more
+// than the starting redundancy covers, so selective acks trigger fast
+// retransmits and the redundancy rises.
+bool TestBurstLoss() {
+    Sim sim;
+    sim.burst_pct = 15;
+    sim.burst_len = 4;
+    sim.delay = milliseconds(40);
+    sim.jitter = milliseconds(5);
+    sim.Run({0x1111, 0x2222}, milliseconds(16), milliseconds(9000),
+            milliseconds(14000));
+    sim.Report("bursts of 4, D=40");
+    uint64_t fast = 0;
+    for (auto& [id, rel] : sim.nodes) fast += rel.stats().fast_retransmits;
+    return sim.CheckExactlyOnceInOrder("burst") &&
+           require(fast > 0, "bursts trigger fast retransmits") &&
+           require(sim.LatePercentile(100) < 400,
+                   "bursts: no stall of 400 ms");
+}
+
+// A quarter second of round trip with heavy jitter and loss.
+bool TestBadLink() {
+    Sim sim;
+    sim.loss_pct = 10;
+    sim.delay = milliseconds(125);
+    sim.jitter = milliseconds(40);
+    // Long enough for the redundancy to settle: the first holes each cost
+    // a round trip before it has risen.
+    sim.Run({0x1111, 0x2222}, milliseconds(16), milliseconds(40000),
+            milliseconds(46000));
+    sim.Report("loss 10% D=125 jitter 40");
+    return sim.CheckExactlyOnceInOrder("bad link") &&
+           require(sim.LatePerMille(80) < 20.0,
+                   "bad link: 98 % of frames within jitter + 40 ms");
+}
+
+// Redundancy is paid in bytes: on a clean link it stays at one earlier
+// frame per datagram, and full-size frames are never bundled.
+bool TestRedundancyCost() {
+    Sim sim;
+    sim.delay = milliseconds(12);
+    sim.Run({0x1111, 0x2222}, milliseconds(16), milliseconds(6000),
+            milliseconds(9000));
+    bool ok = true;
+    for (auto& [id, rel] : sim.nodes) {
+        const auto st = rel.stats();
+        ok = require(st.redundancy == Reliable::kMinRedundancy,
+                     "clean link keeps the lowest redundancy") && ok;
+        // 313 frames of 64 bytes, each bundled once on the next frame
+        // and at most once more on an ack.
+        ok = require(st.redundant_bytes <=
+                         2u * 313u * (mpnet::kBundleHeaderBytes + 64u),
+                     "clean link: each frame bundled at most twice") && ok;
+    }
+
+    Reliable a(0xAAAA), b(0xBBBB);
+    a.AddPeer(0xBBBB);
+    b.AddPeer(0xAAAA);
+    const Time t0 = Time() + std::chrono::hours(1);
+    std::vector<std::vector<uint8_t>> to_a, to_b;
+    const auto send_a = [&](uint32_t, const uint8_t* d, size_t n) {
+        to_b.emplace_back(d, d + n);
+    };
+    const auto send_b = [&](uint32_t, const uint8_t* d, size_t n) {
+        to_a.emplace_back(d, d + n);
+    };
+    // Synchronise both ways, then send big frames.
+    std::vector<Frame> ready;
+    a.SendControl(0xBBBB, mpnet::kFlagHello, t0, send_a);
+    b.SendControl(0xAAAA, mpnet::kFlagHello, t0, send_b);
+    const auto pump = [&](Time now) {
+        for (auto& d : to_b) {
+            Frame f;
+            if (mpnet::Decode(d.data(), d.size(), &f))
+                b.Receive(std::move(f), now, &ready);
+        }
+        to_b.clear();
+        for (auto& d : to_a) {
+            Frame f;
+            if (mpnet::Decode(d.data(), d.size(), &f))
+                a.Receive(std::move(f), now, &ready);
+        }
+        to_a.clear();
+    };
+    pump(t0);
+    b.SendControl(0xAAAA, mpnet::kFlagAckOnly, t0, send_b);
+    pump(t0);
+    size_t largest = 0;
+    for (int i = 0; i < 4; ++i) {
+        Frame big;
+        big.type = 1;
+        big.payload.assign(mpnet::kMaxPayloadBytes, 0x5A);
+        a.Send(&big, true, t0 + milliseconds(i), send_a);
+        Frame small;
+        small.type = 1;
+        small.payload.assign(40, 0x11);
+        a.Send(&small, true, t0 + milliseconds(i), send_a);
+        for (auto& d : to_b) largest = std::max(largest, d.size());
+        to_b.clear();  // none arrive: all stay unacknowledged
+    }
+    return ok &&
+           require(largest == mpnet::kMaxDatagramBytes,
+                   "a full-size frame goes out alone, at its own size");
 }
 
 bool TestNoPeers() {
@@ -326,6 +552,9 @@ int main() {
     ok = TestLossyJitteryLink() && ok;
     ok = TestReorderingLink() && ok;
     ok = TestHeavyLoss() && ok;
+    ok = TestBurstLoss() && ok;
+    ok = TestBadLink() && ok;
+    ok = TestRedundancyCost() && ok;
     if (!ok) return 1;
     std::printf("mp_reliable_test: ok\n");
     return 0;

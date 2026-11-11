@@ -234,6 +234,13 @@ struct NdsLocalMpStats {
     uint64_t rel_gap_skips = 0;
     uint64_t rel_give_ups = 0;
     uint64_t rel_held = 0;
+    // Of rel_retransmits, the ones a selective ack triggered; frames that
+    // first arrived as a bundled copy (a lost datagram that cost no round
+    // trip); bytes of bundled copies sent; copies per datagram now.
+    uint64_t rel_fast_retransmits = 0;
+    uint64_t rel_recovered = 0;
+    uint64_t rel_redundant_bytes = 0;
+    uint64_t rel_redundancy = 0;
     uint64_t peers = 0;              // other runners in range now
     // Index = frame type: 0 packet/beacon, 1 MP cmd, 2 reply, 3 ack.
     // sent_by_type counts logical frames (one per send, not per target).

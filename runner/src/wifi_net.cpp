@@ -1143,6 +1143,14 @@ public:
         out->rel_give_ups =
             stats_rel_give_ups_.load(std::memory_order_relaxed);
         out->rel_held = stats_rel_held_.load(std::memory_order_relaxed);
+        out->rel_fast_retransmits =
+            stats_rel_fast_retransmits_.load(std::memory_order_relaxed);
+        out->rel_recovered =
+            stats_rel_recovered_.load(std::memory_order_relaxed);
+        out->rel_redundant_bytes =
+            stats_rel_redundant_bytes_.load(std::memory_order_relaxed);
+        out->rel_redundancy =
+            stats_rel_redundancy_.load(std::memory_order_relaxed);
         out->peers = stats_peers_.load(std::memory_order_relaxed);
         for (int i = 0; i < 4; ++i) {
             out->sent_by_type[i] =
@@ -1573,6 +1581,13 @@ private:
         stats_rel_gap_skips_.store(rs.gap_skips, std::memory_order_relaxed);
         stats_rel_give_ups_.store(rs.give_ups, std::memory_order_relaxed);
         stats_rel_held_.store(rs.held, std::memory_order_relaxed);
+        stats_rel_fast_retransmits_.store(rs.fast_retransmits,
+                                          std::memory_order_relaxed);
+        stats_rel_recovered_.store(rs.recovered, std::memory_order_relaxed);
+        stats_rel_redundant_bytes_.store(rs.redundant_bytes,
+                                         std::memory_order_relaxed);
+        stats_rel_redundancy_.store(rs.redundancy,
+                                    std::memory_order_relaxed);
         stats_peers_.store(rs.peers, std::memory_order_relaxed);
     }
 
@@ -1733,7 +1748,8 @@ private:
                 "gap_waits=%.0f | "
                 "client host-wait calls=%.0f timeouts=%.0f wait_ms=%.1f | "
                 "lab_drops=%.0f held=%zu | "
-                "rel retx=%.0f dup=%.0f reorder=%.0f gap_skips=%.0f "
+                "rel retx=%.0f fast=%.0f recovered=%.0f redundancy=%llu "
+                "redundant_kB=%.1f dup=%.0f reorder=%.0f gap_skips=%.0f "
                 "give_ups=%.0f waiting=%llu peers=%llu | "
                 "reply_lat_ms[<1/2/4/8/16/32/32+]=%s turnaround=%s\n",
                 static_cast<unsigned>(instance_),
@@ -1762,6 +1778,11 @@ private:
                 rate(cur.injected_drops, p.injected_drops),
                 delayed_.size(),
                 rate(cur.rel_retransmits, p.rel_retransmits),
+                rate(cur.rel_fast_retransmits, p.rel_fast_retransmits),
+                rate(cur.rel_recovered, p.rel_recovered),
+                static_cast<unsigned long long>(cur.rel_redundancy),
+                rate(cur.rel_redundant_bytes, p.rel_redundant_bytes) /
+                    1024.0,
                 rate(cur.rel_duplicates, p.rel_duplicates),
                 rate(cur.rel_reordered, p.rel_reordered),
                 rate(cur.rel_gap_skips, p.rel_gap_skips),
@@ -1931,6 +1952,10 @@ private:
     std::atomic<uint64_t> stats_rel_gap_skips_{0};
     std::atomic<uint64_t> stats_rel_give_ups_{0};
     std::atomic<uint64_t> stats_rel_held_{0};
+    std::atomic<uint64_t> stats_rel_fast_retransmits_{0};
+    std::atomic<uint64_t> stats_rel_recovered_{0};
+    std::atomic<uint64_t> stats_rel_redundant_bytes_{0};
+    std::atomic<uint64_t> stats_rel_redundancy_{0};
     std::atomic<uint64_t> stats_peers_{0};
     std::chrono::steady_clock::time_point last_cmd_send_wall_{};
     std::chrono::steady_clock::time_point last_cmd_recv_wall_{};

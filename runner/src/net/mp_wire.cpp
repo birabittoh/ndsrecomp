@@ -2,6 +2,8 @@
 
 #include "net/mp_wire.h"
 
+#include <utility>
+
 namespace mpnet {
 
 namespace {
@@ -56,7 +58,8 @@ bool Decode(const uint8_t* data, size_t len, Frame* out) {
     if (ReadLe32(data) != kMagic) return false;
     const uint32_t payload_len = ReadLe32(data + 12);
     if (payload_len > kMaxPayloadBytes) return false;
-    if (kHeaderBytes + payload_len != len) return false;
+    if (kHeaderBytes + payload_len > len) return false;
+    if (len > kMaxDatagramBytes) return false;
     out->node = ReadLe32(data + 4);
     if (out->node == 0) return false;
     out->type = ReadLe32(data + 8);
@@ -68,7 +71,43 @@ bool Decode(const uint8_t* data, size_t len, Frame* out) {
     out->ack_next = ReadLe32(data + 44);
     out->ack_bits = ReadLe32(data + 48);
     out->flags = ReadLe32(data + 52);
-    out->payload.assign(data + kHeaderBytes, data + len);
+    size_t at = kHeaderBytes + payload_len;
+    out->payload.assign(data + kHeaderBytes, data + at);
+    out->bundled.clear();
+    while (at != len) {
+        if (len - at < kBundleHeaderBytes) return false;
+        const size_t blen = static_cast<size_t>(data[at + 16]) |
+                            (static_cast<size_t>(data[at + 17]) << 8u);
+        if (len - at - kBundleHeaderBytes < blen) return false;
+        Frame b;
+        b.node = out->node;
+        b.seq = ReadLe32(data + at);
+        if (b.seq == 0) return false;
+        b.type = ReadLe32(data + at + 4);
+        b.timestamp = ReadLe64(data + at + 8);
+        b.sent_ns = out->sent_ns;
+        at += kBundleHeaderBytes;
+        b.payload.assign(data + at, data + at + blen);
+        at += blen;
+        out->bundled.push_back(std::move(b));
+    }
+    return true;
+}
+
+bool AppendBundled(std::vector<uint8_t>* out, const uint8_t* source) {
+    const size_t blen = ReadLe32(source + 12);
+    if (out->size() + kBundleHeaderBytes + blen > kBundleLimitBytes)
+        return false;
+    const size_t at = out->size();
+    out->resize(at + kBundleHeaderBytes + blen);
+    uint8_t* p = out->data() + at;
+    PutLe32(p, ReadLe32(source + 32));
+    PutLe32(p + 4, ReadLe32(source + 8));
+    PutLe64(p + 8, ReadLe64(source + 16));
+    p[16] = static_cast<uint8_t>(blen);
+    p[17] = static_cast<uint8_t>(blen >> 8u);
+    for (size_t i = 0; i < blen; ++i)
+        p[kBundleHeaderBytes + i] = source[kHeaderBytes + i];
     return true;
 }
 

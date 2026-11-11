@@ -21,6 +21,7 @@ void Reliable::Reset(uint32_t self_node) {
     next_seq_ = 1;
     peers_.clear();
     unacked_.clear();
+    fast_pending_ = false;
     stats_ = Stats{};
 }
 
@@ -74,10 +75,8 @@ size_t Reliable::Send(Frame* frame, bool reliable, Time now,
 
     std::vector<uint8_t> datagram;
     Encode(*frame, &datagram);
-    for (auto& [node, peer] : peers_) {
-        StampFor(node, peer, &datagram, now);
-        send(node, datagram.data(), datagram.size());
-    }
+    for (auto& [node, peer] : peers_)
+        SendWithBundle(node, peer, &datagram, reliable, now, send);
     // With no peer there is nobody to retransmit to: a peer that turns up
     // later joins the stream after this frame.
     if (reliable && !peers_.empty()) {
@@ -107,10 +106,49 @@ void Reliable::SendControl(uint32_t node, uint32_t flags, Time now,
     if (node != 0) {
         const auto it = peers_.find(node);
         if (it == peers_.end()) return;
-        StampFor(node, it->second, &datagram, now);
+        SendWithBundle(node, it->second, &datagram, false, now, send);
+        return;
     }
     send(node, datagram.data(), datagram.size());
 }
+
+void Reliable::SendWithBundle(uint32_t node, Peer& peer,
+                              std::vector<uint8_t>* datagram,
+                              bool sequenced, Time now, const SendFn& send) {
+    StampFor(node, peer, datagram, now);
+    // The newest frames this peer has not acknowledged, the one going out
+    // right now (not in unacked_ yet) aside.
+    const Sent* pick[kMaxRedundancy];
+    uint32_t picked = 0;
+    for (auto it = unacked_.rbegin(); peer.tx_synced &&
+         it != unacked_.rend() && picked < peer.redundancy; ++it) {
+        if (!PeerLacks(node, peer, *it)) {
+            // Everything older is acknowledged too, bar holes, and those
+            // are the retransmission timers' business.
+            if (SeqBefore(it->seq, peer.tx_acked_next)) break;
+            continue;
+        }
+        pick[picked++] = &*it;
+    }
+    if (picked != 0 && !sequenced) {
+        if (pick[0]->seq == peer.control_bundled_seq) picked = 0;
+        else peer.control_bundled_seq = pick[0]->seq;
+    }
+    if (picked == 0) {
+        send(node, datagram->data(), datagram->size());
+        return;
+    }
+    scratch_ = *datagram;
+    while (picked > 0) {
+        const Sent& sent = *pick[--picked];
+        const size_t before = scratch_.size();
+        if (!AppendBundled(&scratch_, sent.datagram.data())) continue;
+        stats_.redundant_bytes += scratch_.size() - before;
+    }
+    send(node, scratch_.data(), scratch_.size());
+}
+
+void Reliable::NoteLoss(Peer& peer) { ++peer.window_losses; }
 
 void Reliable::MarkAckDue(Peer& peer, Time now) {
     if (peer.ack_due) return;
@@ -153,6 +191,26 @@ void Reliable::OnAck(uint32_t node, Peer& peer, uint32_t ack_next,
         sent->sacked_by.push_back(node);
         if (sent->retransmits == 0) sample_from = sent;
     }
+    // The peer holds frames after ack_next but not ack_next itself, nor
+    // the ones its bitmap leaves out below the highest it has: lost, once
+    // a round trip has passed since they last went out (before that the
+    // ack may simply predate their arrival).
+    if (ack_bits && peer.tx_synced) {
+        const Clock::duration guard =
+            peer.have_rtt ? peer.srtt + peer.rttvar : kInitialRto / 2;
+        uint32_t top = 31;
+        while ((ack_bits & (1u << top)) == 0) --top;
+        for (uint32_t i = 0; i <= top; ++i) {
+            if (i > 0 && (ack_bits & (1u << (i - 1u)))) continue;
+            Sent* sent = FindSent(ack_next + i);
+            if (!sent || !PeerLacks(node, peer, *sent)) continue;
+            if (now - sent->last_sent < guard) continue;
+            if (std::find(sent->fast_for.begin(), sent->fast_for.end(),
+                          node) == sent->fast_for.end())
+                sent->fast_for.push_back(node);
+            fast_pending_ = true;
+        }
+    }
     if (!peer.tx_synced) {
         peer.tx_synced = true;
         peer.tx_acked_next = ack_next;
@@ -179,8 +237,9 @@ void Reliable::OnAck(uint32_t node, Peer& peer, uint32_t ack_next,
         peer.rttvar = (peer.rttvar * 3 + err) / 4;
         peer.srtt = (peer.srtt * 7 + sample) / 8;
     }
-    peer.rto = std::clamp<Clock::duration>(peer.srtt + peer.rttvar * 4,
-                                           kMinRto, kMaxRto);
+    peer.rto = std::clamp<Clock::duration>(
+        peer.srtt + std::max<Clock::duration>(peer.rttvar * 4, kRtoMargin),
+        kMinRto, kMaxRto);
 }
 
 void Reliable::ReleaseInOrder(Peer& peer, std::vector<Frame>* ready) {
@@ -205,37 +264,59 @@ void Reliable::Receive(Frame&& frame, Time now, std::vector<Frame>* ready) {
     if (frame.ack_node == self_ && frame.ack_next != 0)
         OnAck(frame.node, peer, frame.ack_next, frame.ack_bits, now);
 
-    if (frame.seq == 0) {
-        if (!peer.rx_synced && frame.next_seq != 0) {
-            peer.rx_synced = true;
-            peer.rx_expected = frame.next_seq;
-            // Tell the sender where we joined, so it can retransmit.
-            MarkAckDue(peer, now);
+    // Where this receiver joins the sender's stream, before anything the
+    // datagram bundles: frames before that were not for it.
+    if (!peer.rx_synced && (frame.seq != 0 || frame.next_seq != 0)) {
+        peer.rx_synced = true;
+        peer.rx_expected = frame.seq != 0 ? frame.seq : frame.next_seq;
+        // Tell the sender where we joined, so it can retransmit.
+        MarkAckDue(peer, now);
+    }
+    // Bundled frames are older than the datagram's own: first, in order.
+    std::vector<Frame> bundled = std::move(frame.bundled);
+    frame.bundled.clear();
+    if (peer.rx_synced) {
+        for (Frame& b : bundled) {
+            b.from = frame.from;
+            Accept(peer, std::move(b), true, now, ready);
         }
+    }
+
+    if (frame.seq == 0) {
         if (frame.flags & (kFlagHello | kFlagAckOnly)) return;
         ready->push_back(std::move(frame));
         return;
     }
+    Accept(peer, std::move(frame), false, now, ready);
+}
 
-    if (!peer.rx_synced) {
-        peer.rx_synced = true;
-        peer.rx_expected = frame.seq;
-    }
-    MarkAckDue(peer, now);
+void Reliable::Accept(Peer& peer, Frame&& frame, bool bundled, Time now,
+                      std::vector<Frame>* ready) {
     if (SeqBefore(frame.seq, peer.rx_expected)) {
-        ++stats_.duplicates;
+        // A bundled copy of a frame already here is the normal case.
+        if (!bundled) {
+            ++stats_.duplicates;
+            MarkAckDue(peer, now);
+        }
         return;
     }
     if (frame.seq != peer.rx_expected) {
         if (peer.held.count(frame.seq)) {
-            ++stats_.duplicates;
+            if (!bundled) {
+                ++stats_.duplicates;
+                MarkAckDue(peer, now);
+            }
         } else if (peer.held.size() < kMaxHeld) {
             if (peer.held.empty()) peer.gap_since = now;
             peer.held.emplace(frame.seq, std::move(frame));
             ++stats_.reordered;
+            if (bundled) ++stats_.recovered;
+            MarkAckDue(peer, now);
         }
         return;
     }
+    MarkAckDue(peer, now);
+    if (bundled) ++stats_.recovered;
     ready->push_back(std::move(frame));
     peer.rx_expected = NextSeq(peer.rx_expected);
     const size_t held_before = peer.held.size();
@@ -255,7 +336,9 @@ bool Reliable::AckedByAll(uint32_t seq) const {
 
 Reliable::Clock::duration Reliable::RetransmitAfter(const Peer& peer,
                                                     const Sent& sent) const {
-    const uint32_t shift = std::min<uint32_t>(sent.retransmits, 4u);
+    // Backing off is for congestion, and this stream is a trickle: double
+    // only so far that a dead path is not flooded.
+    const uint32_t shift = std::min<uint32_t>(sent.retransmits, 2u);
     return std::min<Clock::duration>(peer.rto * (1u << shift), kMaxRto * 2);
 }
 
@@ -267,16 +350,37 @@ void Reliable::Service(Time now, const SendFn& send,
         bool resent = false;
         for (auto& [node, peer] : peers_) {
             if (!PeerLacks(node, peer, sent)) continue;
-            if (now - sent.last_sent < RetransmitAfter(peer, sent)) continue;
+            const bool fast =
+                std::find(sent.fast_for.begin(), sent.fast_for.end(),
+                          node) != sent.fast_for.end();
+            if (!fast &&
+                now - sent.last_sent < RetransmitAfter(peer, sent))
+                continue;
             StampFor(node, peer, &sent.datagram, now);
             send(node, sent.datagram.data(), sent.datagram.size());
             ++stats_.retransmits;
+            if (fast) {
+                ++stats_.fast_retransmits;
+            } else if (now - peer.rto_backed_off >= peer.rto) {
+                peer.rto_backed_off = now;
+                peer.rto = std::min<Clock::duration>(peer.rto * 2, kMaxRto);
+            }
+            NoteLoss(peer);
             resent = true;
             if (budget) --budget;
         }
+        sent.fast_for.clear();
         if (resent) {
             sent.last_sent = now;
             ++sent.retransmits;
+        }
+    }
+
+    fast_pending_ = false;
+    for (const Sent& sent : unacked_) {
+        if (!sent.fast_for.empty()) {
+            fast_pending_ = true;  // over this call's budget
+            break;
         }
     }
 
@@ -303,10 +407,23 @@ void Reliable::Service(Time now, const SendFn& send,
         }
         if (peer.ack_due && now - peer.ack_due_since >= kAckDelay)
             SendControl(node, kFlagAckOnly, now, send);
+        // Redundancy follows the loss it did not cover.
+        if (peer.window_start == Time{}) peer.window_start = now;
+        if (peer.window_losses >= kRedundancyRaiseAt) {
+            if (peer.redundancy < kMaxRedundancy) ++peer.redundancy;
+            peer.window_losses = 0;
+            peer.window_start = now;
+        } else if (now - peer.window_start >= kRedundancyWindow) {
+            if (peer.window_losses == 0 && peer.redundancy > kMinRedundancy)
+                --peer.redundancy;
+            peer.window_losses = 0;
+            peer.window_start = now;
+        }
     }
 }
 
 Reliable::Time Reliable::NextDeadline() const {
+    if (fast_pending_) return Time::min();
     Time next = Time::max();
     for (const auto& [node, peer] : peers_) {
         if (peer.ack_due)
@@ -329,7 +446,11 @@ Reliable::Time Reliable::NextDeadline() const {
 Reliable::Stats Reliable::stats() const {
     Stats out = stats_;
     out.held = 0;
-    for (const auto& [node, peer] : peers_) out.held += peer.held.size();
+    out.redundancy = 0;
+    for (const auto& [node, peer] : peers_) {
+        out.held += peer.held.size();
+        out.redundancy = std::max(out.redundancy, peer.redundancy);
+    }
     out.unacked = unacked_.size();
     out.peers = peers_.size();
     return out;

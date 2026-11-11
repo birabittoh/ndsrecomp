@@ -6,7 +6,7 @@
 // sender's acknowledgement of the receiver's stream, see mp_reliable.h.
 //
 // Layout, little-endian:
-//   0  magic 'NIF2'          28 sent_ns hi
+//   0  magic 'NIF3'          28 sent_ns hi
 //   4  node                  32 seq
 //   8  type                  36 next_seq
 //  12  len                   40 ack_node
@@ -14,6 +14,11 @@
 //  24  sent_ns lo            48 ack_bits
 //                            52 flags
 //  56  payload (len bytes)
+//  then zero or more bundled frames, to the end of the datagram: earlier
+//  reliable frames of the same sender that the receiver has not
+//  acknowledged yet, sent again so that a lost datagram costs no round
+//  trip (mp_reliable.h). Each: seq u32, type u32, guest timestamp u64,
+//  len u16, payload.
 
 #pragma once
 
@@ -23,11 +28,16 @@
 
 namespace mpnet {
 
-constexpr uint32_t kMagic = 0x3246494Eu;  // "NIF2"
+constexpr uint32_t kMagic = 0x3346494Eu;  // "NIF3"
 constexpr size_t kHeaderBytes = 56;
 // melonDS's largest TX buffer (12-byte TX header + 802.11 frame).
 constexpr size_t kMaxPayloadBytes = 0x948;
 constexpr size_t kMaxDatagramBytes = kHeaderBytes + kMaxPayloadBytes;
+constexpr size_t kBundleHeaderBytes = 18;
+// Frames are bundled only while the datagram stays below this, so the
+// redundancy never makes a datagram fragment on the way (a TURN relay
+// path carries about 1200 bytes whole).
+constexpr size_t kBundleLimitBytes = 1100;
 
 enum : uint32_t {
     kFlagHello = 1u << 0,    // discovery and keepalive, no payload
@@ -68,12 +78,20 @@ struct Frame {
     uint32_t flags = 0;
     PeerAddr from{};        // filled by the receiver, not on the wire
     std::vector<uint8_t> payload;
+    // Bundled earlier frames (node, type, timestamp, seq, payload set),
+    // oldest first. Filled by Decode only; see AppendBundled.
+    std::vector<Frame> bundled;
 };
 
 void Encode(const Frame& frame, std::vector<uint8_t>* out);
 
 // False for anything that is not a well-formed datagram of this format.
 bool Decode(const uint8_t* data, size_t len, Frame* out);
+
+// Appends the frame of the encoded datagram `source` (its header and
+// payload, not what it bundles) to the encoded datagram `out` as a bundled
+// frame. False, and `out` untouched, if that would pass kBundleLimitBytes.
+bool AppendBundled(std::vector<uint8_t>* out, const uint8_t* source);
 
 // Rewrites the per-send fields of an encoded datagram in place.
 void Restamp(uint8_t* datagram, int64_t sent_ns, uint32_t ack_node,
