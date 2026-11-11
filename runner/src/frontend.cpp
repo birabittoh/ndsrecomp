@@ -4809,6 +4809,12 @@ int nds_run_interactive_frontend(const NdsFrontendOptions& initial_options) {
                  event.type == SDL_MOUSEMOTION)) {
                 continue;
             }
+            if ((event.type == SDL_MOUSEBUTTONDOWN ||
+                 event.type == SDL_MOUSEBUTTONUP) &&
+                event.button.button == SDL_BUTTON_RIGHT) {
+                nds_title_set_right_mouse_held(
+                    event.type == SDL_MOUSEBUTTONDOWN);
+            }
             const bool primary_left_down =
                 event.type == SDL_MOUSEBUTTONDOWN &&
                 event.button.button == SDL_BUTTON_LEFT &&

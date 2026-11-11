@@ -114,6 +114,18 @@ void nds_title_set_pointer_hover(int x, int y, bool hovering) {
 }
 
 namespace {
+std::atomic<bool> g_right_mouse_held{false};
+}  // namespace
+
+bool nds_title_right_mouse_held() {
+    return g_right_mouse_held.load(std::memory_order_relaxed);
+}
+
+void nds_title_set_right_mouse_held(bool held) {
+    g_right_mouse_held.store(held, std::memory_order_relaxed);
+}
+
+namespace {
 // -1, or y << 16 | x.
 std::atomic<int> g_top_pointer{-1};
 // count << 32 | y << 16 | x of the latest click.
