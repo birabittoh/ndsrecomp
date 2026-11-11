@@ -32,6 +32,7 @@ EXPORTS
     runtime_dispatch_bad_entry
     runtime_dispatch_with_exchange
     runtime_insn_slow
+    runtime_insn_enter_slow
     runtime_live_transfer_slow
     runtime_should_yield_slow
     runtime_tick_slow

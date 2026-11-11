@@ -42,6 +42,7 @@ extern "C" void runtime_call_push_return(uint32_t) {}
 extern "C" int runtime_call_should_return(uint32_t) { return 0; }
 extern "C" void runtime_call_cancel_return(uint32_t) {}
 extern "C" void runtime_insn_slow(void) {}
+extern "C" bool runtime_insn_enter_slow(void) { return false; }
 extern "C" void runtime_tick_slow(uint32_t) {}
 extern "C" bool runtime_should_yield_slow(void) { return false; }
 

@@ -455,16 +455,27 @@ set_source_files_properties(
     ${SM64DS_BANK_SOURCES}
     ${TITLE_BANK_SOURCES}
     PROPERTIES COMPILE_OPTIONS "-Wno-unused-variable;-Wno-unused-but-set-variable")
+# Generated bodies touch a dozen runtime globals per guest instruction
+# (g_cpu, g_runtime_cycles, g_nds_fast_limit, g_insn_count, ...). Clang's
+# PIE default reaches each through a GOT entry, which the linker relaxes to
+# a separate `lea` before every access. The banks are linked into the
+# runner itself, which defines all of them, so address them RIP-relative
+# directly: -6% bank text and one instruction less per access. GCC already
+# does this for PIE (copy relocations); ELF only, COFF has no GOT here.
+set(NDS_GAME_BANK_COMPILE_OPTIONS "-w;-O2;-g0")
+if(CMAKE_C_COMPILER_ID MATCHES "Clang" AND NOT WIN32 AND NOT APPLE)
+    list(APPEND NDS_GAME_BANK_COMPILE_OPTIONS "-fdirect-access-external-data")
+endif()
 if(SM64DS_BANK_SOURCES AND NOT MSVC)
     # Game banks are on the hot path (the ARM7 runtime-RAM bank carries the
     # sound engine); boot correctness is gate-proven (G1/G2/G3), so compile
     # them optimized. -g0 keeps the large generated TUs cheap to link.
     set_source_files_properties(${SM64DS_BANK_SOURCES}
-        PROPERTIES COMPILE_OPTIONS "-w;-O2;-g0")
+        PROPERTIES COMPILE_OPTIONS "${NDS_GAME_BANK_COMPILE_OPTIONS}")
 endif()
 if(TITLE_BANK_SOURCES AND NOT MSVC)
     set_source_files_properties(${TITLE_BANK_SOURCES}
-        PROPERTIES COMPILE_OPTIONS "-w;-O2;-g0")
+        PROPERTIES COMPILE_OPTIONS "${NDS_GAME_BANK_COMPILE_OPTIONS}")
 endif()
 
 # Every immutable bank is CPU-specific even though both use one runtime ABI.

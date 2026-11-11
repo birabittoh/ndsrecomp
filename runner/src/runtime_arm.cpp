@@ -1557,6 +1557,9 @@ void publish_fast_limit() {
     if (!g_cycle_fast_limit_enabled ||      // selector: NDS_CYCLE_FAST_LIMIT=0
         !g_cpu_fast_poll ||                 // faithful full-poll reference mode
         g_runtime_break_pc ||               // per-PC predicate, not cycle-based
+        g_insn_hook_armed ||                // per-insn payload (runtime_insn_enter)
+        (g_nds_active == NDS_ARM9 &&        // stale code-fetch publication
+         g_arm9_code_pub_gen != g_cp15_timing_generation) ||  // (numc_entered)
         g_nds_terminal ||
         g_cycle_cap == 0u ||                // no slice bound to inherit
         g_deferred_cycles != 0u ||          // tick must commit HALT debt

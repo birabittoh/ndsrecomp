@@ -90,6 +90,7 @@ EXPORTS
     runtime_inline_leaf_admit
     runtime_insn_fp
     runtime_insn_slow
+    runtime_insn_enter_slow
     runtime_mem_cycles
     runtime_mem_cycles_slow
     runtime_mrs_cpsr

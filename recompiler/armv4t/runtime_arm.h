@@ -589,10 +589,23 @@ NDS_HOT_INLINE uint32_t nds_code_numc(uint32_t pc, uint32_t k) {
     if (g_nds_active != NDS_ARM9) return runtime_code_cycles(pc);
     if (g_arm9_code_pub_gen != g_cp15_timing_generation)
         return runtime_code_cycles(pc);
-    g_last_code_pc[0] = pc;
+    // No g_last_code_pc[0] store: only the ARM7 slot is ever read
+    // (arm7_cycle_combine). runtime_code_cycles still records both.
     if (k == 0u) return 0u;                       // Thumb odd halfword
     if (pc < g_arm9_itcm_code_limit) return 1u;   // live ITCM mapping
     return (k >> g_arm9_code_class_shift) & 0xFFu;
+}
+// nds_code_numc() for an instruction entered below g_nds_fast_limit
+// (codegen version 4, the LC_ path). The runtime publishes a nonzero limit
+// on the ARM9 only while g_arm9_code_pub_gen == g_cp15_timing_generation,
+// and zeroes it wherever that can stop holding (a CP15 timing-generation
+// bump, a dropped publication), so below the limit the generation check
+// above is known to pass and is skipped. Same result as nds_code_numc().
+NDS_HOT_INLINE uint32_t nds_code_numc_entered(uint32_t pc, uint32_t k) {
+    if (g_nds_active != NDS_ARM9) return runtime_code_cycles(pc);
+    if (k == 0u) return 0u;                       // Thumb odd halfword
+    const uint32_t region = (k >> g_arm9_code_class_shift) & 0xFFu;
+    return pc < g_arm9_itcm_code_limit ? 1u : region;
 }
 
 // ── Inline condition evaluation (beads-yjp.70 phase 2A) ─────────────────
@@ -1021,6 +1034,43 @@ NDS_MACHINERY_INLINE bool runtime_unwinding(void) {
     return g_nds_unwinding != 0u;
 }
 #endif
+
+// ── Folded per-instruction entry (codegen version 4) ──────────────────
+// The emitted prologue used to be
+//
+//     if (runtime_should_yield()) return;
+//     ++g_insn_count[g_nds_active];
+//     if (g_insn_hook_armed) runtime_insn_slow();
+//
+// The runtime keeps g_nds_fast_limit at zero while g_insn_hook_armed is set
+// (publish_fast_limit, nds_insn_hook_recompute), so below the limit the
+// hook cannot be armed and the whole sequence is the counter bump. At or
+// over the limit runtime_insn_enter_slow() runs the three steps above in
+// that order and returns what the yield check returned.
+bool runtime_insn_enter_slow(void);
+NDS_MACHINERY_INLINE bool runtime_insn_due(void) {
+    return __builtin_expect(g_runtime_cycles >= g_nds_fast_limit, 0);
+}
+NDS_MACHINERY_INLINE bool runtime_insn_enter(void) {
+    if (runtime_insn_due()) return runtime_insn_enter_slow();
+    ++g_insn_count[g_nds_active];
+    return false;
+}
+// runtime_tick() that reports which path it took: true when the cycles fit
+// under the limit (g_runtime_cycles is now strictly below g_nds_fast_limit),
+// false after the faithful runtime_tick_slow(). A fall-through site uses a
+// true result to enter the next instruction past its entry check: with the
+// clock below the limit that check is provably the counter bump alone, and
+// R15 already holds the next pc.
+NDS_MACHINERY_INLINE bool runtime_tick_fast(uint32_t cycles) {
+    const unsigned long long next = g_runtime_cycles + cycles;
+    if (__builtin_expect(next < g_nds_fast_limit, 1)) {
+        g_runtime_cycles = next;
+        return true;
+    }
+    runtime_tick_slow(cycles);
+    return false;
+}
 
 // Cooperative slice-yield signal, checked ONLY at backward branches (loop
 // tops, which are dispatch entries). Lets the scheduler preempt a guest

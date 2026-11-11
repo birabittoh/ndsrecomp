@@ -57,7 +57,14 @@ namespace ndsrecomp {
 //     code-timing class — instead of a runtime_code_cycles(pc) call, and
 //     condition guards call the inline arm_cond_passes_i. Emitted cycle
 //     counts and tick boundaries are unchanged.
-inline constexpr unsigned kCodegenVersion = 3;
+// 4 — folded per-instruction entry: the yield check, the retired-insn bump
+//     and the armed-payload test are one compare against g_nds_fast_limit
+//     (runtime_insn_due / runtime_insn_enter_slow; the runtime holds the
+//     limit at zero while a payload is armed), and a fall-through tick that
+//     stays under the limit enters the next instruction past that compare
+//     (runtime_tick_fast, LC_ labels). Ticks, cycle counts and IRQ
+//     boundaries are unchanged.
+inline constexpr unsigned kCodegenVersion = 4;
 
 // The string `--codegen-identity` prints and the shard provider identity
 // folds. Tagged so that a hash of it can never collide with a bare integer
