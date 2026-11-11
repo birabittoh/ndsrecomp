@@ -971,7 +971,7 @@ bool nds_compute_host_present_top(const unsigned int* fallback_pixels,
     const uint32_t fb_height = chain.getHeight();
     const NdsSingleLayout layout = nds_single_layout(
         g_window_mode, g_scaling, int(fb_width), int(fb_height), width,
-        int(kHeight), g_inset_percent);
+        int(kHeight), g_inset_percent, nds_stack_vertically_flag().load());
     const NdsPresentRect& rect = layout.main;
     // Size the next 3D frame by this rect: from here on 3D follows the
     // window pixel for pixel, whatever its size.

@@ -1769,6 +1769,9 @@ struct FrontendPresentation {
     int shown_screen = 0;
     // The other LCD's size beside it, percent; 0 hides it.
     int inset_percent = 0;
+    // A game mode forces both screens stacked at the same size (single
+    // layout only): inset_percent is 100 and the top LCD is the main one.
+    bool stacked = false;
     bool gl_top = false;
     SDL_Window* windows[2]{};
     SDL_Renderer* renderers[2]{};
@@ -2011,7 +2014,8 @@ NdsPresentRect window_present_rect(const FrontendPresentation& presentation,
         return nds_single_layout(presentation.window_mode,
                                  presentation.scaling, drawable_w, drawable_h,
                                  content_w, content_h,
-                                 presentation.inset_percent).main;
+                                 presentation.inset_percent,
+                                 presentation.stacked).main;
     return nds_present_rect(presentation.window_mode, presentation.scaling,
                             drawable_w, drawable_h, content_w, content_h);
 }
@@ -2052,7 +2056,10 @@ uint8_t requested_internal_scale_for(const FrontendPresentation& presentation,
     const NdsPresentRect rect = nds_single_layout(
         options.window_mode, options.scaling, drawable_w, drawable_h,
         content_w, content_h,
-        presentation.single ? options.second_screen_size : 0).main;
+        presentation.single
+            ? (presentation.stacked ? 100 : options.second_screen_size)
+            : 0,
+        presentation.stacked).main;
     if (rect_out) *rect_out = rect;
     return nds_auto_internal_scale(rect.h, content_h, options.scaling,
                                    options.resolution_scale,
@@ -2136,7 +2143,8 @@ void convert_mouse_event_to_logical_coordinates(
             rect = nds_single_layout(presentation.window_mode,
                                      presentation.scaling, drawable_w,
                                      drawable_h, content_w, content_h,
-                                     presentation.inset_percent).inset;
+                                     presentation.inset_percent,
+                                     presentation.stacked).inset;
         }
         float cx = 0.0f, cy = 0.0f;
         nds_present_rect_to_content(rect, content_w, content_h, px, py,
@@ -2857,7 +2865,8 @@ PresentationTicks present_single_screen(FrontendPresentation& presentation,
     window_drawable_size(presentation, 0, &drawable_w, &drawable_h);
     const NdsSingleLayout layout = nds_single_layout(
         presentation.window_mode, presentation.scaling, drawable_w, drawable_h,
-        width, kScreenHeight, presentation.inset_percent);
+        width, kScreenHeight, presentation.inset_percent,
+        presentation.stacked);
     const NdsPresentRect& rect = layout.main;
     const SDL_Rect screen_rect{rect.x, rect.y, rect.w, rect.h};
     render_screen(presentation, shown, screen_rect);
@@ -5275,9 +5284,15 @@ int nds_run_interactive_frontend(const NdsFrontendOptions& initial_options) {
                                  static_cast<unsigned long long>(shown_frames));
                     screen_toggled = false;
                 }
-                const int shown = nds_single_shown_screen(
-                    main_screen.main, screen_toggled,
-                    mph_prime_virtual_stylus || generic_virtual_stylus);
+                presentation.stacked = nds_title_stacked_layout_wanted();
+                nds_stack_vertically_flag().store(
+                    presentation.stacked, std::memory_order_relaxed);
+                const int shown = presentation.stacked
+                    ? 0
+                    : nds_single_shown_screen(
+                          main_screen.main, screen_toggled,
+                          mph_prime_virtual_stylus ||
+                              generic_virtual_stylus);
                 if (shown != presentation.shown_screen) {
                     // A held mouse touch belongs to the LCD it started on.
                     if (mouse_down) {
@@ -5334,7 +5349,8 @@ int nds_run_interactive_frontend(const NdsFrontendOptions& initial_options) {
             presentation.resolution_scale = options.resolution_scale;
             presentation.internal_resolution = options.internal_resolution;
             presentation.inset_percent =
-                presentation.single ? options.second_screen_size : 0;
+                !presentation.single ? 0 : presentation.stacked ? 100
+                : options.second_screen_size;
             const PresentationTicks synthetic_ticks = present_screens(
                 presentation, blend_cache.blended[0].data(), top_width,
                 blend_cache.blended[1].data(), bottom_width,
@@ -5369,7 +5385,8 @@ int nds_run_interactive_frontend(const NdsFrontendOptions& initial_options) {
         presentation.resolution_scale = options.resolution_scale;
         presentation.internal_resolution = options.internal_resolution;
         presentation.inset_percent =
-            presentation.single ? options.second_screen_size : 0;
+            !presentation.single ? 0 : presentation.stacked ? 100
+            : options.second_screen_size;
         const PresentationTicks presentation_ticks = present_screens(
             presentation, top_pixels, top_width,
             bottom_pixels, bottom_width,

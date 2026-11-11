@@ -77,6 +77,18 @@ bool nds_title_unscaled_touch_rect(int* x0, int* y0, int* x1, int* y1);
 void nds_title_set_touch_unscaled(bool unscaled);
 bool nds_title_touch_unscaled();
 
+// Registers a query the frontend calls once per presented frame: true while
+// the game is in a mode that wants both screens stacked vertically at the
+// same size (a title screen, say), whatever the screen_layout option says.
+// It applies to the single-screen layout only, where it shows the top LCD
+// above the touchscreen; the other layouts already show both. The query
+// runs on the frontend thread and may only read guest memory. nullptr
+// removes it. Call it from a static initializer, like a setting.
+typedef bool (*NdsTitleStackedLayoutQuery)();
+void nds_title_set_stacked_layout_query(NdsTitleStackedLayoutQuery query);
+// For the frontend: the query's answer (false with none registered).
+bool nds_title_stacked_layout_wanted();
+
 // For the frontend.
 size_t nds_title_setting_count();
 const NdsTitleSetting* nds_title_setting_at(int id);

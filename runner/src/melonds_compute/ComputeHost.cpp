@@ -592,7 +592,7 @@ bool nds_compute_host_present_top(const unsigned int* fallback_pixels,
     sdl_get_drawable_size(g_window, &drawable_width, &drawable_height);
     const NdsSingleLayout layout = nds_single_layout(
         g_window_mode, g_scaling, drawable_width, drawable_height, width,
-        192, g_inset_percent);
+        192, g_inset_percent, nds_stack_vertically_flag().load());
     const NdsPresentRect rect = layout.main;
     g_last_rect = rect;
     // GL's viewport origin is bottom-left.
