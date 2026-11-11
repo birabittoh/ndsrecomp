@@ -93,6 +93,14 @@ unsigned nds_title_top_click(int* x, int* y);
 // For the frontend: on mouse motion and button changes.
 void nds_title_set_top_pointer(int x, int y, bool over);
 void nds_title_note_top_click(int x, int y);
+// While the left button is held after a press on the top screen (a drag):
+// true, with the pointer in top-screen DS pixels, not clamped (the drag goes
+// on off the screen, where it can be negative or past 255 / 191). False
+// otherwise. Any thread.
+bool nds_title_top_drag(int* x, int* y);
+// For the frontend: on the left press on the top screen, motion while held,
+// and the release.
+void nds_title_set_top_drag(int x, int y, bool active);
 
 // A rectangle of the touchscreen (DS pixels, x0..x1 and y0..y1 exclusive)
 // that a title draws at its native place while it scales the rest of its UI

@@ -211,6 +211,29 @@ void nds_title_note_top_click(int x, int y) {
 }
 
 namespace {
+// bit 32 = active, then int16 y << 16 | int16 x.
+std::atomic<uint64_t> g_top_drag{0};
+}  // namespace
+
+bool nds_title_top_drag(int* x, int* y) {
+    const uint64_t v = g_top_drag.load(std::memory_order_relaxed);
+    if (!(v >> 32)) return false;
+    *x = static_cast<int16_t>(v & 0xFFFF);
+    *y = static_cast<int16_t>((v >> 16) & 0xFFFF);
+    return true;
+}
+
+void nds_title_set_top_drag(int x, int y, bool active) {
+    auto coord = [](int v) {
+        v = v < -32767 ? -32767 : v > 32767 ? 32767 : v;
+        return static_cast<uint64_t>(static_cast<uint16_t>(v));
+    };
+    g_top_drag.store(active ? (uint64_t{1} << 32 | coord(y) << 16 | coord(x))
+                            : 0,
+                     std::memory_order_relaxed);
+}
+
+namespace {
 std::atomic<uint64_t> g_unscaled_touch_rect{0};
 }  // namespace
 
