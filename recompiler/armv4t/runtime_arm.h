@@ -684,6 +684,75 @@ void arm_set_nzcv_adc(uint32_t a, uint32_t b, uint32_t c_in, uint32_t result);
 void arm_set_nzcv_sub(uint32_t a, uint32_t b, uint32_t result);
 void arm_set_nzcv_sbc(uint32_t a, uint32_t b, uint32_t c_in, uint32_t result);
 
+// Generated banks (built with NDS_STATIC_CPU) take these inline: each is a
+// few ALU ops on CPSR, and the cross-TU call was the cost (arm_set_nzcv_sub
+// alone ran at ~1% of the DQ9 emulation thread, 900+ sites a shard). The
+// bodies are runner/src/runtime_arm.cpp's, verbatim; the exported symbols
+// stay for everything else.
+#ifdef NDS_STATIC_CPU
+NDS_MACHINERY_INLINE void arm_set_nz_i(uint32_t r) {
+    uint32_t c = g_cpu.cpsr & ~(CPSR_N_BIT | CPSR_Z_BIT);
+    if (r & 0x80000000u) c |= CPSR_N_BIT;
+    if (r == 0) c |= CPSR_Z_BIT;
+    g_cpu.cpsr = c;
+}
+NDS_MACHINERY_INLINE void arm_set_nzc_logic_i(uint32_t r, uint32_t sh) {
+    uint32_t c = g_cpu.cpsr & ~(CPSR_N_BIT | CPSR_Z_BIT | CPSR_C_BIT);
+    if (r & 0x80000000u) c |= CPSR_N_BIT;
+    if (r == 0) c |= CPSR_Z_BIT;
+    if (sh) c |= CPSR_C_BIT;
+    g_cpu.cpsr = c;
+}
+NDS_MACHINERY_INLINE void arm_set_nzcv_add_i(uint32_t a, uint32_t b,
+                                             uint32_t r) {
+    uint32_t c = g_cpu.cpsr &
+                 ~(CPSR_N_BIT | CPSR_Z_BIT | CPSR_C_BIT | CPSR_V_BIT);
+    if (r & 0x80000000u) c |= CPSR_N_BIT;
+    if (r == 0) c |= CPSR_Z_BIT;
+    if (r < a) c |= CPSR_C_BIT;
+    if ((~(a ^ b) & (a ^ r)) & 0x80000000u) c |= CPSR_V_BIT;
+    g_cpu.cpsr = c;
+}
+NDS_MACHINERY_INLINE void arm_set_nzcv_adc_i(uint32_t a, uint32_t b,
+                                             uint32_t ci, uint32_t r) {
+    uint32_t c = g_cpu.cpsr &
+                 ~(CPSR_N_BIT | CPSR_Z_BIT | CPSR_C_BIT | CPSR_V_BIT);
+    uint64_t w = (uint64_t)a + b + ci;
+    if (r & 0x80000000u) c |= CPSR_N_BIT;
+    if (r == 0) c |= CPSR_Z_BIT;
+    if (w >> 32) c |= CPSR_C_BIT;
+    if ((~(a ^ b) & (a ^ r)) & 0x80000000u) c |= CPSR_V_BIT;
+    g_cpu.cpsr = c;
+}
+NDS_MACHINERY_INLINE void arm_set_nzcv_sub_i(uint32_t a, uint32_t b,
+                                             uint32_t r) {
+    uint32_t c = g_cpu.cpsr &
+                 ~(CPSR_N_BIT | CPSR_Z_BIT | CPSR_C_BIT | CPSR_V_BIT);
+    if (r & 0x80000000u) c |= CPSR_N_BIT;
+    if (r == 0) c |= CPSR_Z_BIT;
+    if (a >= b) c |= CPSR_C_BIT;
+    if (((a ^ b) & (a ^ r)) & 0x80000000u) c |= CPSR_V_BIT;
+    g_cpu.cpsr = c;
+}
+NDS_MACHINERY_INLINE void arm_set_nzcv_sbc_i(uint32_t a, uint32_t b,
+                                             uint32_t ci, uint32_t r) {
+    uint32_t c = g_cpu.cpsr &
+                 ~(CPSR_N_BIT | CPSR_Z_BIT | CPSR_C_BIT | CPSR_V_BIT);
+    uint64_t w = (uint64_t)a + (~b & 0xFFFFFFFFu) + ci;
+    if (r & 0x80000000u) c |= CPSR_N_BIT;
+    if (r == 0) c |= CPSR_Z_BIT;
+    if (w >> 32) c |= CPSR_C_BIT;
+    if (((a ^ b) & (a ^ r)) & 0x80000000u) c |= CPSR_V_BIT;
+    g_cpu.cpsr = c;
+}
+#define arm_set_nz arm_set_nz_i
+#define arm_set_nzc_logic arm_set_nzc_logic_i
+#define arm_set_nzcv_add arm_set_nzcv_add_i
+#define arm_set_nzcv_adc arm_set_nzcv_adc_i
+#define arm_set_nzcv_sub arm_set_nzcv_sub_i
+#define arm_set_nzcv_sbc arm_set_nzcv_sbc_i
+#endif
+
 // ── Dispatch ───────────────────────────────────────────────────────
 // `target_pc` is a guest PC. Low bit indicates THUMB on BX/BLX. The
 // dispatcher binary-searches the per-game dispatch table; if the
