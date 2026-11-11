@@ -970,6 +970,14 @@ extern unsigned long long g_runtime_cycles;
 // current runtime_dispatch the moment the guest PC equals this value.
 // Set via the TCP set_break_pc command; 0 = disabled. (MC-HP-002.)
 extern uint32_t g_runtime_break_pc;
+// Title "before" hooks (recompiler emit_hook_site): the PC whose hook has
+// already run when its instruction yielded right after it, per CPU, or
+// 0xFFFFFFFF. A handler's MMIO access can end the slice (the performance
+// fence), so without this the resume at that PC would run the handler again.
+// The resume clears it and skips the handler once, taking a bool handler's
+// result from g_hook_resume_result.
+extern uint32_t g_hook_resume_pc[2];
+extern unsigned char g_hook_resume_result[2];
 
 // ── BIOS / SWI ─────────────────────────────────────────────────────
 // SWI emits a call here. The runtime sets up the exception frame
