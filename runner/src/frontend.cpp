@@ -264,6 +264,7 @@ namespace {
 #undef SDL_MOUSEBUTTONDOWN
 #undef SDL_MOUSEBUTTONUP
 #undef SDL_MOUSEMOTION
+#undef SDL_MOUSEWHEEL
 #undef SDL_QUIT
 #undef SDL_FALSE
 #undef SDL_TRUE
@@ -307,6 +308,7 @@ namespace {
 #define SDL_MOUSEBUTTONDOWN SDL_EVENT_MOUSE_BUTTON_DOWN
 #define SDL_MOUSEBUTTONUP SDL_EVENT_MOUSE_BUTTON_UP
 #define SDL_MOUSEMOTION SDL_EVENT_MOUSE_MOTION
+#define SDL_MOUSEWHEEL SDL_EVENT_MOUSE_WHEEL
 #define SDL_QUIT SDL_EVENT_QUIT
 #define SDL_FALSE false
 #define SDL_TRUE true
@@ -961,7 +963,7 @@ uint16_t controller_bit(SDL_GameControllerButton button) {
         case SDL_CONTROLLER_BUTTON_DPAD_DOWN:     return 1u << 7;
         case SDL_CONTROLLER_BUTTON_RIGHTSHOULDER: return 1u << 8;
         case SDL_CONTROLLER_BUTTON_LEFTSHOULDER:  return 1u << 9;
-        case SDL_CONTROLLER_BUTTON_X:             return 1u << 10;
+        case SDL_CONTROLLER_BUTTON_X:         return 1u << 10;
         case SDL_CONTROLLER_BUTTON_Y:             return 1u << 11;
         default:                                  return 0;
     }
@@ -3561,6 +3563,9 @@ int nds_run_interactive_frontend(const NdsFrontendOptions& initial_options) {
     // everywhere), kept separate from button-event state so a wobbling
     // stick never fights explicit D-pad presses.
     uint16_t stick_pressed = 0;
+    int zoom_stick_frames = 0;
+    float zoom_stick_rem = 0.0f;
+    bool zoom_save_pending = false;
     auto publish_keys = [&]() {
         nds_set_key_mask(static_cast<uint16_t>(
             0x0FFFu &
@@ -3650,6 +3655,7 @@ int nds_run_interactive_frontend(const NdsFrontendOptions& initial_options) {
     for (size_t i = 0; i < nds_title_setting_count(); ++i) {
         const NdsTitleSetting& setting =
             *nds_title_setting_at(static_cast<int>(i));
+        if (setting.hidden) continue;
         const bool choice = setting.choices && setting.choice_count;
         runtime_menu_list.push_back(
             {title_menu_keys[i].c_str(), "Game", setting.label,
@@ -4809,6 +4815,17 @@ int nds_run_interactive_frontend(const NdsFrontendOptions& initial_options) {
                  event.type == SDL_MOUSEMOTION)) {
                 continue;
             }
+            // Wheel up/down raises/lowers a title's zoom value (title_settings.h).
+            if (event.type == SDL_MOUSEWHEEL && !runtime_menu_open()) {
+                // Scroll up lowers the value (zooms in), down raises it.
+                const float wheel = static_cast<float>(event.wheel.y) *
+                    (event.wheel.direction == 1 ? -1.0f : 1.0f);
+                // 50 units (5%) per notch, smaller for a hi-res wheel's fractions.
+                int delta = static_cast<int>(std::lround(-wheel * 50.0f));
+                if (delta == 0 && wheel != 0.0f) delta = wheel > 0.0f ? -1 : 1;
+                if (nds_title_zoom_add(delta))
+                    runtime_menu_save(&runtime_menu_state);
+            }
             if ((event.type == SDL_MOUSEBUTTONDOWN ||
                  event.type == SDL_MOUSEBUTTONUP) &&
                 event.button.button == SDL_BUTTON_RIGHT) {
@@ -5154,6 +5171,45 @@ int nds_run_interactive_frontend(const NdsFrontendOptions& initial_options) {
                 stick_dir(lx, 1u << 5, false);   // Left
                 stick_dir(ly, 1u << 6, false);   // Up (SDL Y axis points down)
                 stick_dir(ly, 1u << 7, true);    // Down
+            }
+
+            // Right stick up/down -> a title's zoom (title_settings.h): up
+            // raises the value, down lowers it, at a speed that follows the
+            // deflection (up to 15 units, 1.5%, a frame). The stick belongs to the
+            // virtual stylus while it is held (LT), to Prime's aim, and to
+            // the runtime menu while that is open. The settings are saved
+            // when the stick is released, and every half second meanwhile.
+            {
+                float ry = 0.0f;
+                if (!menu_open && !virtual_stylus_active() &&
+                    !mph_prime_controls_available) {
+                    ry = SDL_GameControllerGetAxis(
+                        controller, SDL_CONTROLLER_AXIS_RIGHTY) / 32767.0f;
+                }
+                constexpr float kZoomDeadzone = 0.25f;
+                const float mag = std::fabs(ry);
+                if (mag > kZoomDeadzone) {
+                    const float curved =
+                        (mag - kZoomDeadzone) / (1.0f - kZoomDeadzone);
+                    // Stick up (negative Y) raises the value.
+                    zoom_stick_rem += (ry < 0.0f ? 1.0f : -1.0f) * curved *
+                                      15.0f;
+                    const int delta = static_cast<int>(zoom_stick_rem);
+                    zoom_stick_rem -= static_cast<float>(delta);
+                    if (nds_title_zoom_add(delta)) zoom_save_pending = true;
+                    if (zoom_save_pending && ++zoom_stick_frames >= 30) {
+                        zoom_stick_frames = 0;
+                        zoom_save_pending = false;
+                        runtime_menu_save(&runtime_menu_state);
+                    }
+                } else {
+                    zoom_stick_rem = 0.0f;
+                    zoom_stick_frames = 0;
+                    if (zoom_save_pending) {
+                        zoom_save_pending = false;
+                        runtime_menu_save(&runtime_menu_state);
+                    }
+                }
             }
 
             if (!menu_open && virtual_stylus_available) {
