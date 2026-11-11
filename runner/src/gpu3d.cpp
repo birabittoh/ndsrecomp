@@ -1304,6 +1304,10 @@ bool gpu3d_savestate_import(const NdsGpu3dSaveState& in,
     return true;
 }
 
+void nds_gpu3d_set_arm9_clock_shift(unsigned shift) {
+    g_nds.ARM9ClockShift = shift;
+}
+
 void nds_gpu3d_reset() {
 #if defined(NDS_USE_NATIVE_GL)
     g_capture_reference.Reset();
@@ -1312,6 +1316,7 @@ void nds_gpu3d_reset() {
     g_command_cache.clear();
 #endif
     g_nds.ARM9Timestamp = 0;
+    g_nds.ARM9ClockShift = g_nds_arm9_clock_shift;
     g_nds.GPU.GPU3D.Reset();
 #if defined(NDS_GX_COMMAND_CACHE)
     g_nds.GPU.GPU3D.NativeProjectionCache.enabled = true;

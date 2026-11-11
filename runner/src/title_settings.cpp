@@ -1,5 +1,7 @@
 #include "title_settings.h"
 
+#include "io.h"
+
 #include <atomic>
 #include <cstring>
 #include <deque>
@@ -170,6 +172,10 @@ bool nds_title_unscaled_touch_rect(int* x0, int* y0, int* x1, int* y1) {
 namespace {
 std::atomic<bool> g_touch_unscaled{false};
 }  // namespace
+
+void nds_title_set_arm9_overclock(int multiple) {
+    if (multiple > 0) nds_request_arm9_overclock(static_cast<unsigned>(multiple));
+}
 
 void nds_title_set_touch_unscaled(bool unscaled) {
     g_touch_unscaled.store(unscaled, std::memory_order_relaxed);

@@ -373,7 +373,7 @@ bool card_register_address(uint32_t addr) {
 }
 
 uint64_t active_system_timestamp() {
-    return (g_nds_active == NDS_ARM9) ? (g_runtime_cycles >> 1u)
+    return (g_nds_active == NDS_ARM9) ? (g_runtime_cycles >> g_nds_arm9_clock_shift)
                                        : g_runtime_cycles;
 }
 
@@ -1730,7 +1730,7 @@ void auxspi_write_data(uint8_t val) {
     // One bit per SPI clock, 8 bits per byte: 8*(8<<speed) system cycles,
     // based at the writing CPU's live timestamp (melonDS ScheduleEvent).
     const uint32_t delay = 8u * (8u << (g_auxspicnt & 3u));
-    const uint64_t now = active() == 0 ? (g_runtime_cycles >> 1)
+    const uint64_t now = active() == 0 ? (g_runtime_cycles >> g_nds_arm9_clock_shift)
                                        : g_runtime_cycles;
     g_auxspi_deadline = now + delay;
     nds_reschedule_slice(g_auxspi_deadline);
@@ -1781,6 +1781,16 @@ bool g_nds_insn_stop = false;
 
 // --rtc-host (see io.h): main.cpp sets this before the initial boot.
 bool g_nds_rtc_host = false;
+unsigned g_nds_arm9_clock_shift = 1u;
+static std::atomic<unsigned> g_arm9_clock_shift_request{1u};
+void nds_request_arm9_overclock(unsigned multiple) {
+    const unsigned shift = multiple == 1u ? 1u : multiple == 2u ? 2u
+                         : multiple == 4u ? 3u : 0u;
+    if (shift) g_arm9_clock_shift_request.store(shift, std::memory_order_relaxed);
+}
+unsigned nds_requested_arm9_clock_shift() {
+    return g_arm9_clock_shift_request.load(std::memory_order_relaxed);
+}
 
 void nds_io_reset() {
     for (int i = 0; i < 2; ++i) {
@@ -3195,8 +3205,9 @@ void nds_tick_display(unsigned long long cyc) {
 
 void nds_tick_timers(int cpu, unsigned long long cpu_cycles) {
     cpu &= 1;
-    // ARM9 timestamps are in the 2x CPU clock; timers use system cycles.
-    const unsigned long long cyc = cpu == 0 ? (cpu_cycles >> 1u) : cpu_cycles;
+    // ARM9 timestamps are in the ARM9 clock; timers use system cycles.
+    const unsigned long long cyc =
+        cpu == 0 ? (cpu_cycles >> g_nds_arm9_clock_shift) : cpu_cycles;
     // Timers. Advance each enabled, non-cascade timer by the elapsed cycles
     // and raise its overflow IRQ (IF bit 3+N). Cascade (count-up) timers
     // are driven by the preceding timer's overflow.

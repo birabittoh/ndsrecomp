@@ -147,8 +147,11 @@ void nds_gpu3d_set_power(uint16_t powcnt1);
 // Geometry engine clock. Called once per scheduler round after the ARM9
 // phase and its timer catch-up, mirroring melonDS NDS::RunSystem
 // (ARM9.Execute / DMA / GXFIFO-stall advance, then RunTimers(0), then
-// GPU.GPU3D.Run()). arm9_cycles is the ARM9 timestamp in its 2x domain.
+// GPU.GPU3D.Run()). arm9_cycles is the ARM9 timestamp, in ARM9 cycles.
 void nds_gpu3d_run(unsigned long long arm9_cycles);
+// The ARM9 timestamp's shift over system cycles (io.h
+// g_nds_arm9_clock_shift), for the geometry engine's own clock.
+void nds_gpu3d_set_arm9_clock_shift(unsigned shift);
 
 // While the GXFIFO stall owns the ARM9, the CPU timestamp advances by the
 // engine's pending cycle debt instead of executing (melonDS CPUStop_GXStall

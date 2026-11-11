@@ -3038,7 +3038,8 @@ constexpr uint32_t kWifiEnd  = 0x04810000u;
 // cpu==7 gate above every call site here means the ARM9 branch should
 // never actually execute in practice.
 uint64_t wifi_current_system_timestamp() {
-    return g_nds_active == NDS_ARM9 ? (g_runtime_cycles >> 1u) : g_runtime_cycles;
+    return g_nds_active == NDS_ARM9 ? (g_runtime_cycles >> g_nds_arm9_clock_shift)
+                                      : g_runtime_cycles;
 }
 
 // Register-access ring hooks live here, in the bridge, rather than as a

@@ -92,6 +92,14 @@ bool nds_title_unscaled_touch_rect(int* x0, int* y0, int* x1, int* y1);
 void nds_title_set_touch_unscaled(bool unscaled);
 bool nds_title_touch_unscaled();
 
+// Runs the emulated ARM9 at `multiple` (1, 2 or 4) times its hardware clock
+// from the next scheduler round on, for a title whose own frame pacing is
+// bound by ARM9 time (a setting that lifts the game's frame-rate cap, say).
+// Devices, timers, the 3D engine and the ARM7 stay on the hardware timeline.
+// 1, the default, is the hardware. Guest-visible timing, like a setting:
+// keep the default untouched. Any thread.
+void nds_title_set_arm9_overclock(int multiple);
+
 // Registers a query the frontend calls once per presented frame: true while
 // the game is in a mode that wants both screens stacked vertically at the
 // same size (a title screen, say), whatever the screen_layout option says.

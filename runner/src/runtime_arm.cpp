@@ -1385,7 +1385,8 @@ extern "C" void nds_set_cycle_cap(unsigned long long cap) {
 }
 extern "C" void nds_reschedule_slice(unsigned long long system_deadline) {
     const unsigned long long cpu_deadline =
-        (g_nds_active == NDS_ARM9) ? (system_deadline << 1u) : system_deadline;
+        (g_nds_active == NDS_ARM9)
+            ? (system_deadline << g_nds_arm9_clock_shift) : system_deadline;
     if (g_cycle_cap == 0 || cpu_deadline < g_cycle_cap) {
         g_cycle_cap = cpu_deadline;
         // A device scheduled an EARLIER deadline than the published limit.

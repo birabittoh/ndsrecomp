@@ -21,6 +21,19 @@ void     nds_io_debug_history_reset();
 // fixed deterministic power-on datetime. Default false — the oracle gates
 // (G1/G3) and all parity work require the deterministic clock.
 extern bool g_nds_rtc_host;
+// The ARM9 clock as a power of two over the system (ARM7) clock: ARM9
+// timestamps are system cycles << this. 1 is the hardware (67 MHz); 2 and 3
+// overclock the ARM9 2x and 4x, which leaves devices, timers and the ARM7 on
+// the hardware timeline and lets the ARM9 retire more instructions per
+// frame. Only the scheduler writes it, between rounds, where it rescales the
+// ARM9 timestamp to match (scheduler.cpp).
+extern unsigned g_nds_arm9_clock_shift;
+// Asks for an ARM9 clock of `multiple` (1, 2 or 4) times the hardware's; any
+// other value is ignored. Takes effect at the next scheduler round. Any
+// thread.
+void nds_request_arm9_overclock(unsigned multiple);
+// The shift asked for last (1 when none was).
+unsigned nds_requested_arm9_clock_shift();
 void     nds_set_touch(uint16_t x, uint16_t y, bool down);
 void     nds_set_key_mask(uint32_t mask);
 // Debug-server throttle override (`turbo` command): frontend treats it like

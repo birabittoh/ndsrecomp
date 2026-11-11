@@ -80,7 +80,8 @@ void profile_add(uint64_t& dst, ProfileClock::time_point start) {
 // is in SYSTEM cycles (= ARM7 cycles = ARM9 cycles >> kArm9ClockShift).
 // g_slot[0].cycles is the ARM9 timestamp (ARM9 cycles); g_slot[1].cycles the ARM7.
 uint64_t           g_sys_timestamp = 0;
-constexpr int      kArm9ClockShift = 1;    // ARM9 runs at 2x the system clock
+// ARM9 runs at 2x the system clock on hardware (io.h).
+#define kArm9ClockShift g_nds_arm9_clock_shift
 bool performance_window_active=false;
 uint64_t performance_windows=0,performance_fences=0;
 constexpr uint64_t kIterCap        = 64;   // system cycles per outer iteration
@@ -340,8 +341,27 @@ void scheduler_set_cpu_boot(int cpu, uint32_t entry, uint32_t sp,
     st.banked_sp[ARM_BANK_SUPERVISOR] = sp_svc;
 }
 
+// Moves the ARM9 timeline to another clock shift (io.h): between rounds the
+// only ARM9-clock state is the slot's timestamp and its HALT debt (in the
+// runtime while the ARM9 is the loaded CPU), and the system time they stand
+// for is kept.
+static void set_arm9_clock_shift(unsigned shift) {
+    const unsigned old = g_nds_arm9_clock_shift;
+    if (shift == old) return;
+    const auto rescale = [&](uint64_t cycles) {
+        return static_cast<uint32_t>((cycles << shift) >> old);
+    };
+    g_slot[0].cycles = (g_slot[0].cycles >> old) << shift;
+    g_slot[0].deferred_cycles = rescale(g_slot[0].deferred_cycles);
+    if (g_cur == 0)
+        runtime_deferred_cycles_set(rescale(runtime_deferred_cycles()));
+    g_nds_arm9_clock_shift = shift;
+    nds_gpu3d_set_arm9_clock_shift(shift);
+}
+
 void scheduler_run_round() {
     RoundActivityGuard round_activity;
+    set_arm9_clock_shift(nds_requested_arm9_clock_shift());
     // melonDS-faithful interleave (docs/scheduler_design.md, Commit A). Each
     // outer iteration is capped at kIterCap SYSTEM cycles (or the next scheduled
     // event, whichever is sooner). ARM9 runs FIRST up to its target and may
@@ -569,7 +589,8 @@ void scheduler_run_round() {
 void scheduler_performance_io_fence() {
     if(performance_window_active&&g_nds_active==NDS_ARM9) {
         ++performance_fences;
-        nds_reschedule_slice((g_runtime_cycles+1u)>>1u);
+        nds_reschedule_slice(
+            (g_runtime_cycles+(1ull<<kArm9ClockShift)-1u)>>kArm9ClockShift);
     }
 }
 void scheduler_performance_window_counts(uint64_t* windows,uint64_t* fences) {
@@ -698,6 +719,24 @@ bool scheduler_savestate_export(NdsSchedulerSaveState* out) {
 
 bool scheduler_savestate_import(const NdsSchedulerSaveState& in,
                                 std::string* error) {
+    // The ARM9 timestamp is system time << the ARM9 clock shift the state
+    // was saved under, which the state does not record: it is the shift that
+    // brings the timestamp closest to the system time. The timeline is moved
+    // to the current shift below.
+    unsigned saved_shift = kArm9ClockShift;
+    if (in.started[0]) {
+        uint64_t best = UINT64_MAX;
+        for (unsigned shift = 1u; shift <= 3u; ++shift) {
+            const uint64_t arm9_system = in.cycles[0] >> shift;
+            const uint64_t apart = arm9_system > in.system_timestamp
+                                       ? arm9_system - in.system_timestamp
+                                       : in.system_timestamp - arm9_system;
+            if (apart < best) {
+                best = apart;
+                saved_shift = shift;
+            }
+        }
+    }
     for (int cpu = 0; cpu < 2; ++cpu) {
         if (in.crs_depth[cpu] > NDS_RUNTIME_CALL_STACK_CAPACITY) {
             if (error) *error = "savestate call-return stack depth is invalid";
@@ -718,5 +757,8 @@ bool scheduler_savestate_import(const NdsSchedulerSaveState& in,
     g_cur = -1;
     runtime_call_stack_restore(nullptr, 0);
     runtime_deferred_cycles_set(0);
+    const unsigned current_shift = g_nds_arm9_clock_shift;
+    g_nds_arm9_clock_shift = saved_shift;
+    set_arm9_clock_shift(current_shift);
     return true;
 }
