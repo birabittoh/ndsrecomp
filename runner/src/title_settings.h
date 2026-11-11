@@ -61,6 +61,12 @@ bool nds_title_pointer_hover(int* x, int* y);
 // For the frontend: on mouse motion and button changes.
 void nds_title_set_pointer_hover(int x, int y, bool hovering);
 
+// Whether the right mouse button is held (over any presentation window). Host
+// state, like the pointer. Any thread.
+bool nds_title_right_mouse_held();
+// For the frontend: on right button changes.
+void nds_title_set_right_mouse_held(bool held);
+
 // Where the mouse points on the top screen, in DS pixels (0..255, 0..191),
 // buttons or not: the top screen is no touchscreen, so a title can read the
 // pointer here to make what it shows there hoverable and clickable. False
