@@ -261,6 +261,9 @@ struct NdsFrontendOptions {
     std::string expected_rom_sha1;
     // Display name from [game].name (runtime settings menu title).
     std::string game_name;
+    // Window icon, 256x256 RGBA8 (empty = the platform default). Taken from
+    // the cartridge banner by main.cpp; see rom_icon.h.
+    std::vector<uint8_t> window_icon_rgba;
     // [game].app_name: the per-title data directory's name (player_launch.h).
     std::string app_name;
     // [title]: values for the title's own settings (title_settings.h), in

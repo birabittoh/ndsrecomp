@@ -786,6 +786,7 @@ add_executable(nds_runner
     src/relative_mouse_touch.cpp
     "${NDS_RECOMP_UI_ROOT}/src/common/recomp_runtime_ui.c"
     src/frontend.cpp
+    src/rom_icon.cpp
     src/cpu_render_handoff.cpp
     src/main.cpp
     src/runtime_exports.def
@@ -842,6 +843,29 @@ if(NDS_MKDS_IMPLEMENTATION STREQUAL "HLE")
 endif()
 message(STATUS "MKDS implementation: ${NDS_MKDS_IMPLEMENTATION}")
 message(STATUS "MKDS card PIO implementation: ${NDS_MKDS_CARD_PIO_IMPLEMENTATION}")
+# The .exe's own icon (Explorer, taskbar before the window opens, Alt-Tab) on
+# Windows: the cartridge banner icon of NDS_EXE_ICON_ROM, converted at build
+# time. The window icon is applied at run time from the loaded ROM instead
+# (src/rom_icon.cpp), on every platform.
+set(NDS_EXE_ICON_ROM "" CACHE FILEPATH
+    "ROM whose banner icon becomes the Windows .exe icon (empty = none)")
+if(WIN32 AND NDS_EXE_ICON_ROM AND EXISTS "${NDS_EXE_ICON_ROM}")
+    find_package(Python3 REQUIRED COMPONENTS Interpreter)
+    enable_language(RC)
+    set(_nds_ico "${CMAKE_CURRENT_BINARY_DIR}/nds_icon.ico")
+    set(_nds_rc "${CMAKE_CURRENT_BINARY_DIR}/nds_icon.rc")
+    add_custom_command(
+        OUTPUT "${_nds_ico}" "${_nds_rc}"
+        COMMAND "${Python3_EXECUTABLE}" -I
+                "${CMAKE_CURRENT_LIST_DIR}/../tools/gen_nds_icon.py"
+                "${NDS_EXE_ICON_ROM}" "${_nds_ico}" "${_nds_rc}"
+        DEPENDS "${NDS_EXE_ICON_ROM}"
+                "${CMAKE_CURRENT_LIST_DIR}/../tools/gen_nds_icon.py"
+        COMMENT "Converting the cartridge banner icon to an .exe icon")
+    target_sources(nds_runner PRIVATE "${_nds_rc}")
+    set_source_files_properties("${_nds_rc}" PROPERTIES OBJECT_DEPENDS "${_nds_ico}")
+endif()
+
 # Title-owned handlers for hooks baked into title banks by
 # `nds_recompile --hooks` (docs/midasm-hooks.md). A bank generated with hooks
 # references its handlers by name, so leaving them out fails at link time

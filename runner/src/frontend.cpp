@@ -1944,6 +1944,33 @@ SDL_Renderer* create_renderer(SDL_Window* window) {
     return renderer;
 }
 
+// The cartridge icon for every window we open. SDL applies it per backend:
+// the Win32 class icon, X11 _NET_WM_ICON, and Wayland's xdg-toplevel-icon
+// where the compositor offers it (others take the icon from the .desktop
+// file matching the app id above).
+const std::vector<uint8_t>* g_window_icon = nullptr;
+
+void apply_window_icon(SDL_Window* window) {
+    if (!window || !g_window_icon || g_window_icon->size() != 256 * 256 * 4)
+        return;
+    void* pixels = const_cast<uint8_t*>(g_window_icon->data());
+#if defined(NDS_HAVE_SDL3)
+    SDL_Surface* icon = SDL_CreateSurfaceFrom(
+        256, 256, SDL_PIXELFORMAT_RGBA32, pixels, 256 * 4);
+#else
+    SDL_Surface* icon = SDL_CreateRGBSurfaceWithFormatFrom(
+        pixels, 256, 256, 32, 256 * 4, SDL_PIXELFORMAT_RGBA32);
+#endif
+    if (!icon)
+        return;
+    SDL_SetWindowIcon(window, icon);
+#if defined(NDS_HAVE_SDL3)
+    SDL_DestroySurface(icon);
+#else
+    SDL_FreeSurface(icon);
+#endif
+}
+
 SDL_Window* create_window(const char* title, int x, int y, int w, int h,
                           uint64_t flags) {
     // Unattended frontend/GPU checks must not show or activate desktop windows.
@@ -1955,10 +1982,12 @@ SDL_Window* create_window(const char* title, int x, int y, int w, int h,
         title, w, h, static_cast<SDL_WindowFlags>(flags));
     if (window)
         SDL_SetWindowPosition(window, x, y);
-    return window;
 #else
-    return SDL_CreateWindow(title, x, y, w, h, static_cast<uint32_t>(flags));
+    SDL_Window* window =
+        SDL_CreateWindow(title, x, y, w, h, static_cast<uint32_t>(flags));
 #endif
+    apply_window_icon(window);
+    return window;
 }
 
 bool set_window_fullscreen(SDL_Window* window, NdsFullscreenMode mode) {
@@ -3021,6 +3050,12 @@ PresentationTicks present_screens(FrontendPresentation& presentation,
 
 int nds_run_interactive_frontend(const NdsFrontendOptions& initial_options) {
     NdsFrontendOptions options = initial_options;
+    g_window_icon = &options.window_icon_rgba;
+    // Wayland identifies a window by app id, not by title or icon.
+#if defined(NDS_HAVE_SDL3)
+    SDL_SetHint(SDL_HINT_APP_ID, options.app_name.empty()
+                                     ? "ndsrecomp" : options.app_name.c_str());
+#endif
     SDL_SetMainReady();
     // SDL_INIT_TIMER matters on Windows: it raises the OS timer resolution
     // to 1 ms (SDL_HINT_TIMER_RESOLUTION default). Without it SDL_Delay(1)

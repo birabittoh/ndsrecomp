@@ -6,6 +6,7 @@
 // halt. Reports where each core got — the execution-driven signal for the
 // next pieces (SPI/firmware boot for ARM7, IPC handshake between them).
 
+#include "rom_icon.h"
 #include <algorithm>
 #include <cstdint>
 #include <cstdio>
@@ -1912,6 +1913,8 @@ int main(int argc, char** argv) {
                                                  : cli_firmware_path);
     }
     auto rom = rom_path.empty() ? std::vector<uint8_t>{} : read_file(rom_path);
+    nds_rom_banner_icon_rgba(rom.data(), rom.size(), 8,
+                             &frontend_options.window_icon_rgba);
     std::string rom_sha1;
     bool sm64ds_wide_policy = false;
     bool mph_mouse_aim_policy = false;
