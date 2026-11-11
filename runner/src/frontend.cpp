@@ -5079,6 +5079,17 @@ int nds_run_interactive_frontend(const NdsFrontendOptions& initial_options) {
         // ── Gamepad dual-stick poll (once per shown frame) ───────────────
         mph_pad_frame_x = 0;
         mph_pad_frame_y = 0;
+        // The raw left stick for title hooks, while it drives the D-pad.
+        if (!controller || runtime_menu_open()) {
+            nds_title_set_left_stick(0, 0, false);
+        } else {
+            nds_title_set_left_stick(
+                SDL_GameControllerGetAxis(controller,
+                                          SDL_CONTROLLER_AXIS_LEFTX),
+                SDL_GameControllerGetAxis(controller,
+                                          SDL_CONTROLLER_AXIS_LEFTY),
+                true);
+        }
         if (controller) {
             // Left stick -> D-pad, with hysteresis so a stick resting near
             // a threshold never flickers a direction.
