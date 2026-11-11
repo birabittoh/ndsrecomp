@@ -147,9 +147,6 @@ bool write_default_settings(const fs::path& path,
         << "screen_layout = "
         << nds_toml_string(nds_screen_layout_name(options.screen_layout))
         << "   # single | stacked | separate\n"
-        << "window_mode = "
-        << nds_toml_string(nds_window_mode_name(options.window_mode))
-        << "   # letterbox | stretch | original\n"
         << "scaling = "
         << nds_toml_string(nds_scaling_filter_name(options.scaling))
         << "   # nearest | bilinear | integer\n"

@@ -1298,7 +1298,6 @@ uint64_t framebuffer_rgb_fnv(int screen) {
 constexpr const char* kRuntimeMouseSensitivityKey =
     "input.mouse_sensitivity";
 constexpr const char* kRuntimeGamepadLayoutKey = "input.gamepad_layout";
-constexpr const char* kRuntimeWindowModeKey = "display.window_mode";
 constexpr const char* kRuntimeScalingKey = "display.scaling";
 constexpr const char* kRuntimeResolutionScaleKey = "display.resolution_scale";
 // Menu steps for resolution_scale; 0 is "off" (the fixed multiplier). TOML
@@ -1401,10 +1400,6 @@ int runtime_menu_get_value(void* context, const RecompRuntimeUiItem* item,
         *value_out = state->options->gamepad_positional ? 1 : 0;
         return 1;
     }
-    if (std::strcmp(item->key, kRuntimeWindowModeKey) == 0) {
-        *value_out = static_cast<int>(state->options->window_mode);
-        return 1;
-    }
     if (std::strcmp(item->key, kRuntimeResolutionScaleKey) == 0) {
         // 0 is "Original" (the fixed multiplier); a percent reads as the
         // nearest percent choice.
@@ -1474,14 +1469,6 @@ int runtime_menu_set_value(void* context, const RecompRuntimeUiItem* item,
         state->options->gamepad_positional = value != 0;
         std::fprintf(stderr, "[sdl] gamepad layout -> %s\n",
                      value ? "positional" : "labels");
-        return 1;
-    }
-    if (std::strcmp(item->key, kRuntimeWindowModeKey) == 0) {
-        if (value < 0 || value > static_cast<int>(NdsWindowMode::Original))
-            return 0;
-        state->options->window_mode = static_cast<NdsWindowMode>(value);
-        std::fprintf(stderr, "[display] window mode -> %s\n",
-                     nds_window_mode_name(state->options->window_mode));
         return 1;
     }
     if (std::strcmp(item->key, kRuntimeResolutionScaleKey) == 0) {
@@ -1589,7 +1576,6 @@ void runtime_menu_save(void* context) {
               std::to_string(options.relative_mouse_sensitivity)},
              {"gamepad_layout",
               options.gamepad_positional ? "positional" : "labels"},
-             {"window_mode", nds_window_mode_name(options.window_mode)},
              {"scaling", nds_scaling_filter_name(options.scaling)},
              {"resolution_scale",
               std::to_string(options.resolution_scale)},
@@ -1604,8 +1590,6 @@ void runtime_menu_save(void* context) {
         return nds_toml_string(name);
     };
     std::vector<NdsSettingUpdate> updates = {
-        {"display", "window_mode",
-         quoted(nds_window_mode_name(options.window_mode))},
         {"display", "scaling", quoted(nds_scaling_filter_name(options.scaling))},
         {"display", "resolution_scale",
          std::to_string(options.resolution_scale)},
@@ -3388,8 +3372,6 @@ int nds_run_interactive_frontend(const NdsFrontendOptions& initial_options) {
     runtime_menu_state.resolution_scale_available =
         presentation.gl_top && nds_compute_host_active();
 #endif
-    static const char* const window_mode_choices[] = {
-        "Letterbox", "Stretch", "Original (1:1)"};
     static const char* const scaling_choices[] = {
         "Integer (pixel-perfect)", "Bilinear", "Nearest neighbor"};
     static const char* const resolution_scale_choices[] = {
@@ -3397,9 +3379,6 @@ int nds_run_interactive_frontend(const NdsFrontendOptions& initial_options) {
     static const char* const gamepad_layout_choices[] = {
         "By label", "By position"};
     static const RecompRuntimeUiItem runtime_menu_items[] = {
-        {kRuntimeWindowModeKey, "Display", "Window mode",
-         "Letterbox keeps 4:3, stretch fills the window, original is 1:1.",
-         RECOMP_RUNTIME_UI_CHOICE, 0, 2, 1, window_mode_choices, 3, nullptr},
         {kRuntimeScalingKey, "Display", "Scaling",
          "Integer keeps whole-pixel multiples; bilinear smooths to any size; "
          "nearest stays pixelated at any size.",
