@@ -38,6 +38,9 @@ void tier3_run(uint32_t pc);
 // normal stretch, the initial native-bank takeover is intentionally bypassed.
 void tier3_step_one(uint32_t pc);
 bool tier3_canonical_state_enabled();
+// False in a build with no interpreter (NDS_INTERPRETER=OFF): nothing can ever
+// be interpreted, so there is nothing for a coverage manifest to record.
+bool tier3_interpreter_present();
 
 uint32_t tier3_debug_trace_copy(Tier3TraceEvent* out, uint32_t max_entries);
 

@@ -30,6 +30,7 @@ void no_interpreter(uint32_t pc) {
 void tier3_run(uint32_t pc) { no_interpreter(pc); }
 void tier3_step_one(uint32_t pc) { no_interpreter(pc); }
 bool tier3_canonical_state_enabled() { return false; }
+bool tier3_interpreter_present() { return false; }
 
 uint32_t tier3_debug_trace_copy(Tier3TraceEvent*, uint32_t) { return 0u; }
 void tier3_reset() { g_stats = {}; }

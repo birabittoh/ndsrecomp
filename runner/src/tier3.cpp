@@ -656,6 +656,8 @@ static void tier3_run_impl(uint32_t /*entry*/, bool single_step) {
     sync_out(ic);
 }
 
+bool tier3_interpreter_present() { return true; }
+
 bool tier3_canonical_state_enabled() {
 #ifdef NDS_TIER3_CANONICAL_STATE
     // Fixed for the process: selection never changes halfway through a slice.

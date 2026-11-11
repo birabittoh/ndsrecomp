@@ -65,6 +65,7 @@
 #include "title_banks.h"
 #include "execution_model.h"
 #include "coverage_manifest.h"
+#include "tier3.h"
 #include "log_file.h"
 #include "player_launch.h"
 #include "title_patches.h"
@@ -1471,7 +1472,8 @@ int main(int argc, char** argv) {
     nds_diagnostics_configure(diagnostics_enabled,
                               cli_diagnostics_dir.c_str(),
                               diagnostics_interval_ms);
-    if (!diagnostics_enabled) coverage_manifest_disabled = true;
+    if (!diagnostics_enabled || !tier3_interpreter_present())
+        coverage_manifest_disabled = true;
     nds_diagnostics_enable_profile_environment();
 
     // Always-on host CPU sampler (host_profile.h). Started HERE -- before the
