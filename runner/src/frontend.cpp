@@ -1674,6 +1674,20 @@ void persist_window_size(NdsFrontendOptions& options, SDL_Window* window) {
                      options.settings_path.c_str(), error.c_str());
 }
 
+// Writes [display] fullscreen so the next launch starts in the mode the window
+// was last left in.
+void persist_fullscreen(const NdsFrontendOptions& options) {
+    if (options.settings_path.empty()) return;
+    std::string error;
+    if (!nds_update_settings_file(
+            options.settings_path,
+            {{"display", "fullscreen",
+              nds_toml_string(nds_fullscreen_mode_name(options.fullscreen))}},
+            &error))
+        std::fprintf(stderr, "[settings] could not save %s: %s\n",
+                     options.settings_path.c_str(), error.c_str());
+}
+
 // The menu's rows for title hooks (title_menu.h): publishes a copy with the
 // current values, then applies what the hooks asked for since last frame.
 void runtime_menu_serve_title(RuntimeMenuState* state,
@@ -4132,6 +4146,11 @@ int nds_run_interactive_frontend(const NdsFrontendOptions& initial_options) {
     // A resize is saved once it has been still for half a second, so dragging
     // a corner writes the settings file once, not per event.
     uint64_t window_resize_save_at = 0;
+    // What Alt+Enter enters: the configured fullscreen mode, or borderless
+    // when the setting is off.
+    const NdsFullscreenMode last_fullscreen_mode =
+        options.fullscreen != NdsFullscreenMode::Off
+            ? options.fullscreen : NdsFullscreenMode::Borderless;
 
     auto show_savestate_result = [&](const NdsSavestateSlotResult& result) {
         savestate_notice = result.message;
@@ -4535,12 +4554,14 @@ int nds_run_interactive_frontend(const NdsFrontendOptions& initial_options) {
                             (window_flags & (SDL_WINDOW_FULLSCREEN |
                                              SDL_WINDOW_FULLSCREEN_DESKTOP)) != 0;
 #endif
-                        set_window_fullscreen(
-                            window,
+                        const NdsFullscreenMode mode =
                             is_fullscreen ? NdsFullscreenMode::Off
-                            : options.fullscreen != NdsFullscreenMode::Off
-                                ? options.fullscreen
-                                : NdsFullscreenMode::Borderless);
+                                          : last_fullscreen_mode;
+                        if (set_window_fullscreen(window, mode)) {
+                            // Remembered across launches, like the size.
+                            options.fullscreen = mode;
+                            persist_fullscreen(options);
+                        }
                     }
                     continue;
                 }
