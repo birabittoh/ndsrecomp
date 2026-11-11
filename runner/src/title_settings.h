@@ -34,6 +34,9 @@ struct NdsTitleSetting {
     size_t choice_count;
     const int* choice_values;
     int default_value;
+    // Kept out of the runtime menu (still saved and loaded): a value the
+    // title changes some other way, such as a zoom bound to the mouse wheel.
+    bool hidden = false;
 };
 
 // Returns the setting's id. `setting` must outlive the program. Call only
@@ -137,6 +140,17 @@ typedef bool (*NdsTitleStackedLayoutQuery)();
 void nds_title_set_stacked_layout_query(NdsTitleStackedLayoutQuery query);
 // For the frontend: the query's answer (false with none registered).
 bool nds_title_stacked_layout_wanted();
+
+// Binds the frontend's zoom inputs (mouse wheel, gamepad right stick up/down)
+// to a number setting: an add changes `value_id`, but only while the
+// setting `mode_id` holds `active_mode_value` (a title's "Manual" mode). Call
+// from a static initializer, like a setting. Unbound by default.
+void nds_title_set_zoom_binding(int value_id, int mode_id,
+                                int active_mode_value);
+// For the frontend: adds `delta` (in the value's own units, may be negative)
+// to the bound value, clamped to its range. True when the value changed (the
+// frontend then saves the settings).
+bool nds_title_zoom_add(int delta);
 
 // For the frontend.
 size_t nds_title_setting_count();

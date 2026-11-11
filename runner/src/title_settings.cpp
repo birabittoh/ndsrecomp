@@ -78,6 +78,34 @@ bool nds_title_setting_set(int id, int value) {
 }
 
 namespace {
+struct ZoomBinding {
+    int value_id = -1;
+    int mode_id = -1;
+    int active_mode_value = 0;
+};
+ZoomBinding g_zoom_binding;
+}  // namespace
+
+void nds_title_set_zoom_binding(int value_id, int mode_id,
+                                int active_mode_value) {
+    g_zoom_binding = {value_id, mode_id, active_mode_value};
+}
+
+bool nds_title_zoom_add(int delta) {
+    const ZoomBinding b = g_zoom_binding;
+    const NdsTitleSetting* setting = nds_title_setting_at(b.value_id);
+    if (!setting || delta == 0) return false;
+    if (nds_title_setting_value(b.mode_id) != b.active_mode_value)
+        return false;
+    const int current = nds_title_setting_value(b.value_id);
+    long next = static_cast<long>(current) + delta;
+    if (next < setting->minimum) next = setting->minimum;
+    if (next > setting->maximum) next = setting->maximum;
+    if (next == current) return false;
+    return nds_title_setting_set(b.value_id, static_cast<int>(next));
+}
+
+namespace {
 std::atomic<NdsTitleStackedLayoutQuery> g_stacked_layout_query{nullptr};
 }  // namespace
 
