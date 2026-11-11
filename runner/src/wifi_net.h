@@ -349,6 +349,26 @@ void nds_wifi_frame_tick();
 // logs MP client timing (diagnostics only).
 bool nds_wifi_local_mp_trace_enabled();
 
+// Lobby beacons (HANDOFF_ONLINE_LOBBY.md, "DQ9's in-game host list"): with
+// Netplay on and no lobby joined, the open lobbies' hosts are put in radio
+// range as beacons only, so the game lists them in its own join menu.
+//
+// The last beacon this instance transmitted as an MP host (transport frame
+// of type 0: melonDS TX header + 802.11 frame). False when it is not
+// beaconing. Any thread.
+bool nds_wifi_local_mp_own_beacon(std::vector<uint8_t>* out);
+// Beacons to replay into this guest's radio, each a frame as above. They
+// are only handed over while the Netplay link is the transport's link and
+// no peer is in range; an empty list stops it. Any thread.
+void nds_wifi_local_mp_set_replay_beacons(
+    std::vector<std::vector<uint8_t>> frames);
+// The game sent an authentication or association request to the BSSID of a
+// replayed beacon: `bssid` is that host. Read-and-clear. Any thread.
+bool nds_wifi_local_mp_take_join_request(uint8_t bssid[6]);
+// Called by the vendored Wifi model before each regular receive: the
+// channel the guest radio listens on.
+void nds_wifi_local_mp_note_rx_channel(int channel);
+
 // Transaction-boundary query installed into the core savestate layer when
 // the bridge attaches. A configured/idle backend does not block. Association,
 // local peers, lifecycle transitions, and currently-unserialized powered

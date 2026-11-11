@@ -798,6 +798,7 @@ public:
             link_ = mpnet::MakeLinkView(std::move(online));
             tuning_.late_replies = true;
             tuning_.stay_awake = true;
+            online_link_ = true;
         } else
 #endif
         {
@@ -861,6 +862,50 @@ public:
         rel_.Reset(0);
         if (link_) link_->Close();
         link_.reset();
+        online_link_ = false;
+        held_.clear();
+    }
+
+    // ---- lobby beacons (see wifi_net.h) ------------------------------------
+
+    bool OwnBeacon(std::vector<uint8_t>* out) {
+        std::lock_guard<std::mutex> lock(beacon_mutex_);
+        if (!beacon_watch_.active() || own_beacon_.empty()) return false;
+        if (out) *out = own_beacon_;
+        return true;
+    }
+
+    void SetReplayBeacons(std::vector<std::vector<uint8_t>> frames) {
+        std::lock_guard<std::mutex> lock(replay_mutex_);
+        std::vector<ReplayBeacon> next;
+        for (auto& f : frames) {
+            if (f.size() < 12 + 24 + 12 || f.size() > kMaxFrameBytes) continue;
+            ReplayBeacon b;
+            b.frame = std::move(f);
+            // Keep the pacing of a host that was already listed.
+            for (const ReplayBeacon& old : replay_)
+                if (std::memcmp(old.frame.data() + 12 + 16,
+                                b.frame.data() + 12 + 16, 6) == 0)
+                    b.last_given = old.last_given;
+            next.push_back(std::move(b));
+        }
+        if (next.size() != replay_.size())
+            std::fprintf(stderr, "[local_mp] inst=%u replaying %zu lobby "
+                         "beacon(s)\n", static_cast<unsigned>(instance_),
+                         next.size());
+        replay_ = std::move(next);
+    }
+
+    bool TakeJoinRequest(uint8_t bssid[6]) {
+        std::lock_guard<std::mutex> lock(replay_mutex_);
+        if (!join_request_) return false;
+        join_request_ = false;
+        std::memcpy(bssid, join_bssid_, 6);
+        return true;
+    }
+
+    void NoteRxChannel(int channel) {
+        rx_channel_.store(channel, std::memory_order_relaxed);
     }
 
     int SendPacket(uint8_t* data, int len, uint64_t timestamp) {
@@ -1313,7 +1358,10 @@ private:
             DrainSocket();
             LocalMpFrame frame;
             if (!packet_queue_.TryPop(&frame)) {
-                if (!block) return 0;
+                if (!block) {
+                    if (timestamp) *timestamp = 0;
+                    return GiveReplayBeacon(data);
+                }
                 // See RecvReplies: wake on datagram arrival, never on a
                 // sleep tick. The client sits here at every NextSync point
                 // waiting for the host's next MP frame, so this wait's
@@ -1347,6 +1395,74 @@ private:
             if (block) RecordHostWait(start);
             return static_cast<int>(frame.payload.size());
         }
+    }
+
+    // A lobby beacon due on the channel the guest listens on, or 0. Only on
+    // the Netplay link with nobody in range: once a lobby is joined, its
+    // host's own beacons come through the link.
+    int GiveReplayBeacon(uint8_t* data) {
+        if (!online_link_ || !LinkOpen() || !peers_.empty()) return 0;
+        const int channel = rx_channel_.load(std::memory_order_relaxed);
+        const auto now = std::chrono::steady_clock::now();
+        std::lock_guard<std::mutex> lock(replay_mutex_);
+        for (ReplayBeacon& b : replay_) {
+            if (b.frame[9] != channel || now - b.last_given < kReplayInterval)
+                continue;
+            b.last_given = now;
+            std::memcpy(data, b.frame.data(), b.frame.size());
+            return static_cast<int>(b.frame.size());
+        }
+        return 0;
+    }
+
+    // Called with a management frame the guest is sending while nobody is
+    // in range: an authentication or association request to a replayed
+    // beacon's BSSID asks to join that lobby. The frame is kept and sent
+    // once the host is in range, so the game's first attempt can work.
+    void NoteJoinAttempt(const LocalMpFrame& frame) {
+        const std::vector<uint8_t>& p = frame.payload;
+        if (!online_link_ || p.size() < 12 + 24) return;
+        const unsigned fc = p[12] | (p[13] << 8);
+        if ((fc & 0x000C) != 0) return;  // management only
+        const unsigned subtype = fc & 0x00F0;
+        if (subtype != 0x00B0 && subtype != 0x0000 && subtype != 0x0020)
+            return;  // authentication, (re)association request
+        const uint8_t* to = p.data() + 12 + 4;
+        std::lock_guard<std::mutex> lock(replay_mutex_);
+        bool listed = false;
+        for (const ReplayBeacon& b : replay_)
+            if (std::memcmp(b.frame.data() + 12 + 16, to, 6) == 0)
+                listed = true;
+        if (!listed) return;
+        if (!join_request_ || std::memcmp(join_bssid_, to, 6) != 0) {
+            std::fprintf(stderr,
+                "[local_mp] inst=%u join request to lobby host "
+                "%02x:%02x:%02x:%02x:%02x:%02x\n",
+                static_cast<unsigned>(instance_), to[0], to[1], to[2], to[3],
+                to[4], to[5]);
+        }
+        join_request_ = true;
+        std::memcpy(join_bssid_, to, 6);
+        if (held_.size() >= kMaxHeld) held_.pop_front();
+        held_.push_back(HeldFrame{std::chrono::steady_clock::now(), frame});
+    }
+
+    // The first peer after a join request: hand it the requests the game
+    // made while the lobby was still being joined.
+    void FlushHeld(std::chrono::steady_clock::time_point now) {
+        if (held_.empty()) return;
+        size_t sent = 0;
+        while (!held_.empty()) {
+            HeldFrame h = std::move(held_.front());
+            held_.pop_front();
+            if (now - h.at > kHeldLifetime) continue;
+            rel_.Send(&h.frame, true, now, PeerSender());
+            ++sent;
+        }
+        if (sent)
+            std::fprintf(stderr, "[local_mp] inst=%u sent %zu held join "
+                         "frame(s) to the lobby host\n",
+                         static_cast<unsigned>(instance_), sent);
     }
 
     void RecordHostWait(std::chrono::steady_clock::time_point start) {
@@ -1457,6 +1573,7 @@ private:
         // no radio-level retransmission left (see mp_reliable.h).
         const bool reliable =
             !mpnet::IsBeacon(type, data, static_cast<size_t>(len));
+        if (low_type == 0u && peers_.empty()) NoteJoinAttempt(frame);
         rel_.Send(&frame, reliable, now, PeerSender());
 
         if (low_type == 0u) NoteAssocResponse(data, len);
@@ -1557,6 +1674,7 @@ private:
                      static_cast<unsigned>(frame.node),
                      mpnet::FormatPeerAddress(frame.from).c_str());
         rel_.SendControl(frame.node, mpnet::kFlagHello, now, PeerSender());
+        FlushHeld(now);
         return true;
     }
 
@@ -1809,6 +1927,7 @@ private:
         mpnet::GameInfo info;
         if (!mpnet::ParseBeaconGameInfo(data, len, &info)) return;
         std::lock_guard<std::mutex> lock(beacon_mutex_);
+        own_beacon_.assign(data, data + len);
         const auto now = std::chrono::steady_clock::now();
         switch (beacon_watch_.OnBeacon(info, now)) {
         case mpnet::BeaconWatch::Event::kStarted:
@@ -1929,6 +2048,29 @@ private:
     unsigned beacon_unlogged_ = 0;
     bool host_valid_ = false;
     NdsNetplayHostInfo host_info_;
+    std::vector<uint8_t> own_beacon_;  // under beacon_mutex_
+    // Lobby beacons. The list and the join request are set and taken by the
+    // lobby thread, under replay_mutex_; the rest is the emulation thread's.
+    struct ReplayBeacon {
+        std::vector<uint8_t> frame;
+        std::chrono::steady_clock::time_point last_given{};
+    };
+    struct HeldFrame {
+        std::chrono::steady_clock::time_point at;
+        LocalMpFrame frame;
+    };
+    // A scanning DS listens to each channel for a few tens of ms; hand a
+    // host's beacon over about that often while the guest is on its channel.
+    static constexpr std::chrono::milliseconds kReplayInterval{20};
+    static constexpr size_t kMaxHeld = 4;
+    static constexpr std::chrono::seconds kHeldLifetime{10};
+    std::mutex replay_mutex_;
+    std::vector<ReplayBeacon> replay_;
+    bool join_request_ = false;
+    uint8_t join_bssid_[6]{};
+    std::deque<HeldFrame> held_;
+    bool online_link_ = false;
+    std::atomic<int> rx_channel_{-1};
     // Always-on wait/traffic counters (see NdsLocalMpStats in wifi_net.h).
     // Relaxed atomics: written on the emulation thread, snapshotted from
     // the debug-server thread.
@@ -3001,6 +3143,23 @@ bool nds_wifi_local_mp_trace_enabled() {
 
 uint16_t nds_wifi_local_mp_take_ack_only() {
     return g_bridge ? g_bridge->local_mp.TakeLateAckOnly() : 0;
+}
+
+bool nds_wifi_local_mp_own_beacon(std::vector<uint8_t>* out) {
+    return g_bridge && g_bridge->local_mp.OwnBeacon(out);
+}
+
+void nds_wifi_local_mp_set_replay_beacons(
+    std::vector<std::vector<uint8_t>> frames) {
+    if (g_bridge) g_bridge->local_mp.SetReplayBeacons(std::move(frames));
+}
+
+bool nds_wifi_local_mp_take_join_request(uint8_t bssid[6]) {
+    return g_bridge && g_bridge->local_mp.TakeJoinRequest(bssid);
+}
+
+void nds_wifi_local_mp_note_rx_channel(int channel) {
+    if (g_bridge) g_bridge->local_mp.NoteRxChannel(channel);
 }
 
 bool nds_wifi_local_mp_stats(NdsLocalMpStats* out) {

@@ -5,6 +5,7 @@
 #include "net/ice_link.h"
 #include "net/lobby_json.h"
 #include "net/lobby_ws.h"
+#include "net/mp_beacon.h"
 #include "wifi_net.h"
 
 #include "recomp_net/auth.h"
@@ -15,6 +16,8 @@
 #include <condition_variable>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
+#include <map>
 #include <mutex>
 #include <thread>
 
@@ -39,6 +42,68 @@ constexpr auto kConnectBackoffMax = std::chrono::seconds(60);
 // hosting. With the radio still on, wait this long before closing.
 constexpr auto kHostGoneWithRadioOn = std::chrono::seconds(30);
 constexpr int kConnectTimeoutMs = 8000;
+
+// Lobby beacons (HANDOFF_ONLINE_LOBBY.md, "DQ9's in-game host list"): a
+// runner that is in no lobby asks each open lobby's host for its current
+// beacon with the server's probe_signal (open to a client that has not
+// joined) and replays it into its own radio, so the game lists the lobby
+// in its own join menu. Our own probe types; recomp-net's ICE probes use
+// 1-3.
+constexpr int kProbeBeaconRequest = 5;
+constexpr int kProbeBeaconReply = 6;
+constexpr auto kBeaconAskInterval = std::chrono::seconds(4);
+// A beacon not refreshed this long is dropped (host gone or not answering).
+constexpr auto kBeaconStale = std::chrono::seconds(15);
+// DQ9's list shows at most 8 hosts and drops extras at random.
+constexpr size_t kMaxReplayedLobbies = 8;
+// After the game asked to join a replayed host, keep that beacon going
+// while the lobby is joined and the relay comes up.
+constexpr auto kJoinBeaconHold = std::chrono::seconds(20);
+constexpr size_t kMaxBeaconBytes = 1024;
+
+std::string HexEncode(const std::vector<uint8_t>& bytes) {
+    static const char kDigits[] = "0123456789abcdef";
+    std::string out;
+    out.reserve(bytes.size() * 2);
+    for (uint8_t b : bytes) {
+        out.push_back(kDigits[b >> 4]);
+        out.push_back(kDigits[b & 15]);
+    }
+    return out;
+}
+
+bool HexDecode(const std::string& text, std::vector<uint8_t>* out) {
+    if (text.size() % 2 != 0) return false;
+    const auto nibble = [](char c) -> int {
+        if (c >= '0' && c <= '9') return c - '0';
+        if (c >= 'a' && c <= 'f') return c - 'a' + 10;
+        if (c >= 'A' && c <= 'F') return c - 'A' + 10;
+        return -1;
+    };
+    out->clear();
+    for (size_t i = 0; i < text.size(); i += 2) {
+        const int hi = nibble(text[i]);
+        const int lo = nibble(text[i + 1]);
+        if (hi < 0 || lo < 0) return false;
+        out->push_back(static_cast<uint8_t>((hi << 4) | lo));
+    }
+    return true;
+}
+
+// A host's beacon as the transport hands frames to the radio: TX header
+// with a matching length, a beacon from a unicast BSSID that is also the
+// sender, on a real channel, carrying a WMGameInfo.
+bool ValidLobbyBeacon(const std::vector<uint8_t>& f) {
+    if (f.size() < 12 + 24 + 12 || f.size() > kMaxBeaconBytes) return false;
+    if (static_cast<size_t>(f[10] | (f[11] << 8)) != f.size() - 12)
+        return false;
+    if (f[9] < 1 || f[9] > 14) return false;
+    const uint8_t* addr2 = f.data() + 12 + 10;
+    const uint8_t* addr3 = f.data() + 12 + 16;
+    if (std::memcmp(addr2, addr3, 6) != 0 || (addr3[0] & 1)) return false;
+    mpnet::GameInfo info;
+    return mpnet::ParseBeaconGameInfo(f.data(), f.size(), &info);
+}
 
 struct Member {
     int slot = -1;
@@ -277,6 +342,7 @@ private:
 
         if (!enabled) {
             if (ws_.IsOpen()) Disconnect("Netplay off");
+            ForgetBeacons();
             Publish(NdsOnlineState::Off, "Off");
             return;
         }
@@ -335,6 +401,8 @@ private:
             std::fprintf(stderr, "[online] connected to the lobby server\n");
             welcomed_ = false;
             player_id_.clear();
+            probes_sent_ = false;
+            probe_unsupported_ = false;
             turn_ok_ = false;
             turn_error_.clear();
             last_ping_ = Clock::now();
@@ -362,13 +430,15 @@ private:
         }
         if (leave && !room_.lobby_id.empty()) LeaveRoom("left");
         if (!join.empty()) RequestJoin(join);
-        if (browsing_now_ && now - last_list_ >= kListInterval) {
+        if ((browsing_now_ || BeaconScanActive()) &&
+            now - last_list_ >= kListInterval) {
             Send(JsonOp("list").Str("game_name", config_.game_name)
                      .Str("game_version", config_.game_version)
                      .Text());
             last_list_ = now;
         }
         HostLogic(now);
+        BeaconLogic(now);
         LinkLogic(now);
         PublishRoom();
     }
@@ -389,6 +459,7 @@ private:
         LeaveRoom(why);
         ws_.Close();
         welcomed_ = false;
+        ForgetBeacons();
         std::fprintf(stderr, "[online] disconnected from the lobby server (%s)\n",
                      why);
     }
@@ -398,6 +469,7 @@ private:
                      why.c_str());
         ws_.Close();
         welcomed_ = false;
+        ForgetBeacons();
         ClearRoom();
         connect_backoff_ =
             std::max<Clock::duration>(kConnectBackoffMin, connect_backoff_);
@@ -438,10 +510,12 @@ private:
             }
         } else if (op == "signal") {
             OnSignal(msg);
+        } else if (op == "probe_signal") {
+            OnProbeSignal(msg);
         } else if (op == "error") {
             OnError(msg.Str("code", ""));
         }
-        // hello_ok, pong, left, chat, server_chat, probe_signal: nothing.
+        // hello_ok, pong, left, chat, server_chat: nothing.
     }
 
     // Test aid: NDS_ONLINE_TURN=host:port:user:pass replaces the server's
@@ -605,6 +679,16 @@ private:
     }
 
     void OnError(const std::string& code) {
+        // A server older than probe_signal (recomp-net-server a39d1d4):
+        // no lobby beacons on this connection, nothing else is wrong.
+        if (code == "unknown_op" && probes_sent_) {
+            if (!probe_unsupported_)
+                std::fprintf(stderr, "[online] the lobby server has no "
+                             "probe_signal: lobbies will not show in the "
+                             "game's join menu\n");
+            probe_unsupported_ = true;
+            return;
+        }
         std::fprintf(stderr, "[online] server error: %s\n", code.c_str());
         if (code == "login_required") {
             // Wait for a session this server has not refused yet.
@@ -720,6 +804,141 @@ private:
         if (link_ref_) link_ref_->ClearRoom();
     }
 
+    // ---- lobby beacons -----------------------------------------------------
+
+    // In no lobby, not hosting, the radio on: the game may be looking for
+    // hosts, so the open lobbies are put in range as beacons.
+    bool BeaconScanActive() const {
+        return welcomed_ && turn_ok_ && room_.lobby_id.empty() &&
+               !join_pending_ && !create_pending_ &&
+               nds_wifi_local_mp_radio_on() && !nds_netplay_host_info(nullptr);
+    }
+
+    void OnProbeSignal(const Json& msg) {
+        const int type = msg.Int("type", 0);
+        const std::string lobby = msg.Str("lobby_id", "");
+        const std::string from = msg.Str("from_player_id", "");
+        if (type == kProbeBeaconRequest) {
+            // Only the server's probe grant lets this reach a guest.
+            if (!room_.is_host || lobby.empty() || lobby != room_.lobby_id ||
+                from.empty())
+                return;
+            std::vector<uint8_t> beacon;
+            if (!nds_wifi_local_mp_own_beacon(&beacon)) return;
+            Send(JsonOp("probe_signal")
+                     .Str("lobby_id", lobby)
+                     .Str("to_player_id", from)
+                     .Int("type", kProbeBeaconReply)
+                     .Str("text", HexEncode(beacon))
+                     .Text());
+        } else if (type == kProbeBeaconReply) {
+            // The server sends a host's probe reply only to a client it
+            // granted a probe of that lobby: this is that lobby's host.
+            const auto it = beacons_.find(lobby);
+            if (it == beacons_.end()) return;
+            std::vector<uint8_t> frame;
+            if (!HexDecode(msg.Str("text", ""), &frame) ||
+                !ValidLobbyBeacon(frame))
+                return;
+            if (it->second.frame.empty())
+                std::fprintf(stderr, "[online] beacon of lobby %s: host "
+                             "%02x:%02x:%02x:%02x:%02x:%02x channel %u\n",
+                             lobby.c_str(), frame[12 + 16], frame[12 + 17],
+                             frame[12 + 18], frame[12 + 19], frame[12 + 20],
+                             frame[12 + 21], static_cast<unsigned>(frame[9]));
+            it->second.frame = std::move(frame);
+            it->second.got = Clock::now();
+        }
+    }
+
+    std::string LobbyByBssid(const uint8_t bssid[6]) const {
+        for (const auto& [id, b] : beacons_)
+            if (!b.frame.empty() &&
+                std::memcmp(b.frame.data() + 12 + 16, bssid, 6) == 0)
+                return id;
+        return {};
+    }
+
+    void BeaconLogic(Clock::time_point now) {
+        uint8_t bssid[6];
+        if (nds_wifi_local_mp_take_join_request(bssid)) {
+            const std::string id = LobbyByBssid(bssid);
+            if (!id.empty() && room_.lobby_id.empty() && !join_pending_) {
+                std::fprintf(stderr, "[online] the game is joining lobby %s\n",
+                             id.c_str());
+                beacon_join_id_ = id;
+                beacon_join_at_ = now;
+                RequestJoin(id);
+            }
+        }
+        if (!beacon_join_id_.empty() && now - beacon_join_at_ > kJoinBeaconHold)
+            beacon_join_id_.clear();
+
+        std::vector<std::vector<uint8_t>> frames;
+        if (BeaconScanActive()) {
+            std::vector<NdsOnlineLobbyRow> rows;
+            {
+                std::lock_guard<std::mutex> lock(mu_);
+                rows = rows_;
+            }
+            rows.erase(std::remove_if(rows.begin(), rows.end(),
+                                      [](const NdsOnlineLobbyRow& r) {
+                                          return r.players >= r.max_slots;
+                                      }),
+                       rows.end());
+            std::stable_sort(rows.begin(), rows.end(),
+                             [](const NdsOnlineLobbyRow& a,
+                                const NdsOnlineLobbyRow& b) {
+                                 return a.max_slots - a.players >
+                                        b.max_slots - b.players;
+                             });
+            if (rows.size() > kMaxReplayedLobbies)
+                rows.resize(kMaxReplayedLobbies);
+            for (auto it = beacons_.begin(); it != beacons_.end();) {
+                const bool listed = std::any_of(
+                    rows.begin(), rows.end(),
+                    [&](const NdsOnlineLobbyRow& r) {
+                        return r.lobby_id == it->first;
+                    });
+                if (listed || it->first == beacon_join_id_) ++it;
+                else it = beacons_.erase(it);
+            }
+            for (const auto& row : rows) {
+                LobbyBeacon& b = beacons_[row.lobby_id];
+                if (!probe_unsupported_ &&
+                    (b.asked == Clock::time_point{} ||
+                     now - b.asked >= kBeaconAskInterval)) {
+                    b.asked = now;
+                    probes_sent_ = true;
+                    Send(JsonOp("probe_signal")
+                             .Str("lobby_id", row.lobby_id)
+                             .Int("type", kProbeBeaconRequest)
+                             .Str("text", "")
+                             .Text());
+                }
+                if (!b.frame.empty() && now - b.got < kBeaconStale)
+                    frames.push_back(b.frame);
+            }
+        } else if (!beacon_join_id_.empty()) {
+            const auto it = beacons_.find(beacon_join_id_);
+            if (it != beacons_.end() && !it->second.frame.empty())
+                frames.push_back(it->second.frame);
+        }
+        PublishReplay(std::move(frames));
+    }
+
+    void PublishReplay(std::vector<std::vector<uint8_t>> frames) {
+        if (frames == replayed_) return;
+        replayed_ = frames;
+        nds_wifi_local_mp_set_replay_beacons(std::move(frames));
+    }
+
+    void ForgetBeacons() {
+        beacons_.clear();
+        beacon_join_id_.clear();
+        PublishReplay({});
+    }
+
     // ---- the link -----------------------------------------------------------
 
     const Member* MemberById(const std::string& id) const {
@@ -802,7 +1021,7 @@ private:
                 Publish(NdsOnlineState::Idle, "Online: " + last_error_);
             } else {
                 Publish(NdsOnlineState::Idle,
-                        "Online: host in the game, or join a lobby");
+                        "Online: open lobbies show in the game's join menu");
             }
             return;
         }
@@ -901,6 +1120,18 @@ private:
     bool peers_set_ = false;
     std::string last_error_;
     Clock::time_point last_error_at_{};
+    // Lobby beacons, by lobby id: the host's last answer and when we asked.
+    struct LobbyBeacon {
+        std::vector<uint8_t> frame;
+        Clock::time_point got{};
+        Clock::time_point asked{};
+    };
+    std::map<std::string, LobbyBeacon> beacons_;
+    std::vector<std::vector<uint8_t>> replayed_;  // as last handed over
+    bool probes_sent_ = false;       // this connection
+    bool probe_unsupported_ = false;  // the server said unknown_op
+    std::string beacon_join_id_;  // the lobby the game asked to join
+    Clock::time_point beacon_join_at_{};
 };
 
 OnlineLobby& Instance() {

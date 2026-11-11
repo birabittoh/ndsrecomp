@@ -1467,6 +1467,7 @@ ndsrecomp_link_tomlpp(frontend_config_test)
         src/net/ice_link.cpp
         src/net/lobby_json.cpp
         src/net/lobby_ws.cpp
+        src/net/mp_beacon.cpp
         src/net/mp_wire.cpp)
     target_include_directories(online_lobby_test PRIVATE src
                                "${NDS_RECOMP_NET_ROOT}/include")

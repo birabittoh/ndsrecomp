@@ -80,6 +80,16 @@ NextSync), each reply it sends and how the reply slots move, duplicate cmds
 dropped from RX, and how long it waited for host frames. Diagnostics only;
 behaviour is unchanged.
 
+## 0029-wifi-rx-channel-hook.patch
+
+2026-11-11: `Wifi.cpp`'s `CheckRX` tells the runner hook
+`nds_wifi_local_mp_note_rx_channel()` the channel it is listening on before
+each regular `MP_RecvPacket`. With Netplay on and no lobby joined, the
+runner replays the open lobbies' host beacons into the radio
+(HANDOFF_ONLINE_LOBBY.md, "DQ9's in-game host list"); it hands one over
+only on the channel the guest is on, since `CheckRX` drops a frame from any
+other channel. The hook only records a number; behaviour is unchanged.
+
 ## 0001-wifi-ap-identity.patch
 
 `src/WifiAP.cpp`: changes the hardcoded AP identity from melonDS's default
