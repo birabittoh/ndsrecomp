@@ -319,6 +319,7 @@ namespace {
 #define SDL_EVENT_WINDOW_FOCUS_GAINED SDL_WINDOWEVENT_FOCUS_GAINED
 #define SDL_EVENT_WINDOW_FOCUS_LOST SDL_WINDOWEVENT_FOCUS_LOST
 #define SDL_EVENT_WINDOW_MOUSE_LEAVE SDL_WINDOWEVENT_LEAVE
+#define SDL_EVENT_WINDOW_RESIZED SDL_WINDOWEVENT_SIZE_CHANGED
 #endif
 
 constexpr int kScreenWidth = 256;
@@ -861,6 +862,14 @@ SDL_Scancode sdl_event_scancode(const SDL_Event& event) {
     return event.key.scancode;
 #else
     return event.key.keysym.scancode;
+#endif
+}
+
+bool sdl_event_alt(const SDL_Event& event) {
+#if defined(NDS_HAVE_SDL3)
+    return (event.key.mod & SDL_KMOD_ALT) != 0;
+#else
+    return (event.key.keysym.mod & KMOD_ALT) != 0;
 #endif
 }
 
@@ -1630,6 +1639,37 @@ void runtime_menu_save(void* context) {
 #endif
     std::string error;
     if (!nds_update_settings_file(options.settings_path, updates, &error))
+        std::fprintf(stderr, "[settings] could not save %s: %s\n",
+                     options.settings_path.c_str(), error.c_str());
+}
+
+// Writes the window's current logical size to [display] window_width/height.
+// Fullscreen and minimized sizes are not worth coming back to, and the logical
+// unit (not pixels) is what SDL_SetWindowSize reads, so a scaled display does
+// not grow the window on every launch. `saved` caches what the file holds.
+void persist_window_size(NdsFrontendOptions& options, SDL_Window* window) {
+    if (options.settings_path.empty() || !window) return;
+    const auto flags = SDL_GetWindowFlags(window);
+#if defined(NDS_HAVE_SDL3)
+    if (flags & (SDL_WINDOW_FULLSCREEN | SDL_WINDOW_MINIMIZED)) return;
+#else
+    if (flags & (SDL_WINDOW_FULLSCREEN | SDL_WINDOW_FULLSCREEN_DESKTOP |
+                 SDL_WINDOW_MINIMIZED))
+        return;
+#endif
+    int width = 0, height = 0;
+    SDL_GetWindowSize(window, &width, &height);
+    if (width < 160 || height < 160 || width > 8192 || height > 8192) return;
+    if (width == options.window_width && height == options.window_height)
+        return;
+    options.window_width = width;
+    options.window_height = height;
+    std::string error;
+    if (!nds_update_settings_file(
+            options.settings_path,
+            {{"display", "window_width", std::to_string(width)},
+             {"display", "window_height", std::to_string(height)}},
+            &error))
         std::fprintf(stderr, "[settings] could not save %s: %s\n",
                      options.settings_path.c_str(), error.c_str());
 }
@@ -2576,6 +2616,17 @@ bool create_presentation(const NdsFrontendOptions& options,
             "[sdl] initial window scale=%u dpi=%.3f top=%dx%d bottom=%dx%d\n",
             options.window_scale, coordinate_scale, initial_size.top_width,
             initial_size.height, initial_size.bottom_width, initial_size.height);
+    }
+    // The size the user last left the window at wins over the scale-derived
+    // one. The two-window layout has no single size to restore.
+    if (!presentation.separate && options.window_width >= 160 &&
+        options.window_height >= 160) {
+        SDL_SetWindowSize(presentation.windows[0], options.window_width,
+                          options.window_height);
+        SDL_SetWindowPosition(presentation.windows[0],
+            SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED);
+        std::fprintf(stderr, "[sdl] restored window size %dx%d\n",
+                     options.window_width, options.window_height);
     }
     if (!presentation.gl_top) {
         presentation.renderers[0] = create_renderer(presentation.windows[0]);
@@ -4078,6 +4129,9 @@ int nds_run_interactive_frontend(const NdsFrontendOptions& initial_options) {
     const uint64_t soak_start = SDL_GetPerformanceCounter();
     std::string savestate_notice;
     uint64_t savestate_notice_until = 0;
+    // A resize is saved once it has been still for half a second, so dragging
+    // a corner writes the settings file once, not per event.
+    uint64_t window_resize_save_at = 0;
 
     auto show_savestate_result = [&](const NdsSavestateSlotResult& result) {
         savestate_notice = result.message;
@@ -4365,6 +4419,11 @@ int nds_run_interactive_frontend(const NdsFrontendOptions& initial_options) {
             }
         }
 #endif
+        if (window_resize_save_at &&
+            SDL_GetPerformanceCounter() >= window_resize_save_at) {
+            window_resize_save_at = 0;
+            persist_window_size(options, presentation.windows[0]);
+        }
         SDL_Event event{};
         while (SDL_PollEvent(&event)) {
             convert_mouse_event_to_logical_coordinates(event, presentation);
@@ -4376,6 +4435,12 @@ int nds_run_interactive_frontend(const NdsFrontendOptions& initial_options) {
                 release_relative_mouse();
                 running = false;
             }
+            if (sdl_window_event_is(event, SDL_EVENT_WINDOW_RESIZED) &&
+                !presentation.separate && presentation.windows[0] &&
+                event.window.windowID ==
+                    SDL_GetWindowID(presentation.windows[0]))
+                window_resize_save_at =
+                    SDL_GetPerformanceCounter() + frequency / 2u;
             if (sdl_window_event_is(event, SDL_EVENT_WINDOW_FOCUS_LOST) &&
                 is_presentation_window(event.window.windowID)) {
                 const int index =
@@ -4450,6 +4515,35 @@ int nds_run_interactive_frontend(const NdsFrontendOptions& initial_options) {
                              (unsigned)event.type,
                              (int)sdl_event_scancode(event),
                              (int)event.key.repeat);
+            }
+            // Alt+Enter toggles fullscreen on the primary window, whatever
+            // the menu or the game is doing; the key never reaches either.
+            if ((event.type == SDL_KEYDOWN || event.type == SDL_KEYUP) &&
+                sdl_event_alt(event)) {
+                const SDL_Scancode alt_key = sdl_event_scancode(event);
+                if (alt_key == SDL_SCANCODE_RETURN ||
+                    alt_key == SDL_SCANCODE_KP_ENTER) {
+                    if (event.type == SDL_KEYDOWN && !event.key.repeat &&
+                        presentation.windows[0]) {
+                        SDL_Window* window = presentation.windows[0];
+                        const auto window_flags = SDL_GetWindowFlags(window);
+#if defined(NDS_HAVE_SDL3)
+                        const bool is_fullscreen =
+                            (window_flags & SDL_WINDOW_FULLSCREEN) != 0;
+#else
+                        const bool is_fullscreen =
+                            (window_flags & (SDL_WINDOW_FULLSCREEN |
+                                             SDL_WINDOW_FULLSCREEN_DESKTOP)) != 0;
+#endif
+                        set_window_fullscreen(
+                            window,
+                            is_fullscreen ? NdsFullscreenMode::Off
+                            : options.fullscreen != NdsFullscreenMode::Off
+                                ? options.fullscreen
+                                : NdsFullscreenMode::Borderless);
+                    }
+                    continue;
+                }
             }
             if (event.type == SDL_KEYDOWN || event.type == SDL_KEYUP) {
                 RecompRuntimeUiInput menu_input{};
@@ -5924,6 +6018,9 @@ int nds_run_interactive_frontend(const NdsFrontendOptions& initial_options) {
         recomp_runtime_ui_destroy(runtime_ui);
         runtime_ui = nullptr;
     }
+    // A resize still inside its settle window when the user quit.
+    if (window_resize_save_at && !presentation.separate)
+        persist_window_size(options, presentation.windows[0]);
     destroy_presentation(presentation);
     SDL_Quit();
     std::fprintf(stderr, "[sdl] closed after %llu presented frames\n",

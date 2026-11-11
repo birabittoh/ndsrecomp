@@ -285,6 +285,12 @@ struct NdsFrontendOptions {
     // Zero preserves the standalone runner's historical 2x sizing. Title
     // launchers can request 1..8x with display-DPI-aware desktop fitting.
     uint8_t window_scale = 0;
+    // [display] window_width / window_height: the last windowed size, in
+    // logical (SDL window) units, written back when a resize settles and
+    // restored at launch. Zero means none saved. Only the one-window layouts
+    // use it.
+    int window_width = 0;
+    int window_height = 0;
     NdsButtonBindings keyboard_bindings = kNdsDefaultKeys;
     NdsButtonBindings gamepad_bindings = kNdsDefaultPad;
     bool custom_gamepad_bindings = false;

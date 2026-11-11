@@ -1016,6 +1016,15 @@ static bool apply_frontend_config(toml::table& root,
                 return false;
             }
         }
+        for (const auto& [key, target] :
+             {std::pair<const char*, int*>{"window_width",
+                                           &options->window_width},
+              std::pair<const char*, int*>{"window_height",
+                                           &options->window_height}}) {
+            if (const auto value = (*display)[key].value<int64_t>())
+                *target = (*value >= 160 && *value <= 8192)
+                              ? static_cast<int>(*value) : 0;
+        }
         if (const auto value = (*display)["scaling"].value<std::string>()) {
             if (!nds_parse_scaling_filter(*value, &options->scaling)) {
                 if (error) {
