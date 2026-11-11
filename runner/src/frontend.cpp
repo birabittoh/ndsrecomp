@@ -2218,6 +2218,9 @@ struct TopLogicalHit {
     float y = 0.0f;
 };
 TopLogicalHit g_top_logical_hit;
+// A left drag that started on the top screen is under way
+// (nds_title_top_drag).
+bool g_top_dragging = false;
 
 void convert_mouse_event_to_logical_coordinates(
     SDL_Event& event, const FrontendPresentation& presentation) {
@@ -5027,6 +5030,29 @@ int nds_run_interactive_frontend(const NdsFrontendOptions& initial_options) {
                 if (over && event.type == SDL_MOUSEBUTTONDOWN &&
                     event.button.button == SDL_BUTTON_LEFT)
                     nds_title_note_top_click(top_x, top_y);
+                // A drag that starts on the top screen follows the pointer
+                // until the release, also off the screen (the window keeps
+                // the mouse while the button is held). It never touches the
+                // touchscreen: the press was not on it.
+                if (over && event.type == SDL_MOUSEBUTTONDOWN &&
+                    event.button.button == SDL_BUTTON_LEFT) {
+                    g_top_dragging = true;
+                    nds_title_set_top_drag(top_x, top_y, true);
+                } else if (g_top_dragging &&
+                           ((event.type == SDL_MOUSEBUTTONUP &&
+                             event.button.button == SDL_BUTTON_LEFT) ||
+                            (motion &&
+                             !(event.motion.state & SDL_BUTTON_LMASK)))) {
+                    g_top_dragging = false;
+                    nds_title_set_top_drag(0, 0, false);
+                } else if (g_top_dragging && motion &&
+                           window == presentation.window_ids[0]) {
+                    nds_title_set_top_drag(
+                        static_cast<int>(std::floor(g_top_logical_hit.x)) -
+                            top_left,
+                        static_cast<int>(std::floor(g_top_logical_hit.y)),
+                        true);
+                }
             }
             if (event.type == SDL_MOUSEMOTION &&
                 virtual_stylus_active() &&
