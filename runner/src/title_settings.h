@@ -67,6 +67,15 @@ bool nds_title_right_mouse_held();
 // For the frontend: on right button changes.
 void nds_title_set_right_mouse_held(bool held);
 
+// The gamepad's left stick (-32767..32767 per axis, y pointing down) while it
+// drives the D-pad: the frontend maps it to the four D-pad bits, and a title
+// whose movement is not bound to eight directions can read the stick itself.
+// False with no gamepad or while the runtime menu has the stick. Host state,
+// like the pointer. Any thread.
+bool nds_title_left_stick(int* x, int* y);
+// For the frontend: once per polled frame.
+void nds_title_set_left_stick(int x, int y, bool active);
+
 // Where the mouse points on the top screen, in DS pixels (0..255, 0..191),
 // buttons or not: the top screen is no touchscreen, so a title can read the
 // pointer here to make what it shows there hoverable and clickable. False

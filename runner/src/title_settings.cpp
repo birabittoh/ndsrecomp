@@ -126,6 +126,29 @@ void nds_title_set_right_mouse_held(bool held) {
 }
 
 namespace {
+// bit 32 = active, then int16 y << 16 | uint16 x.
+std::atomic<uint64_t> g_left_stick{0};
+}  // namespace
+
+bool nds_title_left_stick(int* x, int* y) {
+    const uint64_t v = g_left_stick.load(std::memory_order_relaxed);
+    if (!(v >> 32)) return false;
+    *x = static_cast<int16_t>(v & 0xFFFF);
+    *y = static_cast<int16_t>((v >> 16) & 0xFFFF);
+    return true;
+}
+
+void nds_title_set_left_stick(int x, int y, bool active) {
+    auto axis = [](int v) {
+        v = v < -32767 ? -32767 : v > 32767 ? 32767 : v;
+        return static_cast<uint64_t>(static_cast<uint16_t>(v));
+    };
+    g_left_stick.store(active ? (uint64_t{1} << 32 | axis(y) << 16 | axis(x))
+                              : 0,
+                       std::memory_order_relaxed);
+}
+
+namespace {
 // -1, or y << 16 | x.
 std::atomic<int> g_top_pointer{-1};
 // count << 32 | y << 16 | x of the latest click.
