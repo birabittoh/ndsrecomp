@@ -61,6 +61,21 @@ bool nds_title_pointer_hover(int* x, int* y);
 // For the frontend: on mouse motion and button changes.
 void nds_title_set_pointer_hover(int x, int y, bool hovering);
 
+// Where the mouse points on the top screen, in DS pixels (0..255, 0..191),
+// buttons or not: the top screen is no touchscreen, so a title can read the
+// pointer here to make what it shows there hoverable and clickable. False
+// when the pointer is elsewhere or the mouse is captured. Host state, like
+// the display height. Any thread.
+bool nds_title_top_pointer(int* x, int* y);
+// A counter of left clicks on the top screen (it increases by one per press,
+// wrapping), with the position of the latest one. A title compares it with
+// the value it saw last to find new clicks, which a press and release
+// between two frames cannot hide. Any thread.
+unsigned nds_title_top_click(int* x, int* y);
+// For the frontend: on mouse motion and button changes.
+void nds_title_set_top_pointer(int x, int y, bool over);
+void nds_title_note_top_click(int x, int y);
+
 // A rectangle of the touchscreen (DS pixels, x0..x1 and y0..y1 exclusive)
 // that a title draws at its native place while it scales the rest of its UI
 // down (nds_gpu2d_set_fixed_size_layers): a touch there is not mapped back

@@ -112,6 +112,40 @@ void nds_title_set_pointer_hover(int x, int y, bool hovering) {
 }
 
 namespace {
+// -1, or y << 16 | x.
+std::atomic<int> g_top_pointer{-1};
+// count << 32 | y << 16 | x of the latest click.
+std::atomic<uint64_t> g_top_click{0};
+}  // namespace
+
+bool nds_title_top_pointer(int* x, int* y) {
+    const int packed = g_top_pointer.load(std::memory_order_relaxed);
+    if (packed < 0) return false;
+    *x = packed & 0xFFFF;
+    *y = packed >> 16;
+    return true;
+}
+
+unsigned nds_title_top_click(int* x, int* y) {
+    const uint64_t v = g_top_click.load(std::memory_order_relaxed);
+    *x = static_cast<int>(v & 0xFFFF);
+    *y = static_cast<int>((v >> 16) & 0xFFFF);
+    return static_cast<unsigned>(v >> 32);
+}
+
+void nds_title_set_top_pointer(int x, int y, bool over) {
+    g_top_pointer.store(over ? (y << 16 | x) : -1, std::memory_order_relaxed);
+}
+
+void nds_title_note_top_click(int x, int y) {
+    const uint64_t old = g_top_click.load(std::memory_order_relaxed);
+    const uint64_t count = ((old >> 32) + 1) & 0xFFFFFFFFu;
+    g_top_click.store(count << 32 | static_cast<uint64_t>(y & 0xFFFF) << 16 |
+                          static_cast<uint64_t>(x & 0xFFFF),
+                      std::memory_order_relaxed);
+}
+
+namespace {
 std::atomic<uint64_t> g_unscaled_touch_rect{0};
 }  // namespace
 

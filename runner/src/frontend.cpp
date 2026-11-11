@@ -1084,6 +1084,19 @@ void set_hover_from_mouse(float x, float y, bool hovering,
                                 static_cast<int>(ds_y), true);
 }
 
+// The mouse position on the top screen in DS pixels, for
+// nds_title_top_pointer / nds_title_top_click. `left` is where the top
+// screen's 256 pixels start in the window's logical x; the top screen always
+// starts at the window's top. False when the point is outside the screen.
+bool top_screen_point(float x, float y, int left, int* ds_x, int* ds_y) {
+    const float fx = x - static_cast<float>(left);
+    if (fx < 0.0f || fx >= kScreenWidth || y < 0.0f || y >= kScreenHeight)
+        return false;
+    *ds_x = static_cast<int>(fx);
+    *ds_y = static_cast<int>(y);
+    return true;
+}
+
 uint32_t audio_queue_count(const NdsAudioDevice& device, AudioQueue& queue) {
     if (!device) return 0;
 #if defined(NDS_HAVE_SDL3)
@@ -2139,6 +2152,17 @@ int window_refresh_hz(SDL_Window* window) {
 // presenter draws into: window -> drawable pixels -> content. Clicks on the
 // bars land outside [0, content) and are therefore never touches. Relative
 // motion (xrel/yrel) is left in window units.
+// Where the last converted mouse event lies on the top screen's content (the
+// window's logical x and y), when it does. With the top LCD shown and the
+// touchscreen inset over it, the event itself is converted for the inset
+// (bottom LCD coordinates), so the top position is kept here.
+struct TopLogicalHit {
+    bool valid = false;
+    float x = 0.0f;
+    float y = 0.0f;
+};
+TopLogicalHit g_top_logical_hit;
+
 void convert_mouse_event_to_logical_coordinates(
     SDL_Event& event, const FrontendPresentation& presentation) {
     auto screen_for_window = [&](uint32_t window_id) -> int {
@@ -2178,6 +2202,40 @@ void convert_mouse_event_to_logical_coordinates(
         float cx = 0.0f, cy = 0.0f;
         nds_present_rect_to_content(rect, content_w, content_h, px, py,
                                     &cx, &cy);
+        g_top_logical_hit = {};
+        if (presentation.single && presentation.shown_screen == 0 &&
+            presentation.inset_percent > 0) {
+            // The main rect is the top LCD; the inset covers part of it.
+            const NdsPresentRect main_rect = window_present_rect(
+                presentation, screen, drawable_w, drawable_h);
+            float tx = 0.0f, ty = 0.0f;
+            nds_present_rect_to_content(main_rect, content_w, content_h, px,
+                                        py, &tx, &ty);
+            const bool in_inset = cx >= 0.0f && cx < content_w &&
+                                  cy >= 0.0f && cy < content_h;
+            g_top_logical_hit = {!in_inset, tx, ty};
+        } else if (presentation.single && presentation.shown_screen == 1 &&
+                   presentation.inset_percent > 0) {
+            // The touchscreen is the main rect; the top LCD is the inset,
+            // over it. A point in the inset is the top screen's, never a
+            // touch.
+            const NdsPresentRect inset_rect = nds_single_layout(
+                presentation.window_mode, presentation.scaling, drawable_w,
+                drawable_h, content_w, content_h,
+                presentation.inset_percent, presentation.stacked).inset;
+            float tx = 0.0f, ty = 0.0f;
+            nds_present_rect_to_content(inset_rect, content_w, content_h, px,
+                                        py, &tx, &ty);
+            const bool in_inset = tx >= 0.0f && tx < content_w &&
+                                  ty >= 0.0f && ty < content_h;
+            g_top_logical_hit = {in_inset, tx, ty};
+            if (in_inset) {
+                cx = -1.0f;
+                cy = -1.0f;
+            }
+        } else {
+            g_top_logical_hit = {true, cx, cy};
+        }
         using Coordinate = std::remove_reference_t<decltype(x)>;
         x = static_cast<Coordinate>(std::floor(cx));
         y = static_cast<Coordinate>(std::floor(cy));
@@ -4787,6 +4845,38 @@ int nds_run_interactive_frontend(const NdsFrontendOptions& initial_options) {
                     motion ? event.motion.y : event.button.y, hovering,
                     options.screen_layout, bottom_logical_width);
             }
+            // The pointer over the top screen, which the guest never polls
+            // as a touchscreen: titles read it to make the top screen
+            // hoverable and clickable. Single layout shows it only when it
+            // is the shown screen and not forced stacked with the other.
+            if (event.type == SDL_MOUSEMOTION ||
+                event.type == SDL_MOUSEBUTTONDOWN ||
+                event.type == SDL_MOUSEBUTTONUP) {
+                const bool motion = event.type == SDL_MOUSEMOTION;
+                const uint32_t window = motion ? event.motion.windowID
+                                               : event.button.windowID;
+                const bool top_shown =
+                    window == presentation.window_ids[0] &&
+                    g_top_logical_hit.valid &&
+                    !relative_mouse.captured() && !virtual_stylus_active() &&
+                    (!presentation.single ||
+                     (!presentation.stacked &&
+                      (presentation.shown_screen == 0 ||
+                       presentation.inset_percent > 0)));
+                int top_x = 0, top_y = 0;
+                const int top_left =
+                    (presentation.screen_widths[0] - kScreenWidth) / 2 +
+                    (presentation.separate || presentation.single
+                         ? 0 : top_content_left);
+                const bool over = top_shown &&
+                    top_screen_point(g_top_logical_hit.x,
+                                     g_top_logical_hit.y, top_left,
+                                     &top_x, &top_y);
+                nds_title_set_top_pointer(top_x, top_y, over);
+                if (over && event.type == SDL_MOUSEBUTTONDOWN &&
+                    event.button.button == SDL_BUTTON_LEFT)
+                    nds_title_note_top_click(top_x, top_y);
+            }
             if (event.type == SDL_MOUSEMOTION &&
                 virtual_stylus_active() &&
                 (event.motion.windowID == presentation.window_ids[0] ||
@@ -4840,6 +4930,9 @@ int nds_run_interactive_frontend(const NdsFrontendOptions& initial_options) {
             if (sdl_window_event_is(event, SDL_EVENT_WINDOW_MOUSE_LEAVE) &&
                 event.window.windowID == presentation.window_ids[1])
                 nds_title_set_pointer_hover(0, 0, false);
+            if (sdl_window_event_is(event, SDL_EVENT_WINDOW_MOUSE_LEAVE) &&
+                event.window.windowID == presentation.window_ids[0])
+                nds_title_set_top_pointer(0, 0, false);
         }
         if (focus_release_pending) {
             if (!any_presentation_window_focused()) {
