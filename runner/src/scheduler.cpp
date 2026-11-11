@@ -302,7 +302,14 @@ void run_slice(int cpu, uint32_t quantum) {
 
 }  // namespace
 
+namespace {
+bool g_gx_test_wait = false;
+uint64_t g_gx_test_wait_requests = 0, g_gx_test_wait_rounds = 0;
+}  // namespace
+bool gx_test_wait_holds();
+
 void scheduler_init() {
+    g_gx_test_wait = false;
     g_slot[0] = CpuSlot{};
     g_slot[1] = CpuSlot{};
     g_cur = -1;
@@ -484,6 +491,17 @@ void scheduler_run_round() {
             // here explains an EXEC_ARM9 fall without a workload change --
             // the confound that would otherwise read as "the CPU got faster".
             nds_emu_note_gxstall_round();
+        } else if (gx_test_wait_holds()) {
+            // A title asked the ARM9 to wait for a box/position/vector test
+            // instead of polling GXSTAT for it (scheduler_request_gx_test_wait).
+            // Same advance as the stall branch; with no command in flight
+            // (the test queued behind a pending SwapBuffers, say) the round
+            // passes, as a halted ARM9's would.
+            uint64_t step = static_cast<uint64_t>(nds_gpu3d_cycles_to_run())
+                            << kArm9ClockShift;
+            if (step == 0u) step = arm9_target - g_slot[0].cycles;
+            g_slot[0].cycles = std::min(arm9_target, g_slot[0].cycles + step);
+            ++g_gx_test_wait_rounds;
         } else {
             run_slice(0, static_cast<uint32_t>(arm9_target - g_slot[0].cycles));
         }
@@ -610,6 +628,32 @@ static bool arm9_private_io(uint32_t addr, uint32_t width, bool write) {
            within(0x1000u, 0x106Fu);
 }
 
+// Title-requested wait for a geometry test (title_settings.h
+// nds_title_wait_gx_test). Holds while GXSTAT bit 0 is set and no ARM9 IRQ
+// is pending: an IRQ ends it so the guest takes the interrupt in its poll
+// loop, as on hardware, and the title's hook simply asks again.
+bool gx_test_wait_holds() {
+    if (!g_gx_test_wait) return false;
+    if (!nds_gpu3d_test_busy() || g_nds_irq_pending_cache[0] != 0u) {
+        g_gx_test_wait = false;
+        return false;
+    }
+    return true;
+}
+void scheduler_request_gx_test_wait() {
+    if (g_nds_active != NDS_ARM9 || g_nds_irq_pending_cache[0] != 0u) return;
+    // Bring the engine to the ARM9's present, as the guest's own GXSTAT
+    // read would, then end the slice at this instruction boundary.
+    nds_gpu3d_run(g_runtime_cycles);
+    if (!nds_gpu3d_test_busy()) return;
+    g_gx_test_wait = true;
+    ++g_gx_test_wait_requests;
+    nds_reschedule_slice(
+        (g_runtime_cycles+(1ull<<kArm9ClockShift)-1u)>>kArm9ClockShift);
+}
+void scheduler_gx_test_wait_counts(uint64_t* requests, uint64_t* rounds) {
+    *requests = g_gx_test_wait_requests; *rounds = g_gx_test_wait_rounds;
+}
 void scheduler_performance_io_fence(uint32_t addr, uint32_t width, bool write) {
     if(performance_window_active&&g_nds_active==NDS_ARM9) {
         // Only for the title-requested windows: the performance model's own
@@ -730,7 +774,7 @@ bool scheduler_savestate_begin() {
     return scheduler_savestate_quiescent();
 }
 
-void scheduler_savestate_end() {}
+void scheduler_savestate_end() { g_gx_test_wait = false; }
 
 bool scheduler_savestate_export(NdsSchedulerSaveState* out) {
     if (!out) return false;

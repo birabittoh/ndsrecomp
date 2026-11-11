@@ -1,4 +1,5 @@
 #include "title_settings.h"
+#include "scheduler.h"
 
 #include "io.h"
 
@@ -269,6 +270,10 @@ void nds_title_set_card_speedup(int factor) {
 
 void nds_title_set_event_windows(bool enabled) {
     nds_request_event_windows(enabled);
+}
+
+void nds_title_wait_gx_test() {
+    scheduler_request_gx_test_wait();
 }
 
 void nds_title_set_touch_unscaled(bool unscaled) {
