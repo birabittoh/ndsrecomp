@@ -63,7 +63,7 @@ static bool settings_file_test() {
         options.resolution_scale == 150 && options.audio_muted &&
         options.audio_volume == 100 && !options.gamepad_positional;
 
-    // The menu's "Off (fixed)", layered over a title default.
+    // The menu's "Original", layered over a title default.
     ok = ok && nds_update_settings_file(
                    path.string(), {{"display", "resolution_scale", "0"}},
                    &error);

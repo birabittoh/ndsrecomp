@@ -1422,6 +1422,8 @@ int runtime_menu_get_value(void* context, const RecompRuntimeUiItem* item,
         return 1;
     }
     if (std::strcmp(item->key, kRuntimeResolutionScaleKey) == 0) {
+        // 0 is "Original" (the fixed multiplier); a percent reads as the
+        // nearest percent choice.
         const int current = state->options->resolution_scale;
         int best = 0;
         if (current > 0) {
@@ -1490,11 +1492,11 @@ int runtime_menu_set_value(void* context, const RecompRuntimeUiItem* item,
         return 1;
     }
     if (std::strcmp(item->key, kRuntimeResolutionScaleKey) == 0) {
-        if (value < 0 || value > 1000) return 0;
+        if (value != 0 && (value < 10 || value > 1000)) return 0;
         state->options->resolution_scale = static_cast<uint16_t>(value);
         if (value == 0)
             std::fprintf(stderr,
-                         "[display] resolution scale -> off (fixed %ux)\n",
+                         "[display] resolution scale -> original (fixed %ux)\n",
                          static_cast<unsigned>(
                              state->options->internal_resolution));
         else
@@ -3588,7 +3590,7 @@ int nds_run_interactive_frontend(const NdsFrontendOptions& initial_options) {
     static const char* const scaling_choices[] = {
         "Integer (pixel-perfect)", "Bilinear", "Nearest neighbor"};
     static const char* const resolution_scale_choices[] = {
-        "Off (fixed)", "25%", "50%", "75%", "100%", "150%", "200%"};
+        "Original", "25%", "50%", "75%", "100%", "150%", "200%"};
     static const char* const gamepad_layout_choices[] = {
         "By label", "By position"};
     static const RecompRuntimeUiItem runtime_menu_items[] = {

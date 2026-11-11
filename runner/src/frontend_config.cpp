@@ -1179,7 +1179,7 @@ static bool apply_frontend_config(toml::table& root,
             (*display)["internal_resolution"].value<int64_t>();
         const auto resolution_scale =
             (*display)["resolution_scale"].value<int64_t>();
-        // resolution_scale = 0 is the runtime menu's "Off (fixed)": it keeps
+        // resolution_scale = 0 is the runtime menu's "Original": it keeps
         // whatever multiplier internal_resolution gives.
         const bool scale_off = resolution_scale && *resolution_scale == 0;
         if (internal_resolution && resolution_scale && !scale_off) {
