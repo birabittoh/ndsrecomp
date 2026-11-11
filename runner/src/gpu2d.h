@@ -201,6 +201,11 @@ void nds_gpu2d_invalidate_hd_frame();
 // adaptive compositor when it runs for the frame.
 void nds_gpu2d_set_fixed_size_layers(uint8_t bg_mask, float scale,
                                      uint16_t anchor_x, uint16_t anchor_y);
+// OBJs whose pixels lie in this native rect (x1, y1 exclusive) stay in the
+// base image at full size instead of joining the layer (a HUD icon). An empty
+// rect (the default) keeps nothing out. Title thread.
+void nds_gpu2d_set_fixed_layers_obj_keep(uint16_t x0, uint16_t y0,
+                                         uint16_t x1, uint16_t y1);
 // Frontend: whether this frame's presenter will draw the layer image
 // (nds_compute_host_supports_layer() on the path that presents engine A's
 // LCD). Without a consumer nothing is split.

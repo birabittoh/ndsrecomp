@@ -161,6 +161,8 @@ NdsGpu2dHdFrame g_hd_frame{};
 
 // Fixed-size layers (see nds_gpu2d_set_fixed_size_layers in gpu2d.h).
 uint8_t g_fixed_mask = 0;
+// Native rect (x0, y0, x1, y1; exclusive) whose OBJs stay out of the layer.
+uint16_t g_fixed_obj_keep[4] = {0, 0, 0, 0};
 float g_fixed_scale = 1.0f;
 uint16_t g_fixed_anchor_x = 0;
 uint16_t g_fixed_anchor_y = 0;
@@ -2728,6 +2730,7 @@ struct AdaptiveCtx {
     // stack and resolved into `layer` (256 x 192, straight alpha) instead.
     uint8_t fixed_mask = 0;
     uint32_t* layer = nullptr;
+    uint16_t obj_keep[4] = {0, 0, 0, 0};
 };
 
 // One fixed-size-layer pixel: the masked BGs at this position resolved on
@@ -2959,7 +2962,10 @@ void composite_adaptive_line(const AdaptiveCtx& c, int y,
             }
         }
         if (obj[x].valid && (window_mask & 0x10u)) {
-            if (c_fixed_mask & 0x10u) {
+            const int hx = hud_x, hy = y;
+            const bool keep = hx >= c.obj_keep[0] && hx < c.obj_keep[2] &&
+                              hy >= c.obj_keep[1] && hy < c.obj_keep[3];
+            if ((c_fixed_mask & 0x10u) && !keep) {
                 // Masked OBJs join the masked BGs (only over native
                 // columns; adaptive widths never split).
                 if (!fixed_first.valid || ahead(obj[x], fixed_first)) {
@@ -3370,6 +3376,7 @@ const uint32_t* nds_gpu2d_adaptive_framebuffer(int screen, uint16_t* width) {
     ctx.no_3d = g_frame_3d_skipped[g_front];
     ctx.front = g_front;
     ctx.fixed_mask = fixed_mask;
+    for (int i = 0; i < 4; ++i) ctx.obj_keep[i] = g_fixed_obj_keep[i];
     ctx.layer = fixed_mask ? g_fixed_layer_pixels.data() : nullptr;
     composite_adaptive_frame(ctx);
     if (fixed_mask) {
@@ -3411,6 +3418,14 @@ void nds_gpu2d_set_fixed_size_layers(uint8_t bg_mask, float scale,
     g_fixed_scale = scale > 0.0f && scale < 1.0f ? scale : 1.0f;
     g_fixed_anchor_x = std::min<uint16_t>(anchor_x, 256);
     g_fixed_anchor_y = std::min<uint16_t>(anchor_y, 192);
+}
+
+void nds_gpu2d_set_fixed_layers_obj_keep(uint16_t x0, uint16_t y0,
+                                         uint16_t x1, uint16_t y1) {
+    g_fixed_obj_keep[0] = x0;
+    g_fixed_obj_keep[1] = y0;
+    g_fixed_obj_keep[2] = x1;
+    g_fixed_obj_keep[3] = y1;
 }
 
 void nds_gpu2d_set_fixed_layers_consumer(bool enabled) {
