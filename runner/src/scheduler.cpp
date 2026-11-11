@@ -613,8 +613,13 @@ static bool arm9_private_io(uint32_t addr, uint32_t width, bool write) {
 void scheduler_performance_io_fence(uint32_t addr, uint32_t width, bool write) {
     if(performance_window_active&&g_nds_active==NDS_ARM9) {
         // Only for the title-requested windows: the performance model's own
-        // keep their every-access fence.
-        if (nds_event_windows_requested() && arm9_private_io(addr, width, write))
+        // keep their every-access fence. A GXFIFO stall must still end the
+        // slice: the ARM9 does not run while it is asserted (the scheduler's
+        // stall branch owns it), and the geometry engine's 64-entry stall
+        // queue drops every command written past it, which showed as models
+        // and sprites missing from random 3D frames.
+        if (nds_event_windows_requested() && !nds_gxfifo_stalled() &&
+            arm9_private_io(addr, width, write))
             return;
         ++performance_fences;
         nds_reschedule_slice(
