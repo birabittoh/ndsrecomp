@@ -2548,6 +2548,8 @@ bool runtime_savestate_import(const NdsRuntimeSaveState& in,
     g_nds_terminal = false;
     g_nds_halt_reason = nullptr;
     g_nds_unwinding = 0;
+    // A loaded state resumes no yield of this session's hooks.
+    g_hook_resume_pc[0] = g_hook_resume_pc[1] = 0xFFFFFFFFu;
     runtime_savestate_invalidate_host_caches();
     return true;
 }

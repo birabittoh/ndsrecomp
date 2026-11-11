@@ -645,6 +645,8 @@ inline void brk_check() {
 // Armed at startup because g_runtime_deep_trace defaults on;
 // nds_insn_hook_recompute keeps it consistent from then on.
 extern "C" uint64_t g_insn_count[2] = {0, 0};
+extern "C" uint32_t g_hook_resume_pc[2] = {0xFFFFFFFFu, 0xFFFFFFFFu};
+extern "C" unsigned char g_hook_resume_result[2] = {0u, 0u};
 extern "C" uint32_t g_insn_hook_armed = 1u;
 
 // Keep the generated code's per-insn slow-path gate consistent with its two
@@ -1827,6 +1829,7 @@ void nds_io_reset() {
     g_in_vblank = false;
     g_counts = {};
     g_insn_count[0] = g_insn_count[1] = 0;
+    g_hook_resume_pc[0] = g_hook_resume_pc[1] = 0xFFFFFFFFu;
     std::memset(g_dma, 0, sizeof(g_dma));
     g_dma_entry_cycle[0] = g_dma_entry_cycle[1] = 0;
     std::memset(g_spi_trace, 0, sizeof(g_spi_trace));

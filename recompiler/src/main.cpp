@@ -705,10 +705,14 @@ std::string emit_hook_outcome(HookAction action, const ConfigHook& hook,
 //
 // before: placed after the instruction's label, behind its own copy of the
 // instruction's yield check. A yield there returns with the hook not yet
-// run, and the resume enters the same label and re-checks, so the handler
-// runs exactly once per executed instance of the instruction. The
-// instruction's own (identical) check that follows sees the same scheduler
-// state, because a handler performs no ticks.
+// run, and the resume enters the same label and re-checks. A handler
+// performs no ticks, but its MMIO accesses can still end the slice (the
+// performance fence reschedules it), so the site checks again right after
+// the handler: a yield there returns with g_hook_resume_pc set to this PC,
+// and the resume skips the handler once and clears it. Either way the
+// handler runs exactly once per executed instance of the instruction, and
+// the instruction's own (identical) check that follows sees the state the
+// site's last check saw.
 //
 // after: placed after the instruction's tick and unwind check, before the
 // next label, so a resume at the next PC does not re-run it.
@@ -717,29 +721,57 @@ void emit_hook_site(std::FILE* f, const ConfigHook& hook, uint32_t pc,
     const bool before = hook.when == HookWhen::Before;
     std::fprintf(f, "    /* hook %s (%s) */\n", hook.name.c_str(),
                  before ? "before" : "after");
-    if (before)
+    const std::string call = hook_call_expr(hook);
+    // The handler's result: a bool hook's return value, which picks the
+    // outcome below. `cond` is what the outcome tests.
+    std::string cond = call;
+    if (before) {
+        char var[16];
+        std::snprintf(var, sizeof var, "_hook_%08X", pc);
+        const std::string assign =
+            hook.returns_bool ? std::string(var) + " = (unsigned char)"
+                              : std::string();
         std::fprintf(f,
             "    g_cpu.R[15] = 0x%08Xu;\n"
-            "    if (runtime_should_yield()) return;\n", pc);
-    const std::string call = hook_call_expr(hook);
+            "    {\n"
+            "    unsigned char _hook_%08X = 0u;\n"
+            "    if (g_hook_resume_pc[g_nds_active] == 0x%08Xu) {\n"
+            "        g_hook_resume_pc[g_nds_active] = 0xFFFFFFFFu;\n"
+            "        _hook_%08X = g_hook_resume_result[g_nds_active];\n"
+            "    } else {\n"
+            "        if (runtime_should_yield()) return;\n"
+            "        %s%s;\n"
+            "        g_cpu.R[15] = 0x%08Xu;\n"
+            "        if (runtime_should_yield()) {\n"
+            "            g_hook_resume_pc[g_nds_active] = 0x%08Xu;\n"
+            "            g_hook_resume_result[g_nds_active] = _hook_%08X;\n"
+            "            return;\n"
+            "        }\n"
+            "    }\n"
+            "    (void)_hook_%08X;\n",
+            pc, pc, pc, pc, assign.c_str(), call.c_str(), pc, pc, pc, pc);
+        cond = var;
+    }
     if (!hook.returns_bool) {
-        std::fprintf(f, "    %s;\n", call.c_str());
+        if (!before) std::fprintf(f, "    %s;\n", call.c_str());
         const std::string outcome = emit_hook_outcome(hook.action, hook, ctx);
         if (!outcome.empty())
             std::fprintf(f, "    {\n%s    }\n", outcome.c_str());
-        return;
+    } else {
+        const std::string on_true = emit_hook_outcome(hook.on_true, hook, ctx);
+        const std::string on_false =
+            emit_hook_outcome(hook.on_false, hook, ctx);
+        if (on_false.empty())
+            std::fprintf(f, "    if (%s) {\n%s    }\n", cond.c_str(),
+                         on_true.c_str());
+        else if (on_true.empty())
+            std::fprintf(f, "    if (!%s) {\n%s    }\n", cond.c_str(),
+                         on_false.c_str());
+        else
+            std::fprintf(f, "    if (%s) {\n%s    } else {\n%s    }\n",
+                         cond.c_str(), on_true.c_str(), on_false.c_str());
     }
-    const std::string on_true = emit_hook_outcome(hook.on_true, hook, ctx);
-    const std::string on_false = emit_hook_outcome(hook.on_false, hook, ctx);
-    if (on_false.empty())
-        std::fprintf(f, "    if (%s) {\n%s    }\n", call.c_str(),
-                     on_true.c_str());
-    else if (on_true.empty())
-        std::fprintf(f, "    if (!%s) {\n%s    }\n", call.c_str(),
-                     on_false.c_str());
-    else
-        std::fprintf(f, "    if (%s) {\n%s    } else {\n%s    }\n",
-                     call.c_str(), on_true.c_str(), on_false.c_str());
+    if (before) std::fputs("    }\n", f);
 }
 
 // ── Tiny-leaf inlining pass (beads-yjp.67) ───────────────────────────────
