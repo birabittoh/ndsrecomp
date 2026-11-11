@@ -531,6 +531,10 @@ void math_reg_write(uint32_t addr, uint32_t value, uint32_t width) {
 }
 
 void schedule_card_event(uint64_t delay, bool end_event) {
+    // nds_request_card_speedup: the transfer keeps its shape (a delay before
+    // each word, a longer one before each block), only shorter.
+    const unsigned speedup = nds_requested_card_speedup();
+    if (speedup > 1u) delay = std::max<uint64_t>(1u, delay / speedup);
     g_card_deadline = active_system_timestamp() + delay;
     g_card_end_event = end_event;
     nds_reschedule_slice(g_card_deadline);
@@ -1790,6 +1794,21 @@ void nds_request_arm9_overclock(unsigned multiple) {
 }
 unsigned nds_requested_arm9_clock_shift() {
     return g_arm9_clock_shift_request.load(std::memory_order_relaxed);
+}
+static std::atomic<bool> g_event_windows_request{false};
+void nds_request_event_windows(bool enabled) {
+    g_event_windows_request.store(enabled, std::memory_order_relaxed);
+}
+bool nds_event_windows_requested() {
+    return g_event_windows_request.load(std::memory_order_relaxed);
+}
+static std::atomic<unsigned> g_card_speedup_request{1u};
+void nds_request_card_speedup(unsigned factor) {
+    g_card_speedup_request.store(factor ? factor : 1u,
+                                 std::memory_order_relaxed);
+}
+unsigned nds_requested_card_speedup() {
+    return g_card_speedup_request.load(std::memory_order_relaxed);
 }
 
 void nds_io_reset() {
@@ -3252,7 +3271,7 @@ void nds_tick_timers(int cpu, unsigned long long cpu_cycles) {
 }
 
 uint32_t nds_io_read(uint32_t addr, uint32_t width) {
-    scheduler_performance_io_fence();
+    scheduler_performance_io_fence(addr, width, false);
     const int cpu = active();
     const uint32_t m = mask_for(width);
     if (card_register_address(addr) && !card_owned_by(cpu)) return 0;
@@ -3410,7 +3429,7 @@ uint32_t nds_io_read(uint32_t addr, uint32_t width) {
 }
 
 void nds_io_write(uint32_t addr, uint32_t value, uint32_t width) {
-    scheduler_performance_io_fence();
+    scheduler_performance_io_fence(addr, width, true);
     const int cpu = active();
     if (card_register_address(addr) && !card_owned_by(cpu)) return;
     if (cpu == 0 && gpu2d_reg_addr(addr)) {

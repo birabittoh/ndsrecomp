@@ -411,7 +411,8 @@ void scheduler_run_round() {
     auto phase_start = round_start;
 
     const uint64_t quantum=nds_native_event_quantum(
-        nds_performance_execution()&&nds_native_options().events&&g_slot[0].started&&g_slot[1].started,
+        ((nds_performance_execution()&&nds_native_options().events)||
+         nds_event_windows_requested())&&g_slot[0].started&&g_slot[1].started,
         nds_cpu_halted(1),nds_halt_wake_pending(1),
         nds_dma_cpu_stalled(0)||nds_dma_cpu_stalled(1),nds_gxfifo_stalled());
     performance_window_active=quantum>kIterCap;
@@ -586,8 +587,35 @@ void scheduler_run_round() {
     // run_due_system_events(rendezvous);  // Commit B+
 }
 
-void scheduler_performance_io_fence() {
+// ARM9 I/O that neither the ARM7 nor a device shared with it can observe:
+// the display engines, DMA, timers, the IRQ registers, the VRAM banks the
+// ARM7 cannot map, the divider and square root, and the 3D engine. An
+// access to one of these inside an event window changes nothing the
+// sleeping ARM7 could see or be woken by, so it need not end the window.
+// IPC, the card and SPI, WRAMCNT, VRAMCNT_C/D, VCOUNT writes and everything
+// else still do.
+static bool arm9_private_io(uint32_t addr, uint32_t width, bool write) {
+    if ((addr >> 16) != 0x0400u) return false;
+    const uint32_t first = addr & 0xFFFFu;
+    const uint32_t last = first + (width ? width - 1u : 0u);
+    const auto within = [&](uint32_t lo, uint32_t hi) {
+        return first >= lo && last <= hi;
+    };
+    if (within(0x000u, 0x06Fu))
+        return !(write && first <= 0x007u && last >= 0x006u);  // VCOUNT
+    return within(0x0B0u, 0x0EFu) || within(0x100u, 0x10Fu) ||
+           within(0x208u, 0x217u) || within(0x240u, 0x241u) ||
+           within(0x244u, 0x246u) || within(0x248u, 0x249u) ||
+           within(0x280u, 0x2BFu) || within(0x320u, 0x6A3u) ||
+           within(0x1000u, 0x106Fu);
+}
+
+void scheduler_performance_io_fence(uint32_t addr, uint32_t width, bool write) {
     if(performance_window_active&&g_nds_active==NDS_ARM9) {
+        // Only for the title-requested windows: the performance model's own
+        // keep their every-access fence.
+        if (nds_event_windows_requested() && arm9_private_io(addr, width, write))
+            return;
         ++performance_fences;
         nds_reschedule_slice(
             (g_runtime_cycles+(1ull<<kArm9ClockShift)-1u)>>kArm9ClockShift);

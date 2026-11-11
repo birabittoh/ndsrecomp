@@ -100,6 +100,17 @@ bool nds_title_touch_unscaled();
 // keep the default untouched. Any thread.
 void nds_title_set_arm9_overclock(int multiple);
 
+// Makes gamecard transfers `factor` times as fast as the hardware's (1, the
+// default, is the hardware), for a title whose frame loop reads the card
+// and waits for it. Guest-visible timing, like nds_title_set_arm9_overclock.
+// Any thread.
+void nds_title_set_card_speedup(int factor);
+
+// Lets the scheduler run the ARM9 in longer stretches while the ARM7 sleeps
+// (io.h nds_request_event_windows): less host time per frame for a title
+// that has raised its own load. Any thread.
+void nds_title_set_event_windows(bool enabled);
+
 // Registers a query the frontend calls once per presented frame: true while
 // the game is in a mode that wants both screens stacked vertically at the
 // same size (a title screen, say), whatever the screen_layout option says.

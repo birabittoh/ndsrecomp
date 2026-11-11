@@ -34,6 +34,21 @@ extern unsigned g_nds_arm9_clock_shift;
 void nds_request_arm9_overclock(unsigned multiple);
 // The shift asked for last (1 when none was).
 unsigned nds_requested_arm9_clock_shift();
+// Divides the gamecard's transfer delays (ROMCTRL gaps and the per-word
+// clock) by `factor` for transfers started from now on; 1, the default, is
+// the hardware's. For a title that reads the card inside its frame loop and
+// has lifted its frame-rate cap. Any thread.
+void nds_request_card_speedup(unsigned factor);
+// Event windows: while the ARM7 sleeps with no wake pending and no DMA or
+// geometry stall, the scheduler lets the ARM9 run up to 256 system cycles
+// (not 64) before the next rendezvous, bounded by the next scheduled event
+// and timer overflow and ended by any ARM9 I/O the ARM7 could observe
+// (scheduler.cpp). It cuts the per-round host cost; what the guest can see
+// of it is that an ARM9 geometry interrupt may arrive up to 192 system
+// cycles later. Off by default. Any thread.
+void nds_request_event_windows(bool enabled);
+bool nds_event_windows_requested();
+unsigned nds_requested_card_speedup();
 void     nds_set_touch(uint16_t x, uint16_t y, bool down);
 void     nds_set_key_mask(uint32_t mask);
 // Debug-server throttle override (`turbo` command): frontend treats it like
