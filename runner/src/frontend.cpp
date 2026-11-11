@@ -2540,15 +2540,15 @@ bool create_presentation(const NdsFrontendOptions& options,
     const bool direct_enabled =
         !direct_selection || !*direct_selection ||
         std::strcmp(direct_selection, "1") == 0;
-    // resolution_scale asks for the GL presenter up front, whatever the
-    // startup multiplier: auto scale can move between 1x and HD at runtime,
-    // and the presenter runs at 1x too, so a change never recreates windows.
-    const bool direct_top_requested =
-        (options.adaptive_screens & NDS_ADAPTIVE_TOP) != 0u ||
-        options.internal_resolution > 1u || options.resolution_scale > 0u;
+    // The GL presenter is asked for up front, whatever the startup
+    // multiplier, even at the menu's "Original" (resolution_scale 0): the
+    // menu can pick a percent at runtime (it is only offered with this
+    // presenter), auto scale can move between 1x and HD, and the presenter
+    // runs at 1x too, so a change never recreates windows. Gating it on
+    // resolution_scale > 0 made "Original" stick: saved as 0, the next launch
+    // had no presenter and the setting greyed out.
     presentation.gl_top = (presentation.separate || presentation.single) &&
         allow_gl_top &&
-        direct_top_requested &&
         nds_gpu3d_renderer_prefers_compute() &&
         direct_enabled;
 #endif
