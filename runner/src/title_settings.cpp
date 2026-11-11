@@ -177,6 +177,14 @@ void nds_title_set_arm9_overclock(int multiple) {
     if (multiple > 0) nds_request_arm9_overclock(static_cast<unsigned>(multiple));
 }
 
+void nds_title_set_card_speedup(int factor) {
+    if (factor > 0) nds_request_card_speedup(static_cast<unsigned>(factor));
+}
+
+void nds_title_set_event_windows(bool enabled) {
+    nds_request_event_windows(enabled);
+}
+
 void nds_title_set_touch_unscaled(bool unscaled) {
     g_touch_unscaled.store(unscaled, std::memory_order_relaxed);
 }
