@@ -1002,11 +1002,17 @@ public:
                 stats_stale_reply_drops_.fetch_add(
                     1, std::memory_order_relaxed);
             }
-            // Jitter can leave a standing backlog, and every queued reply
-            // is one more cmd of delay. Empty default replies carry no
-            // data, so they are the ones to shed.
-            while (q.size() > kLateBacklogTarget && IsDefaultReply(q.front())) {
-                q.pop_front();
+            // Jitter and every reply answered for (below) leave a standing
+            // backlog, and every queued reply is one more cmd of delay.
+            // Empty default replies carry no data, so they are the ones to
+            // shed, wherever they sit: the replies with data keep their
+            // order.
+            for (size_t i = 0; q.size() > kLateBacklogTarget && i < q.size();) {
+                if (!IsDefaultReply(q[i])) {
+                    ++i;
+                    continue;
+                }
+                q.erase(q.begin() + static_cast<std::ptrdiff_t>(i));
                 stats_late_trimmed_.fetch_add(1, std::memory_order_relaxed);
             }
             if (!q.empty()) {
