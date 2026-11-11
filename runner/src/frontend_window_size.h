@@ -1,6 +1,7 @@
 #pragma once
 
 #include <algorithm>
+#include <atomic>
 #include <cmath>
 #include <cstdint>
 
@@ -123,11 +124,24 @@ struct NdsSingleLayout {
     NdsPresentRect main, inset;
 };
 
+// Set while a game mode forces the stacked arrangement (see
+// title_settings.h, nds_title_set_stacked_layout_query): the presenters pass
+// it as nds_single_layout's stack_vertically.
+inline std::atomic<bool>& nds_stack_vertically_flag() {
+    static std::atomic<bool> flag{false};
+    return flag;
+}
+
+//
+// stack_vertically puts the inset below the main screen whatever the
+// drawable's shape (what a title forces on some game modes, with
+// inset_percent 100: both screens the same size, one above the other).
 inline NdsSingleLayout nds_single_layout(NdsWindowMode mode,
                                          NdsScalingFilter scaling,
                                          int drawable_w, int drawable_h,
                                          int content_w, int content_h,
-                                         int inset_percent) {
+                                         int inset_percent,
+                                         bool stack_vertically = false) {
     NdsSingleLayout layout{};
     const int inset_content_w = content_w * inset_percent / 100;
     if (inset_percent <= 0 || inset_content_w <= 0) {
@@ -135,7 +149,7 @@ inline NdsSingleLayout nds_single_layout(NdsWindowMode mode,
                                        content_w, content_h);
         return layout;
     }
-    if (drawable_h > drawable_w) {
+    if (stack_vertically || drawable_h > drawable_w) {
         const int total_h = content_h + content_h * inset_percent / 100;
         const NdsPresentRect all = nds_present_rect(
             mode, scaling, drawable_w, drawable_h, content_w, total_h);

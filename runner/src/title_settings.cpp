@@ -75,6 +75,20 @@ bool nds_title_setting_set(int id, int value) {
     return true;
 }
 
+namespace {
+std::atomic<NdsTitleStackedLayoutQuery> g_stacked_layout_query{nullptr};
+}  // namespace
+
+void nds_title_set_stacked_layout_query(NdsTitleStackedLayoutQuery query) {
+    g_stacked_layout_query.store(query, std::memory_order_relaxed);
+}
+
+bool nds_title_stacked_layout_wanted() {
+    const NdsTitleStackedLayoutQuery query =
+        g_stacked_layout_query.load(std::memory_order_relaxed);
+    return query && query();
+}
+
 int nds_title_display_height() {
     return g_display_height.load(std::memory_order_relaxed);
 }
