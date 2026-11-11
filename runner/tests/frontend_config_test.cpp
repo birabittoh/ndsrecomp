@@ -115,9 +115,9 @@ int main() {
     NdsWindowMode window_mode = NdsWindowMode::Letterbox;
     NdsScalingFilter scaling = NdsScalingFilter::Integer;
     if (!require(nds_parse_window_mode("Stretch", &window_mode)) ||
-        !require(window_mode == NdsWindowMode::Stretch) ||
+        !require(window_mode == NdsWindowMode::Letterbox) ||
         !require(nds_parse_window_mode("1:1", &window_mode)) ||
-        !require(window_mode == NdsWindowMode::Original) ||
+        !require(window_mode == NdsWindowMode::Letterbox) ||
         !require(nds_parse_window_mode("letterbox", &window_mode)) ||
         !require(window_mode == NdsWindowMode::Letterbox) ||
         !require(!nds_parse_window_mode("zoom", &window_mode)) ||
@@ -518,7 +518,7 @@ int main() {
     }
     options = {};
     if (!require(nds_load_frontend_config(path.string(), &options, &error)) ||
-        !require(options.window_mode == NdsWindowMode::Original) ||
+        !require(options.window_mode == NdsWindowMode::Letterbox) ||
         !require(options.scaling == NdsScalingFilter::Bilinear))
         return 41;
 

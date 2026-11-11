@@ -56,13 +56,10 @@ bool nds_parse_window_mode(const std::string& value, NdsWindowMode* out) {
         *out = NdsWindowMode::Letterbox;
         return true;
     }
-    if (normalized == "stretch") {
-        *out = NdsWindowMode::Stretch;
-        return true;
-    }
-    if (normalized == "original" || normalized == "1:1" ||
-        normalized == "native") {
-        *out = NdsWindowMode::Original;
+    // Letterbox is the only window mode; the old names fall back to it.
+    if (normalized == "stretch" || normalized == "original" ||
+        normalized == "1:1" || normalized == "native") {
+        *out = NdsWindowMode::Letterbox;
         return true;
     }
     return false;
