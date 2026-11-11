@@ -87,6 +87,13 @@ std::string nds_dispatch_stats_json() {
             ",\"cache_hit_absent\":" + std::to_string(s.cache_hit_absent) +
             ",\"cache_slow_lookup\":" +
                 std::to_string(s.cache_slow_lookup) +
+            ",\"cache_slow_empty\":" + std::to_string(s.cache_slow_empty) +
+            ",\"cache_slow_collide\":" +
+                std::to_string(s.cache_slow_collide) +
+            ",\"cache_slow_epoch\":" + std::to_string(s.cache_slow_epoch) +
+            ",\"cache_slow_gen\":" + std::to_string(s.cache_slow_gen) +
+            ",\"cache_slow_gen_refresh\":" +
+                std::to_string(s.cache_slow_gen_refresh) +
             ",\"crs_push\":" + std::to_string(s.crs_push) +
             ",\"crs_hit\":" + std::to_string(s.crs_hit) +
             ",\"crs_miss\":" + std::to_string(s.crs_miss) +
@@ -299,6 +306,11 @@ struct alignas(64) CachedStaticLookup {
 static_assert(sizeof(CachedStaticLookup) == 128u);
 std::array<std::array<CachedStaticLookup, kDispatchCacheSize>, 2>
     g_dispatch_cache{};
+
+inline uint32_t dispatch_cache_index(uint32_t pc, bool thumb) {
+    return ((pc >> 1u) ^ (pc >> 13u) ^ uint32_t{thumb}) &
+        (kDispatchCacheSize - 1u);
+}
 
 void clear_dispatch_cache_cpu(unsigned cpu) {
     CachedStaticLookup empty{};
@@ -568,9 +580,7 @@ struct SlowLookupScope {
 const CachedStaticLookup* lookup_static_cached_impl(const CpuCtx& c,
                                                     uint32_t pc, bool thumb) {
     auto& cache = g_dispatch_cache[g_nds_active];
-    CachedStaticLookup& slot =
-        cache[((pc >> 1u) ^ (pc >> 13u) ^ uint32_t{thumb}) &
-              (kDispatchCacheSize - 1u)];
+    CachedStaticLookup& slot = cache[dispatch_cache_index(pc, thumb)];
     if (slot.occupied && slot.dispatch_epoch == c.dispatch_epoch &&
         slot.pc == pc && slot.thumb == uint8_t{thumb} &&
         cached_lookup_live(slot)) {
@@ -583,7 +593,16 @@ const CachedStaticLookup* lookup_static_cached_impl(const CpuCtx& c,
         ++stats.cache_hit_absent;
         return nullptr;
     }
-    ++g_nds_dispatch_stats[g_nds_active].cache_slow_lookup;
+    {
+        NdsDispatchStats& stats = g_nds_dispatch_stats[g_nds_active];
+        ++stats.cache_slow_lookup;
+        if (!slot.occupied) ++stats.cache_slow_empty;
+        else if (slot.pc != pc || slot.thumb != uint8_t{thumb})
+            ++stats.cache_slow_collide;
+        else if (slot.dispatch_epoch != c.dispatch_epoch)
+            ++stats.cache_slow_epoch;
+        else ++stats.cache_slow_gen;
+    }
 #if !defined(NDS_MPH_SUBMIT_HLE) && !defined(NDS_MPH_MATH_HLE) && \
     !defined(NDS_MKDS_HLE)
     // Generation-only miss: same key, same epoch, a cached native hit, but a
@@ -610,6 +629,7 @@ const CachedStaticLookup* lookup_static_cached_impl(const CpuCtx& c,
             c.dispatch_index, slot.index_pos, pc, thumb,
             dispatch_validation_live, nullptr);
         if (again.selected == slot.entry) {
+            ++g_nds_dispatch_stats[g_nds_active].cache_slow_gen_refresh;
             for (uint32_t i = 0; i < slot.page_count; ++i) {
                 slot.generation[i] = slot.generation_ptr[i]
                     ? *slot.generation_ptr[i]
@@ -1907,6 +1927,9 @@ void runtime_dispatch_impl(uint32_t target_pc, NdsLinkSlot* linked) {
                            ? NDS_DISPATCH_CACHE_HIT_ABSENT
                            : NDS_DISPATCH_CACHE_SLOW);
             ++g_nds_dispatch_timing[g_nds_active].cache_events[cache_path];
+            if (cache_path == NDS_DISPATCH_CACHE_SLOW)
+                ++g_nds_dispatch_timing[g_nds_active]
+                      .class_slow[cost_region.cls()];
             cache_region.close_as(cache_path);
             // Refill the offered slot from the authoritative resolution.
             // Only when the slot's own target is the PC actually resolved
