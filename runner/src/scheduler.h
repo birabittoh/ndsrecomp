@@ -101,3 +101,10 @@ void scheduler_savestate_end();
 // Experimental peer-asleep event windows, fenced by every MMIO access.
 void scheduler_performance_io_fence(uint32_t addr, uint32_t width, bool write);
 void scheduler_performance_window_counts(uint64_t* windows,uint64_t* fences);
+
+// Title-requested ARM9 wait for a box/position/vector test (see
+// nds_title_wait_gx_test): when GXSTAT bit 0 is set, ends the ARM9 slice and
+// lets the scheduler advance the ARM9 with the geometry engine, as during a
+// GXFIFO stall, until the test is done or an ARM9 IRQ is pending. ARM9 only.
+void scheduler_request_gx_test_wait();
+void scheduler_gx_test_wait_counts(uint64_t* requests, uint64_t* rounds);

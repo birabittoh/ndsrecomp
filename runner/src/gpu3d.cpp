@@ -1481,6 +1481,10 @@ int32_t nds_gpu3d_cycles_to_run() {
     return g_nds.GPU.GPU3D.CyclesToRunFor();
 }
 
+bool nds_gpu3d_test_busy() {
+    return (g_nds.GPU.GPU3D.GXStat & 1u) != 0u;
+}
+
 void nds_gpu3d_check_fifo_dma() {
     g_nds.GPU.GPU3D.CheckFIFODMA();
 }

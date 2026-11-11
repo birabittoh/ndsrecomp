@@ -157,6 +157,9 @@ void nds_gpu3d_set_arm9_clock_shift(unsigned shift);
 // engine's pending cycle debt instead of executing (melonDS CPUStop_GXStall
 // branch). Returns GPU3D::CyclesToRunFor() in system cycles.
 int32_t nds_gpu3d_cycles_to_run();
+// GXSTAT bit 0 (a box, position or vector test is in flight) as of the
+// engine's last Run(); unlike a GXSTAT read it does not run the engine.
+bool nds_gpu3d_test_busy();
 
 // GXFIFO DMA (ARM9 start mode 7): enabling the channel or exhausting a
 // 112-unit iteration re-arms through the engine's FIFO-level check rather

@@ -137,6 +137,15 @@ void nds_title_set_card_speedup(int factor);
 // that has raised its own load. Any thread.
 void nds_title_set_event_windows(bool enabled);
 
+// For a title hook at the head of a loop that polls GXSTAT for a box,
+// position or vector test result (G3X_GetBoxTestResult and kin), ARM9 only.
+// When the test is still in flight it ends the slice there and the scheduler
+// moves the ARM9's clock along with the geometry engine's, as during a
+// GXFIFO stall, until the result is ready or an ARM9 IRQ is pending; the
+// guest's next poll then sees it. Saves the host cost of thousands of polls,
+// not guest time: the CPU still waits as long as the engine takes.
+void nds_title_wait_gx_test();
+
 // Registers a query the frontend calls once per presented frame: true while
 // the game is in a mode that wants both screens stacked vertically at the
 // same size (a title screen, say), whatever the screen_layout option says.
