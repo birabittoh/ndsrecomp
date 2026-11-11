@@ -2999,10 +2999,20 @@ void composite_adaptive_line(const AdaptiveCtx& c, int y,
         else if (mbmode == 2u)
             color = darken(color, mb, 15u);
         dst[x] = to_rgb32(color);
-        if (fixed_layer && hud_x >= 0)
+        if (fixed_layer && hud_x >= 0) {
+            // A skipped frame has no 3D pixel in the stack, yet the
+            // presenter shows the HD raster under the layer: stand in for
+            // it (coverage unknown, so taken as full) so a BG that blends
+            // over the 3D still gets its EVA as alpha.
+            Pixel rest = top;
+            if (c.no_3d && (window_mask & 0x01u)) {
+                const Pixel stand_in{0u, 0x01u, 0, prio3d, 1, true, 31};
+                if (ahead(stand_in, rest)) rest = stand_in;
+            }
             fixed_layer[hud_x] = fixed_layer_pixel(
-                u, fixed_first, fixed_second, top,
+                u, fixed_first, fixed_second, rest,
                 (window_mask & 0x20u) != 0u, mbmode, mb);
+        }
     }
 }
 
