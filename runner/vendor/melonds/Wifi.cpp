@@ -36,6 +36,7 @@ void nds_wifi_on_local_mp_disconnected();
 bool nds_wifi_inhibit_power_down();
 uint16_t nds_wifi_local_mp_take_ack_only();
 bool nds_wifi_local_mp_trace_enabled();
+void nds_wifi_local_mp_note_rx_channel(int channel);
 
 namespace melonDS
 {
@@ -1646,6 +1647,7 @@ bool Wifi::CheckRX(int type) // 0=regular 1=MP replies 2=MP host frames
 
         if (type == 0)
         {
+            ::nds_wifi_local_mp_note_rx_channel(CurChannel);
             rxlen = Platform::MP_RecvPacket(RXBuffer, &timestamp, NDS.UserData);
             if ((rxlen <= 0) && (!IsMP))
                 rxlen = WifiAP->RecvPacket(RXBuffer);

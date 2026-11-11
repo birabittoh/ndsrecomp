@@ -1,0 +1,20 @@
+Subject: Wifi: tell the runner the RX channel
+
+ndsrecomp modification to vendored melonDS src/Wifi.cpp (GPLv3 5(a)
+notice; see patches/README.md for the convention).
+
+CheckRX passes CurChannel to the runner hook
+nds_wifi_local_mp_note_rx_channel right before each regular
+MP_RecvPacket. The runner uses it to hand over a replayed lobby beacon only
+on the channel the guest is scanning; CheckRX itself drops frames from
+other channels, as before. The hook only stores the value.
+
+--- a/src/Wifi.cpp
++++ b/src/Wifi.cpp
+@@ (runner hook declarations)
++void nds_wifi_local_mp_note_rx_channel(int channel);
+@@ Wifi::CheckRX, type 0
+         if (type == 0)
+         {
++            ::nds_wifi_local_mp_note_rx_channel(CurChannel);
+             rxlen = Platform::MP_RecvPacket(RXBuffer, &timestamp, NDS.UserData);

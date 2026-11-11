@@ -14,6 +14,10 @@
 // opens "Tester's lobby" with 4 seats. The guest joins the first lobby it
 // lists, sends a datagram to the hub over the relay, and the hub echoes it.
 // Each process prints PASS and exits 0 when its half worked.
+//
+// `online_lobby_test turn` runs only that TURN server, for two runners
+// playing over a local lobby server (--netplay-lobby-url, NDS_ONLINE_TURN
+// as above).
 
 #include "net/ice_link.h"
 #include "net/online_lobby.h"
@@ -52,9 +56,45 @@ bool nds_netplay_host_info(NdsNetplayHostInfo* out) {
 
 bool nds_wifi_local_mp_radio_on() { return g_hosting; }
 
+// No radio here: no beacons to answer probes with or to replay.
+bool nds_wifi_local_mp_own_beacon(std::vector<uint8_t>*) { return false; }
+void nds_wifi_local_mp_set_replay_beacons(std::vector<std::vector<uint8_t>>) {}
+bool nds_wifi_local_mp_take_join_request(uint8_t*) { return false; }
+
 namespace {
 
 using Clock = std::chrono::steady_clock;
+
+juice_server_t* StartTurn() {
+    static juice_server_credentials_t cred;
+    std::memset(&cred, 0, sizeof(cred));
+    cred.username = "test";
+    cred.password = "secret";
+    cred.allocations_quota = 8;
+    juice_server_config_t sc;
+    std::memset(&sc, 0, sizeof(sc));
+    sc.credentials = &cred;
+    sc.credentials_count = 1;
+    sc.max_allocations = 16;
+    sc.bind_address = "127.0.0.2";
+    sc.external_address = "127.0.0.2";
+    sc.port = 34780;
+    sc.realm = "test";
+    juice_server_t* turn = juice_server_create(&sc);
+    if (!turn) std::fprintf(stderr, "FAIL: TURN server on 127.0.0.2:34780\n");
+    return turn;
+}
+
+// Only the TURN server, until killed: the relay for two runners testing
+// Netplay on one machine against a local lobby server.
+int Turn() {
+    juice_server_t* turn = StartTurn();
+    if (!turn) return 1;
+    std::printf("TURN server on 127.0.0.2:34780 (user test, password "
+                "secret); Ctrl+C to stop\n");
+    std::fflush(stdout);
+    for (;;) std::this_thread::sleep_for(std::chrono::seconds(60));
+}
 
 bool WaitStatus(NdsOnlineState want, int min_linked, int seconds) {
     const auto deadline = Clock::now() + std::chrono::seconds(seconds);
@@ -85,25 +125,8 @@ bool RecvOne(mpnet::IceLink& link, std::string* text, mpnet::PeerAddr* from,
 }
 
 int Host(const std::string& url) {
-    juice_server_credentials_t cred;
-    std::memset(&cred, 0, sizeof(cred));
-    cred.username = "test";
-    cred.password = "secret";
-    cred.allocations_quota = 8;
-    juice_server_config_t sc;
-    std::memset(&sc, 0, sizeof(sc));
-    sc.credentials = &cred;
-    sc.credentials_count = 1;
-    sc.max_allocations = 16;
-    sc.bind_address = "127.0.0.2";
-    sc.external_address = "127.0.0.2";
-    sc.port = 34780;
-    sc.realm = "test";
-    juice_server_t* turn = juice_server_create(&sc);
-    if (!turn) {
-        std::fprintf(stderr, "FAIL: TURN server on 127.0.0.2:34780\n");
-        return 1;
-    }
+    juice_server_t* turn = StartTurn();
+    if (!turn) return 1;
 
     NdsOnlineConfig config;
     config.lobby_url = url;
@@ -193,8 +216,10 @@ int main(int argc, char** argv) {
     WSADATA wsa;
     WSAStartup(MAKEWORD(2, 2), &wsa);
 #endif
+    if (argc == 2 && std::string(argv[1]) == "turn") return Turn();
     if (argc != 3) {
-        std::fprintf(stderr, "usage: online_lobby_test host|guest ws://...\n");
+        std::fprintf(stderr, "usage: online_lobby_test host|guest ws://...\n"
+                             "       online_lobby_test turn\n");
         return 2;
     }
     const std::string role = argv[1];
