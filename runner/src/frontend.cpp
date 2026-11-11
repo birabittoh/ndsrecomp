@@ -4058,6 +4058,19 @@ int nds_run_interactive_frontend(const NdsFrontendOptions& initial_options) {
             clear_gameplay_input_for_runtime_menu();
     };
     uint32_t audio_pace_floor = kAudioQueueFrames;
+    // The steady-state queue target. kAudioQueueFrames (~63 ms) leaves about
+    // one late frame of runway once a frame's emulation and the device's own
+    // pull are taken out, so a host that drops a frame now and then hears a
+    // gap each time. Every frame that saw an underrun raises the target one
+    // step (~16 ms, a 60 Hz frame), up to ~156 ms; it comes back down a step
+    // for every two minutes without one. A host that never underruns keeps
+    // the 63 ms latency.
+    constexpr uint32_t kAudioSteadyStepFrames = 512;
+    constexpr uint32_t kAudioSteadyMaxFrames = 5120;
+    constexpr uint64_t kAudioSteadyDecayFrames = 2u * 60u * 60u;
+    uint32_t audio_steady_floor = kAudioQueueFrames;
+    uint64_t audio_steady_underruns = 0;
+    uint64_t audio_steady_quiet_frames = 0;
     uint32_t audio_min_queue = std::numeric_limits<uint32_t>::max();
     uint32_t audio_max_queue = 0;
     uint64_t host_key_presses = 0;
@@ -5724,10 +5737,33 @@ int nds_run_interactive_frontend(const NdsFrontendOptions& initial_options) {
         // 63 ms target, shedding the extra startup latency over a couple of
         // seconds without ever forcing the queue down during a slow stretch.
         constexpr uint32_t kGlideStepFrames = 300;
-        if (audio_pace_floor > kAudioQueueFrames + kGlideStepFrames)
+        if (audio_started && !turbo_active) {
+            const uint64_t underruns =
+                audio_queue.underruns.load(std::memory_order_relaxed);
+            if (underruns != audio_steady_underruns) {
+                audio_steady_quiet_frames = 0;
+                if (audio_steady_floor < kAudioSteadyMaxFrames) {
+                    audio_steady_floor += kAudioSteadyStepFrames;
+                    std::fprintf(stderr,
+                                 "[sdl] audio underrun: queue target raised "
+                                 "to %u frames (%u ms)\n",
+                                 audio_steady_floor,
+                                 audio_steady_floor * 1000u / kAudioFrequency);
+                }
+            } else if (++audio_steady_quiet_frames >= kAudioSteadyDecayFrames) {
+                audio_steady_quiet_frames = 0;
+                if (audio_steady_floor > kAudioQueueFrames)
+                    audio_steady_floor -= kAudioSteadyStepFrames;
+            }
+            audio_steady_underruns = underruns;
+        } else {
+            audio_steady_underruns =
+                audio_queue.underruns.load(std::memory_order_relaxed);
+        }
+        if (audio_pace_floor > audio_steady_floor + kGlideStepFrames)
             audio_pace_floor -= kGlideStepFrames;
         else
-            audio_pace_floor = kAudioQueueFrames;
+            audio_pace_floor = audio_steady_floor;
         uint32_t queued = audio_queue_count(audio, audio_queue);
         const uint32_t latency_queue_before_drain = queued;
         if (turbo_active) {
