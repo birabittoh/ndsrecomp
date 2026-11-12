@@ -721,7 +721,16 @@ add_library(nds_armv4t STATIC ${NDS_ARM_RECOMP_SOURCES})
 target_include_directories(nds_armv4t PUBLIC
     ${NDS_ARM_RECOMP_INCLUDE_DIRS})
 
-add_executable(nds_runner
+# On Android the runner is libnds_runner.so, which SDL's Java glue loads and
+# enters through SDL_main (src/main.cpp); the APK packages it.
+if(ANDROID)
+    set(NDS_RUNNER_TARGET_KIND add_library)
+    set(NDS_RUNNER_TARGET_TYPE SHARED)
+else()
+    set(NDS_RUNNER_TARGET_KIND add_executable)
+    set(NDS_RUNNER_TARGET_TYPE "")
+endif()
+cmake_language(CALL ${NDS_RUNNER_TARGET_KIND} nds_runner ${NDS_RUNNER_TARGET_TYPE}
     src/arm9_native.cpp
     src/runtime_arm.cpp
     src/execution_region.cpp
@@ -1414,6 +1423,8 @@ elseif(ANDROID)
     target_sources(nds_runner PRIVATE
         src/update/http_android.cpp
         src/update/self_update_android.cpp)
+    # liblog: stdout/stderr forwarded to logcat (src/main.cpp).
+    target_link_libraries(nds_runner PRIVATE log)
 else()
     find_package(CURL REQUIRED)
     target_link_libraries(nds_runner PRIVATE CURL::libcurl)

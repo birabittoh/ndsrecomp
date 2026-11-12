@@ -360,7 +360,51 @@ std::filesystem::path exe_dir_from_argv(const char* argv0) {
 
 }  // namespace
 
+// On Android the runner is a shared library and SDL's Java glue calls
+// SDL_main; SDL_main.h renames main to it there.
+#if defined(__ANDROID__) && defined(NDS_HAVE_SDL3)
+#include <SDL3/SDL_main.h>
+#endif
+
+#if defined(__ANDROID__)
+#include <android/log.h>
+#include <unistd.h>
+
+namespace {
+// An app's stdout and stderr go nowhere on Android: send them, line by line,
+// to logcat under the "ndsrecomp" tag. Runs before nds_log_capture_begin(),
+// which then tees into this pipe as the console.
+void forward_stdio_to_logcat() {
+    static int fds[2];
+    if (pipe(fds) != 0) return;
+    dup2(fds[1], STDOUT_FILENO);
+    dup2(fds[1], STDERR_FILENO);
+    close(fds[1]);
+    setvbuf(stdout, nullptr, _IOLBF, 0);
+    std::thread([] {
+        std::string line;
+        char buffer[1024];
+        ssize_t got;
+        while ((got = read(fds[0], buffer, sizeof(buffer))) > 0) {
+            for (ssize_t i = 0; i < got; ++i) {
+                if (buffer[i] != '\n') {
+                    line.push_back(buffer[i]);
+                    continue;
+                }
+                __android_log_write(ANDROID_LOG_INFO, "ndsrecomp",
+                                    line.c_str());
+                line.clear();
+            }
+        }
+    }).detach();
+}
+}  // namespace
+#endif
+
 int main(int argc, char** argv) {
+#if defined(__ANDROID__)
+    forward_stdio_to_logcat();
+#endif
     // stderr is the runner's diagnostic stream and is read from files by
     // harnesses and field-bundle collectors. Under Windows UCRT a redirected
     // stderr becomes BLOCK buffered, so a force-killed process loses its tail
