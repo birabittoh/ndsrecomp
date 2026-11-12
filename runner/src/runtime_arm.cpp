@@ -468,40 +468,104 @@ bool cached_lookup_live(const CachedStaticLookup& cached) {
     return true;
 }
 
-bool cache_page_generation(CachedStaticLookup& slot, uint32_t page) {
+// The 64-byte blocks of 4 KiB page `page` that [addr, last] covers, as a
+// code_mask word (bit i = block i). The range must intersect the page.
+uint64_t range_page_blocks(uint32_t addr, uint32_t last, uint32_t page) {
+    const uint32_t lo = std::max(addr, page) - page;
+    const uint32_t hi = std::min(last, page | 0xFFFu) - page;
+    return (~0ull >> (63u - (hi >> 6u))) & (~0ull << (lo >> 6u));
+}
+
+// Main-RAM pages snapshot their CODE generation (bus_code_watch): it moves
+// only when a store touches a 64-byte block some snapshot watches, so a
+// data store elsewhere in the page no longer invalidates the snapshot. Exact
+// because the watched blocks cover every byte the validation reads (bytes
+// and provenance), and a store outside them can change neither: written[]
+// only goes 0 -> 1 between bus resets / savestate loads, which bump every
+// code generation (bus_init, runtime_note_code_write). Other pages keep the
+// plain page generation, bumped by every store.
+bool cache_page_generation(CachedStaticLookup& slot, uint32_t page,
+                           uint64_t blocks) {
     for (uint32_t i = 0; i < slot.page_count; ++i) {
-        if (slot.page_addr[i] == page) return true;
+        if (slot.page_addr[i] == page) {
+            if (slot.generation_ptr[i]) bus_code_watch(page, blocks);
+            return true;
+        }
     }
     if (slot.page_count >= 4u) return false;
     const uint32_t index = slot.page_count++;
     slot.page_addr[index] = page;
-    if (page - 0x02000000u < 0x01000000u && g_busf_main.gen) {
-        const uint32_t offset = page & g_busf_main.mask;
-        slot.generation_ptr[index] =
-            g_busf_main.gen + (offset >> 12u);
-        slot.generation[index] = *slot.generation_ptr[index];
+    if (uint32_t* cell = bus_code_watch(page, blocks)) {
+        slot.generation_ptr[index] = cell;
+        slot.generation[index] = *cell;
     } else {
+        bus_code_watch_page(page);
         slot.generation[index] = bus_exec_page_generation(page);
     }
     return true;
 }
 
+extern "C" uint32_t g_code_diag_watch_pc, g_code_diag_watch_addr,
+    g_code_diag_watch_size;
+
 bool cache_validation_pages(CachedStaticLookup& slot,
                             const NdsStaticValidation* validation) {
+    g_code_diag_watch_pc = slot.pc;
     return for_each_validation_range(
         validation, [&](const NdsStaticValidationRange& range) {
+            g_code_diag_watch_addr = range.addr;
+            g_code_diag_watch_size = range.size;
             if (!range.expected || range.size == 0u) return false;
             const uint64_t end = uint64_t{range.addr} + range.size;
             if (end > 0x1'0000'0000ull) return false;
+            const uint32_t last = static_cast<uint32_t>(end - 1u);
             const uint32_t first_page = range.addr & ~0xFFFu;
-            const uint32_t last_page =
-                static_cast<uint32_t>(end - 1u) & ~0xFFFu;
+            const uint32_t last_page = last & ~0xFFFu;
             for (uint32_t page = first_page;; page += 4096u) {
-                if (!cache_page_generation(slot, page)) return false;
+                if (!cache_page_generation(
+                        slot, page, range_page_blocks(range.addr, last, page)))
+                    return false;
                 if (page == last_page) break;
             }
             return true;
         });
+}
+
+// A cached hit's selection also depends on the other candidates of its
+// (pc, thumb) run: a newer variant that becomes live wins. A store to one of
+// their bytes on a page the slot snapshots must still invalidate the slot,
+// as the page-wide generation did. Watch those blocks too. (Candidate bytes
+// on other pages were never covered by the snapshot; that is unchanged.)
+void watch_candidate_run(const CpuCtx& c, uint32_t pc, bool thumb,
+                         const CachedStaticLookup& slot) {
+    const uint64_t wanted = (uint64_t{pc} << 1u) | uint64_t{thumb};
+    auto it = std::lower_bound(
+        c.dispatch_index.begin(), c.dispatch_index.end(), wanted,
+        [](const DispatchEntry* entry, uint64_t value) {
+            return nds_dispatch_entry_key(entry) < value;
+        });
+    for (; it != c.dispatch_index.end() &&
+           nds_dispatch_entry_key(*it) == wanted; ++it) {
+        for_each_validation_range(
+            (*it)->validation, [&](const NdsStaticValidationRange& range) {
+                if (range.size == 0u) return true;
+                const uint64_t end = uint64_t{range.addr} + range.size;
+                if (end > 0x1'0000'0000ull) return true;
+                const uint32_t last = static_cast<uint32_t>(end - 1u);
+                g_code_diag_watch_pc = pc | 0x80000000u;  // run candidate
+                g_code_diag_watch_addr = range.addr;
+                g_code_diag_watch_size = range.size;
+                for (uint32_t i = 0; i < slot.page_count; ++i) {
+                    const uint32_t page = slot.page_addr[i];
+                    if (!slot.generation_ptr[i] || last < page ||
+                        range.addr > (page | 0xFFFu))
+                        continue;
+                    bus_code_watch(page,
+                                   range_page_blocks(range.addr, last, page));
+                }
+                return true;
+            });
+    }
 }
 
 bool cache_rejected_candidate_chain(const CpuCtx& c, uint32_t pc, bool thumb,
@@ -757,7 +821,7 @@ const CachedStaticLookup* lookup_static_cached_impl(const CpuCtx& c,
         if (replacement.guard_size) {
             const uint32_t last = (replacement.guard_start + replacement.guard_size - 1) & ~0xFFFu;
             for (uint32_t page = replacement.guard_start & ~0xFFFu;; page += 4096u) {
-                if (!cache_page_generation(slot, page)) { slot = {}; return nullptr; }
+                if (!cache_page_generation(slot, page, ~0ull)) { slot = {}; return nullptr; }
                 if (page == last) break;
             }
         }
@@ -775,6 +839,7 @@ const CachedStaticLookup* lookup_static_cached_impl(const CpuCtx& c,
         }
     }
 #endif
+    if (hit && slot.page_count) watch_candidate_run(c, pc, thumb, slot);
     return slot.fn ? &slot : nullptr;
 }
 
@@ -799,22 +864,23 @@ bool arm_static_guard(const NdsStaticValidation* validation,
     guard = {};
     if (!validation) return true;
     guard.validation = validation;
-    auto add_page = [&](uint32_t page) {
+    auto add_page = [&](uint32_t page, uint64_t blocks) {
         for (uint32_t i = 0u; i < guard.page_count; ++i) {
-            if (guard.page_addr[i] == page) return true;
+            if (guard.page_addr[i] == page) {
+                if (guard.generation_ptr[i]) bus_code_watch(page, blocks);
+                return true;
+            }
         }
         if (guard.page_count >= 4u) return false;
         const uint32_t i = guard.page_count++;
         guard.page_addr[i] = page;
-        // Main RAM's generation storage is stable for a runtime instance.
-        // Keep the exact counter used by the dispatch cache so every nested
-        // static return does not resolve the same virtual page again.
-        if (page - 0x02000000u < 0x01000000u && g_busf_main.gen) {
-            const uint32_t offset = page & g_busf_main.mask;
-            guard.generation_ptr[i] =
-                g_busf_main.gen + (offset >> 12u);
-            guard.generation[i] = *guard.generation_ptr[i];
+        // Same snapshot rule as cache_page_generation: main RAM pages keep
+        // the exact code generation cell the dispatch cache uses.
+        if (uint32_t* cell = bus_code_watch(page, blocks)) {
+            guard.generation_ptr[i] = cell;
+            guard.generation[i] = *cell;
         } else {
+            bus_code_watch_page(page);
             guard.generation[i] = bus_exec_page_generation(page);
         }
         return true;
@@ -824,11 +890,12 @@ bool arm_static_guard(const NdsStaticValidation* validation,
             if (!range.expected || range.size == 0u) return false;
             const uint64_t end = uint64_t{range.addr} + range.size;
             if (end > 0x1'0000'0000ull) return false;
+            const uint32_t last = static_cast<uint32_t>(end - 1u);
             const uint32_t first_page = range.addr & ~0xFFFu;
-            const uint32_t last_page =
-                static_cast<uint32_t>(end - 1u) & ~0xFFFu;
+            const uint32_t last_page = last & ~0xFFFu;
             for (uint32_t page = first_page;; page += 4096u) {
-                if (!add_page(page)) return false;
+                if (!add_page(page, range_page_blocks(range.addr, last, page)))
+                    return false;
                 if (page == last_page) break;
             }
             return true;
@@ -1158,15 +1225,25 @@ extern "C" void runtime_request_yield_poll(void) { request_yield_poll(); }
 // instruction boundary, and the fast tick path does not look at it).
 extern "C" void runtime_clear_fast_limit(void) { g_nds_fast_limit = 0u; }
 
-static void publish_code_write(const uint32_t* first,uint32_t count) {
+// Dynarmic watches page-generation cells, not code-generation cells, and
+// sees every store (its main window publishes all of them, bus.cpp).
+static inline void publish_native_write(const uint32_t* page_cells,
+                                        uint32_t count) {
 #if defined(NDS_ARM9_DYNARMIC)
-    nds_arm9_native_note_write_pages(first,count);
+    nds_arm9_native_note_write_pages(page_cells,count);
+#else
+    (void)page_cells; (void)count;
 #endif
-    // beads-yjp.28: every guest RAM write funnels through here -- the slow bus
+}
+
+static void publish_code_write(const uint32_t* first,uint32_t count) {
+    // beads-yjp.28: every guest RAM write to a watched page of an untracked
+    // backing, and every write to a tracked backing (main RAM, ITCM, ARM7
+    // WRAM) that touches watched code, funnels through here -- the slow bus
     // path (bus.cpp note_ram_write) and the generated-bank inline fast path
-    // (runtime_arm.h nds_busf_note_write) alike -- so this single counter is
-    // what lets the coverage page cache stay trusted between writes instead of
-    // paying a generation lookup per interpreted instruction.
+    // (runtime_arm.h nds_busf_note_write) alike -- so this counter lets the
+    // coverage page cache trust an untracked page between writes. Tracked
+    // pages compare their page generation instead (coverage_manifest.h).
     ++g_coverage_write_epoch;
     if (g_static_guard && !g_static_guard->invalidated &&
         write_may_change_guard(*g_static_guard,first,count) &&
@@ -1178,10 +1255,42 @@ static void publish_code_write(const uint32_t* first,uint32_t count) {
     }
 }
 
+// ABI 7 store publisher (nds_busf_note_write, bus.cpp note_ram_write). A
+// window without code tracking publishes its page cells as before. On
+// tracked backings (main RAM, ITCM, ARM7 WRAM), only code generations whose
+// watched blocks the store overlaps move; a store that overlaps none changes
+// no byte any cached snapshot depends on and publishes nothing. Coverage
+// (coverage_note_exec) compares tracked page generations directly, so it
+// needs no epoch bump for those stores.
+extern "C" void runtime_note_code_store(const NdsBusFastWin* w, uint32_t off,
+                                        uint32_t width) {
+    if (!width) return;
+    const uint32_t first = off >> 12u;
+    const uint32_t pages = ((off + width - 1u) >> 12u) - first + 1u;
+    publish_native_write(w->gen + first, pages);
+    if (!w->code_gen) {
+        bus_code_diag_untracked(w);
+        publish_code_write(w->gen + first, pages);
+        return;
+    }
+    uint32_t count = 0u;
+    if (const uint32_t* cells = bus_code_store(w, off, width, &count))
+        publish_code_write(cells, count);
+}
+// Page-cell publisher kept for the non-main slow path and for shards built
+// against ABI <= 6, which call it on every store with page-generation
+// cells. Main-RAM cells bump their whole pages' code generations.
 extern "C" void runtime_note_code_write_pages(const uint32_t* first,uint32_t count) {
+    publish_native_write(first, count);
+    if (const uint32_t* cells = bus_code_store_pages(first, count)) {
+        publish_code_write(cells, count);
+        return;
+    }
     publish_code_write(first,count);
 }
 extern "C" void runtime_note_code_write(void) {
+    publish_native_write(nullptr, 0);
+    bus_code_store_all();
     publish_code_write(nullptr,0);
 }
 

@@ -148,6 +148,39 @@ bool bus_addr_is_writable_ram(uint32_t addr);
 bool bus_addr_has_write_provenance(uint32_t addr);
 bool bus_range_has_write_provenance(uint32_t addr, uint32_t size);
 uint32_t bus_exec_page_generation(uint32_t addr);
+// The page-generation cell bus_exec_page_generation(addr) reads when addr
+// resolves to a code-tracked fast window (main RAM, ITCM, ARM7 WRAM) under
+// the current mapping, else nullptr.
+const uint32_t* bus_main_page_generation_cell(uint32_t addr);
+// Exact code-write tracking for main RAM, ITCM and ARM7 WRAM
+// (NdsBusFastWin::code_mask). A cached snapshot that depends on bytes of the
+// 4 KiB virtual page `page` marks the 64-byte blocks it covers and
+// snapshots the returned code generation cell. Only stores that touch a
+// marked block bump that cell. Returns nullptr when `page` does not resolve
+// to a tracked backing under the active CPU's current mapping; such
+// snapshots keep the plain page generation (bus_exec_page_generation).
+struct NdsBusFastWin;
+uint32_t* bus_code_watch(uint32_t page, uint64_t blocks);
+// Watch the whole physical page behind `addr` (any RAM backing): every
+// store to it publishes (runtime_note_code_store). For snapshots and caches
+// of untracked pages, which compare plain page generations but rely on
+// publication for the active static guard and the coverage epoch.
+void bus_code_watch_page(uint32_t addr);
+// Store [offset, offset + width) through tracked window `w` (offsets
+// relative to the window): bump the code generation of every page whose
+// marked blocks it overlaps. Returns the first bumped cell and the number
+// of consecutive cells, or nullptr.
+uint32_t* bus_code_store(const NdsBusFastWin* w, uint32_t offset,
+                         uint32_t width, uint32_t* count);
+// Map tracked page-generation cells to their code generation cells and
+// bump those unconditionally (writers that report only pages: older shards).
+uint32_t* bus_code_store_pages(const uint32_t* page_gen, uint32_t count);
+// An unlocated write (backing replacement, savestate load): bump every
+// main-RAM code generation.
+void bus_code_store_all();
+// NDS_CODE_STORE_REPORT diagnostic: a store published by an untracked window.
+struct NdsBusFastWin;
+void bus_code_diag_untracked(const NdsBusFastWin* w);
 // (runtime_note_code_write moved to runtime_arm.h with C linkage — the
 // inline bus fast path's write side calls it from generated C banks.)
 // Recompute the inline fast-map windows (runtime_arm.h) from the current

@@ -117,7 +117,12 @@ typedef struct NdsDispatchEntry {
 // runner needs, so the version is bumped rather than silently mixing linked
 // and unlinked shards. Bumping invalidates every previously cached shard by
 // design.
-#define NDS_LIVE_BANK_ABI_VERSION 6u
+//
+// ABI 7 adds NdsBusFastWin::code_mask/code_gen and runtime_note_code_store:
+// inline stores publish only when they touch cached code. An older shard
+// would still publish every store through runtime_note_code_write_pages,
+// which stays exported and conservative, but its window layout differs.
+#define NDS_LIVE_BANK_ABI_VERSION 7u
 #define NDS_LIVE_BANK_FLAG_DEPENDENCY_CLOSURE 0x00000001u
 
 typedef struct NdsBusFastWin NdsBusFastWin;
@@ -204,8 +209,8 @@ int arm_cond_passes(unsigned cond);
 //     slow path would (same mirror math, same bounds; unaligned edge
 //     cases that resolve() rejects fall back to the slow path);
 //   * writes preserve Tier-3 provenance byte-for-byte: written[] bytes,
-//     per-4KiB-page generation bump (0 skipped), and the static-guard
-//     invalidation via runtime_note_code_write();
+//     per-4KiB-page generation bump (0 skipped), and the code-tracker
+//     publication via runtime_note_code_store() for masked blocks;
 //   * windows are refreshed by bus_fast_refresh() whenever the mapping
 //     inputs change (WRAMCNT, CP15 TCM config, bus_init).
 
@@ -224,6 +229,11 @@ void runtime_note_code_write(void);
 // Aliased virtual addresses share these cells. The addressless entry above
 // remains conservative for backing replacement and older compiled banks.
 void runtime_note_code_write_pages(const uint32_t* first, uint32_t count);
+// ABI 7 store publisher: the store [off, off + width) in window w touched a
+// 64-byte block marked in w->code_mask. Called after the page generation
+// bumps, before the written[] marks.
+void runtime_note_code_store(const NdsBusFastWin* w, uint32_t off,
+                             uint32_t width);
 void runtime_note_live_write(uint32_t addr, uint32_t width,
                              uint32_t old_value, uint32_t new_value);
 // Optional native RAM stores may publish directly only within this qualified
@@ -244,6 +254,16 @@ typedef struct NdsBusFastWin {
     uint8_t*  written;  // per-byte write-provenance flags (parallel)
     uint32_t* gen;      // per-4KiB-page provenance generations (parallel)
     uint32_t  mask;     // mirror mask: off = addr & mask (window-relative)
+    // Exact code-write tracking (ABI 7). Per 4 KiB page, bit i of
+    // code_mask is set while some cached snapshot (dispatch slot, link
+    // guard, static guard) depends on bytes in 64-byte block i of that
+    // page. A store publishes (runtime_note_code_store) only when it
+    // touches a set bit; the handler then bumps code_gen[page], which is
+    // the generation those snapshots compare. Windows without code
+    // tracking point code_mask at an all-ones table (every store
+    // publishes, as before) and code_gen is NULL.
+    const uint64_t* code_mask;
+    uint32_t* code_gen;
 } NdsBusFastWin;
 
 extern NdsBusFastWin g_busf_main;        // 0x02000000..0x02FFFFFF, both CPUs
@@ -290,21 +310,30 @@ static inline const NdsBusFastWin* nds_busf_classify(uint32_t addr,
 
 // Write-side Tier-3 provenance, identical to the slow path's
 // note_ram_write: bump every touched page's generation (skipping 0),
-// invalidate the static guard, mark the written bytes.
+// publish to the code trackers when the store touches a block some cached
+// snapshot depends on, mark the written bytes. width <= 4, so the store
+// covers at most the two blocks holding its first and last byte.
 static inline void nds_busf_note_write(const NdsBusFastWin* w, uint32_t off,
                                        uint32_t width) {
+    const uint32_t end = off + width - 1u;
     const uint32_t first = off >> 12u;
-    const uint32_t last = (off + width - 1u) >> 12u;
-    uint32_t page;
-    for (page = first; page <= last; ++page) {
-        const uint32_t g = w->gen[page] + 1u;
-        w->gen[page] = g ? g : 1u;
-    }
-    runtime_note_code_write_pages(w->gen + first, last - first + 1u);
+    const uint32_t last = end >> 12u;
+    uint32_t* const gen = w->gen;
+    const uint64_t* const code_mask = w->code_mask;
+    // Loaded before the publication call: it never reallocates backings.
+    uint8_t* const written = w->written;
     {
-        uint32_t i;
-        for (i = 0; i < width; ++i) w->written[off + i] = 1u;
+        const uint32_t g = gen[first] + 1u;
+        gen[first] = g ? g : 1u;
     }
+    if (last != first) {
+        const uint32_t g = gen[last] + 1u;
+        gen[last] = g ? g : 1u;
+    }
+    if (((code_mask[first] >> ((off >> 6u) & 63u)) |
+         (code_mask[last] >> ((end >> 6u) & 63u))) & 1u)
+        runtime_note_code_store(w, off, width);
+    memset(written + off, 1, width);
 }
 
 static inline uint32_t bus_read_u32(uint32_t addr) {
