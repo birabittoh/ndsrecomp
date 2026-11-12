@@ -2124,10 +2124,7 @@ std::string handle(const std::string& line) {
         std::vector<uint32_t> pixels;
         unsigned width = 0, height = 0;
         const std::string surface = json_str(line, "surface", "game");
-        if (surface == "menu") {
-            if (!nds_frontend_read_runtime_menu(pixels, &width, &height))
-                return "{\"error\":\"no rendered runtime menu on this thread\"}";
-        } else {
+        {
             if (surface != "game") return "{\"error\":\"unknown presentation surface\"}";
 #if defined(NDS_HAVE_COMPUTE_RENDERER)
             if (!nds_compute_host_read_presented(pixels, width, height))

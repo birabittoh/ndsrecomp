@@ -1,36 +1,6 @@
 cmake_minimum_required(VERSION 3.20)
 project(nds_runner VERSION 0.6.12 LANGUAGES C CXX)
 
-# Resolve the shared menu dependency before bank discovery or optional backends.
-# An explicit cache value wins; otherwise accept the environment or a checkout
-# beside/inside this repository. Never depend on a developer's drive layout.
-set(NDS_RECOMP_UI_ROOT_DEFAULT "")
-if(DEFINED ENV{RECOMP_UI_ROOT})
-    set(NDS_RECOMP_UI_ROOT_DEFAULT "$ENV{RECOMP_UI_ROOT}")
-else()
-    foreach(_ui_root IN ITEMS
-            "${CMAKE_CURRENT_LIST_DIR}/../recomp-ui"
-            "${CMAKE_CURRENT_LIST_DIR}/../../recomp-ui"
-            "${CMAKE_CURRENT_LIST_DIR}/../../../recomp-ui")
-        if(EXISTS "${_ui_root}/src/recomp_runtime_ui.h" AND
-           EXISTS "${_ui_root}/src/common/recomp_runtime_ui.c")
-            set(NDS_RECOMP_UI_ROOT_DEFAULT "${_ui_root}")
-            break()
-        endif()
-    endforeach()
-endif()
-set(NDS_RECOMP_UI_ROOT "${NDS_RECOMP_UI_ROOT_DEFAULT}" CACHE PATH
-    "Path to the shared recomp-ui checkout for the runner in-game menu")
-if(NOT EXISTS "${NDS_RECOMP_UI_ROOT}/src/recomp_runtime_ui.h" OR
-   NOT EXISTS "${NDS_RECOMP_UI_ROOT}/src/common/recomp_runtime_ui.c")
-    message(FATAL_ERROR
-        "The runner requires a recomp-ui checkout (headers and common runtime).\n"
-        "Clone https://github.com/RetroPortingToolKit/recomp-ui.git beside ndsrecomp,\n"
-        "or configure with -DNDS_RECOMP_UI_ROOT=/path/to/recomp-ui.\n"
-        "RECOMP_UI_ROOT may also be supplied as an environment variable.\n"
-        "Current NDS_RECOMP_UI_ROOT: '${NDS_RECOMP_UI_ROOT}'")
-endif()
-
 include("${CMAKE_CURRENT_LIST_DIR}/../cmake/NdsCompilerCache.cmake")
 include("${CMAKE_CURRENT_LIST_DIR}/../cmake/NdsJobPools.cmake")
 include("${CMAKE_CURRENT_LIST_DIR}/../cmake/NdsTomlPlusPlus.cmake")
@@ -745,7 +715,6 @@ if(NOT MSVC)
     target_compile_options(slirp PRIVATE -w)
 endif()
 
-
 # The runner: runtime ABI + DS bus + CP15 + driver.
 # The portable ARMv4T/v5TE core (decoders + IR + the Tier-3 interpreter).
 add_library(nds_armv4t STATIC ${NDS_ARM_RECOMP_SOURCES})
@@ -817,7 +786,6 @@ add_executable(nds_runner
     src/player_launch.cpp
     src/log_file.cpp
     src/relative_mouse_touch.cpp
-    "${NDS_RECOMP_UI_ROOT}/src/common/recomp_runtime_ui.c"
     src/frontend.cpp
     src/cpu_render_handoff.cpp
     src/main.cpp
@@ -897,8 +865,9 @@ endif()
 
 # Online lobbies for local wireless:
 # ICE through a TURN relay (libjuice) and Discord sign-in for the lobby
-# server (recomp-net's auth.h). recomp-net is a sibling checkout, found like
-# recomp-ui; only its account module and the libjuice it builds are used.
+# server (recomp-net's auth.h). recomp-net is a sibling checkout (or
+# RECOMP_NET_ROOT); only its account module and the libjuice it builds are
+# used.
 option(NDS_ONLINE "Online lobbies for local wireless (needs recomp-net)" OFF)
 if(NDS_ONLINE)
     if(DEFINED ENV{RECOMP_NET_ROOT})
@@ -1201,9 +1170,7 @@ target_include_directories(nds_runner PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/../recompiler/armv4t   # runtime_arm.h
     ${NDS_ARM_RECOMP_INCLUDE_DIRS}                     # shared ARM core headers
     ${CMAKE_CURRENT_SOURCE_DIR}/../recompiler/support   # sha1.h
-    ${CMAKE_CURRENT_SOURCE_DIR}/../vendor/freebios      # embedded FreeBIOS (BSD-2-Clause)
-    "${NDS_RECOMP_UI_ROOT}/src"
-    "${NDS_RECOMP_UI_ROOT}/src/common")
+    ${CMAKE_CURRENT_SOURCE_DIR}/../vendor/freebios)     # embedded FreeBIOS (BSD-2-Clause)
 ndsrecomp_link_tomlpp(nds_runner)
 if(NOT MSVC)
     # Unmodified upstream melonDS sources carry their own warning posture;
