@@ -64,6 +64,20 @@ NdsDispatchStats g_nds_dispatch_stats[2] = {};
 // the stats JSON below can report it; the mechanism itself is further down.
 namespace { bool g_cycle_fast_limit_enabled = true; }
 unsigned long long g_nds_fast_limit_publishes = 0;
+namespace {
+enum : unsigned {
+    kFastLimitPublished, kFastLimitMode, kFastLimitCodePub, kFastLimitNoCap,
+    kFastLimitDeferred, kFastLimitStaticCode, kFastLimitBreak,
+    kFastLimitHalted, kFastLimitDma, kFastLimitIrq, kFastLimitReasons
+};
+unsigned long long g_fast_limit_reasons[2][kFastLimitReasons] = {};
+}  // namespace
+extern "C" void runtime_fast_limit_stats(unsigned long long out[2][10]) {
+    static_assert(kFastLimitReasons == 10);
+    for (int c = 0; c < 2; ++c)
+        for (unsigned r = 0; r < kFastLimitReasons; ++r)
+            out[c][r] = g_fast_limit_reasons[c][r];
+}
 
 std::string nds_dispatch_stats_json() {
     std::string out = "{";
@@ -1683,21 +1697,48 @@ namespace {
 // Every disqualifying condition below yields zero — "always take the
 // faithful path". A too-small limit is only slow, never wrong.
 void publish_fast_limit() {
+    // Diagnostics: one counter per CPU and outcome (runtime_fast_limit_stats,
+    // perf log "fast_limit"). This is the slow path's own publisher, never
+    // the per-instruction path.
+    unsigned long long* const why =
+        g_fast_limit_reasons[g_nds_active == NDS_ARM7 ? 1 : 0];
+    unsigned reason = kFastLimitPublished;
     if (!g_cycle_fast_limit_enabled ||      // selector: NDS_CYCLE_FAST_LIMIT=0
         !g_cpu_fast_poll ||                 // faithful full-poll reference mode
         g_runtime_break_pc ||               // per-PC predicate, not cycle-based
         g_insn_hook_armed ||                // per-insn payload (runtime_insn_enter)
-        (g_nds_active == NDS_ARM9 &&        // stale code-fetch publication
-         g_arm9_code_pub_gen != g_cp15_timing_generation) ||  // (numc_entered)
-        g_nds_terminal ||
-        g_cycle_cap == 0u ||                // no slice bound to inherit
-        g_deferred_cycles != 0u ||          // tick must commit HALT debt
-        active_static_code_changed() ||     // guest rewrote executing code
-        g_nds_insn_stop ||                  // exact-index observer armed
-        nds_event_break_hit() ||            // debug event break already fired
-        nds_cpu_halted(g_nds_active) ||     // resumable hardware sleep
-        nds_dma_cpu_stalled(g_nds_active) ||  // DMA owns this CPU's bus slot
-        g_nds_irq_pending_cache[g_nds_active] != 0u) {  // IRQ due at next tick
+        g_nds_terminal) {
+        reason = kFastLimitMode;
+    } else if (g_nds_active == NDS_ARM9 &&  // stale code-fetch publication
+               g_arm9_code_pub_gen != g_cp15_timing_generation) {  // (numc_entered)
+        reason = kFastLimitCodePub;
+    } else if (g_cycle_cap == 0u) {         // no slice bound to inherit
+        reason = kFastLimitNoCap;
+    } else if (g_deferred_cycles != 0u) {   // tick must commit HALT debt
+        reason = kFastLimitDeferred;
+    } else if (active_static_code_changed()) {  // guest rewrote executing code
+        reason = kFastLimitStaticCode;
+    } else if (g_nds_insn_stop ||           // exact-index observer armed
+               nds_event_break_hit()) {     // debug event break already fired
+        reason = kFastLimitBreak;
+    } else if (nds_cpu_halted(g_nds_active)) {  // resumable hardware sleep
+        reason = kFastLimitHalted;
+    } else if (nds_dma_cpu_stalled(g_nds_active)) {  // DMA owns this CPU's bus slot
+        reason = kFastLimitDma;
+    } else if (g_nds_irq_pending_cache[g_nds_active] != 0u &&  // IRQ due at
+               !(g_cpu.cpsr & CPSR_I_BIT)) {                     // next tick
+        // With CPSR.I set a pending IRQ cannot be taken at any boundary until
+        // the guest clears I, and every path that can clear it drops the
+        // limit (note_cpsr_unmask: MSR, exception return, SPSR restore;
+        // Tier 3's own check; whole-CPSR restores), so the tick at the end
+        // of the unmasking instruction runs the faithful path and delivers
+        // at exactly the boundary it always did. Refusing here instead sent
+        // every instruction of an IRQ handler or critical section with an
+        // IRQ queued through the slow entry (~23k per DQ9 town frame).
+        reason = kFastLimitIrq;
+    }
+    ++why[reason];
+    if (reason != kFastLimitPublished) {
         g_nds_fast_limit = 0u;
         return;
     }
@@ -2519,6 +2560,15 @@ extern "C" void runtime_write_user_reg(uint32_t reg, uint32_t value) {
     else if (reg == 13u) g_cpu.banked_sp[ARM_BANK_USER] = value;
     else                 g_cpu.banked_lr[ARM_BANK_USER] = value;
 }
+// A CPSR write that clears I can make a queued IRQ deliverable at this
+// instruction's tick; publish_fast_limit may have published a limit while I
+// was set, so drop it (see the IRQ case there).
+static inline void note_cpsr_unmask(uint32_t oc, uint32_t nc) {
+    if (oc & ~nc & CPSR_I_BIT) g_nds_fast_limit = 0u;
+}
+extern "C" void runtime_note_cpsr_unmask(uint32_t old_cpsr, uint32_t new_cpsr) {
+    note_cpsr_unmask(old_cpsr, new_cpsr);
+}
 extern "C" uint32_t runtime_mrs_cpsr(void) { return g_cpu.cpsr; }
 extern "C" uint32_t runtime_mrs_spsr(void) { return g_cpu.banked_spsr[mode_to_bank(g_cpu.cpsr)]; }
 extern "C" void runtime_msr_cpsr(uint32_t value, uint32_t mask) {
@@ -2530,6 +2580,7 @@ extern "C" void runtime_msr_cpsr(uint32_t value, uint32_t mask) {
     unsigned ob = mode_to_bank(oc), nb = mode_to_bank(nc);
     g_cpu.cpsr = nc;
     if (ob != nb) { bank_out(ob, oc); bank_in(nb, nc); }
+    note_cpsr_unmask(oc, nc);
 }
 extern "C" void runtime_msr_spsr(uint32_t value, uint32_t mask) {
     unsigned bank = mode_to_bank(g_cpu.cpsr);
@@ -2545,6 +2596,7 @@ extern "C" void runtime_exception_return(uint32_t new_pc) {
     if (om == 0x10u || om == 0x1Fu) { g_cpu.R[15] = new_pc; return; }
     unsigned ob = mode_to_bank(oc); uint32_t spsr = g_cpu.banked_spsr[ob];
     bank_out(ob, oc); g_cpu.cpsr = spsr; bank_in(mode_to_bank(spsr), spsr);
+    note_cpsr_unmask(oc, spsr);
     g_cpu.R[15] = new_pc;
 }
 extern "C" void runtime_restore_cpsr_from_spsr(void) {
@@ -2552,6 +2604,7 @@ extern "C" void runtime_restore_cpsr_from_spsr(void) {
     if (om == 0x10u || om == 0x1Fu) return;
     unsigned ob = mode_to_bank(oc); uint32_t spsr = g_cpu.banked_spsr[ob];
     bank_out(ob, oc); g_cpu.cpsr = spsr; bank_in(mode_to_bank(spsr), spsr);
+    note_cpsr_unmask(oc, spsr);
 }
 
 // ── SWI / IRQ (per-CPU exception base) ──────────────────────────────────
