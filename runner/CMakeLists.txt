@@ -776,6 +776,7 @@ add_executable(nds_runner
     src/title_patches.cpp
     src/title_settings.cpp
     src/title_menu.cpp
+    src/title_save.cpp
     ${NDS_TIER3_SOURCE}
     src/coverage_manifest.cpp
     src/diagnostics.cpp

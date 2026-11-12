@@ -8,6 +8,7 @@
 #pragma once
 
 #include <cstdint>
+#include <string>
 
 #include "cartridge_config.h"
 
@@ -373,3 +374,9 @@ void     nds_io_set_cartridge_save_path(const char* path);
 bool     nds_io_flush_cartridge_save();
 bool     nds_io_cartridge_save_snapshot(const uint8_t** data, uint32_t* size,
                                         bool* dirty);
+// The battery file's path ("" when persistence is off).
+const char* nds_io_cartridge_save_path();
+// Installs `data` as the cartridge save (it must be the backup's size) and
+// writes it to the battery file. The guest sees it after a reset.
+bool     nds_io_replace_cartridge_save(const uint8_t* data, uint32_t size,
+                                       std::string* error);

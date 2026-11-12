@@ -9,6 +9,7 @@
 #include <cstdio>
 #include <cstring>
 #include <ctime>
+#include <string>
 #include <vector>
 
 #include "battery_save.h"
@@ -2081,6 +2082,31 @@ bool nds_io_flush_cartridge_save() {
     g_cart_backup.dirty = false;
     std::fprintf(stderr, "[save] wrote %zu bytes to %s\n",
                  g_cart_backup.sram.size(), g_cart_save_path.c_str());
+    return true;
+}
+
+const char* nds_io_cartridge_save_path() {
+    return g_cart_save_path.c_str();
+}
+
+bool nds_io_replace_cartridge_save(const uint8_t* data, uint32_t size,
+                                   std::string* error) {
+    if (g_cart_backup.sram.empty() || size != g_cart_backup.sram.size()) {
+        if (error)
+            *error = "the save must be " +
+                     std::to_string(g_cart_backup.sram.size()) + " bytes";
+        return false;
+    }
+    std::copy(data, data + size, g_cart_backup.sram.begin());
+    g_cart_backup.dirty = true;
+    // A save the player picked is the canonical one again, even after a
+    // historical savestate load detached this session from the file.
+    g_cart_persistence_detached = false;
+    g_cart_detached_warning_emitted = false;
+    if (!nds_io_flush_cartridge_save()) {
+        if (error) *error = "could not write " + g_cart_save_path;
+        return false;
+    }
     return true;
 }
 

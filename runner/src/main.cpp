@@ -2670,6 +2670,7 @@ int main(int argc, char** argv) {
         // via debug_pump(). Execution stays frontend-owned (run_to_* are
         // rejected); queries, rings, and touch/keys injection are live.
         debug_set_reset_fn(boot);
+        nds_frontend_set_reset(boot);
         debug_pump_start(port);
         std::fprintf(stderr, "[run] interactive SDL mode from reset\n");
         const int rc = nds_run_interactive_frontend(frontend_options);

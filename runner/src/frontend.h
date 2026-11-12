@@ -1,6 +1,7 @@
 #pragma once
 
 #include <cstdint>
+#include <functional>
 #include <string>
 #include <utility>
 #include <vector>
@@ -567,6 +568,10 @@ const char* nds_adaptive_screens_name(uint8_t value);
 const char* nds_frame_interpolation_name(NdsFrameInterpolation value);
 
 int nds_run_interactive_frontend(const NdsFrontendOptions& options);
+
+// The console's power-on reset (the runner's boot), which the frontend runs
+// between frames, e.g. after a title menu imported a save (title_save.h).
+void nds_frontend_set_reset(std::function<void()> reset);
 
 // Request the interactive frontend's normal SDL quit path. Debug-driven
 // scenario harnesses use this instead of TerminateProcess so runtime teardown

@@ -19,12 +19,14 @@
 #include <initializer_list>
 #include <limits>
 #include <memory>
+#include <mutex>
 #include <stdexcept>
 #include <string>
 #include <type_traits>
 #include <utility>
 #include <vector>
 
+#include "battery_save.h"
 #include "debug_server.h"
 #include "diagnostics.h"
 #include "gpu2d.h"
@@ -39,11 +41,20 @@
 #include "spu.h"
 #include "title_patches.h"
 #include "title_menu.h"
+#include "title_save.h"
 #include "title_settings.h"
 #include "wifi_net.h"
 #if defined(NDS_HAVE_COMPUTE_RENDERER)
 #include "melonds_compute/ComputeHost.h"
 #endif
+
+namespace {
+std::function<void()> g_frontend_reset;
+}  // namespace
+
+void nds_frontend_set_reset(std::function<void()> reset) {
+    g_frontend_reset = std::move(reset);
+}
 
 namespace {
 // Written per presented frame by the frontend loop, read from the same
@@ -1690,6 +1701,144 @@ void persist_fullscreen(const NdsFrontendOptions& options) {
             &error))
         std::fprintf(stderr, "[settings] could not save %s: %s\n",
                      options.settings_path.c_str(), error.c_str());
+}
+
+// Save import and export asked for by a title hook (title_save.h). The
+// dialog runs asynchronously; its result is handled on a later frame.
+struct TitleSaveDialog {
+    std::mutex mutex;
+    bool open = false;
+    bool done = false;
+    bool unavailable = false;
+    std::string path;
+    NdsTitleSaveRequest request;
+};
+
+TitleSaveDialog g_title_save_dialog;
+
+#if defined(NDS_HAVE_SDL3)
+void SDLCALL title_save_dialog_finished(void* userdata,
+                                        const char* const* files, int) {
+    auto* dialog = static_cast<TitleSaveDialog*>(userdata);
+    std::lock_guard<std::mutex> lock(dialog->mutex);
+    dialog->unavailable = files == nullptr;
+    dialog->path = files && files[0] ? files[0] : "";
+    dialog->done = true;
+    std::fprintf(stderr, "[save] file dialog closed: %s\n",
+                 files ? (files[0] ? files[0] : "cancelled")
+                       : SDL_GetError());
+}
+#endif
+
+std::string title_save_import(const std::string& path,
+                              NdsTitleSaveConvert convert, bool* reset) {
+    std::ifstream in(path, std::ios::binary);
+    if (!in) return "Could not open " + path;
+    const std::vector<uint8_t> file((std::istreambuf_iterator<char>(in)),
+                                    std::istreambuf_iterator<char>());
+    std::vector<uint8_t> image;
+    std::string error;
+    if (convert) {
+        if (!convert(file, &image, &error))
+            return "Not imported: " + error;
+    } else {
+        image = file;
+    }
+    if (!nds_io_replace_cartridge_save(
+            image.data(), static_cast<uint32_t>(image.size()), &error))
+        return "Not imported: " + error;
+    *reset = true;
+    return "Save file imported";
+}
+
+std::string title_save_export(const std::string& path) {
+    nds_io_flush_cartridge_save();
+    const uint8_t* data = nullptr;
+    uint32_t size = 0;
+    bool dirty = false;
+    if (!nds_io_cartridge_save_snapshot(&data, &size, &dirty))
+        return "No save to export";
+    std::string error;
+    if (!nds_battery_save_write_atomic(path, data, size, &error))
+        return "Not exported: " + error;
+    return "Save file exported to " + path;
+}
+
+// Once per frame. Returns the notice to show ("" for none); *reset is set
+// when the console has to be reset to load an imported save.
+std::string serve_title_save(SDL_Window* parent, bool* reset) {
+    TitleSaveDialog& dialog = g_title_save_dialog;
+    std::unique_lock<std::mutex> lock(dialog.mutex);
+    if (!dialog.open) {
+        NdsTitleSaveRequest request;
+        if (!nds_title_save_take_request(&request)) return "";
+#if defined(NDS_HAVE_SDL3)
+        dialog.open = true;
+        dialog.done = false;
+        dialog.request = request;
+        lock.unlock();
+        static const SDL_DialogFileFilter kFilters[] = {
+            {"Save files", "sav;dsv;duc;bin"},
+            {"All files", "*"},
+        };
+        const bool importing = request.action == NdsTitleSaveAction::Import;
+        const SDL_PropertiesID properties = SDL_CreateProperties();
+        SDL_SetStringProperty(properties, SDL_PROP_FILE_DIALOG_TITLE_STRING,
+                              importing ? "Import save file"
+                                        : "Export save file");
+        SDL_SetPointerProperty(properties, SDL_PROP_FILE_DIALOG_WINDOW_POINTER,
+                               parent);
+        SDL_SetPointerProperty(properties,
+                               SDL_PROP_FILE_DIALOG_FILTERS_POINTER,
+                               const_cast<SDL_DialogFileFilter*>(kFilters));
+        SDL_SetNumberProperty(properties, SDL_PROP_FILE_DIALOG_NFILTERS_NUMBER,
+                              2);
+        std::string location;
+        if (!importing) {
+            // An absolute path: the xdg portal refuses a relative folder,
+            // and SDL turns a bare file name into one (".").
+            const std::filesystem::path save = nds_io_cartridge_save_path();
+            const char* folder = SDL_GetUserFolder(SDL_FOLDER_DOCUMENTS);
+            if (!folder) folder = SDL_GetUserFolder(SDL_FOLDER_HOME);
+            const std::string name =
+                save.empty() ? "save.sav" : save.filename().string();
+            location = folder ? (std::filesystem::path(folder) / name).string()
+                              : name;
+            SDL_SetStringProperty(properties,
+                                  SDL_PROP_FILE_DIALOG_LOCATION_STRING,
+                                  location.c_str());
+        }
+        std::fprintf(stderr, "[save] opening the %s file dialog\n",
+                     importing ? "import" : "export");
+        SDL_ClearError();
+        SDL_ShowFileDialogWithProperties(
+            importing ? SDL_FILEDIALOG_OPENFILE : SDL_FILEDIALOG_SAVEFILE,
+            title_save_dialog_finished, &dialog, properties);
+        if (const char* error = SDL_GetError(); error && *error)
+            std::fprintf(stderr, "[save] file dialog: %s\n", error);
+        SDL_DestroyProperties(properties);
+        return "";
+#else
+        (void)parent;
+        nds_title_save_finish();
+        return "File dialogs need the SDL3 build";
+#endif
+    }
+    if (!dialog.done) return "";
+    dialog.open = false;
+    const std::string path = dialog.path;
+    const bool unavailable = dialog.unavailable;
+    const NdsTitleSaveRequest request = dialog.request;
+    lock.unlock();
+    nds_title_save_finish();
+    if (unavailable) return "Could not open a file dialog";
+    if (path.empty()) return "";  // cancelled
+    std::string notice =
+        request.action == NdsTitleSaveAction::Import
+            ? title_save_import(path, request.convert, reset)
+            : title_save_export(path);
+    std::fprintf(stderr, "[save] %s\n", notice.c_str());
+    return notice;
 }
 
 // The menu's rows for title hooks (title_menu.h): publishes a copy with the
@@ -4453,6 +4602,22 @@ int nds_run_interactive_frontend(const NdsFrontendOptions& initial_options) {
         }
 #endif
         runtime_menu_serve_title(&runtime_menu_state, runtime_menu_list);
+        {
+            bool reset_console = false;
+            const std::string notice =
+                serve_title_save(presentation.windows[0], &reset_console);
+            if (!notice.empty()) {
+                savestate_notice = notice;
+                savestate_notice_until =
+                    SDL_GetPerformanceCounter() + frequency * 4u;
+            }
+            if (reset_console && g_frontend_reset) {
+                finish_pending_save(true);
+                g_frontend_reset();
+                blend_cache.valid = false;
+                publish_keys();
+            }
+        }
 #if NDS_ONLINE
         if (netplay_menu) {
             const bool editing = nds_netplay_menu_editing();
