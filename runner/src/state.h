@@ -148,6 +148,18 @@ bool bus_addr_is_writable_ram(uint32_t addr);
 bool bus_addr_has_write_provenance(uint32_t addr);
 bool bus_range_has_write_provenance(uint32_t addr, uint32_t size);
 uint32_t bus_exec_page_generation(uint32_t addr);
+// True while a DMA channel performs its bus access. The ARM9 TCMs are
+// core-local (melonDS: DMA goes through the bus, not ARMv5's TCM path), so
+// resolve() skips them; the inline windows are hidden by BusDmaScope.
+extern bool g_bus_dma_master;
+struct BusDmaScope {
+    uint32_t itcm_limit = 0u, dtcm_limit = 0u;
+    bool active = false;
+    explicit BusDmaScope(int cpu);
+    ~BusDmaScope();
+    BusDmaScope(const BusDmaScope&) = delete;
+    BusDmaScope& operator=(const BusDmaScope&) = delete;
+};
 // The page-generation cell bus_exec_page_generation(addr) reads when addr
 // resolves to a code-tracked fast window (main RAM, ITCM, ARM7 WRAM) under
 // the current mapping, else nullptr.

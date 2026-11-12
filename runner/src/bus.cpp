@@ -167,6 +167,10 @@ std::vector<uint8_t> g_itcm_written;
 std::vector<uint8_t> g_dtcm_written;
 std::vector<uint8_t> g_shared_wram_written;
 std::vector<uint8_t> g_arm7_wram_written;
+}  // namespace
+bool g_bus_dma_master = false;
+namespace {
+
 // Exact code-write tracking (see NdsBusFastWin::code_mask in runtime_arm.h)
 // for the backings code executes from under a mapping that WRAMCNT cannot
 // move: main RAM, ITCM and ARM7 WRAM. Bits are set by bus_code_watch and
@@ -584,7 +588,8 @@ inline void ring_push(uint8_t write, uint8_t width, uint32_t addr, uint32_t valu
 uint8_t* resolve(uint32_t addr, uint32_t len) {
     const bool arm9 = (g_nds_active == NDS_ARM9);
 
-    if (arm9) {
+    // The TCMs sit inside the ARM9 core; DMA (BusDmaScope) never sees them.
+    if (arm9 && !g_bus_dma_master) {
         // ITCM: responds across its virtual region [0, itcm_size) (the DS
         // firmware programs a 32 MB span), with the 32 KB physical backing
         // MIRRORED every 32 KB within that span. itcm_size is the virtual
@@ -1072,6 +1077,24 @@ void bus_code_watch_page(uint32_t addr) {
     if (watch(g_itcm, g_code_itcm.mask)) return;
     if (watch(g_dtcm, g_dtcm_code_mask)) return;
     watch(g_arm7_wram, g_code_arm7_wram.mask);
+}
+
+BusDmaScope::BusDmaScope(int) {
+    // Any channel: the bus view follows g_nds_active, and no DMA master may
+    // see the ARM9's core-local TCMs whichever CPU's turn it runs on.
+    active = true;
+    itcm_limit = g_busf_itcm_limit;
+    dtcm_limit = g_busf_dtcm_limit;
+    g_busf_itcm_limit = 0u;
+    g_busf_dtcm_limit = 0u;
+    g_bus_dma_master = true;
+}
+
+BusDmaScope::~BusDmaScope() {
+    if (!active) return;
+    g_bus_dma_master = false;
+    g_busf_itcm_limit = itcm_limit;
+    g_busf_dtcm_limit = dtcm_limit;
 }
 
 const uint32_t* bus_main_page_generation_cell(uint32_t addr) {

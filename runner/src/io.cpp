@@ -3089,12 +3089,19 @@ void nds_dma_run(int cpu, unsigned long long target_cycles) {
 #endif
             const uint32_t unit = dma_unit_cycles(cpu, d, width);
             g_runtime_cycles += uint64_t{unit} << (cpu == 0 ? 1u : 0u);
-            if (width == 4u) {
-                const uint32_t v = bus_read_u32(d.cur_src & ~3u);
-                bus_write_u32(d.cur_dst & ~3u, v);
-            } else {
-                const uint16_t v = bus_read_u16(d.cur_src & ~1u);
-                bus_write_u16(d.cur_dst & ~1u, v);
+            {
+                // ARM9 DMA does not reach ITCM/DTCM (they are inside the
+                // core; melonDS routes DMA through the bus only). Without
+                // this, DQ9's dummy channel-0 DMA (0 -> 0, 0x020C9F1C)
+                // rewrote ITCM[0] 380k times a session.
+                BusDmaScope dma_bus(cpu);
+                if (width == 4u) {
+                    const uint32_t v = bus_read_u32(d.cur_src & ~3u);
+                    bus_write_u32(d.cur_dst & ~3u, v);
+                } else {
+                    const uint16_t v = bus_read_u16(d.cur_src & ~1u);
+                    bus_write_u16(d.cur_dst & ~1u, v);
+                }
             }
             d.cur_src = static_cast<uint32_t>(
                 int64_t{d.cur_src} + int64_t{d.src_inc} * width);
