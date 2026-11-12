@@ -1537,16 +1537,19 @@ int runtime_menu_set_value(RuntimeMenuState* state, const NdsMenuItem* item,
     }
     if (std::strcmp(item->key, kRuntimeVolumeKey) == 0 ||
         std::strcmp(item->key, kRuntimeMuteKey) == 0) {
-        if (!state->audio || !state->audio_queue) return 0;
+        // The volume is a stored setting: it is kept (and saved) while muted
+        // or with no device, and is what plays once there is output again.
         if (std::strcmp(item->key, kRuntimeVolumeKey) == 0) {
             if (value < 0 || value > 100) return 0;
             state->options->audio_volume = static_cast<uint8_t>(value);
         } else {
+            if (!state->audio || !*state->audio) return 0;
             state->options->audio_muted = value != 0;
         }
-        apply_audio_output_level(*state->audio, *state->audio_queue,
-                                 state->options->audio_volume,
-                                 state->options->audio_muted);
+        if (state->audio && state->audio_queue)
+            apply_audio_output_level(*state->audio, *state->audio_queue,
+                                     state->options->audio_volume,
+                                     state->options->audio_muted);
         return 1;
     }
     return 0;
@@ -1575,9 +1578,8 @@ int runtime_menu_is_enabled(const RuntimeMenuState* state,
     if (std::strcmp(item->key, kRuntimeSecondScreenKey) == 0)
         return state->options->screen_layout == NdsScreenLayout::Single
             ? 1 : 0;
-    if (std::strcmp(item->key, kRuntimeVolumeKey) == 0)
-        return state->audio && *state->audio &&
-               !state->options->audio_muted ? 1 : 0;
+    // Volume stays enabled while muted or with no device (see set_value);
+    // only Mute needs a device to act on.
     if (std::strcmp(item->key, kRuntimeMuteKey) == 0)
         return state->audio && *state->audio ? 1 : 0;
     return 1;
