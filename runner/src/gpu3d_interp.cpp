@@ -196,7 +196,18 @@ void nds_gx_interp_after_vblank(GPU3D& gpu3d, melonDS::NDS& nds, bool active,
         trace_image(s, std::move(bytes));
     }
 
-    if (active && s.last_valid && s.vblank - s.last_vblank <= kMaxImageGap) {
+    const uint64_t gap = s.vblank - s.last_vblank;
+    if (active && s.last_valid && gap == 1) {
+        // The game drew this image one DS frame after the last: there is no
+        // free frame to fill, so the last image is shown again, exactly,
+        // keeping 3D one frame late as after a blend. A game at 60 that
+        // misses a frame then holds the newer image, and the image after
+        // that comes two frames apart and gets the halfway image, so a slip
+        // shows as smooth motion instead of a repeated frame.
+        if (!s.replayer) s.replayer = std::make_unique<NdsGxReplayer>(nds);
+        if (s.replayer->run(s.last) && s.replayer->count() > 0)
+            show_blend(gpu3d, target, s.replayer->polygons(), s.replayer->count());
+    } else if (active && s.last_valid && gap <= kMaxImageGap) {
         NdsGxLerpStats lerp;
         bool shown = false;
         if (nds_gx_lerp_streams(s.last, s.incoming, 0.5f, &s.halfway, &lerp)) {

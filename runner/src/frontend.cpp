@@ -3642,6 +3642,16 @@ int nds_run_interactive_frontend(const NdsFrontendOptions& initial_options) {
     // go before System.
     std::vector<RecompRuntimeUiItem> runtime_menu_list(
         std::begin(runtime_menu_items), std::end(runtime_menu_items));
+    // A title that decides smoothing itself (title_settings.h) shows its own
+    // setting for it instead.
+    if (nds_title_smooth_3d_owned())
+        runtime_menu_list.erase(
+            std::remove_if(runtime_menu_list.begin(), runtime_menu_list.end(),
+                           [](const RecompRuntimeUiItem& item) {
+                               return std::strcmp(item.key,
+                                                  kRuntimeSmooth3dKey) == 0;
+                           }),
+            runtime_menu_list.end());
     for (const auto& [key, value] : options.title_settings) {
         const int id = nds_title_setting_find(key.c_str());
         if (id < 0)
@@ -5736,7 +5746,11 @@ int nds_run_interactive_frontend(const NdsFrontendOptions& initial_options) {
         // Fast-forward shows the game's own 3D images only: building and
         // drawing the halfway image costs host time that turbo would rather
         // spend running more DS frames, and at turbo speed it is not seen.
-        nds_gpu3d_set_interpolation(options.smooth_3d && !turbo_active);
+        // A title that owns smoothing replaces display.smooth_3d.
+        const bool smooth_3d = nds_title_smooth_3d_owned()
+                                   ? nds_title_smooth_3d_wanted()
+                                   : options.smooth_3d;
+        nds_gpu3d_set_interpolation(smooth_3d && !turbo_active);
         presentation.window_mode = options.window_mode;
         presentation.scaling = options.scaling;
         presentation.resolution_scale = options.resolution_scale;
