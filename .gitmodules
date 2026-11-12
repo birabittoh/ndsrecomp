@@ -4,6 +4,7 @@
 [submodule "external/arm-recomp-core"]
 	path = external/arm-recomp-core
 	url = git@github.com:birabittoh/arm-recomp-core.git
+	branch = dq9
 [submodule "external/plume"]
 	path = external/plume
 	url = https://github.com/birabittoh/plume.git
