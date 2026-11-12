@@ -47,7 +47,7 @@ def main():
                  NDS_BOOTSTRAP_FIRMWARE='ON', NDS_SDL_BACKEND='SDL3',
                  NDS_GENERATED_DIR=str(args.workspace / 'ndsrecomp/generated'),
                  NDS_TITLE_BANK_DIR=str(game / 'generated/recomp'),
-                 NDS_RECOMP_UI_ROOT='F:/Projects/recomp-ui', NDS_BUILD_NATIVE_GL_TESTS='ON')
+                 NDS_BUILD_NATIVE_GL_TESTS='ON')
     if args.title == 'mkds':
         banks = json.loads(args.banks.read_text())['variants']
         flags.update(NDS_MKDS_IMPLEMENTATION='HLE', NDS_MKDS_HLE_GROUPS='VECTOR',

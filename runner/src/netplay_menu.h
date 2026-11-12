@@ -1,14 +1,7 @@
-// netplay_menu.h -- the runtime menu's Netplay section (net/online_lobby.h):
-// the Netplay toggle, the lobby status, Discord sign-in, the lobby name,
-// the lobby list and Leave, plus toasts when a lobby opens, closes, or a
-// player enters or leaves it. Built only with NDS_ONLINE.
-//
-// recomp-ui's menu has a static item table and no list rows, so the lobby
-// list is a fixed set of ACTION rows whose labels this module rewrites
-// every frame (the menu reads labels and descriptions each time it draws).
-// Its software presentation cannot edit TEXT rows either, so the lobby
-// name is edited here: the frontend forwards typed text and Enter / Esc /
-// Backspace while nds_netplay_menu_editing() is true.
+// netplay_menu.h -- the runtime settings' Netplay rows (net/online_lobby.h):
+// the Netplay toggle and the Discord sign-in. Title hooks show them in the
+// game's own menus through title_menu.h; hosting, joining and leaving follow
+// the game's own multiplayer menus. Built only with NDS_ONLINE.
 //
 // Main thread only.
 
@@ -17,34 +10,25 @@
 #include <string>
 #include <vector>
 
-#include "recomp_runtime_ui.h"
+#include "runtime_menu_item.h"
 
 // False when the lobby thread is not running (local wireless off, or a
-// non-interactive run): the menu then has no Netplay section.
+// non-interactive run): there are no Netplay rows then.
 bool nds_netplay_menu_available();
-void nds_netplay_menu_append_items(std::vector<RecompRuntimeUiItem>* items);
+void nds_netplay_menu_append_items(std::vector<NdsMenuItem>* items);
 
-// The menu callbacks, for items whose key starts with "netplay.".
-bool nds_netplay_menu_owns(const RecompRuntimeUiItem* item);
-int nds_netplay_menu_get_value(const RecompRuntimeUiItem* item, int* value);
-int nds_netplay_menu_set_value(const RecompRuntimeUiItem* item, int value);
-int nds_netplay_menu_run_action(RecompRuntimeUi* ui,
-                                const RecompRuntimeUiItem* item);
-int nds_netplay_menu_is_enabled(const RecompRuntimeUiItem* item);
-void nds_netplay_menu_visibility(bool open);
+// The settings callbacks, for items whose key starts with "netplay.".
+bool nds_netplay_menu_owns(const NdsMenuItem* item);
+int nds_netplay_menu_get_value(const NdsMenuItem* item, int* value);
+int nds_netplay_menu_set_value(const NdsMenuItem* item, int value);
+int nds_netplay_menu_run_action(const NdsMenuItem* item);
+int nds_netplay_menu_is_enabled(const NdsMenuItem* item);
 
-// Once per host frame: rewrites the rows from the lobby status and shows
-// or clears the toast.
-void nds_netplay_menu_tick(RecompRuntimeUi* ui);
-
-// Lobby name editing.
-enum class NdsNetplayEditKey { Commit, Cancel, Erase };
-bool nds_netplay_menu_editing();
-void nds_netplay_menu_edit_text(const char* utf8);
-// True when the edit was committed (the settings should be saved).
-bool nds_netplay_menu_edit_key(NdsNetplayEditKey key);
+// Once per host frame: rewrites the sign-in row's label from the lobby
+// status.
+void nds_netplay_menu_tick();
 
 // The values to write to settings.toml's [online] once the player changed
 // one of them here; false before that, so command-line flags such as
-// --netplay on are never saved by a change elsewhere in the menu.
+// --netplay on are never saved by a change elsewhere in the settings.
 bool nds_netplay_menu_settings(bool* enabled, std::string* lobby_name);

@@ -715,16 +715,6 @@ if(NOT MSVC)
     target_compile_options(slirp PRIVATE -w)
 endif()
 
-if(DEFINED ENV{RECOMP_UI_ROOT})
-    set(NDS_RECOMP_UI_ROOT_DEFAULT "$ENV{RECOMP_UI_ROOT}")
-elseif(EXISTS "${CMAKE_CURRENT_LIST_DIR}/../../../recomp-ui/src/recomp_runtime_ui.h")
-    set(NDS_RECOMP_UI_ROOT_DEFAULT "${CMAKE_CURRENT_LIST_DIR}/../../../recomp-ui")
-else()
-    set(NDS_RECOMP_UI_ROOT_DEFAULT "F:/Projects/recomp-ui")
-endif()
-set(NDS_RECOMP_UI_ROOT "${NDS_RECOMP_UI_ROOT_DEFAULT}" CACHE PATH
-    "Path to the shared recomp-ui checkout for the runner in-game menu")
-
 # The runner: runtime ABI + DS bus + CP15 + driver.
 # The portable ARMv4T/v5TE core (decoders + IR + the Tier-3 interpreter).
 add_library(nds_armv4t STATIC ${NDS_ARM_RECOMP_SOURCES})
@@ -796,7 +786,6 @@ add_executable(nds_runner
     src/player_launch.cpp
     src/log_file.cpp
     src/relative_mouse_touch.cpp
-    "${NDS_RECOMP_UI_ROOT}/src/common/recomp_runtime_ui.c"
     src/frontend.cpp
     src/rom_icon.cpp
     src/cpu_render_handoff.cpp
@@ -900,8 +889,9 @@ endif()
 
 # Online lobbies for local wireless (HANDOFF_ONLINE_LOBBY.md in DQ9Recomp):
 # ICE through a TURN relay (libjuice) and Discord sign-in for the lobby
-# server (recomp-net's auth.h). recomp-net is a sibling checkout, found like
-# recomp-ui; only its account module and the libjuice it builds are used.
+# server (recomp-net's auth.h). recomp-net is a sibling checkout (or
+# RECOMP_NET_ROOT); only its account module and the libjuice it builds are
+# used.
 option(NDS_ONLINE "Online lobbies for local wireless (needs recomp-net)" OFF)
 if(NDS_ONLINE)
     if(DEFINED ENV{RECOMP_NET_ROOT})
@@ -1204,9 +1194,7 @@ target_include_directories(nds_runner PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/../recompiler/armv4t   # runtime_arm.h
     ${NDS_ARM_RECOMP_INCLUDE_DIRS}                     # shared ARM core headers
     ${CMAKE_CURRENT_SOURCE_DIR}/../recompiler/support   # sha1.h
-    ${CMAKE_CURRENT_SOURCE_DIR}/../vendor/freebios      # embedded FreeBIOS (BSD-2-Clause)
-    "${NDS_RECOMP_UI_ROOT}/src"
-    "${NDS_RECOMP_UI_ROOT}/src/common")
+    ${CMAKE_CURRENT_SOURCE_DIR}/../vendor/freebios)     # embedded FreeBIOS (BSD-2-Clause)
 ndsrecomp_link_tomlpp(nds_runner)
 if(NOT MSVC)
     # Unmodified upstream melonDS sources carry their own warning posture;

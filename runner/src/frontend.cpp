@@ -229,7 +229,7 @@ void observe_top_black_bands(const uint32_t* pixels, uint64_t frame,
 #else
 #include <SDL.h>
 #endif
-#include "recomp_runtime_ui.h"
+#include "runtime_menu_item.h"
 #if NDS_ONLINE
 #include "netplay_menu.h"
 #endif
@@ -1344,22 +1344,17 @@ constexpr const char* kRuntimeVolumeKey = "audio.volume";
 constexpr const char* kRuntimeMuteKey = "audio.mute";
 // Rows for the title's own settings (title_settings.h): "title.<key>".
 constexpr const char* kRuntimeTitlePrefix = "title.";
-constexpr const char* kRuntimeResumeKey = "system.resume";
-constexpr const char* kRuntimeQuitKey = "system.quit";
 
 struct RuntimeMenuState {
     NdsFrontendOptions* options = nullptr;
-    bool* running = nullptr;
-    bool close_requested = false;
     // Resolution scale needs the GL presenter on the compute renderer.
     bool resolution_scale_available = false;
     const NdsAudioDevice* audio = nullptr;
     AudioQueue* audio_queue = nullptr;
-    RecompRuntimeUi* ui = nullptr;  // for confirm prompts and status text
 };
 
 // The title setting behind a "title.<key>" row, or -1.
-int runtime_menu_title_setting(const RecompRuntimeUiItem* item) {
+int runtime_menu_title_setting(const NdsMenuItem* item) {
     const size_t prefix = std::strlen(kRuntimeTitlePrefix);
     if (std::strncmp(item->key, kRuntimeTitlePrefix, prefix) != 0) return -1;
     return nds_title_setting_find(item->key + prefix);
@@ -1412,9 +1407,8 @@ bool save_runtime_settings(
     return static_cast<bool>(out);
 }
 
-int runtime_menu_get_value(void* context, const RecompRuntimeUiItem* item,
+int runtime_menu_get_value(RuntimeMenuState* state, const NdsMenuItem* item,
                            int* value_out) {
-    auto* state = static_cast<RuntimeMenuState*>(context);
     if (!state || !state->options || !item || !value_out) return 0;
 #if NDS_ONLINE
     if (nds_netplay_menu_owns(item))
@@ -1474,9 +1468,8 @@ int runtime_menu_get_value(void* context, const RecompRuntimeUiItem* item,
     return 0;
 }
 
-int runtime_menu_set_value(void* context, const RecompRuntimeUiItem* item,
+int runtime_menu_set_value(RuntimeMenuState* state, const NdsMenuItem* item,
                            int value) {
-    auto* state = static_cast<RuntimeMenuState*>(context);
     if (!state || !state->options || !item) return 0;
 #if NDS_ONLINE
     if (nds_netplay_menu_owns(item))
@@ -1556,26 +1549,16 @@ int runtime_menu_set_value(void* context, const RecompRuntimeUiItem* item,
     return 0;
 }
 
-int runtime_menu_run_action(void* context, const RecompRuntimeUiItem* item) {
-    auto* state = static_cast<RuntimeMenuState*>(context);
-    if (!state || !item) return 0;
+int runtime_menu_run_action(const NdsMenuItem* item) {
+    if (!item) return 0;
 #if NDS_ONLINE
-    if (nds_netplay_menu_owns(item))
-        return nds_netplay_menu_run_action(state->ui, item);
+    if (nds_netplay_menu_owns(item)) return nds_netplay_menu_run_action(item);
 #endif
-    if (std::strcmp(item->key, kRuntimeResumeKey) == 0) {
-        state->close_requested = true;
-        return 1;
-    }
-    if (std::strcmp(item->key, kRuntimeQuitKey) == 0) {
-        if (state->running) *state->running = false;
-        return 1;
-    }
     return 0;
 }
 
-int runtime_menu_is_enabled(void* context, const RecompRuntimeUiItem* item) {
-    auto* state = static_cast<RuntimeMenuState*>(context);
+int runtime_menu_is_enabled(const RuntimeMenuState* state,
+                            const NdsMenuItem* item) {
     if (!state || !state->options || !item) return 0;
 #if NDS_ONLINE
     if (nds_netplay_menu_owns(item)) return nds_netplay_menu_is_enabled(item);
@@ -1597,8 +1580,7 @@ int runtime_menu_is_enabled(void* context, const RecompRuntimeUiItem* item) {
     return 1;
 }
 
-void runtime_menu_save(void* context) {
-    auto* state = static_cast<RuntimeMenuState*>(context);
+void runtime_menu_save(const RuntimeMenuState* state) {
     if (!state || !state->options) return;
     const NdsFrontendOptions& options = *state->options;
     if (save_runtime_settings(
@@ -1844,18 +1826,19 @@ std::string serve_title_save(SDL_Window* parent, bool* reset) {
 // The menu's rows for title hooks (title_menu.h): publishes a copy with the
 // current values, then applies what the hooks asked for since last frame.
 void runtime_menu_serve_title(RuntimeMenuState* state,
-                              const std::vector<RecompRuntimeUiItem>& items) {
+                              const std::vector<NdsMenuItem>& items) {
+#if NDS_ONLINE
+    nds_netplay_menu_tick();
+#endif
     bool changed = false;
     for (const NdsTitleMenuRequest& request : nds_title_menu_take_requests()) {
-        for (const RecompRuntimeUiItem& item : items) {
+        for (const NdsMenuItem& item : items) {
             if (request.key != item.key) continue;
             if (!runtime_menu_is_enabled(state, &item)) break;
             if (request.run) {
-                if (item.type == RECOMP_RUNTIME_UI_ACTION)
-                    changed |= runtime_menu_run_action(state, &item) != 0;
-            } else if (item.type == RECOMP_RUNTIME_UI_BOOL ||
-                       item.type == RECOMP_RUNTIME_UI_INT ||
-                       item.type == RECOMP_RUNTIME_UI_CHOICE) {
+                if (item.type == NdsMenuItemType::Action)
+                    changed |= runtime_menu_run_action(&item) != 0;
+            } else {
                 changed |=
                     runtime_menu_set_value(state, &item, request.value) != 0;
             }
@@ -1866,22 +1849,20 @@ void runtime_menu_serve_title(RuntimeMenuState* state,
 
     std::vector<NdsTitleMenuRow> rows;
     rows.reserve(items.size());
-    for (const RecompRuntimeUiItem& item : items) {
+    for (const NdsMenuItem& item : items) {
         NdsTitleMenuRow row;
         row.key = item.key ? item.key : "";
         row.section = item.section ? item.section : "";
         row.label = item.label ? item.label : "";
         row.description = item.description ? item.description : "";
         switch (item.type) {
-        case RECOMP_RUNTIME_UI_BOOL:
+        case NdsMenuItemType::Bool:
             row.type = NdsTitleMenuRowType::Bool; break;
-        case RECOMP_RUNTIME_UI_INT:
+        case NdsMenuItemType::Int:
             row.type = NdsTitleMenuRowType::Int; break;
-        case RECOMP_RUNTIME_UI_CHOICE:
+        case NdsMenuItemType::Choice:
             row.type = NdsTitleMenuRowType::Choice; break;
-        case RECOMP_RUNTIME_UI_TEXT:
-            row.type = NdsTitleMenuRowType::Text; break;
-        default:
+        case NdsMenuItemType::Action:
             row.type = NdsTitleMenuRowType::Action; break;
         }
         row.minimum = item.minimum;
@@ -1898,87 +1879,6 @@ void runtime_menu_serve_title(RuntimeMenuState* state,
         rows.push_back(std::move(row));
     }
     nds_title_menu_publish(std::move(rows));
-}
-
-bool runtime_menu_key_input(SDL_Scancode scancode,
-                            RecompRuntimeUiInput* input) {
-    if (!input) return false;
-    switch (scancode) {
-        case SDL_SCANCODE_ESCAPE:
-            *input = RECOMP_RUNTIME_UI_INPUT_TOGGLE;
-            return true;
-        case SDL_SCANCODE_BACKSPACE:
-            *input = RECOMP_RUNTIME_UI_INPUT_BACK;
-            return true;
-        case SDL_SCANCODE_UP:
-            *input = RECOMP_RUNTIME_UI_INPUT_UP;
-            return true;
-        case SDL_SCANCODE_DOWN:
-            *input = RECOMP_RUNTIME_UI_INPUT_DOWN;
-            return true;
-        case SDL_SCANCODE_LEFT:
-            *input = RECOMP_RUNTIME_UI_INPUT_LEFT;
-            return true;
-        case SDL_SCANCODE_RIGHT:
-            *input = RECOMP_RUNTIME_UI_INPUT_RIGHT;
-            return true;
-        case SDL_SCANCODE_RETURN:
-        case SDL_SCANCODE_KP_ENTER:
-            *input = RECOMP_RUNTIME_UI_INPUT_ACCEPT;
-            return true;
-        default:
-            return false;
-    }
-}
-
-bool runtime_menu_controller_input(SDL_GameControllerButton button,
-                                   RecompRuntimeUiInput* input) {
-    if (!input) return false;
-    switch (button) {
-        case SDL_CONTROLLER_BUTTON_START:
-            *input = RECOMP_RUNTIME_UI_INPUT_TOGGLE;
-            return true;
-        case SDL_CONTROLLER_BUTTON_BACK:
-        case SDL_CONTROLLER_BUTTON_B:
-            *input = RECOMP_RUNTIME_UI_INPUT_BACK;
-            return true;
-        case SDL_CONTROLLER_BUTTON_DPAD_UP:
-            *input = RECOMP_RUNTIME_UI_INPUT_UP;
-            return true;
-        case SDL_CONTROLLER_BUTTON_DPAD_DOWN:
-            *input = RECOMP_RUNTIME_UI_INPUT_DOWN;
-            return true;
-        case SDL_CONTROLLER_BUTTON_DPAD_LEFT:
-            *input = RECOMP_RUNTIME_UI_INPUT_LEFT;
-            return true;
-        case SDL_CONTROLLER_BUTTON_DPAD_RIGHT:
-            *input = RECOMP_RUNTIME_UI_INPUT_RIGHT;
-            return true;
-        case SDL_CONTROLLER_BUTTON_A:
-            *input = RECOMP_RUNTIME_UI_INPUT_ACCEPT;
-            return true;
-        default:
-            return false;
-    }
-}
-
-const uint32_t* runtime_menu_overlay(RecompRuntimeUi* ui,
-                                     const uint32_t* pixels,
-                                     int width,
-                                     int height) {
-    // A toast shows over the game with the menu closed too.
-    if (!ui ||
-        (!recomp_runtime_ui_is_open(ui) && !recomp_runtime_ui_toast_visible(ui)) ||
-        !pixels || width <= 0 || height <= 0) {
-        return pixels;
-    }
-    static std::vector<uint32_t> surface;
-    const size_t count = static_cast<size_t>(width) *
-                         static_cast<size_t>(height);
-    surface.assign(pixels, pixels + count);
-    recomp_runtime_ui_render_argb8888(
-        ui, surface.data(), width, height, width * sizeof(uint32_t));
-    return surface.data();
 }
 
 struct FrontendPresentation {
@@ -3064,17 +2964,15 @@ void draw_separate_screen(FrontendPresentation& presentation, int screen,
 }
 
 // Single-screen layout: present presentation.shown_screen, with the other LCD
-// as an optional inset next to it, and the runtime menu, virtual stylus (bottom
-// LCD only) and savestate notice on the shown screen.
+// as an optional inset next to it, and the virtual stylus (bottom LCD only)
+// and savestate notice on the shown screen.
 // The GL window has no SDL renderer, so there the stylus and notice go
-// through the presenter's overlay layer, and an open runtime menu (drawn into
-// the CPU pixels) makes that frame present the CPU composite instead of HD.
+// through the presenter's overlay layer.
 PresentationTicks present_single_screen(FrontendPresentation& presentation,
                                         const uint32_t* top_pixels,
                                         int top_width,
                                         const uint32_t* bottom_pixels,
                                         int bottom_width,
-                                        RecompRuntimeUi* runtime_ui,
                                         bool virtual_stylus_visible,
                                         float virtual_stylus_x,
                                         float virtual_stylus_y,
@@ -3087,15 +2985,11 @@ PresentationTicks present_single_screen(FrontendPresentation& presentation,
     const uint32_t* other_pixels = shown ? top_pixels : bottom_pixels;
     const int other_width = shown ? top_width : bottom_width;
     const bool stylus = virtual_stylus_visible && shown == 1;
-    const bool menu_open = runtime_ui && recomp_runtime_ui_is_open(runtime_ui);
-    pixels = runtime_menu_overlay(runtime_ui, pixels, width, kScreenHeight);
     if (presentation.gl_top) {
 #if defined(NDS_HAVE_COMPUTE_RENDERER)
         // The OBJ-only direct path draws engine A on the top LCD only.
         NdsGpu2dDirectFrame direct_frame{};
-        const bool direct = shown == 0 && !menu_open &&
-                            nds_gpu2d_direct_frame(&direct_frame);
-        if (menu_open) nds_gpu2d_invalidate_hd_frame();
+        const bool direct = shown == 0 && nds_gpu2d_direct_frame(&direct_frame);
         static std::vector<uint32_t> overlay;
         const bool want_overlay =
             stylus || (savestate_notice && *savestate_notice) ||
@@ -3126,9 +3020,7 @@ PresentationTicks present_single_screen(FrontendPresentation& presentation,
         nds_compute_host_set_inset(other_pixels,
                                    static_cast<unsigned>(other_width),
                                    presentation.inset_percent);
-        // An open menu is drawn into `pixels`, the full composite, and has
-        // already dropped the split along with the HD surfaces.
-        const bool layer_set = !menu_open && !direct && set_fixed_layers(width);
+        const bool layer_set = !direct && set_fixed_layers(width);
         NdsGpu2dFixedLayersFrame fixed_shown{};
         if (layer_set && shown == 1 &&
             nds_gpu2d_fixed_layers_frame(&fixed_shown)) {
@@ -3200,7 +3092,6 @@ PresentationTicks present_screens(FrontendPresentation& presentation,
                                   int top_width,
                                   const uint32_t* bottom_pixels,
                                   int bottom_width,
-                                  RecompRuntimeUi* runtime_ui,
                                   bool virtual_stylus_visible,
                                   float virtual_stylus_x,
                                   float virtual_stylus_y,
@@ -3214,7 +3105,7 @@ PresentationTicks present_screens(FrontendPresentation& presentation,
     if (presentation.single)
         return present_single_screen(
             presentation, top_pixels, top_width, bottom_pixels, bottom_width,
-            runtime_ui, virtual_stylus_visible, virtual_stylus_x,
+            virtual_stylus_visible, virtual_stylus_x,
             virtual_stylus_y, savestate_notice, fps_counter);
     if (presentation.gl_top) {
 #if defined(NDS_HAVE_COMPUTE_RENDERER)
@@ -3247,10 +3138,6 @@ PresentationTicks present_screens(FrontendPresentation& presentation,
         ticks.swap += gl_ticks.swap;
         ticks.gl_setup = gl_ticks.setup;
         ticks.gl_error = gl_ticks.error;
-        const auto overlay_begin = latency ? SDL_GetPerformanceCounter() : 0;
-        bottom_pixels = runtime_menu_overlay(
-            runtime_ui, bottom_pixels, bottom_width, kScreenHeight);
-        if (latency) ticks.overlay = SDL_GetPerformanceCounter() - overlay_begin;
         uint64_t start = SDL_GetPerformanceCounter();
         SDL_UpdateTexture(presentation.textures[1], nullptr, bottom_pixels,
                           bottom_width * sizeof(uint32_t));
@@ -3267,8 +3154,6 @@ PresentationTicks present_screens(FrontendPresentation& presentation,
 #endif
         return ticks;
     }
-    top_pixels = runtime_menu_overlay(
-        runtime_ui, top_pixels, top_width, kScreenHeight);
     uint64_t start = SDL_GetPerformanceCounter();
     SDL_UpdateTexture(presentation.textures[0], nullptr, top_pixels,
                       top_width * sizeof(uint32_t));
@@ -3729,7 +3614,7 @@ int nds_run_interactive_frontend(const NdsFrontendOptions& initial_options) {
     publish_keys();
     nds_set_touch(0, 0, false);
     bool running = true;
-    RuntimeMenuState runtime_menu_state{&options, &running, false};
+    RuntimeMenuState runtime_menu_state{&options};
     runtime_menu_state.audio = &audio;
     runtime_menu_state.audio_queue = &audio_queue;
 #if defined(NDS_HAVE_COMPUTE_RENDERER)
@@ -3742,61 +3627,52 @@ int nds_run_interactive_frontend(const NdsFrontendOptions& initial_options) {
         "Original", "25%", "50%", "75%", "100%", "150%", "200%"};
     static const char* const gamepad_layout_choices[] = {
         "By label", "By position"};
-    static const RecompRuntimeUiItem runtime_menu_items[] = {
+    static const NdsMenuItem runtime_menu_items[] = {
         {kRuntimeScalingKey, "Display", "Scaling",
          "Integer keeps whole-pixel multiples; bilinear smooths to any size; "
          "nearest stays pixelated at any size.",
-         RECOMP_RUNTIME_UI_CHOICE, 0, 2, 1, scaling_choices, 3, nullptr},
+         NdsMenuItemType::Choice, 0, 2, 1, scaling_choices, 3, nullptr},
         {kRuntimeResolutionScaleKey, "Display", "Resolution scale",
          "3D detail relative to the window: 100% matches the screen, "
          "less is coarser, more supersamples.",
-         RECOMP_RUNTIME_UI_CHOICE, 0, 200, 1, resolution_scale_choices, 7,
+         NdsMenuItemType::Choice, 0, 200, 1, resolution_scale_choices, 7,
          kResolutionScaleChoiceValues},
         {kRuntimeSecondScreenKey, "Display", "Second screen size",
          "The other screen beside the main one, as a percent of its size. "
          "0 hides it.",
-         RECOMP_RUNTIME_UI_INT, 0, 60, 5, nullptr, 0, nullptr},
+         NdsMenuItemType::Int, 0, 60, 5, nullptr, 0, nullptr},
         {kRuntimeShowFpsKey, "Display", "Show FPS",
          "New 3D images per second in the corner of the screen, updated "
          "once a second. Reads 0 when nothing 3D is moving.",
-         RECOMP_RUNTIME_UI_BOOL, 0, 1, 1, nullptr, 0, nullptr},
+         NdsMenuItemType::Bool, 0, 1, 1, nullptr, 0, nullptr},
         {kRuntimeSmooth3dKey, "Display", "Smooth 3D",
          "Blends in-between 3D images for games that draw below 60. Shows 3D "
          "one frame later; may glitch.",
-         RECOMP_RUNTIME_UI_BOOL, 0, 1, 1, nullptr, 0, nullptr},
+         NdsMenuItemType::Bool, 0, 1, 1, nullptr, 0, nullptr},
         {kRuntimeVolumeKey, "Audio", "Volume",
          "Host output level in percent; the game keeps running at full mix.",
-         RECOMP_RUNTIME_UI_INT, 0, 100, 5, nullptr, 0, nullptr},
+         NdsMenuItemType::Int, 0, 100, 5, nullptr, 0, nullptr},
         {kRuntimeMuteKey, "Audio", "Mute",
          "Silence all audio output.",
-         RECOMP_RUNTIME_UI_BOOL, 0, 1, 1, nullptr, 0, nullptr},
+         NdsMenuItemType::Bool, 0, 1, 1, nullptr, 0, nullptr},
         {kRuntimeGamepadLayoutKey, "Input", "Gamepad layout",
          "By label, pad A is DS A. By position, the pad's right button is "
          "DS A, as on a DS.",
-         RECOMP_RUNTIME_UI_CHOICE, 0, 1, 1, gamepad_layout_choices, 2,
+         NdsMenuItemType::Choice, 0, 1, 1, gamepad_layout_choices, 2,
          nullptr},
         {kRuntimeMouseSensitivityKey, "Input", "Mouse sensitivity",
          "Prime Controls relative aim speed.",
-         RECOMP_RUNTIME_UI_INT, 10, 400, 1, nullptr, 0, nullptr},
+         NdsMenuItemType::Int, 10, 400, 1, nullptr, 0, nullptr},
     };
-    static const RecompRuntimeUiItem runtime_menu_system_items[] = {
-        {kRuntimeResumeKey, "System", "Resume game",
-         "Close settings and return to the game.",
-         RECOMP_RUNTIME_UI_ACTION, 0, 0, 0, nullptr, 0, nullptr},
-        {kRuntimeQuitKey, "System", "Quit",
-         "Close the runner.",
-         RECOMP_RUNTIME_UI_ACTION, 0, 0, 0, nullptr, 0, nullptr},
-    };
-    // The title's own settings, then Netplay when the lobby thread runs,
-    // go before System.
-    std::vector<RecompRuntimeUiItem> runtime_menu_list(
+    // Then the title's own settings, then Netplay when the lobby thread runs.
+    std::vector<NdsMenuItem> runtime_menu_list(
         std::begin(runtime_menu_items), std::end(runtime_menu_items));
     // A title that decides smoothing itself (title_settings.h) shows its own
     // setting for it instead.
     if (nds_title_smooth_3d_owned())
         runtime_menu_list.erase(
             std::remove_if(runtime_menu_list.begin(), runtime_menu_list.end(),
-                           [](const RecompRuntimeUiItem& item) {
+                           [](const NdsMenuItem& item) {
                                return std::strcmp(item.key,
                                                   kRuntimeSmooth3dKey) == 0;
                            }),
@@ -3824,47 +3700,13 @@ int nds_run_interactive_frontend(const NdsFrontendOptions& initial_options) {
         runtime_menu_list.push_back(
             {title_menu_keys[i].c_str(), "Game", setting.label,
              setting.description,
-             choice ? RECOMP_RUNTIME_UI_CHOICE : RECOMP_RUNTIME_UI_INT,
+             choice ? NdsMenuItemType::Choice : NdsMenuItemType::Int,
              setting.minimum, setting.maximum, setting.step, setting.choices,
              setting.choice_count, setting.choice_values});
     }
 #if NDS_ONLINE
-    const bool netplay_menu = nds_netplay_menu_available();
-    if (netplay_menu) nds_netplay_menu_append_items(&runtime_menu_list);
-#endif
-    runtime_menu_list.insert(runtime_menu_list.end(),
-                             std::begin(runtime_menu_system_items),
-                             std::end(runtime_menu_system_items));
-    RecompRuntimeUiConfig runtime_menu_config{};
-    // Title from the game config's [game].name; this menu used to say
-    // "Metroid Prime Hunters" for every title.
-    runtime_menu_config.title = options.game_name.empty()
-        ? "Nintendo DS" : options.game_name.c_str();
-    runtime_menu_config.subtitle = "Runtime Settings";
-    runtime_menu_config.items = runtime_menu_list.data();
-    runtime_menu_config.item_count = runtime_menu_list.size();
-    runtime_menu_config.callbacks.context = &runtime_menu_state;
-    runtime_menu_config.callbacks.get_value = runtime_menu_get_value;
-    runtime_menu_config.callbacks.set_value = runtime_menu_set_value;
-    runtime_menu_config.callbacks.run_action = runtime_menu_run_action;
-    runtime_menu_config.callbacks.is_enabled = runtime_menu_is_enabled;
-    runtime_menu_config.callbacks.save = runtime_menu_save;
-#if NDS_ONLINE
-    if (netplay_menu)
-        runtime_menu_config.callbacks.visibility_changed =
-            [](void*, int open) { nds_netplay_menu_visibility(open != 0); };
-#endif
-    runtime_menu_config.theme = "nds";
-    runtime_menu_config.accept_label = "A / Enter";
-    runtime_menu_config.back_label = "B / Backspace";
-    RecompRuntimeUi* runtime_ui =
-        recomp_runtime_ui_create(&runtime_menu_config);
-    if (!runtime_ui) {
-        std::fprintf(stderr, "[sdl] runtime menu unavailable\n");
-    }
-    runtime_menu_state.ui = runtime_ui;
-#if NDS_ONLINE
-    bool netplay_text_input = false;
+    if (nds_netplay_menu_available())
+        nds_netplay_menu_append_items(&runtime_menu_list);
 #endif
     bool compute_failed = false;
     bool mouse_down = false;
@@ -3902,13 +3744,6 @@ int nds_run_interactive_frontend(const NdsFrontendOptions& initial_options) {
     bool mph_pad_trigger_left_held = false;
     bool mph_pad_trigger_right_held = false;
     uint64_t mph_pad_aim_writes = 0;
-    bool runtime_stick_held = false;
-    // Back + Start opens the menu; Start alone belongs to the game.
-    bool pad_back_held = false;
-    bool pad_start_held = false;
-    RecompRuntimeUiInput runtime_stick_input =
-        RECOMP_RUNTIME_UI_INPUT_DOWN;
-    uint32_t runtime_stick_frames = 0;
     auto mph_prime_active = [&]() {
         return mph_prime_controls_available &&
                (relative_mouse.captured() || mph_prime_pad_engaged);
@@ -4197,35 +4032,6 @@ int nds_run_interactive_frontend(const NdsFrontendOptions& initial_options) {
     auto clear_tab_turbo = [&]() { turbo_pressed = false; };
     auto is_shift_key = [](SDL_Scancode key) {
         return key == SDL_SCANCODE_LSHIFT || key == SDL_SCANCODE_RSHIFT;
-    };
-    auto runtime_menu_open = [&]() {
-        return runtime_ui && recomp_runtime_ui_is_open(runtime_ui);
-    };
-    auto clear_gameplay_input_for_runtime_menu = [&]() {
-        release_relative_mouse();
-        keyboard_pressed = 0;
-        controller_pressed = 0;
-        stick_pressed = 0;
-        mouse_pressed = 0;
-        mph_prime_pressed = 0;
-        mph_prime_pad_engaged = false;
-        mph_pad_trigger_left_held = false;
-        mph_pad_trigger_right_held = false;
-        virtual_stylus_pad_trigger_left_held = false;
-        virtual_stylus_pad_trigger_right_held = false;
-        turbo_pressed = false;
-        clear_mph_prime_controls();
-        clear_virtual_stylus();
-        nds_set_touch(0, 0, false);
-        publish_keys();
-    };
-    auto finish_runtime_menu_input = [&](bool was_open) {
-        if (runtime_menu_state.close_requested) {
-            runtime_menu_state.close_requested = false;
-            if (runtime_ui) recomp_runtime_ui_close(runtime_ui);
-        }
-        if (!was_open && runtime_menu_open())
-            clear_gameplay_input_for_runtime_menu();
     };
     uint32_t audio_pace_floor = kAudioQueueFrames;
     // The steady-state queue target. kAudioQueueFrames (~63 ms) leaves about
@@ -4596,11 +4402,6 @@ int nds_run_interactive_frontend(const NdsFrontendOptions& initial_options) {
                 relative_mouse_selftest_stage = 10;
             }
         }
-#if NDS_ONLINE
-        if (netplay_menu) {
-            nds_netplay_menu_tick(runtime_ui);
-        }
-#endif
         runtime_menu_serve_title(&runtime_menu_state, runtime_menu_list);
         {
             bool reset_console = false;
@@ -4618,25 +4419,6 @@ int nds_run_interactive_frontend(const NdsFrontendOptions& initial_options) {
                 publish_keys();
             }
         }
-#if NDS_ONLINE
-        if (netplay_menu) {
-            const bool editing = nds_netplay_menu_editing();
-            if (editing != netplay_text_input) {
-                netplay_text_input = editing;
-                for (SDL_Window* window : presentation.windows) {
-                    if (!window) continue;
-#if defined(NDS_HAVE_SDL3)
-                    if (editing) SDL_StartTextInput(window);
-                    else SDL_StopTextInput(window);
-#endif
-                }
-#if !defined(NDS_HAVE_SDL3)
-                if (editing) SDL_StartTextInput();
-                else SDL_StopTextInput();
-#endif
-            }
-        }
-#endif
         if (window_resize_save_at &&
             SDL_GetPerformanceCounter() >= window_resize_save_at) {
             window_resize_save_at = 0;
@@ -4680,44 +4462,6 @@ int nds_run_interactive_frontend(const NdsFrontendOptions& initial_options) {
                     presentation_window_focused[index] = true;
                 focus_release_pending = false;
             }
-#if NDS_ONLINE
-            // The lobby name editor has the keyboard (and A / B) to itself.
-            if (nds_netplay_menu_editing()) {
-#if defined(NDS_HAVE_SDL3)
-                const bool text_event = event.type == SDL_EVENT_TEXT_INPUT;
-#else
-                const bool text_event = event.type == SDL_TEXTINPUT;
-#endif
-                bool consumed = true;
-                if (text_event) {
-                    nds_netplay_menu_edit_text(event.text.text);
-                } else if (event.type == SDL_KEYDOWN) {
-                    const SDL_Scancode key = sdl_event_scancode(event);
-                    if (key == SDL_SCANCODE_RETURN ||
-                        key == SDL_SCANCODE_KP_ENTER) {
-                        if (nds_netplay_menu_edit_key(NdsNetplayEditKey::Commit))
-                            runtime_menu_save(&runtime_menu_state);
-                    } else if (key == SDL_SCANCODE_ESCAPE) {
-                        nds_netplay_menu_edit_key(NdsNetplayEditKey::Cancel);
-                    } else if (key == SDL_SCANCODE_BACKSPACE) {
-                        nds_netplay_menu_edit_key(NdsNetplayEditKey::Erase);
-                    }
-                } else if (event.type == SDL_CONTROLLERBUTTONDOWN) {
-                    const auto button = static_cast<SDL_GameControllerButton>(
-                        sdl_controller_button(event));
-                    if (button == SDL_CONTROLLER_BUTTON_A) {
-                        if (nds_netplay_menu_edit_key(NdsNetplayEditKey::Commit))
-                            runtime_menu_save(&runtime_menu_state);
-                    } else if (button == SDL_CONTROLLER_BUTTON_B) {
-                        nds_netplay_menu_edit_key(NdsNetplayEditKey::Cancel);
-                    }
-                } else {
-                    consumed = event.type == SDL_KEYUP ||
-                               event.type == SDL_CONTROLLERBUTTONUP;
-                }
-                if (consumed) continue;
-            }
-#endif
             // NDS_DEBUG_KEYEV=1: trace every polled keyboard event to stderr.
             // Exists because an injected key that vanishes between
             // SDL_PushEvent (debug pump, counted) and this loop is otherwise
@@ -4735,7 +4479,7 @@ int nds_run_interactive_frontend(const NdsFrontendOptions& initial_options) {
                              (int)event.key.repeat);
             }
             // Alt+Enter toggles fullscreen on the primary window, whatever
-            // the menu or the game is doing; the key never reaches either.
+            // the game is doing; the key never reaches it.
             if ((event.type == SDL_KEYDOWN || event.type == SDL_KEYUP) &&
                 sdl_event_alt(event)) {
                 const SDL_Scancode alt_key = sdl_event_scancode(event);
@@ -4762,24 +4506,6 @@ int nds_run_interactive_frontend(const NdsFrontendOptions& initial_options) {
                             persist_fullscreen(options);
                         }
                     }
-                    continue;
-                }
-            }
-            if (event.type == SDL_KEYDOWN || event.type == SDL_KEYUP) {
-                RecompRuntimeUiInput menu_input{};
-                const SDL_Scancode scancode = sdl_event_scancode(event);
-                const bool was_open = runtime_menu_open();
-                const bool known = runtime_menu_key_input(
-                    scancode, &menu_input);
-                if (known && runtime_ui &&
-                    recomp_runtime_ui_handle_input(
-                        runtime_ui, menu_input, event.type == SDL_KEYDOWN,
-                        event.key.repeat)) {
-                    finish_runtime_menu_input(was_open);
-                    continue;
-                }
-                if (was_open) {
-                    finish_runtime_menu_input(was_open);
                     continue;
                 }
             }
@@ -4849,11 +4575,10 @@ int nds_run_interactive_frontend(const NdsFrontendOptions& initial_options) {
                             nds_set_touch(0, 0, false);
                         }
                     }
-                } else if (scancode == SDL_SCANCODE_ESCAPE) {
-                    if (relative_mouse.captured() || virtual_stylus_active())
-                        release_relative_mouse();
-                    else
-                        running = false;
+                } else if (scancode == SDL_SCANCODE_ESCAPE &&
+                           (relative_mouse.captured() ||
+                            virtual_stylus_active())) {
+                    release_relative_mouse();
                 } else if (process_virtual_stylus_key(scancode, true)) {
                     // Consumed by the generic lower-screen pointer helper.
                 } else if (presentation.single &&
@@ -4917,8 +4642,6 @@ int nds_run_interactive_frontend(const NdsFrontendOptions& initial_options) {
             }
             if (event.type == SDL_CONTROLLERDEVICEREMOVED &&
                 controller && sdl_controller_device_id(event) == controller_id) {
-                pad_back_held = false;
-                pad_start_held = false;
                 SDL_GameControllerClose(controller);
                 controller = nullptr;
                 controller_id = -1;
@@ -4928,36 +4651,6 @@ int nds_run_interactive_frontend(const NdsFrontendOptions& initial_options) {
                 clear_mph_prime_controls();
                 clear_virtual_stylus();
                 publish_keys();
-            }
-            if (event.type == SDL_CONTROLLERBUTTONDOWN ||
-                event.type == SDL_CONTROLLERBUTTONUP) {
-                RecompRuntimeUiInput menu_input{};
-                const bool was_open = runtime_menu_open();
-                const auto button = static_cast<SDL_GameControllerButton>(
-                    sdl_controller_button(event));
-                const bool down = event.type == SDL_CONTROLLERBUTTONDOWN;
-                if (button == SDL_CONTROLLER_BUTTON_BACK)
-                    pad_back_held = down;
-                if (button == SDL_CONTROLLER_BUTTON_START)
-                    pad_start_held = down;
-                if (!was_open) {
-                    if (down && pad_back_held && pad_start_held && runtime_ui &&
-                        recomp_runtime_ui_handle_input(
-                            runtime_ui, RECOMP_RUNTIME_UI_INPUT_TOGGLE, 1, 0)) {
-                        finish_runtime_menu_input(was_open);
-                        continue;
-                    }
-                } else if (runtime_menu_controller_input(button, &menu_input) &&
-                           runtime_ui &&
-                           recomp_runtime_ui_handle_input(
-                               runtime_ui, menu_input, down, false)) {
-                    finish_runtime_menu_input(was_open);
-                    continue;
-                }
-                if (was_open) {
-                    finish_runtime_menu_input(was_open);
-                    continue;
-                }
             }
             if (event.type == SDL_CONTROLLERBUTTONDOWN) {
                 const auto button = static_cast<SDL_GameControllerButton>(
@@ -4989,14 +4682,8 @@ int nds_run_interactive_frontend(const NdsFrontendOptions& initial_options) {
                     publish_keys();
                 }
             }
-            if (runtime_menu_open() &&
-                (event.type == SDL_MOUSEBUTTONDOWN ||
-                 event.type == SDL_MOUSEBUTTONUP ||
-                 event.type == SDL_MOUSEMOTION)) {
-                continue;
-            }
             // Wheel up/down raises/lowers a title's zoom value (title_settings.h).
-            if (event.type == SDL_MOUSEWHEEL && !runtime_menu_open()) {
+            if (event.type == SDL_MOUSEWHEEL) {
                 // Scroll up lowers the value (zooms in), down raises it.
                 const float wheel = static_cast<float>(event.wheel.y) *
                     (event.wheel.direction == 1 ? -1.0f : 1.0f);
@@ -5300,7 +4987,7 @@ int nds_run_interactive_frontend(const NdsFrontendOptions& initial_options) {
         mph_pad_frame_x = 0;
         mph_pad_frame_y = 0;
         // The raw left stick for title hooks, while it drives the D-pad.
-        if (!controller || runtime_menu_open()) {
+        if (!controller) {
             nds_title_set_left_stick(0, 0, false);
         } else {
             nds_title_set_left_stick(
@@ -5317,74 +5004,30 @@ int nds_run_interactive_frontend(const NdsFrontendOptions& initial_options) {
                 controller, SDL_CONTROLLER_AXIS_LEFTX) / 32767.0f;
             const float ly = SDL_GameControllerGetAxis(
                 controller, SDL_CONTROLLER_AXIS_LEFTY) / 32767.0f;
-            const bool menu_open = runtime_menu_open();
-            if (menu_open) {
-                if (stick_pressed != 0) {
-                    stick_pressed = 0;
+            auto stick_dir = [&](float value, uint16_t bit, bool positive) {
+                const float v = positive ? value : -value;
+                const bool held = (stick_pressed & bit) != 0;
+                const bool next = v > (held ? 0.35f : 0.5f);
+                if (next != held) {
+                    if (next) stick_pressed |= bit;
+                    else stick_pressed &= static_cast<uint16_t>(~bit);
                     publish_keys();
                 }
-                bool have_stick_input = false;
-                RecompRuntimeUiInput stick_input =
-                    RECOMP_RUNTIME_UI_INPUT_DOWN;
-                const float ax = std::fabs(lx);
-                const float ay = std::fabs(ly);
-                if (std::max(ax, ay) > 0.5f) {
-                    have_stick_input = true;
-                    if (ax > ay)
-                        stick_input = lx > 0.0f
-                            ? RECOMP_RUNTIME_UI_INPUT_RIGHT
-                            : RECOMP_RUNTIME_UI_INPUT_LEFT;
-                    else
-                        stick_input = ly > 0.0f
-                            ? RECOMP_RUNTIME_UI_INPUT_DOWN
-                            : RECOMP_RUNTIME_UI_INPUT_UP;
-                }
-                if (have_stick_input) {
-                    const bool same = runtime_stick_held &&
-                                      runtime_stick_input == stick_input;
-                    if (!same) {
-                        runtime_stick_held = true;
-                        runtime_stick_input = stick_input;
-                        runtime_stick_frames = 0;
-                        recomp_runtime_ui_handle_input(
-                            runtime_ui, stick_input, 1, 0);
-                    } else if (++runtime_stick_frames >= 18 &&
-                               ((runtime_stick_frames - 18) % 5) == 0) {
-                        recomp_runtime_ui_handle_input(
-                            runtime_ui, stick_input, 1, 1);
-                    }
-                } else {
-                    runtime_stick_held = false;
-                    runtime_stick_frames = 0;
-                }
-            } else {
-                runtime_stick_held = false;
-                runtime_stick_frames = 0;
-                auto stick_dir = [&](float value, uint16_t bit, bool positive) {
-                    const float v = positive ? value : -value;
-                    const bool held = (stick_pressed & bit) != 0;
-                    const bool next = v > (held ? 0.35f : 0.5f);
-                    if (next != held) {
-                        if (next) stick_pressed |= bit;
-                        else stick_pressed &= static_cast<uint16_t>(~bit);
-                        publish_keys();
-                    }
-                };
-                stick_dir(lx, 1u << 4, true);    // Right
-                stick_dir(lx, 1u << 5, false);   // Left
-                stick_dir(ly, 1u << 6, false);   // Up (SDL Y axis points down)
-                stick_dir(ly, 1u << 7, true);    // Down
-            }
+            };
+            stick_dir(lx, 1u << 4, true);    // Right
+            stick_dir(lx, 1u << 5, false);   // Left
+            stick_dir(ly, 1u << 6, false);   // Up (SDL Y axis points down)
+            stick_dir(ly, 1u << 7, true);    // Down
 
             // Right stick up/down -> a title's zoom (title_settings.h): up
             // lowers the value, down raises it, at a speed that follows the
             // deflection (up to 15 units, 1.5%, a frame). The stick belongs to the
-            // virtual stylus while it is held (LT), to Prime's aim, and to
-            // the runtime menu while that is open. The settings are saved
-            // when the stick is released, and every half second meanwhile.
+            // virtual stylus while it is held (LT) and to Prime's aim. The
+            // settings are saved when the stick is released, and every half
+            // second meanwhile.
             {
                 float ry = 0.0f;
-                if (!menu_open && !virtual_stylus_active() &&
+                if (!virtual_stylus_active() &&
                     !mph_prime_controls_available) {
                     ry = SDL_GameControllerGetAxis(
                         controller, SDL_CONTROLLER_AXIS_RIGHTY) / 32767.0f;
@@ -5415,7 +5058,7 @@ int nds_run_interactive_frontend(const NdsFrontendOptions& initial_options) {
                 }
             }
 
-            if (!menu_open && virtual_stylus_available) {
+            if (virtual_stylus_available) {
                 const float rx = SDL_GameControllerGetAxis(
                     controller, SDL_CONTROLLER_AXIS_RIGHTX) / 32767.0f;
                 const float ry = SDL_GameControllerGetAxis(
@@ -5463,7 +5106,7 @@ int nds_run_interactive_frontend(const NdsFrontendOptions& initial_options) {
                 }
             }
 
-            if (!menu_open && mph_prime_controls_available) {
+            if (mph_prime_controls_available) {
                 // Right stick -> camera aim; triggers act as bindable
                 // pseudo-buttons (defaults: RT shoot, LT scan-fire).
                 const float rx = SDL_GameControllerGetAxis(
@@ -5524,8 +5167,6 @@ int nds_run_interactive_frontend(const NdsFrontendOptions& initial_options) {
                 }
             }
         } else {
-            runtime_stick_held = false;
-            runtime_stick_frames = 0;
             if (stick_pressed != 0) {
                 stick_pressed = 0;
                 publish_keys();
@@ -5647,7 +5288,7 @@ int nds_run_interactive_frontend(const NdsFrontendOptions& initial_options) {
                 const int binding = options.gamepad_bindings[row];
                 if (binding < 100 || binding > 111) continue;
                 axis_rows |= kNdsButtonMasks[row];
-                if (!controller || runtime_menu_open() || virtual_stylus_active() ||
+                if (!controller || virtual_stylus_active() ||
                     mph_prime_controls_available) continue;
                 const int value = SDL_GameControllerGetAxis(controller,
                     static_cast<decltype(SDL_CONTROLLER_AXIS_LEFTX)>((binding - 100) / 2));
@@ -5886,7 +5527,6 @@ int nds_run_interactive_frontend(const NdsFrontendOptions& initial_options) {
             const PresentationTicks synthetic_ticks = present_screens(
                 presentation, blend_cache.blended[0].data(), top_width,
                 blend_cache.blended[1].data(), bottom_width,
-                runtime_ui,
                 mph_prime_virtual_stylus || generic_virtual_stylus,
                 mph_virtual_x, mph_virtual_y,
                 savestate_notice.empty() ? nullptr : savestate_notice.c_str(),
@@ -5926,7 +5566,6 @@ int nds_run_interactive_frontend(const NdsFrontendOptions& initial_options) {
         const PresentationTicks presentation_ticks = present_screens(
             presentation, top_pixels, top_width,
             bottom_pixels, bottom_width,
-            runtime_ui,
             mph_prime_virtual_stylus || generic_virtual_stylus,
             mph_virtual_x, mph_virtual_y,
             savestate_notice.empty() ? nullptr : savestate_notice.c_str(),
@@ -6351,10 +5990,6 @@ int nds_run_interactive_frontend(const NdsFrontendOptions& initial_options) {
     nds_compute_host_stop();
 #endif
     if (controller) SDL_GameControllerClose(controller);
-    if (runtime_ui) {
-        recomp_runtime_ui_destroy(runtime_ui);
-        runtime_ui = nullptr;
-    }
     // A resize still inside its settle window when the user quit.
     if (window_resize_save_at && !presentation.separate)
         persist_window_size(options, presentation.windows[0]);

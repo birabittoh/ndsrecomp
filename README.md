@@ -235,8 +235,8 @@ arguments (or only a `.nds` path) then asks for the ROM once and plays, with
 `settings.toml`, saves, savestates and logs in one per-title folder:
 `~/.local/share/<app_name>`, `Documents\<app_name>` on Windows,
 `~/Library/Application Support/<app_name>` on macOS, or the executable's own
-folder if `portable.txt` sits next to it. The runtime menu writes its changes
-to `settings.toml`, keeping comments. Any other command line ignores that file.
+folder if `portable.txt` sits next to it. Runtime settings changed in game are
+written to `settings.toml`, keeping comments. Any other command line ignores that file.
 See `runner/src/player_launch.h`.
 
 ### Interactive display configuration
@@ -315,7 +315,8 @@ never below 1x); `bilinear` filters linearly to the exact rect, and `nearest`
 point-samples into that same rect (pixelated at any size, with uneven pixel
 widths when the factor is not whole). With the GL
 presenter, bilinear resamples the composed frame at its own sample density,
-so HD 3D keeps its detail. Both are in the runtime menu (Esc) and have
+so HD 3D keeps its detail. Both are runtime settings, which a title can show
+in its own menus (`runner/src/title_menu.h`), and have
 `NDS_WINDOW_MODE` / `NDS_SCALING` and `--window-mode` / `--scaling`
 overrides.
 
@@ -329,8 +330,8 @@ land on whole screen pixels. It follows window resizes, fullscreen and
 window-mode changes, applied 250 ms after the size settles and only when the
 whole multiplier changes (each change rebuilds the 3D renderer). Only 3D
 gains density; the 2D layers stay native and are upscaled. It needs the
-OpenGL compute renderer with the `separate` or `single` layout, is in the
-runtime menu, and has `NDS_RESOLUTION_SCALE` / `--resolution-scale`
+OpenGL compute renderer with the `separate` or `single` layout, is a
+runtime setting, and has `NDS_RESOLUTION_SCALE` / `--resolution-scale`
 overrides. `internal_resolution` (1..16) instead pins the multiplier; the two
 are exclusive within one source, and the later source (TOML < env < CLI)
 wins. The performance governor drops 3D to 1x when frames wait on the GPU, and
@@ -342,11 +343,8 @@ restores it once that wait falls again. `[display] performance_governor`
 `labels` (the default) matches names, so a pad's A is DS A; `positional`
 matches the diamond instead, so the bottom button is DS B and the right one
 DS A, which is what Xbox-style pads need to feel like a DS. An explicit
-`--gamepad-bindings` wins over it and greys out the runtime menu's Input >
-Gamepad layout row, which otherwise switches it live. The menu keeps its own
-accept/back buttons either way. On a pad, Back + Start opens that menu (Esc
-on the keyboard); Start alone is DS Start. Press Back first: until the second
-button lands, the game sees the first one, so it gets a brief DS Select.
+`--gamepad-bindings` wins over it and disables the Input > Gamepad layout
+runtime setting, which otherwise switches it live.
 
 `second_screen_size` (0..60, default 0) shows the other LCD in the `single`
 layout, to the right of the main screen and bottom-aligned, as a percent of its
@@ -355,20 +353,20 @@ screen, centred. The pair is fitted as one image, so `window_mode` and
 `scaling` apply to it and the main screen is never covered. The percent is a
 minimum: with `window_mode = "letterbox"`, space the main screen can't use goes
 to the second screen too, up to the main screen's size. Clicking the inset
-touches the bottom LCD when that is the screen it shows. It is also in the
-runtime menu (Esc), along with the audio volume and mute.
+touches the bottom LCD when that is the screen it shows. It is also a runtime
+setting, along with the audio volume and mute.
 
 `show_fps` (default false) draws the 3D frame rate in the top-left of the
 screen, updated once a second: how many new 3D images the game finished, not
 how many frames were presented, so a game drawing 3D at 30 reads 30 on a 60 Hz
-DS screen, and a still or 2D scene reads 0. It is also in the runtime menu,
+DS screen, and a still or 2D scene reads 0. It is also a runtime setting,
 under Display. With two screens showing, the counter is on the bottom one.
 
 `smooth_3d` (default false, experimental) is for games that draw 3D below the
 DS frame rate. A game at 30 holds each image for two DS frames, so the second
 one is filled with an image halfway between the last two, built by pairing
 their polygons. 3D is shown one DS frame later for it, and the guest never sees
-the blended images. It is also in the runtime menu, so it can be compared live;
+the blended images. It is also a runtime setting, so it can be compared live;
 `show_fps` counts the blended images too. Pairs that are too different, such as
 a scene cut, show the real image instead.
 

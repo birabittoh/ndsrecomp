@@ -1,23 +1,22 @@
-// title_menu.h -- the runtime menu's rows, for a title that shows them in
+// title_menu.h -- the runtime settings' rows, for a title that shows them in
 // its own menus.
 //
-// The runtime menu (recomp-ui) and its values live on the frontend thread.
-// A title hook that draws the same settings with the game's own windows
+// The runtime settings (runtime_menu_item.h) and their values live on the
+// frontend thread. A title hook that draws them with the game's own windows
 // runs on the title thread, so the two meet here: the frontend publishes a
 // copy of the rows once per host frame, and the hook asks for a change,
-// which the frontend applies (and saves) on its next frame through the
-// menu's own callbacks. A change therefore shows up in the rows one host
-// frame later.
+// which the frontend applies (and saves) on its next frame. A change
+// therefore shows up in the rows one host frame later.
 //
 // Like a title setting (title_settings.h), this is host state a hook can
 // read: a hook that only draws it and sends changes back leaves the guest
-// as deterministic as the menu does.
+// deterministic.
 #pragma once
 
 #include <string>
 #include <vector>
 
-enum class NdsTitleMenuRowType { Bool, Int, Choice, Action, Text };
+enum class NdsTitleMenuRowType { Bool, Int, Choice, Action };
 
 struct NdsTitleMenuRow {
     std::string key;          // "display.scaling", "title.<key>", ...
