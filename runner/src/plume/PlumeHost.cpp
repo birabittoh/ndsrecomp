@@ -183,6 +183,9 @@ SDL_MetalView g_metal_view = nullptr;
 bool g_active = false;
 bool g_visible = false;
 bool g_resize_pending = false;
+// A resize failed for a reason other than a zero-sized window; logged once
+// per failure, and again when it recovers.
+bool g_resize_failing = false;
 NdsWindowMode g_window_mode = NdsWindowMode::Letterbox;
 NdsScalingFilter g_scaling = NdsScalingFilter::Integer;
 const uint32_t* g_overlay_pixels = nullptr;
@@ -249,21 +252,52 @@ void create_framebuffers() {
             g_backend.device->createCommandSemaphore());
 }
 
+// A minimised window has a 0x0 client area: nothing to draw into, and a
+// swap chain cannot take that size. Checked before the swap chain is
+// touched, so it keeps its images and a restore at the same size needs no
+// resize at all. Hidden windows (NDS_FRONTEND_HIDDEN checks) keep their size
+// and still present.
+bool window_presentable() {
+    if (!g_window) return false;
+    if (SDL_GetWindowFlags(g_window) & SDL_WINDOW_MINIMIZED) return false;
+    int width = 0, height = 0;
+    if (!SDL_GetWindowSizeInPixels(g_window, &width, &height)) return true;
+    return width > 0 && height > 0;
+}
+
 // Every frame is drawn at the window's current size: apply a pending or
 // required resize before acquiring. A resize replaces the swap chain images,
 // which a frame still in flight may be drawing into, so it drains the queue.
-void resize_if_needed() {
+// False when there is nothing to present into this frame.
+bool resize_if_needed() {
+    if (!window_presentable()) return false;
     RenderSwapChain& chain = *g_backend.swap_chain;
-    if (!g_resize_pending && !chain.needsResize()) return;
+    if (!g_resize_pending && !chain.needsResize()) return true;
     g_resize_pending = false;
     wait_all_slots();
     g_backend.framebuffers.clear();
     if (!chain.resize()) {
-        std::fprintf(stderr, "[plume] swap chain resize failed\n");
+        // Retried next frame. resize() reads the window size first, and a
+        // zero one (minimised between SDL's state and the OS's) is no error.
         g_resize_pending = true;
-        return;
+        const bool zero_sized = chain.getWidth() == 0 || chain.getHeight() == 0;
+        if (!zero_sized && !g_resize_failing) {
+            g_resize_failing = true;
+            std::fprintf(stderr, "[plume] swap chain resize to %ux%u failed "
+                                 "(0x%llx); retrying every frame\n",
+                         chain.getWidth(), chain.getHeight(),
+                         static_cast<unsigned long long>(chain.getLastError()));
+        }
+        return false;
     }
-    if (!chain.isEmpty()) create_framebuffers();
+    if (g_resize_failing) {
+        g_resize_failing = false;
+        std::fprintf(stderr, "[plume] swap chain resize recovered (%ux%u)\n",
+                     chain.getWidth(), chain.getHeight());
+    }
+    if (chain.isEmpty()) return false;
+    create_framebuffers();
+    return !g_backend.framebuffers.empty();
 }
 
 std::unique_ptr<RenderShader> create_shader(const void* spirv, size_t spirv_size,
@@ -536,10 +570,17 @@ bool start_presenter(SDL_Window* window) {
     // on a vblank (no tearing) but a present never blocks for a whole
     // refresh. Without MAILBOX it falls back to FIFO.
     g_backend.swap_chain->setVsyncEnabled(true);
-    // A swap chain has no images until its first resize.
+    // A swap chain has no images until its first resize. A window that
+    // starts minimised has no size to give it yet: the first frame presented
+    // after the restore resizes it.
     if (!g_backend.swap_chain->resize()) {
-        std::fprintf(stderr, "[plume] initial swap chain resize failed\n");
-        return false;
+        const bool zero_sized = g_backend.swap_chain->getWidth() == 0 ||
+                                g_backend.swap_chain->getHeight() == 0;
+        if (!zero_sized) {
+            std::fprintf(stderr, "[plume] initial swap chain resize failed\n");
+            return false;
+        }
+        g_resize_pending = true;
     }
     if (!g_backend.swap_chain->isEmpty()) create_framebuffers();
     if (!create_pipelines()) {
@@ -592,6 +633,7 @@ void release_backend() {
     g_active = false;
     g_visible = false;
     g_resize_pending = false;
+    g_resize_failing = false;
 }
 
 // Copies `width` x 192 ARGB rows into the slot's staging area for `image`,
@@ -963,9 +1005,10 @@ bool nds_compute_host_present_top(const unsigned int* fallback_pixels,
     if (width <= 0 || width > int(kMaxWidth)) return false;
     const auto diagnostic_begin = ticks->diagnostic ? SDL_GetPerformanceCounter() : 0;
 
-    resize_if_needed();
+    // Minimised (zero-sized surface) or a resize still failing: nothing to
+    // present to, and not an error. The frame is skipped, not dropped.
+    if (!resize_if_needed()) return true;
     RenderSwapChain& chain = *g_backend.swap_chain;
-    // Minimised (zero-sized surface): nothing to present to, and not an error.
     if (chain.isEmpty() || g_backend.framebuffers.empty()) return true;
     const uint32_t fb_width = chain.getWidth();
     const uint32_t fb_height = chain.getHeight();
