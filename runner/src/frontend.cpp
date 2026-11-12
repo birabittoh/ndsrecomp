@@ -1332,8 +1332,6 @@ uint64_t framebuffer_rgb_fnv(int screen) {
     return hash;
 }
 
-constexpr const char* kRuntimeMouseSensitivityKey =
-    "input.mouse_sensitivity";
 constexpr const char* kRuntimeGamepadLayoutKey = "input.gamepad_layout";
 constexpr const char* kRuntimeScalingKey = "display.scaling";
 constexpr const char* kRuntimeResolutionScaleKey = "display.resolution_scale";
@@ -1421,10 +1419,6 @@ int runtime_menu_get_value(RuntimeMenuState* state, const NdsMenuItem* item,
         *value_out = nds_title_setting_value(title);
         return 1;
     }
-    if (std::strcmp(item->key, kRuntimeMouseSensitivityKey) == 0) {
-        *value_out = state->options->relative_mouse_sensitivity;
-        return 1;
-    }
     if (std::strcmp(item->key, kRuntimeGamepadLayoutKey) == 0) {
         *value_out = state->options->gamepad_positional ? 1 : 0;
         return 1;
@@ -1482,13 +1476,6 @@ int runtime_menu_set_value(RuntimeMenuState* state, const NdsMenuItem* item,
         if (!nds_title_setting_set(title, value)) return 0;
         std::fprintf(stderr, "[title] %s -> %d\n",
                      nds_title_setting_at(title)->key, value);
-        return 1;
-    }
-    if (std::strcmp(item->key, kRuntimeMouseSensitivityKey) == 0) {
-        if (value < 10 || value > 400) return 0;
-        state->options->relative_mouse_sensitivity =
-            static_cast<uint16_t>(value);
-        std::fprintf(stderr, "[sdl] mouse sensitivity set to %d%%\n", value);
         return 1;
     }
     if (std::strcmp(item->key, kRuntimeGamepadLayoutKey) == 0) {
@@ -1571,8 +1558,6 @@ int runtime_menu_is_enabled(const RuntimeMenuState* state,
 #if NDS_ONLINE
     if (nds_netplay_menu_owns(item)) return nds_netplay_menu_is_enabled(item);
 #endif
-    if (std::strcmp(item->key, kRuntimeMouseSensitivityKey) == 0)
-        return state->options->relative_mouse_touch ? 1 : 0;
     if (std::strcmp(item->key, kRuntimeGamepadLayoutKey) == 0)
         return state->options->custom_gamepad_bindings ? 0 : 1;
     if (std::strcmp(item->key, kRuntimeResolutionScaleKey) == 0)
@@ -3784,9 +3769,6 @@ int nds_run_interactive_frontend(const NdsFrontendOptions& initial_options) {
          "DS A, as on a DS.",
          NdsMenuItemType::Choice, 0, 1, 1, gamepad_layout_choices, 2,
          nullptr},
-        {kRuntimeMouseSensitivityKey, "Input", "Mouse sensitivity",
-         "Prime Controls relative aim speed.",
-         NdsMenuItemType::Int, 10, 400, 1, nullptr, 0, nullptr},
     };
     // Then the title's own settings, then Netplay when the lobby thread runs.
     std::vector<NdsMenuItem> runtime_menu_list(
