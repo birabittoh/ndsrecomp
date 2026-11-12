@@ -1340,6 +1340,7 @@ constexpr const char* kRuntimeResolutionScaleKey = "display.resolution_scale";
 constexpr int kResolutionScaleChoiceValues[] = {0, 25, 50, 75, 100, 150, 200};
 constexpr const char* kRuntimeSecondScreenKey = "display.second_screen_size";
 constexpr const char* kRuntimeShowFpsKey = "display.show_fps";
+constexpr const char* kRuntimeFullscreenKey = "display.fullscreen";
 constexpr const char* kRuntimeSmooth3dKey = "display.smooth_3d";
 constexpr const char* kRuntimeVolumeKey = "audio.volume";
 constexpr const char* kRuntimeMuteKey = "audio.mute";
@@ -1352,6 +1353,10 @@ struct RuntimeMenuState {
     bool resolution_scale_available = false;
     const NdsAudioDevice* audio = nullptr;
     AudioQueue* audio_queue = nullptr;
+    // options->fullscreen changed from the settings; the frontend applies it
+    // to the window (and saves it) on its next frame.
+    bool fullscreen_pending = false;
+    NdsFullscreenMode fullscreen_on_mode = NdsFullscreenMode::Borderless;
 };
 
 // The title setting behind a "title.<key>" row, or -1.
@@ -1450,6 +1455,10 @@ int runtime_menu_get_value(RuntimeMenuState* state, const NdsMenuItem* item,
         *value_out = state->options->show_fps ? 1 : 0;
         return 1;
     }
+    if (std::strcmp(item->key, kRuntimeFullscreenKey) == 0) {
+        *value_out = state->options->fullscreen != NdsFullscreenMode::Off;
+        return 1;
+    }
     if (std::strcmp(item->key, kRuntimeSmooth3dKey) == 0) {
         *value_out = state->options->smooth_3d ? 1 : 0;
         return 1;
@@ -1519,6 +1528,16 @@ int runtime_menu_set_value(RuntimeMenuState* state, const NdsMenuItem* item,
         state->options->show_fps = value != 0;
         return 1;
     }
+    if (std::strcmp(item->key, kRuntimeFullscreenKey) == 0) {
+        if (value < 0 || value > 1) return 0;
+        const bool on = state->options->fullscreen != NdsFullscreenMode::Off;
+        if ((value != 0) == on) return 1;
+        // On is the mode Alt+Enter uses: the configured one, else borderless.
+        state->options->fullscreen = value ? state->fullscreen_on_mode
+                                           : NdsFullscreenMode::Off;
+        state->fullscreen_pending = true;
+        return 1;
+    }
     if (std::strcmp(item->key, kRuntimeSmooth3dKey) == 0) {
         if (value < 0 || value > 1) return 0;
         state->options->smooth_3d = value != 0;
@@ -1560,6 +1579,10 @@ int runtime_menu_is_enabled(const RuntimeMenuState* state,
 #endif
     if (std::strcmp(item->key, kRuntimeGamepadLayoutKey) == 0)
         return state->options->custom_gamepad_bindings ? 0 : 1;
+#if defined(__ANDROID__)
+    // Always fullscreen there (nds_run_interactive_frontend).
+    if (std::strcmp(item->key, kRuntimeFullscreenKey) == 0) return 0;
+#endif
     if (std::strcmp(item->key, kRuntimeResolutionScaleKey) == 0)
         return state->resolution_scale_available ? 1 : 0;
     if (std::strcmp(item->key, kRuntimeSecondScreenKey) == 0)
@@ -3737,6 +3760,8 @@ int nds_run_interactive_frontend(const NdsFrontendOptions& initial_options) {
     RuntimeMenuState runtime_menu_state{&options};
     runtime_menu_state.audio = &audio;
     runtime_menu_state.audio_queue = &audio_queue;
+    if (options.fullscreen != NdsFullscreenMode::Off)
+        runtime_menu_state.fullscreen_on_mode = options.fullscreen;
 #if defined(NDS_HAVE_COMPUTE_RENDERER)
     runtime_menu_state.resolution_scale_available =
         presentation.gl_top && nds_compute_host_active();
@@ -3748,6 +3773,9 @@ int nds_run_interactive_frontend(const NdsFrontendOptions& initial_options) {
     static const char* const gamepad_layout_choices[] = {
         "By label", "By position"};
     static const NdsMenuItem runtime_menu_items[] = {
+        {kRuntimeFullscreenKey, "Display", "Fullscreen",
+         "Fill the whole screen. Alt+Enter also toggles it.",
+         NdsMenuItemType::Bool, 0, 1, 1, nullptr, 0, nullptr},
         {kRuntimeScalingKey, "Display", "Scaling",
          "Integer keeps whole-pixel multiples; bilinear smooths to any size; "
          "nearest stays pixelated at any size.",
@@ -4520,6 +4548,21 @@ int nds_run_interactive_frontend(const NdsFrontendOptions& initial_options) {
             }
         }
         runtime_menu_serve_title(&runtime_menu_state, runtime_menu_list);
+        if (runtime_menu_state.fullscreen_pending) {
+            runtime_menu_state.fullscreen_pending = false;
+            if (presentation.windows[0] &&
+                set_window_fullscreen(presentation.windows[0],
+                                      options.fullscreen)) {
+                persist_fullscreen(options);
+            } else {
+                std::fprintf(stderr, "[sdl] cannot set fullscreen %s: %s\n",
+                             nds_fullscreen_mode_name(options.fullscreen),
+                             SDL_GetError());
+                options.fullscreen = options.fullscreen == NdsFullscreenMode::Off
+                                         ? runtime_menu_state.fullscreen_on_mode
+                                         : NdsFullscreenMode::Off;
+            }
+        }
         {
             bool reset_console = false;
             const std::string notice =
