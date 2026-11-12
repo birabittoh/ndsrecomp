@@ -1494,7 +1494,10 @@ int main(int argc, char** argv) {
     if (cli_net_capture_no_pcap) frontend_options.network.capture_no_pcap = true;
     if (!cli_net_capture_scenario.empty())
         frontend_options.network.capture_scenario = cli_net_capture_scenario;
-    bool diagnostics_enabled = true;
+    // Opt-in: the performance log, the ~36 MB host-profile bundle and the
+    // dispatch-miss log are developer artifacts, not something a stock launch
+    // should leave in logs/. Pass `--diagnostics on` to get them.
+    bool diagnostics_enabled = false;
     if (!cli_diagnostics.empty() &&
         !nds_parse_on_off(cli_diagnostics, &diagnostics_enabled)) {
         std::fprintf(stderr, "invalid --diagnostics (expected on or off)\n");
@@ -1516,7 +1519,10 @@ int main(int argc, char** argv) {
     nds_diagnostics_configure(diagnostics_enabled,
                               cli_diagnostics_dir.c_str(),
                               diagnostics_interval_ms);
-    if (!diagnostics_enabled || !tier3_interpreter_present())
+    // The coverage manifest is a player-facing feature, so it stays on by
+    // default; only an explicit `--diagnostics off` turns it off with them.
+    if ((!cli_diagnostics.empty() && !diagnostics_enabled) ||
+        !tier3_interpreter_present())
         coverage_manifest_disabled = true;
     nds_diagnostics_enable_profile_environment();
 
