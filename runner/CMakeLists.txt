@@ -466,6 +466,13 @@ set(NDS_GAME_BANK_COMPILE_OPTIONS "-w;-O2;-g0")
 if(CMAKE_C_COMPILER_ID MATCHES "Clang" AND NOT WIN32 AND NOT APPLE)
     list(APPEND NDS_GAME_BANK_COMPILE_OPTIONS "-fdirect-access-external-data")
 endif()
+# A shared runner (Android) builds the banks -fPIC, where clang ignores the
+# flag above; declaring the runtime hidden gets the same direct access
+# (src/bank_hidden_visibility.h).
+if(ANDROID)
+    list(APPEND NDS_GAME_BANK_COMPILE_OPTIONS
+        "-include;${CMAKE_CURRENT_SOURCE_DIR}/src/bank_hidden_visibility.h")
+endif()
 if(SM64DS_BANK_SOURCES AND NOT MSVC)
     # Game banks are on the hot path (the ARM7 runtime-RAM bank carries the
     # sound engine); boot correctness is gate-proven (G1/G2/G3), so compile
@@ -721,7 +728,16 @@ add_library(nds_armv4t STATIC ${NDS_ARM_RECOMP_SOURCES})
 target_include_directories(nds_armv4t PUBLIC
     ${NDS_ARM_RECOMP_INCLUDE_DIRS})
 
-add_executable(nds_runner
+# On Android the runner is libnds_runner.so, which SDL's Java glue loads and
+# enters through SDL_main (src/main.cpp); the APK packages it.
+if(ANDROID)
+    set(NDS_RUNNER_TARGET_KIND add_library)
+    set(NDS_RUNNER_TARGET_TYPE SHARED)
+else()
+    set(NDS_RUNNER_TARGET_KIND add_executable)
+    set(NDS_RUNNER_TARGET_TYPE "")
+endif()
+cmake_language(CALL ${NDS_RUNNER_TARGET_KIND} nds_runner ${NDS_RUNNER_TARGET_TYPE}
     src/arm9_native.cpp
     src/runtime_arm.cpp
     src/execution_region.cpp
@@ -1414,6 +1430,13 @@ elseif(ANDROID)
     target_sources(nds_runner PRIVATE
         src/update/http_android.cpp
         src/update/self_update_android.cpp)
+    # liblog: stdout/stderr forwarded to logcat (src/main.cpp).
+    target_link_libraries(nds_runner PRIVATE log)
+    # Bind the library's calls to its own functions at link time. Without it
+    # every call from the generated banks into the runtime (bus_read_u32,
+    # runtime_dispatch, ...) goes through a PLT stub: ~4 percent of the
+    # emulation thread on a Cortex-A720.
+    target_link_options(nds_runner PRIVATE -Wl,-Bsymbolic-functions)
 else()
     find_package(CURL REQUIRED)
     target_link_libraries(nds_runner PRIVATE CURL::libcurl)
