@@ -168,17 +168,17 @@ int main() {
         check(original.main.w == 256 && original.main.h == 192 &&
                   original.inset.w == 128 && original.inset.h == 96,
               "original stays 1:1");
-        // A portrait window moves the inset below the main screen, centred.
+        // A portrait window moves the inset above the main screen, centred.
         const auto tall = nds_single_layout(M::Letterbox, S::Nearest, 480,
                                             640, 256, 192, 25);
-        check(rect_is(tall.main, 0, 0, 480, 360),
-              "portrait main keeps the full width, at the top");
-        check(rect_is(tall.inset, 53, 360, 373, 280),
+        check(rect_is(tall.main, 0, 280, 480, 360),
+              "portrait main keeps the full width, at the bottom");
+        check(rect_is(tall.inset, 53, 0, 373, 280),
               "portrait inset fills the rest, centred, keeps 4:3");
         const auto tower = nds_single_layout(M::Letterbox, S::Nearest, 480,
                                              1000, 256, 192, 25);
-        check(rect_is(tower.main, 0, 140, 480, 360) &&
-                  rect_is(tower.inset, 0, 500, 480, 360),
+        check(rect_is(tower.inset, 0, 140, 480, 360) &&
+                  rect_is(tower.main, 0, 500, 480, 360),
               "portrait inset growth stops at the main screen's size");
         const auto tall_off = nds_single_layout(M::Letterbox, S::Nearest, 480,
                                                 640, 256, 192, 0);
@@ -195,8 +195,8 @@ int main() {
         check(tall_original.main.w == 256 && tall_original.main.h == 192 &&
                   tall_original.inset.w == 128 &&
                   tall_original.inset.h == 96 &&
-                  tall_original.inset.y ==
-                      tall_original.main.y + tall_original.main.h,
+                  tall_original.main.y ==
+                      tall_original.inset.y + tall_original.inset.h,
               "portrait original stays 1:1");
         const auto tall_stretch = nds_single_layout(
             M::Stretch, S::Nearest, 480, 640, 256, 192, 25);
@@ -207,7 +207,35 @@ int main() {
                                             640, 256, 192, 25);
         check(even.inset.x == even.main.x + even.main.w,
               "square window keeps the inset beside main");
+        // 100: both screens the same size, side by side or stacked.
+        const auto full = nds_single_layout(M::Letterbox, S::Nearest, 1920,
+                                            1080, 256, 192, 100);
+        check(rect_is(full.main, 0, 180, 960, 720) &&
+                  rect_is(full.inset, 960, 180, 960, 720),
+              "100% inset matches the main screen, side by side");
+        const auto full_tall = nds_single_layout(
+            M::Letterbox, S::Nearest, 1080, 1920, 256, 192, 100);
+        check(rect_is(full_tall.inset, 0, 150, 1080, 810) &&
+                  rect_is(full_tall.main, 0, 960, 1080, 810),
+              "100% portrait inset matches the main screen, above it");
+        // A forced stack keeps the DS order: the inset below the main one.
+        const auto stacked_tall = nds_single_layout(
+            M::Letterbox, S::Nearest, 1080, 1920, 256, 192, 100, true);
+        check(rect_is(stacked_tall.main, 0, 150, 1080, 810) &&
+                  rect_is(stacked_tall.inset, 0, 960, 1080, 810),
+              "stacked portrait keeps the inset below the main screen");
+        const auto stacked_wide = nds_single_layout(
+            M::Letterbox, S::Nearest, 1920, 1080, 256, 192, 100, true);
+        check(stacked_wide.inset.y == stacked_wide.main.y + stacked_wide.main.h,
+              "stacked landscape keeps the inset below the main screen");
     }
+
+    // The initial single window counts the inset beside the main screen.
+    const NdsInitialWindowSize single_full =
+        nds_initial_window_size(256, 256, false, 8, 1.0f, 1920, 1080, true,
+                                100);
+    check(single_full.top_width == 912 && single_full.height == 684,
+          "single window with a 100% inset fits the display width");
 
     if (failures) return 1;
     std::puts("frontend window size checks passed");

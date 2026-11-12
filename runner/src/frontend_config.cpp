@@ -248,7 +248,9 @@ bool nds_parse_second_screen_size(const std::string& value, uint8_t* out) {
     if (!out || value.empty()) return false;
     char* end = nullptr;
     const long parsed = std::strtol(value.c_str(), &end, 10);
-    if (!end || *end != '\0' || parsed < 0 || parsed > 60) return false;
+    if (!end || *end != '\0' || parsed < kNdsMinSecondScreenSize ||
+        parsed > kNdsMaxSecondScreenSize)
+        return false;
     *out = static_cast<uint8_t>(parsed);
     return true;
 }
@@ -1288,7 +1290,7 @@ static bool apply_frontend_config(toml::table& root,
             if (!nds_parse_second_screen_size(
                     std::to_string(*value), &options->second_screen_size)) {
                 if (error) {
-                    *error = "display.second_screen_size must be 0..60";
+                    *error = "display.second_screen_size must be 10..100";
                 }
                 return false;
             }

@@ -1499,7 +1499,9 @@ int runtime_menu_set_value(RuntimeMenuState* state, const NdsMenuItem* item,
         return 1;
     }
     if (std::strcmp(item->key, kRuntimeSecondScreenKey) == 0) {
-        if (value < 0 || value > 60) return 0;
+        if (value < kNdsMinSecondScreenSize ||
+            value > kNdsMaxSecondScreenSize)
+            return 0;
         state->options->second_screen_size = static_cast<uint8_t>(value);
         std::fprintf(stderr, "[display] second screen size -> %d%%\n", value);
         return 1;
@@ -2613,7 +2615,8 @@ bool create_presentation(const NdsFrontendOptions& options,
         initial_size = nds_initial_window_size(
             presentation.screen_widths[0], presentation.screen_widths[1],
             presentation.separate, options.window_scale, coordinate_scale,
-            usable.w, usable.h, presentation.single);
+            usable.w, usable.h, presentation.single,
+            presentation.inset_percent);
         SDL_SetWindowSize(presentation.windows[0],
             presentation.separate ? initial_size.top_width
                 : std::max(initial_size.top_width, initial_size.bottom_width) *
@@ -2902,13 +2905,7 @@ void draw_separate_screen(FrontendPresentation& presentation, int screen,
     draw_fps_counter(target, fps_counter);
 }
 
-// Single-screen layout: present only presentation.shown_screen, with the
-// runtime menu, virtual stylus (bottom LCD only) and savestate notice on it.
 // Single-screen layout: present presentation.shown_screen, with the other LCD
-// as an optional inset next to it, and the runtime menu, virtual stylus (bottom
-// Single-screen layout: present presentation.shown_screen, with the other LCD
-// as an optional inset beside it, and the runtime menu, virtual stylus (bottom
-// LCD only) and savestate notice on the shown screen.
 // as an optional inset next to it, and the virtual stylus (bottom LCD only)
 // and savestate notice on the shown screen.
 // The GL window has no SDL renderer, so there the stylus and notice go
@@ -3605,9 +3602,9 @@ int nds_run_interactive_frontend(const NdsFrontendOptions& initial_options) {
          NdsMenuItemType::Choice, 0, 200, 1, resolution_scale_choices, 7,
          kResolutionScaleChoiceValues},
         {kRuntimeSecondScreenKey, "Display", "Second screen size",
-         "The other screen beside the main one, as a percent of its size. "
-         "0 hides it.",
-         NdsMenuItemType::Int, 0, 60, 5, nullptr, 0, nullptr},
+         "The other screen beside the main one, as a percent of its size.",
+         NdsMenuItemType::Int, kNdsMinSecondScreenSize,
+         kNdsMaxSecondScreenSize, 10, nullptr, 0, nullptr},
         {kRuntimeShowFpsKey, "Display", "Show FPS",
          "New 3D images per second in the corner of the screen, updated "
          "once a second. Reads 0 when nothing 3D is moving.",

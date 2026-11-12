@@ -375,8 +375,8 @@ struct NdsFrontendOptions {
     // internal_resolution clears this and pins the multiplier.
     uint16_t resolution_scale = 0;
     // Single-screen layout: the other LCD beside the main one, as a percent
-    // of its size. 0 shows only the main screen.
-    uint8_t second_screen_size = 0;
+    // of its size, kNdsMinSecondScreenSize..kNdsMaxSecondScreenSize.
+    uint8_t second_screen_size = 30;
     // On-screen frame rate, in the top-left of the shown screen.
     bool show_fps = false;
     // Blends 3D images for games drawing below the DS frame rate, at the cost
@@ -519,7 +519,11 @@ bool nds_parse_antialiasing(const std::string& value, uint8_t* out);
 bool nds_parse_internal_resolution(const std::string& value, uint8_t* out);
 // 10..1000 (percent).
 bool nds_parse_resolution_scale(const std::string& value, uint16_t* out);
-// 0..60 (percent).
+// The second screen's size range, in percent: the inset is always shown in
+// the single layout, from a tenth of the main screen up to its full size.
+inline constexpr uint8_t kNdsMinSecondScreenSize = 10;
+inline constexpr uint8_t kNdsMaxSecondScreenSize = 100;
+// kNdsMinSecondScreenSize..kNdsMaxSecondScreenSize (percent).
 bool nds_parse_second_screen_size(const std::string& value, uint8_t* out);
 bool nds_parse_gamepad_layout(const std::string& value, bool* positional);
 bool nds_parse_texture_upscale(const std::string& value, uint8_t* out);
