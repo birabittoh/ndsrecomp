@@ -139,7 +139,7 @@ bool write_default_settings(const fs::path& path,
         << "\n[paths]\n"
         << "# Empty means the default. Relative paths start from this "
            "folder.\n"
-        << "rom = \"\"    # asked for on first launch, then remembered\n"
+        << "rom = \"\"    # asked for on first launch, copied into this folder\n"
         << "bios = \"\"   # folder with biosnds7.rom, biosnds9.rom, "
            "firmware.bin\n"
         << "save = \"\"   # default: saves/" << options.app_name << ".sav\n"
@@ -342,8 +342,27 @@ bool resolve_rom(const fs::path& root, const fs::path& settings,
         }
         const fs::path path = fs::absolute(candidate);
         if (rom_matches(path, options.expected_rom_sha1)) {
-            *rom = path;
-            remember(settings, "rom", to_stored(root, path));
+            // Keep our own copy in the data folder and run from it, so the
+            // original can be moved or deleted.
+            const fs::path copy = root / (options.app_name + ".nds");
+            std::error_code ec;
+            if (fs::equivalent(path, copy, ec)) {
+                *rom = copy;
+            } else {
+                ec.clear();
+                fs::create_directories(root, ec);
+                ec.clear();
+                if (fs::copy_file(path, copy,
+                                  fs::copy_options::overwrite_existing, ec)) {
+                    *rom = copy;
+                } else {
+                    std::fprintf(stderr,
+                                 "[player] could not copy the ROM to %s: %s\n",
+                                 copy.string().c_str(), ec.message().c_str());
+                    *rom = path;
+                }
+            }
+            remember(settings, "rom", to_stored(root, *rom));
             return true;
         }
         nds_player_error(path.filename().string() +
