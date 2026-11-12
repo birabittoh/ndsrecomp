@@ -1430,8 +1430,9 @@ elseif(ANDROID)
     target_sources(nds_runner PRIVATE
         src/update/http_android.cpp
         src/update/self_update_android.cpp)
-    # liblog: stdout/stderr forwarded to logcat (src/main.cpp).
-    target_link_libraries(nds_runner PRIVATE log)
+    # liblog: stdout/stderr forwarded to logcat (src/main.cpp); libandroid:
+    # ANativeWindow, which Plume's Vulkan backend sizes its swapchain from.
+    target_link_libraries(nds_runner PRIVATE log android)
     # Bind the library's calls to its own functions at link time. Without it
     # every call from the generated banks into the runtime (bus_read_u32,
     # runtime_dispatch, ...) goes through a PLT stub: ~4 percent of the
