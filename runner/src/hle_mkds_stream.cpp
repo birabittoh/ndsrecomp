@@ -9,6 +9,9 @@
 #include <cstring>
 #include <limits>
 
+// runtime_arm.cpp: drops the fast limit when a CPSR write clears I.
+extern "C" void runtime_note_cpsr_unmask(uint32_t old_cpsr, uint32_t new_cpsr);
+
 namespace mkds_stream {
 namespace {
 constexpr uint32_t entry = 0x0214d464u, length = 256u;
@@ -138,6 +141,7 @@ void decode() {
     g_cpu.R[5] = state.flags; g_cpu.R[6] = state.bits;
     g_cpu.R[7] = state.token; g_cpu.R[8] = state.pending;
     g_cpu.R[9] = state.scratch9; g_cpu.R[10] = state.scratch10;
+    runtime_note_cpsr_unmask(g_cpu.cpsr, state.cpsr);
     g_cpu.cpsr = state.cpsr; g_cpu.R[15] = pcs[static_cast<unsigned>(state.phase)];
     if (state.phase == nds_lz::Phase::Finish && budget - used >= 18u) {
         bus_write_u32(context, g_cpu.R[3]); bus_write_u32(context + 4u, g_cpu.R[4]);

@@ -7,6 +7,7 @@
 #include <chrono>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <ctime>
 #include <filesystem>
 #include <string>
@@ -27,6 +28,8 @@
 #include "scheduler.h"
 #include "tier3.h"
 #include "wifi_net.h"
+
+extern "C" void runtime_fast_limit_stats(unsigned long long out[2][10]);
 
 namespace {
 
@@ -1026,6 +1029,30 @@ void nds_diagnostics_maybe_write_performance_sample(
     // carried the dispatches. Both, always: reading either alone is how the
     // first cut of this block spent a field session reporting the idle loop as
     // "the hottest code in the game".
+    {
+        // Why the per-instruction fast limit was or was not published, per
+        // CPU (runtime_arm.cpp publish_fast_limit). Each refusal sends the
+        // next instruction through runtime_insn_enter_slow again.
+        static const char* const kReasons[10] = {
+            "published", "mode", "code_pub", "no_cap", "deferred",
+            "static_code", "break", "halted", "dma", "irq"};
+        static unsigned long long prev[2][10] = {};
+        unsigned long long now[2][10];
+        runtime_fast_limit_stats(now);
+        std::fprintf(g_perf, ",\"fast_limit_delta\":{");
+        for (int c = 0; c < 2; ++c) {
+            std::fprintf(g_perf, "%s\"%s\":{", c ? "," : "", c ? "arm7" : "arm9");
+            for (int r = 0; r < 10; ++r)
+                std::fprintf(g_perf, "%s\"%s\":%llu", r ? "," : "", kReasons[r],
+                             now[c][r] - prev[c][r]);
+            std::fprintf(g_perf, "}");
+        }
+        std::fprintf(g_perf, "}");
+        std::memcpy(prev, now, sizeof prev);
+        // Cumulative GX command cache statistics ({} when not built in).
+        std::fprintf(g_perf, ",\"gx_command_cache\":%s",
+                     nds_gpu3d_command_batch_json());
+    }
     std::fprintf(g_perf, ",\"pc_hot_delta\":");
     write_pc_delta(NDS_PC_HOT_PARK);
     std::fprintf(g_perf, ",\"pc_exec_delta\":");

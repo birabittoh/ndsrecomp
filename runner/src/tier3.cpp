@@ -37,6 +37,7 @@ using armv4t::Instr;
 extern "C" int  nds_has_bank(uint32_t pc, int thumb);
 extern "C" int  nds_slice_over(void);
 extern "C" void runtime_publish_fast_limit(void);
+extern "C" void runtime_clear_fast_limit(void);
 extern "C" uint32_t nds_exception_base(void);
 
 namespace {
@@ -352,8 +353,10 @@ static void tier3_run_impl(uint32_t /*entry*/, bool single_step) {
         // sites; the argument here is tighter than on the bank path:
         //   * nds_slice_over  -- the limit never exceeds g_cycle_cap, which is
         //     exactly what slice_over compares against.
-        //   * nds_irq_pending -- a nonzero pending cache refuses to publish,
-        //     and irq_recompute (its single funnel) clears the deadline.
+        //   * nds_irq_pending -- a nonzero pending cache refuses to publish
+        //     while CPSR.I is clear, irq_recompute (its single funnel) clears
+        //     the deadline, and an interpreted instruction that clears I
+        //     clears it too (after Interpreter::step below).
         //   * nds_cpu_halted / nds_dma_cpu_stalled -- both are entered by THIS
         //     CPU's own store during an interpreted instruction, and both
         //     entry points (nds_cpu_enter_halt, dma_start) already call
@@ -460,7 +463,12 @@ static void tier3_run_impl(uint32_t /*entry*/, bool single_step) {
 
         g_bus.begin_instruction();
         uint32_t cyc = 1;
+        const bool irq_masked_before = ic.cpsr.i;
         Interpreter::Result r = Interpreter::step(ic, g_bus, in, &cyc);
+        // A limit may have been published while CPSR.I was set (see
+        // runtime_arm.cpp publish_fast_limit); clearing I here must reach
+        // the IRQ check below through poll_after, as on the bank path.
+        if (irq_masked_before && !ic.cpsr.i) runtime_clear_fast_limit();
         if (g_nds_active != NDS_ARM9 && thumb &&
             in.op == armv4t::IrOp::MUL) {
             // melonDS ARM7 T_MUL_REG models the architecturally-destroyed C

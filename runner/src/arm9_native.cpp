@@ -99,6 +99,9 @@ bool preparation_enabled() {
 #if defined(NDS_MKDS_PERFORMANCE)
 struct PreparationPage {uint32_t address,first,end;const char* sha1;};
 #include "mkds_native_preparation.inc"
+
+// runtime_arm.cpp: drops the fast limit when a CPSR write clears I.
+extern "C" void runtime_note_cpsr_unmask(uint32_t old_cpsr, uint32_t new_cpsr);
 struct PreparationProgress {
     const uint32_t* generation=nullptr;
     uint32_t value=0,next=0;
@@ -251,7 +254,8 @@ public:
     }
 #endif
     void publish() {
-        std::copy(registers->begin(),registers->end(),g_cpu.R);g_cpu.cpsr=jit->Cpsr();
+        std::copy(registers->begin(),registers->end(),g_cpu.R);
+        runtime_note_cpsr_unmask(g_cpu.cpsr,jit->Cpsr());g_cpu.cpsr=jit->Cpsr();
     }
     std::optional<uint32_t> code(uint32_t addr,bool watch) {
         if(ram_transactions()) {
@@ -352,7 +356,8 @@ public:
     }
     void context() {
         g_cpu.R[15]=(*registers)[15];
-        g_cpu.cpsr=(g_cpu.cpsr&~0xffu)|(jit->Cpsr()&0xffu);
+        const uint32_t cpsr=(g_cpu.cpsr&~0xffu)|(jit->Cpsr()&0xffu);
+        runtime_note_cpsr_unmask(g_cpu.cpsr,cpsr);g_cpu.cpsr=cpsr;
     }
     void device() {
         context();++devices;jit->HaltExecution();device_halted=true;
