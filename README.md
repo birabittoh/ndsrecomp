@@ -346,11 +346,10 @@ DS A, which is what Xbox-style pads need to feel like a DS. An explicit
 `--gamepad-bindings` wins over it and disables the Input > Gamepad layout
 runtime setting, which otherwise switches it live.
 
-`second_screen_size` (5..60, default 25) shows the other LCD in the `single`
+`second_screen_size` (10..100, default 30) shows the other LCD in the `single`
 layout, to the right of the main screen and bottom-aligned, as a percent of its
-size. It is always shown: a value under 5, such as the 0 that used to hide it,
-loads as 5. In a portrait window (taller than wide) it goes just below the main
-screen, centred. The pair is fitted as one image, so `window_mode` and
+size; 100 shows both screens at the same size. In a portrait window (taller
+than wide) it goes just below the main screen, centred. The pair is fitted as one image, so `window_mode` and
 `scaling` apply to it and the main screen is never covered. The percent is a
 minimum: with `window_mode = "letterbox"`, space the main screen can't use goes
 to the second screen too, up to the main screen's size. Clicking the inset

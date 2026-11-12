@@ -207,7 +207,25 @@ int main() {
                                             640, 256, 192, 25);
         check(even.inset.x == even.main.x + even.main.w,
               "square window keeps the inset beside main");
+        // 100: both screens the same size, side by side or stacked.
+        const auto full = nds_single_layout(M::Letterbox, S::Nearest, 1920,
+                                            1080, 256, 192, 100);
+        check(rect_is(full.main, 0, 180, 960, 720) &&
+                  rect_is(full.inset, 960, 180, 960, 720),
+              "100% inset matches the main screen, side by side");
+        const auto full_tall = nds_single_layout(
+            M::Letterbox, S::Nearest, 1080, 1920, 256, 192, 100);
+        check(rect_is(full_tall.main, 0, 150, 1080, 810) &&
+                  rect_is(full_tall.inset, 0, 960, 1080, 810),
+              "100% portrait inset matches the main screen, below it");
     }
+
+    // The initial single window counts the inset beside the main screen.
+    const NdsInitialWindowSize single_full =
+        nds_initial_window_size(256, 256, false, 8, 1.0f, 1920, 1080, true,
+                                100);
+    check(single_full.top_width == 912 && single_full.height == 684,
+          "single window with a 100% inset fits the display width");
 
     if (failures) return 1;
     std::puts("frontend window size checks passed");

@@ -1474,7 +1474,8 @@ add_test(NAME cpu_render_handoff_test COMMAND cpu_render_handoff_test)
 
   add_executable(frontend_config_test
       tests/frontend_config_test.cpp
-      src/frontend_config.cpp)
+      src/frontend_config.cpp
+      src/perf_governor.cpp)
 target_include_directories(frontend_config_test PRIVATE src)
 ndsrecomp_link_tomlpp(frontend_config_test)
   add_test(NAME frontend_config_test COMMAND frontend_config_test)

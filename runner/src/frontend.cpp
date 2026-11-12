@@ -2791,7 +2791,8 @@ bool create_presentation(const NdsFrontendOptions& options,
         initial_size = nds_initial_window_size(
             presentation.screen_widths[0], presentation.screen_widths[1],
             presentation.separate, options.window_scale, coordinate_scale,
-            usable.w, usable.h, presentation.single);
+            usable.w, usable.h, presentation.single,
+            presentation.inset_percent);
         SDL_SetWindowSize(presentation.windows[0],
             presentation.separate ? initial_size.top_width
                 : std::max(initial_size.top_width, initial_size.bottom_width) *
@@ -3763,7 +3764,7 @@ int nds_run_interactive_frontend(const NdsFrontendOptions& initial_options) {
         {kRuntimeSecondScreenKey, "Display", "Second screen size",
          "The other screen beside the main one, as a percent of its size.",
          NdsMenuItemType::Int, kNdsMinSecondScreenSize,
-         kNdsMaxSecondScreenSize, 5, nullptr, 0, nullptr},
+         kNdsMaxSecondScreenSize, 10, nullptr, 0, nullptr},
         {kRuntimeShowFpsKey, "Display", "Show FPS",
          "New 3D images per second in the corner of the screen, updated "
          "once a second. Reads 0 when nothing 3D is moving.",

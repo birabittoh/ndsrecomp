@@ -47,6 +47,8 @@ static bool settings_file_test() {
     std::ifstream in(path);
     const std::string text((std::istreambuf_iterator<char>(in)),
                            std::istreambuf_iterator<char>());
+    // Closed before the remove below: Windows can't delete an open file.
+    in.close();
     NdsFrontendOptions options{};
     options.resolution_scale = 100;
     const bool loaded =
@@ -162,13 +164,15 @@ int main() {
     uint16_t mouse_value = 0;
     uint16_t local_wireless_port = 0;
     uint8_t second_screen_size = 0;
-    if (!require(nds_parse_second_screen_size("25", &second_screen_size)) ||
-        !require(second_screen_size == 25) ||
-        !require(nds_parse_second_screen_size("0", &second_screen_size)) ||
-        !require(second_screen_size == 5) ||
-        !require(nds_parse_second_screen_size("3", &second_screen_size)) ||
-        !require(second_screen_size == 5) ||
-        !require(!nds_parse_second_screen_size("61", &second_screen_size)) ||
+    if (!require(nds_parse_second_screen_size("30", &second_screen_size)) ||
+        !require(second_screen_size == 30) ||
+        !require(nds_parse_second_screen_size("10", &second_screen_size)) ||
+        !require(second_screen_size == 10) ||
+        !require(nds_parse_second_screen_size("100", &second_screen_size)) ||
+        !require(second_screen_size == 100) ||
+        !require(!nds_parse_second_screen_size("0", &second_screen_size)) ||
+        !require(!nds_parse_second_screen_size("9", &second_screen_size)) ||
+        !require(!nds_parse_second_screen_size("101", &second_screen_size)) ||
         !require(!nds_parse_second_screen_size("-1", &second_screen_size)))
         return 1;
     if (!require(nds_parse_on_off("on", &toggle)) || !require(toggle) ||
