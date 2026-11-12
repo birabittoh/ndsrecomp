@@ -81,6 +81,14 @@ fs::path data_directory(const std::string& app) {
 #elif defined(__APPLE__)
     return fs::path(env_or_empty("HOME")) / "Library" /
            "Application Support" / app;
+#elif defined(__ANDROID__) && defined(NDS_HAVE_SDL3)
+    // The app's folder on shared storage (Android/data/<package>/files),
+    // which a file manager can reach, else its private one.
+    if (const char* external = SDL_GetAndroidExternalStoragePath())
+        return fs::path(external);
+    if (const char* internal = SDL_GetAndroidInternalStoragePath())
+        return fs::path(internal);
+    return fs::current_path();
 #else
     const std::string xdg = env_or_empty("XDG_DATA_HOME");
     if (!xdg.empty()) return fs::path(xdg) / app;
@@ -262,6 +270,41 @@ DialogResult pick_folder(const std::string&, std::string*) {
 }
 #endif
 
+#if defined(__ANDROID__) && defined(NDS_HAVE_SDL3)
+// The Android picker hands out a content:// URI, which only SDL (through the
+// ContentResolver) can open: copy it to `dest` so the rest reads a file.
+bool import_uri(const std::string& uri, const fs::path& dest) {
+    SDL_IOStream* in = SDL_IOFromFile(uri.c_str(), "rb");
+    if (!in) {
+        std::fprintf(stderr, "[player] could not open %s: %s\n", uri.c_str(),
+                     SDL_GetError());
+        return false;
+    }
+    std::error_code ec;
+    fs::create_directories(dest.parent_path(), ec);
+    std::ofstream out(dest, std::ios::binary | std::ios::trunc);
+    std::vector<char> buffer(1u << 20);
+    bool ok = static_cast<bool>(out);
+    while (ok) {
+        const size_t got = SDL_ReadIO(in, buffer.data(), buffer.size());
+        if (got == 0) {
+            ok = SDL_GetIOStatus(in) == SDL_IO_STATUS_EOF;
+            break;
+        }
+        ok = static_cast<bool>(out.write(buffer.data(),
+                                         static_cast<std::streamsize>(got)));
+    }
+    SDL_CloseIO(in);
+    out.close();
+    if (!ok) {
+        std::fprintf(stderr, "[player] could not import %s to %s\n",
+                     uri.c_str(), dest.string().c_str());
+        fs::remove(dest, ec);
+    }
+    return ok;
+}
+#endif
+
 bool rom_matches(const fs::path& path, const std::string& expected_sha1) {
     if (expected_sha1.empty()) return true;
     std::ifstream in(path, std::ios::binary);
@@ -340,6 +383,20 @@ bool resolve_rom(const fs::path& root, const fs::path& settings,
                     return false;
             }
         }
+        bool imported = false;
+#if defined(__ANDROID__) && defined(NDS_HAVE_SDL3)
+        // Straight to the copy the code below would make.
+        if (candidate.rfind("content://", 0) == 0) {
+            const fs::path copy = root / (options.app_name + ".nds");
+            if (!import_uri(candidate, copy)) {
+                nds_player_error("The selected file could not be read.");
+                candidate.clear();
+                continue;
+            }
+            candidate = copy.string();
+            imported = true;
+        }
+#endif
         const fs::path path = fs::absolute(candidate);
         if (rom_matches(path, options.expected_rom_sha1)) {
             // Keep our own copy in the data folder and run from it, so the
@@ -365,7 +422,12 @@ bool resolve_rom(const fs::path& root, const fs::path& settings,
             remember(settings, "rom", to_stored(root, *rom));
             return true;
         }
-        nds_player_error(path.filename().string() +
+        if (imported) {
+            std::error_code ec;
+            fs::remove(path, ec);
+        }
+        nds_player_error((imported ? std::string("The selected file")
+                                   : path.filename().string()) +
                          " is not the ROM this build runs: " +
                          options.game_name + ", SHA-1 " +
                          options.expected_rom_sha1 + ".");
@@ -551,8 +613,13 @@ bool nds_player_prepare(int argc, char** argv, NdsFrontendOptions* options,
     const fs::path settings = root / "settings.toml";
     std::error_code fs_error;
     // Logs sit next to the executable whatever the data directory is, so a
-    // bug report never means hunting through Documents.
+    // bug report never means hunting through Documents. Not on Android,
+    // where the "executable" is the system's read-only app_process.
+#if defined(__ANDROID__)
+    const fs::path logs = root / "logs";
+#else
     const fs::path logs = executable_dir() / "logs";
+#endif
     for (const fs::path& dir : {root / "saves", root / "savestates", logs})
         fs::create_directories(dir, fs_error);
     if (fs_error) {
