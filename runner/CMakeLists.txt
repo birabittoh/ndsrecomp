@@ -1357,6 +1357,91 @@ if(WIN32)
     target_link_libraries(nds_runner PRIVATE ws2_32 iphlpapi)
 endif()
 
+# Self-update (src/update/self_update.h, offered to titles through
+# src/title_update.h): checks NDS_UPDATE_REPO's latest GitHub release for an
+# asset named NDS_UPDATE_ASSET_FORMAT ("{tag}" and "{platform}" filled in)
+# plus the platform's extension, and compares its tag with
+# NDS_RELEASE_VERSION. That version is an explicit override, else the
+# release tag CI passes in NDS_VERSION_NAME (the Android Gradle build reads
+# it too), else the newest v* tag reachable in the title repo (the one
+# holding NDS_TITLE_BANK_DIR), else empty, which leaves the updater off; a
+# leading "v" is dropped. Unlike NDS_GAME_VERSION (a diagnostics string that
+# can be a hash or "-dirty"), it is always a plain X.Y.Z or empty.
+# Recomputed on every configure, so a new tag reaches an old build dir.
+set(NDS_UPDATE_REPO "" CACHE STRING
+    "GitHub repo (owner/name) the self-updater checks; empty turns it off")
+set(NDS_UPDATE_ASSET_FORMAT "" CACHE STRING
+    "Release asset name without its extension, with {tag} and {platform}")
+set(NDS_RELEASE_VERSION_OVERRIDE "" CACHE STRING
+    "Version embedded for the self-updater (vX.Y.Z or X.Y.Z); empty to derive it")
+set(NDS_RELEASE_VERSION "${NDS_RELEASE_VERSION_OVERRIDE}")
+if(NDS_RELEASE_VERSION STREQUAL "")
+    set(NDS_RELEASE_VERSION "$ENV{NDS_VERSION_NAME}")
+endif()
+if(NDS_RELEASE_VERSION STREQUAL "")
+    if(NDS_TITLE_BANK_DIR AND EXISTS "${NDS_TITLE_BANK_DIR}")
+        set(_nds_release_git_dir "${NDS_TITLE_BANK_DIR}")
+    else()
+        set(_nds_release_git_dir "${CMAKE_CURRENT_SOURCE_DIR}")
+    endif()
+    find_package(Git QUIET)
+    if(GIT_FOUND)
+        execute_process(
+            COMMAND "${GIT_EXECUTABLE}" describe --tags --abbrev=0 --match "v*"
+            WORKING_DIRECTORY "${_nds_release_git_dir}"
+            OUTPUT_VARIABLE NDS_RELEASE_VERSION
+            OUTPUT_STRIP_TRAILING_WHITESPACE
+            ERROR_QUIET)
+    endif()
+endif()
+string(REGEX REPLACE "^[vV]" "" NDS_RELEASE_VERSION "${NDS_RELEASE_VERSION}")
+message(STATUS "nds_runner: release version '${NDS_RELEASE_VERSION}', "
+               "updates from '${NDS_UPDATE_REPO}'")
+
+target_sources(nds_runner PRIVATE
+    src/title_update.cpp
+    src/update/self_update.cpp
+    src/update/archive.cpp
+    vendor/miniz/miniz.c)
+if(WIN32)
+    target_sources(nds_runner PRIVATE
+        src/update/http_win.cpp
+        src/update/self_update_win.cpp)
+    target_link_libraries(nds_runner PRIVATE winhttp)
+elseif(ANDROID)
+    # Bionic has no libcurl: HTTP goes through HttpURLConnection over JNI,
+    # and the update is handed to the package installer the same way.
+    target_sources(nds_runner PRIVATE
+        src/update/http_android.cpp
+        src/update/self_update_android.cpp)
+else()
+    find_package(CURL REQUIRED)
+    target_link_libraries(nds_runner PRIVATE CURL::libcurl)
+    target_sources(nds_runner PRIVATE src/update/http_curl.cpp)
+    if(APPLE)
+        target_sources(nds_runner PRIVATE src/update/self_update_mac.cpp)
+    else()
+        target_sources(nds_runner PRIVATE src/update/self_update_posix.cpp)
+    endif()
+endif()
+# Vendored single-file libraries (THIRD_PARTY_ATTRIBUTION.md): miniz for the
+# .zip / .tar.gz payloads, picosha2 for the asset digest, nlohmann/json for
+# the release response. toml++ (ndsrecomp_link_tomlpp above) merges shipped
+# TOML files.
+target_include_directories(nds_runner SYSTEM PRIVATE
+    vendor/miniz
+    vendor/picosha2
+    vendor)
+if(NOT MSVC)
+    set_source_files_properties(vendor/miniz/miniz.c
+        PROPERTIES COMPILE_OPTIONS "-w")
+endif()
+# Only the files that read them, so a new version or repo does not rebuild
+# the whole runner.
+set_source_files_properties(src/title_update.cpp src/update/self_update.cpp
+    PROPERTIES COMPILE_DEFINITIONS
+    "NDS_RELEASE_VERSION=\"${NDS_RELEASE_VERSION}\";NDS_UPDATE_REPO=\"${NDS_UPDATE_REPO}\";NDS_UPDATE_ASSET_FORMAT=\"${NDS_UPDATE_ASSET_FORMAT}\"")
+
 # The dual-CPU boot nests deeply enough to exhaust the 8 MB main-thread stack
 # macOS gives a process by default, faulting in ___chkstk_darwin before the
 # firmware hands off. Linux's 8 MB soft limit is raisable per-shell; the macOS

@@ -288,6 +288,35 @@ later" option from every downstream recipient. xBRZ is "xBR, Zenju
 enhanced", so xBR-lv2 is the same algorithm family without that cost. No
 DeSmuME source is used.
 
+## Self-updater libraries (runner)
+
+The runner's self-updater (`runner/src/update/`) vendors three single-file
+libraries, unmodified, each with its license file next to it. All three are
+permissive and compatible with the GPL-3.0-or-later `nds_runner` executable.
+
+- **miniz** 11.3.2 (`runner/vendor/miniz/`): ZIP extraction and the raw
+  inflate behind the `.tar.gz` reader.
+  - Upstream: https://github.com/richgel999/miniz
+  - Copyright 2013-2014 RAD Game Tools and Valve Software; Copyright
+    2010-2014 Rich Geldreich and Tenacious Software LLC
+  - License: MIT (`runner/vendor/miniz/LICENSE`)
+- **PicoSHA2** (`runner/vendor/picosha2/`): SHA-256 of a downloaded release
+  asset, checked against the digest GitHub publishes for it.
+  - Upstream: https://github.com/okdshin/PicoSHA2
+  - Copyright (c) 2017 okdshin
+  - License: MIT (`runner/vendor/picosha2/LICENSE`)
+- **JSON for Modern C++** 3.11.3 (`runner/vendor/nlohmann/`): parsing the
+  GitHub Releases API response.
+  - Upstream: https://github.com/nlohmann/json
+  - Copyright (c) 2013-2021 Niels Lohmann
+  - License: MIT (`runner/vendor/nlohmann/LICENSE.MIT`)
+
+The updater also merges shipped TOML files with toml++, which the build
+already stages for the recompiler and the runner (`cmake/NdsTomlPlusPlus.cmake`,
+MIT). On Linux and macOS it links the system libcurl (curl license, MIT-style);
+on Windows it uses WinHTTP and on Android the platform's
+`HttpURLConnection`, neither of which is redistributed.
+
 ## mGBA
 
 mGBA is copyright © Jeffrey Pfau and contributors and is distributed under the

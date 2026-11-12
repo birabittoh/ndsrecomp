@@ -20,6 +20,7 @@
 #include <limits>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <stdexcept>
 #include <string>
 #include <type_traits>
@@ -43,6 +44,8 @@
 #include "title_menu.h"
 #include "title_save.h"
 #include "title_settings.h"
+#include "title_update.h"
+#include "update/self_update.h"
 #include "wifi_net.h"
 #if defined(NDS_HAVE_COMPUTE_RENDERER)
 #include "melonds_compute/ComputeHost.h"
@@ -1879,6 +1882,122 @@ void runtime_menu_serve_title(RuntimeMenuState* state,
         rows.push_back(std::move(row));
     }
     nds_title_menu_publish(std::move(rows));
+}
+
+// The self-updater for title hooks (title_update.h): checks once at
+// startup, takes the hooks' install request, and applies a staged update
+// at once. Returns the notice to show ("" for none); *quit is set when the
+// update helper has been started and the frontend has to exit so it can
+// swap the files.
+std::string serve_title_update(bool* quit) {
+    using nds::update::SelfUpdater;
+    static SelfUpdater updater(nds::update::BuildConfig());
+    static const std::filesystem::path install_root = SelfUpdater::InstallRoot();
+    static bool started = false;
+    static bool installing = false;
+    static bool applied = false;
+    static std::string failure;
+    const nds::update::Config config = nds::update::BuildConfig();
+
+    if (!started) {
+        started = true;
+        if (updater.Enabled() && !install_root.empty()) {
+            // Also drops a stale staged APK on Android.
+            SelfUpdater::HasPendingSelfUpdate(install_root, config.current_version);
+            updater.CheckAsync();
+        }
+    }
+
+    std::string notice;
+    const std::optional<nds::update::UpdateInfo> info = updater.Available();
+    // Hands a staged update over; on desktop that ends this process.
+    // Android keeps running behind the package installer, and if the player
+    // backs out of it the row stays, so asking again reopens the installer.
+    auto apply = [&]() {
+        if (!SelfUpdater::ApplyAndRestart(install_root,
+                                          SelfUpdater::ExecutablePath()))
+            return false;
+        if (SelfUpdater::RestartsItself()) {
+            applied = true;
+            std::fprintf(stderr, "[update] restarting into %s\n",
+                         info ? info->version.c_str() : "the update");
+            *quit = true;
+        }
+        return true;
+    };
+
+    if (nds_title_update_take_install_request() && info && !installing &&
+        !applied) {
+        failure.clear();
+        const std::filesystem::path apk = SelfUpdater::StagedApkPath(install_root);
+        if (!SelfUpdater::RestartsItself() && !apk.empty() &&
+            SelfUpdater::StagedApkVersion(apk) == info->version) {
+            // Already downloaded: straight to the installer.
+            if (!apply()) failure = "the staged update could not be applied";
+        } else {
+            std::fprintf(stderr, "[update] installing %s\n", info->version.c_str());
+            installing = true;
+            updater.InstallAsync(*info, install_root);
+        }
+    }
+
+    const nds::update::InstallResult install = updater.InstallSnapshot();
+    if (installing && install.done) {
+        installing = false;
+        if (!install.ok) {
+            failure = install.message;
+            notice = "Update failed: " + install.message;
+        } else if (apply()) {
+            if (SelfUpdater::RestartsItself())
+                notice = "Restarting into the update";
+        } else {
+            failure = "the staged update could not be applied";
+            notice = "Update failed: " + failure;
+        }
+    } else if (installing) {
+        char text[64];
+        if (install.total_bytes > 0) {
+            std::snprintf(text, sizeof(text), "Downloading update %d%%",
+                          static_cast<int>(100.0 *
+                                           static_cast<double>(install.downloaded_bytes) /
+                                           static_cast<double>(install.total_bytes)));
+        } else {
+            std::snprintf(text, sizeof(text), "Downloading update");
+        }
+        notice = text;
+    }
+
+    NdsTitleUpdateStatus status;
+    status.current_version = config.current_version;
+    status.restarts = SelfUpdater::RestartsItself();
+    if (info) status.available_version = info->version;
+    status.downloaded_bytes = install.downloaded_bytes;
+    status.total_bytes = install.total_bytes;
+    if (!updater.Enabled() || install_root.empty()) {
+        status.state = NdsTitleUpdateState::Off;
+    } else if (applied) {
+        status.state = NdsTitleUpdateState::Applying;
+    } else if (installing) {
+        status.state = NdsTitleUpdateState::Downloading;
+    } else if (!failure.empty()) {
+        status.state = NdsTitleUpdateState::Failed;
+        status.message = failure;
+    } else {
+        switch (updater.state()) {
+        case nds::update::CheckState::kIdle:
+        case nds::update::CheckState::kChecking:
+            status.state = NdsTitleUpdateState::Checking; break;
+        case nds::update::CheckState::kUpToDate:
+            status.state = NdsTitleUpdateState::UpToDate; break;
+        case nds::update::CheckState::kUpdateAvailable:
+            status.state = NdsTitleUpdateState::Available; break;
+        case nds::update::CheckState::kFailed:
+            status.state = NdsTitleUpdateState::Failed;
+            status.message = "the update check failed"; break;
+        }
+    }
+    nds_title_update_publish(std::move(status));
+    return notice;
 }
 
 struct FrontendPresentation {
@@ -4417,6 +4536,19 @@ int nds_run_interactive_frontend(const NdsFrontendOptions& initial_options) {
                 g_frontend_reset();
                 blend_cache.valid = false;
                 publish_keys();
+            }
+        }
+        {
+            bool quit_for_update = false;
+            const std::string notice = serve_title_update(&quit_for_update);
+            if (!notice.empty()) {
+                savestate_notice = notice;
+                savestate_notice_until =
+                    SDL_GetPerformanceCounter() + frequency * 4u;
+            }
+            if (quit_for_update) {
+                release_relative_mouse();
+                running = false;
             }
         }
         if (window_resize_save_at &&
