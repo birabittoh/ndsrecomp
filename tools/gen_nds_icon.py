@@ -72,4 +72,5 @@ def main():
         f.write('101 ICON "%s"\n' % ico_path.replace("\\", "/"))
 
 
-main()
+if __name__ == "__main__":
+    main()
