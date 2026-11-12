@@ -1727,12 +1727,34 @@ void SDLCALL title_save_dialog_finished(void* userdata,
 }
 #endif
 
+#if defined(NDS_HAVE_SDL3)
+// On Android the dialogs hand out content:// URIs, not paths: only SDL's I/O
+// (through the ContentResolver) can open those.
+bool title_save_is_uri(const std::string& path) {
+    return path.rfind("content://", 0) == 0;
+}
+#endif
+
 std::string title_save_import(const std::string& path,
                               NdsTitleSaveConvert convert, bool* reset) {
+    std::vector<uint8_t> file;
+#if defined(NDS_HAVE_SDL3)
+    size_t size = 0;
+    void* data = SDL_LoadFile(path.c_str(), &size);
+    if (!data) {
+        std::fprintf(stderr, "[save] could not read %s: %s\n", path.c_str(),
+                     SDL_GetError());
+        return "Could not open the selected file";
+    }
+    file.assign(static_cast<const uint8_t*>(data),
+                static_cast<const uint8_t*>(data) + size);
+    SDL_free(data);
+#else
     std::ifstream in(path, std::ios::binary);
     if (!in) return "Could not open " + path;
-    const std::vector<uint8_t> file((std::istreambuf_iterator<char>(in)),
-                                    std::istreambuf_iterator<char>());
+    file.assign(std::istreambuf_iterator<char>(in),
+                std::istreambuf_iterator<char>());
+#endif
     std::vector<uint8_t> image;
     std::string error;
     if (convert) {
@@ -1755,6 +1777,24 @@ std::string title_save_export(const std::string& path) {
     bool dirty = false;
     if (!nds_io_cartridge_save_snapshot(&data, &size, &dirty))
         return "No save to export";
+#if defined(NDS_HAVE_SDL3)
+    // A URI cannot be written beside and renamed over, so no atomic write.
+    if (title_save_is_uri(path)) {
+        SDL_IOStream* out = SDL_IOFromFile(path.c_str(), "wb");
+        const bool ok = out && SDL_WriteIO(out, data, size) == size;
+        if (out && !SDL_CloseIO(out)) {
+            std::fprintf(stderr, "[save] could not close %s: %s\n",
+                         path.c_str(), SDL_GetError());
+            return "Not exported: the file could not be written";
+        }
+        if (!ok) {
+            std::fprintf(stderr, "[save] could not write %s: %s\n",
+                         path.c_str(), SDL_GetError());
+            return "Not exported: the file could not be written";
+        }
+        return "Save file exported";
+    }
+#endif
     std::string error;
     if (!nds_battery_save_write_atomic(path, data, size, &error))
         return "Not exported: " + error;
