@@ -103,6 +103,11 @@ struct NdsGpu3dProfile {
     uint64_t gx_new_images;
     uint64_t gx_swap_polygons;
     uint64_t gx_lcd_flips;
+    // ALWAYS-ON: packed GXFIFO words, FIFO entries written and executed
+    // (melonDS GPU3D host counters), the geometry engine's per-entry load.
+    uint64_t gx_fifo_words;
+    uint64_t gx_fifo_writes;
+    uint64_t gx_fifo_executed;
     // Motion smoothing (gpu3d_interp.h): blended images, their polygons, and
     // how many of those had a partner in the previous image.
     uint64_t gx_interp_images;

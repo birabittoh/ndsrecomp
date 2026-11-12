@@ -549,3 +549,15 @@ viewport, output-width and guest-wide-mode keys qualify hits. Zero-W behavior
 is retained. Reset and load discard derived entries. The bridge enables this
 only in the MPH submission HLE build; focused tests compare it with caching
 disabled. FIFO/device timing and polygon processing are unchanged.
+
+## 0030-gpu3d-register-fifo-entries.patch
+
+2026-11-12: `GPU3D.{cpp,h}` build each `CmdFIFOEntry` as one 64-bit value
+(`MakeCmdFIFOEntry`) and pass it by value, so a command word no longer goes
+through two 4-byte stores read back as one 8-byte load (a store-forwarding
+stall per entry). `CmdFIFOWrite` and `CmdFIFORead` are forced inline into
+their callers in `GPU3D.cpp`; the full-FIFO stall branch moves out of line
+into `CmdFIFOStall` with the same body. Three host-only counters
+(`HostGXFIFOWords`, `HostFIFOWrites`, `HostFIFOExecuted`) feed the runner's
+perf log; they are not hardware state and do not enter the serializer.
+FIFO, PIPE, stall, IRQ, DMA and command semantics are unchanged.

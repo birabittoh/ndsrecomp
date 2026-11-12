@@ -1063,7 +1063,12 @@ bool nds_gpu3d_capture_copy_counts(uint64_t* texture, uint64_t* palette) {
 }
 
 void nds_gpu3d_profile(NdsGpu3dProfile* out) {
-    if (out) *out = g_gpu3d_profile;
+    if (!out) return;
+    *out = g_gpu3d_profile;
+    const auto& g3 = g_nds.GPU.GPU3D;
+    out->gx_fifo_words = g3.HostGXFIFOWords;
+    out->gx_fifo_writes = g3.HostFIFOWrites;
+    out->gx_fifo_executed = g3.HostFIFOExecuted;
 }
 
 void nds_gpu3d_debug_history_reset() {
@@ -1377,10 +1382,17 @@ void nds_gpu3d_write(uint32_t addr, uint32_t value, uint32_t width) {
         g3.GeometryEnabled ? 1u : 0u, g3.GXStat, g3.CmdPIPE.Level(),
         0u, 0u,
     };
-    switch (width) {
-        case 1:  g3.Write8(addr, static_cast<melonDS::u8>(value)); break;
-        case 2:  g3.Write16(addr, static_cast<melonDS::u16>(value)); break;
-        default: g3.Write32(addr, value); break;
+    if (width == 4u && addr - 0x04000400u < 0x40u) {
+        // GXFIFO: exactly what GPU3D::Write32 does for these addresses (its
+        // geometry-enable check, then no switch case before the GXFIFO
+        // range), without walking its register switch per command word.
+        if (g3.GeometryEnabled) g3.WriteToGXFIFO(value);
+    } else {
+        switch (width) {
+            case 1:  g3.Write8(addr, static_cast<melonDS::u8>(value)); break;
+            case 2:  g3.Write16(addr, static_cast<melonDS::u16>(value)); break;
+            default: g3.Write32(addr, value); break;
+        }
     }
     e.gxstat_after = g3.GXStat;
     e.pipe_after = g3.CmdPIPE.Level();
