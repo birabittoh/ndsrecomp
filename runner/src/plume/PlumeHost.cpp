@@ -73,7 +73,13 @@ extern std::unique_ptr<RenderInterface> CreateD3D12Interface();
 namespace {
 using namespace plume;
 
+// Adreno surfaces list no B8G8R8A8_UNORM; Plume then makes the swap chain
+// with VK_FORMAT_UNDEFINED, which the pipelines below cannot draw into.
+#if defined(__ANDROID__)
+constexpr RenderFormat kSwapChainFormat = RenderFormat::R8G8B8A8_UNORM;
+#else
 constexpr RenderFormat kSwapChainFormat = RenderFormat::B8G8R8A8_UNORM;
+#endif
 // The frontend's frames are 0xAARRGGBB words: little endian bytes B, G, R, A.
 constexpr RenderFormat kImageFormat = RenderFormat::B8G8R8A8_UNORM;
 constexpr uint32_t kSwapChainBuffers = 3;
@@ -438,6 +444,11 @@ RenderWindow render_window_for(SDL_Window* window) {
     return static_cast<HWND>(SDL_GetPointerProperty(
         SDL_GetWindowProperties(window), SDL_PROP_WINDOW_WIN32_HWND_POINTER,
         nullptr));
+#elif defined(__ANDROID__)
+    // Plume's Vulkan backend makes a VK_KHR_android_surface from it.
+    return static_cast<ANativeWindow*>(SDL_GetPointerProperty(
+        SDL_GetWindowProperties(window), SDL_PROP_WINDOW_ANDROID_WINDOW_POINTER,
+        nullptr));
 #elif defined(PLUME_SDL3_VULKAN_ENABLED)
     return window;
 #elif defined(__APPLE__)
@@ -456,7 +467,7 @@ RenderWindow render_window_for(SDL_Window* window) {
 }
 
 bool render_window_valid(const RenderWindow& window) {
-#if defined(_WIN32) || defined(PLUME_SDL3_VULKAN_ENABLED)
+#if defined(_WIN32) || defined(__ANDROID__) || defined(PLUME_SDL3_VULKAN_ENABLED)
     return window != nullptr;
 #elif defined(__APPLE__)
     return window.window != nullptr && window.view != nullptr;
@@ -517,7 +528,7 @@ bool create_interface() {
         g_backend.api = "Vulkan";
     }
     return g_backend.render_interface != nullptr;
-#elif defined(PLUME_SDL3_VULKAN_ENABLED)
+#elif defined(__ANDROID__) || defined(PLUME_SDL3_VULKAN_ENABLED)
     g_backend.render_interface = CreateVulkanInterface();
     g_backend.api = "Vulkan";
     return g_backend.render_interface != nullptr;
