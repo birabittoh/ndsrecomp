@@ -338,6 +338,17 @@ private:
             std::fprintf(stderr,
                          "[online] Discord sign-in: opening the browser\n");
             rnet_account_login_begin();
+            logged_sign_in_error_.clear();
+        }
+        // The reason a sign-in failed is only shown while the server wants
+        // one, so the log gets it whenever it changes.
+        if (rnet_account_state() == RNET_ACCOUNT_FAILED) {
+            const char* err = rnet_account_error();
+            if (logged_sign_in_error_ != (err ? err : "")) {
+                logged_sign_in_error_ = err ? err : "";
+                std::fprintf(stderr, "[online] Discord sign-in failed: %s\n",
+                             logged_sign_in_error_.c_str());
+            }
         }
 
         if (!enabled) {
@@ -1081,6 +1092,7 @@ private:
     // Requests, under mu_.
     bool enabled_ = false;
     bool sign_in_request_ = false;
+    std::string logged_sign_in_error_;  // the last failure written to the log
     bool sign_out_request_ = false;
     bool leave_request_ = false;
     bool browsing_ = false;

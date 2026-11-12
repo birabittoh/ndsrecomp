@@ -363,7 +363,13 @@ int nds_netplay_menu_is_enabled(const RecompRuntimeUiItem* item) {
     const bool on = m.status.state != NdsOnlineState::Off;
     if (is(item, kEnabledKey) || is(item, kNameKey)) return 1;
     if (is(item, kStatusKey)) return 0;
-    if (is(item, kAccountKey)) return on ? 1 : 0;
+    // Only a server that wants Discord sign-in has a use for the row; one that
+    // does not offer it (a private server) leaves it disabled.
+    if (is(item, kAccountKey))
+        return on && (m.status.state == NdsOnlineState::NeedSignIn ||
+                      m.status.state == NdsOnlineState::SigningIn ||
+                      !m.status.account.empty())
+                   ? 1 : 0;
     if (is(item, kLeaveKey))
         return m.status.state == NdsOnlineState::Guest ||
                m.status.state == NdsOnlineState::Joining;
