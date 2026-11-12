@@ -165,6 +165,9 @@ int main() {
     if (!require(nds_parse_second_screen_size("25", &second_screen_size)) ||
         !require(second_screen_size == 25) ||
         !require(nds_parse_second_screen_size("0", &second_screen_size)) ||
+        !require(second_screen_size == 5) ||
+        !require(nds_parse_second_screen_size("3", &second_screen_size)) ||
+        !require(second_screen_size == 5) ||
         !require(!nds_parse_second_screen_size("61", &second_screen_size)) ||
         !require(!nds_parse_second_screen_size("-1", &second_screen_size)))
         return 1;

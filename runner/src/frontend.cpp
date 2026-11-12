@@ -1520,7 +1520,9 @@ int runtime_menu_set_value(RuntimeMenuState* state, const NdsMenuItem* item,
         return 1;
     }
     if (std::strcmp(item->key, kRuntimeSecondScreenKey) == 0) {
-        if (value < 0 || value > 60) return 0;
+        if (value < kNdsMinSecondScreenSize ||
+            value > kNdsMaxSecondScreenSize)
+            return 0;
         state->options->second_screen_size = static_cast<uint8_t>(value);
         std::fprintf(stderr, "[display] second screen size -> %d%%\n", value);
         return 1;
@@ -3759,9 +3761,9 @@ int nds_run_interactive_frontend(const NdsFrontendOptions& initial_options) {
          NdsMenuItemType::Choice, 0, 200, 1, resolution_scale_choices, 7,
          kResolutionScaleChoiceValues},
         {kRuntimeSecondScreenKey, "Display", "Second screen size",
-         "The other screen beside the main one, as a percent of its size. "
-         "0 hides it.",
-         NdsMenuItemType::Int, 0, 60, 5, nullptr, 0, nullptr},
+         "The other screen beside the main one, as a percent of its size.",
+         NdsMenuItemType::Int, kNdsMinSecondScreenSize,
+         kNdsMaxSecondScreenSize, 5, nullptr, 0, nullptr},
         {kRuntimeShowFpsKey, "Display", "Show FPS",
          "New 3D images per second in the corner of the screen, updated "
          "once a second. Reads 0 when nothing 3D is moving.",

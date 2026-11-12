@@ -182,8 +182,11 @@ bool nds_parse_second_screen_size(const std::string& value, uint8_t* out) {
     if (!out || value.empty()) return false;
     char* end = nullptr;
     const long parsed = std::strtol(value.c_str(), &end, 10);
-    if (!end || *end != '\0' || parsed < 0 || parsed > 60) return false;
-    *out = static_cast<uint8_t>(parsed);
+    if (!end || *end != '\0' || parsed < 0 ||
+        parsed > kNdsMaxSecondScreenSize)
+        return false;
+    *out = static_cast<uint8_t>(
+        std::max<long>(parsed, kNdsMinSecondScreenSize));
     return true;
 }
 

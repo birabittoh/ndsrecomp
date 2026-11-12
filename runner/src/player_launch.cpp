@@ -157,7 +157,7 @@ bool write_default_settings(const fs::path& path,
            "a fixed\n# multiplier: add internal_resolution = 1..16.\n"
         << "resolution_scale = " << options.resolution_scale << "\n"
         << "# The other screen beside the main one, as a % of its size "
-           "(0..60; 0 hides it).\n"
+           "(5..60).\n"
         << "second_screen_size = "
         << static_cast<unsigned>(options.second_screen_size) << "\n"
         << "show_fps = " << (options.show_fps ? "true" : "false")
