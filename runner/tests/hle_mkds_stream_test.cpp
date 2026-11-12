@@ -31,6 +31,8 @@ void differential(const char* path);
 
 namespace {
 constexpr uint32_t entry=0x0214d464, target=0x020f0000, mask=0x3fffff;
+// Every store publishes, as the runner's untracked windows do.
+const std::array<uint64_t,1024> all_code_blocks=[]{std::array<uint64_t,1024> a{};a.fill(~0ull);return a;}();
 void require(bool condition,const char* message) { if(!condition)throw std::runtime_error(message); }
 struct Memory : armv4t::Bus {
     std::vector<uint8_t> bytes=std::vector<uint8_t>(mask+1);
@@ -100,7 +102,7 @@ void differential(const char* path) {
         Memory live=initial;actual=&live;
         std::fill(live.bytes.begin()+0x200000,live.bytes.begin()+0x230000,uint8_t(0x31+test));
         std::fill(written.begin(),written.end(),uint8_t(0));generations.fill(1);
-        g_busf_main={live.bytes.data(),written.data(),generations.data(),mask};
+        g_busf_main={live.bytes.data(),written.data(),generations.data(),mask,all_code_blocks.data(),nullptr};
         uint32_t output=0x02208000,source=0x02201000,context=0x02222000,sp=0x02221000;
         if(test%7==1)source=output-8; // source aliases already produced/history bytes
         if(test%7==2)source=output+8; // writes can modify future compressed input
@@ -171,6 +173,7 @@ NdsBusFastWin g_busf_main{},g_busf_wram_lo[2]{},g_busf_wram_hi[2]{},g_busf_itcm{
 uint32_t g_busf_itcm_limit=0,g_busf_dtcm_base=0,g_busf_dtcm_limit=0;
 void runtime_note_code_write(){}
 void runtime_note_code_write_pages(const uint32_t* first,uint32_t count){++publications;if(pio_fixture::active)pio_fixture::published(first,count);}
+void runtime_note_code_store(const NdsBusFastWin* w,uint32_t off,uint32_t width){const uint32_t first=off>>12;runtime_note_code_write_pages(w->gen+first,((off+width-1u)>>12)-first+1u);}
 void runtime_note_live_write(uint32_t,uint32_t,uint32_t,uint32_t){}
 uint8_t bus_read_u8_slow(uint32_t a){return actual->read8(a);}
 uint16_t bus_read_u16_slow(uint32_t a){return actual->read16(a);}
@@ -328,7 +331,7 @@ struct PioMemory final : Memory {
 
 PioMemory& live(){return *static_cast<PioMemory*>(actual);}
 void bind(PioMemory& memory) {
-    actual=&memory;g_busf_main={memory.bytes.data(),memory.written.data(),memory.generations.data(),mask};
+    actual=&memory;g_busf_main={memory.bytes.data(),memory.written.data(),memory.generations.data(),mask,all_code_blocks.data(),nullptr};
 }
 void compare(const char* name,const PioMemory& memory,const PioMemory& reference,const armv4t::CPUState& cpu) {
     require(g_runtime_cycles==memory.cycles,"PIO host/device clock diverged");

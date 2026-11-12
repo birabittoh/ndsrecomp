@@ -18,6 +18,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <string>
+#include <unordered_map>
 #include <vector>
 
 #include "state.h"
@@ -166,6 +167,46 @@ std::vector<uint8_t> g_itcm_written;
 std::vector<uint8_t> g_dtcm_written;
 std::vector<uint8_t> g_shared_wram_written;
 std::vector<uint8_t> g_arm7_wram_written;
+// Exact code-write tracking (see NdsBusFastWin::code_mask in runtime_arm.h)
+// for the backings code executes from under a mapping that WRAMCNT cannot
+// move: main RAM, ITCM and ARM7 WRAM. Bits are set by bus_code_watch and
+// cleared only when the backing is reallocated: a stale bit costs an extra
+// publication, never a missed one. Any mapping refresh (WRAMCNT, CP15 TCM,
+// savestate, reset) bumps every code generation, so a snapshot taken under
+// the old mapping is re-resolved.
+struct CodeTrack {
+    const std::vector<uint8_t>* bytes;
+    uint32_t report_base;  // for the diagnostic only
+    std::vector<uint64_t> mask;
+    std::vector<uint32_t> gen;
+};
+CodeTrack g_code_main{&g_main_ram, 0x02000000u, {}, {}};
+CodeTrack g_code_itcm{&g_itcm, 0x01FF8000u, {}, {}};
+CodeTrack g_code_arm7_wram{&g_arm7_wram, 0x03800000u, {}, {}};
+CodeTrack* const g_code_tracks[] = {&g_code_main, &g_code_itcm,
+                                    &g_code_arm7_wram};
+// DTCM never executes. A page some snapshot or the coverage cache depends on
+// anyway is watched whole (bus_code_watch_page) and publishes page cells as
+// before; the ARM9 stack's pages publish nothing. Their page generations
+// still move on every store. Shared WRAM is remapped by WRAMCNT under a
+// fixed virtual page, so it keeps publishing every store (g_code_mask_all).
+std::vector<uint64_t> g_dtcm_code_mask;
+constexpr uint32_t kCodeMaskPages = 1024u;  // >= pages of any fast window
+alignas(64) const uint64_t g_code_mask_all[kCodeMaskPages] = {
+#define NDS_ONES8 ~0ull, ~0ull, ~0ull, ~0ull, ~0ull, ~0ull, ~0ull, ~0ull
+#define NDS_ONES64 NDS_ONES8, NDS_ONES8, NDS_ONES8, NDS_ONES8, \
+                   NDS_ONES8, NDS_ONES8, NDS_ONES8, NDS_ONES8
+    NDS_ONES64, NDS_ONES64, NDS_ONES64, NDS_ONES64,
+    NDS_ONES64, NDS_ONES64, NDS_ONES64, NDS_ONES64,
+    NDS_ONES64, NDS_ONES64, NDS_ONES64, NDS_ONES64,
+    NDS_ONES64, NDS_ONES64, NDS_ONES64, NDS_ONES64,
+#undef NDS_ONES64
+#undef NDS_ONES8
+};
+
+inline void bump_code_gen(uint32_t& cell) {
+    if (++cell == 0u) cell = 1u;
+}
 
 std::vector<uint32_t>* generation_for_ptr(const uint8_t* ptr,
                                           uint32_t* offset) {
@@ -197,8 +238,20 @@ void note_ram_write(uint8_t* ptr, uint32_t width) {
         uint32_t& generation = (*generations)[page];
         if (++generation == 0u) generation = 1u;
     }
-    runtime_note_code_write_pages(generations->data() + first,
-        std::min<uint32_t>(last + 1u, generations->size()) - first);
+    // Same rule as the inline fast path (nds_busf_note_write) for the
+    // tracked backings: the handler publishes only a store that touches a
+    // watched block. These windows index their backing from offset 0.
+    if (generations == &g_main_ram_generation && g_busf_main.code_gen) {
+        runtime_note_code_store(&g_busf_main, offset, width);
+    } else if (generations == &g_itcm_generation && g_busf_itcm.code_gen) {
+        runtime_note_code_store(&g_busf_itcm, offset, width);
+    } else if (generations == &g_arm7_wram_generation &&
+               g_busf_wram_hi[0].code_gen) {
+        runtime_note_code_store(&g_busf_wram_hi[0], offset, width);
+    } else {
+        runtime_note_code_write_pages(generations->data() + first,
+            std::min<uint32_t>(last + 1u, generations->size()) - first);
+    }
     uint32_t written_offset = 0u;
     if (std::vector<uint8_t>* written =
             written_for_ptr(ptr, &written_offset)) {
@@ -208,6 +261,186 @@ void note_ram_write(uint8_t* ptr, uint32_t width) {
                   written->begin() + end, uint8_t{1});
     }
 }
+
+// ── Code-store report (NDS_CODE_STORE_REPORT=1) ────────────────────────
+// Host-only diagnostic: which watched 64-byte blocks get stored to, by which
+// guest PC, and which validation range watches them. Printed at exit.
+struct CodeStoreDiag {
+    bool enabled = false;
+    struct Block {
+        uint64_t bumps = 0;
+        uint32_t watch_pc = 0, watch_addr = 0, watch_size = 0;
+        std::unordered_map<uint64_t, uint64_t> writers;  // cpu<<32 | pc
+    };
+    std::unordered_map<uint32_t, Block> blocks;  // backing offset >> 6
+    uint64_t store_calls = 0, store_bumps = 0, page_calls = 0, all_calls = 0;
+    uint64_t untracked[5] = {};  // itcm, dtcm, wram_lo, wram_hi, other
+    CodeStoreDiag() {
+        const char* v = std::getenv("NDS_CODE_STORE_REPORT");
+        enabled = v && *v && *v != '0';
+        if (enabled) std::atexit([] { report(); });
+    }
+    static void report();
+};
+CodeStoreDiag& g_code_diag = *new CodeStoreDiag();
+void CodeStoreDiag::report() {
+    auto& d = g_code_diag;
+    std::fprintf(stderr, "[code-store] store_calls=%llu bumps=%llu page_calls=%llu all_calls=%llu blocks=%zu\n",
+        (unsigned long long)d.store_calls, (unsigned long long)d.store_bumps,
+        (unsigned long long)d.page_calls, (unsigned long long)d.all_calls,
+        d.blocks.size());
+    std::fprintf(stderr, "[code-store] untracked publications itcm=%llu dtcm=%llu wram_lo=%llu wram_hi=%llu other=%llu\n",
+        (unsigned long long)d.untracked[0], (unsigned long long)d.untracked[1],
+        (unsigned long long)d.untracked[2], (unsigned long long)d.untracked[3],
+        (unsigned long long)d.untracked[4]);
+    std::vector<std::pair<uint64_t, uint32_t>> order;
+    for (auto& [b, row] : d.blocks) if (row.bumps) order.push_back({row.bumps, b});
+    std::sort(order.rbegin(), order.rend());
+    for (size_t i = 0; i < order.size() && i < 30; ++i) {
+        const auto& row = d.blocks[order[i].second];
+        const uint32_t key = order[i].second;
+        std::fprintf(stderr, "[code-store] block %08X bumps=%llu watched_by pc=%08X range=%08X+%X writers:",
+            g_code_tracks[key >> 24]->report_base + ((key & 0xFFFFFFu) << 6),
+            (unsigned long long)row.bumps,
+            row.watch_pc, row.watch_addr, row.watch_size);
+        std::vector<std::pair<uint64_t, uint64_t>> w;
+        for (auto& [k, n] : row.writers) w.push_back({n, k});
+        std::sort(w.rbegin(), w.rend());
+        for (size_t j = 0; j < w.size() && j < 4; ++j)
+            std::fprintf(stderr, " arm%c:%08X x%llu", (w[j].second >> 32) ? '7' : '9',
+                unsigned(w[j].second), (unsigned long long)w[j].first);
+        std::fputc('\n', stderr);
+    }
+}
+
+}  // namespace
+
+void bus_code_diag_untracked(const NdsBusFastWin* w) {
+    if (!g_code_diag.enabled) return;
+    const int k = w == &g_busf_itcm ? 0 : w == &g_busf_dtcm ? 1
+        : (w == &g_busf_wram_lo[0] || w == &g_busf_wram_lo[1]) ? 2
+        : (w == &g_busf_wram_hi[0] || w == &g_busf_wram_hi[1]) ? 3 : 4;
+    ++g_code_diag.untracked[k];
+}
+
+extern "C" {
+uint32_t g_code_diag_watch_pc = 0, g_code_diag_watch_addr = 0,
+         g_code_diag_watch_size = 0;
+}
+
+// The tracked backing behind a window (its code_gen cells), or nullptr.
+static CodeTrack* code_track_for(const NdsBusFastWin* w, uint32_t* base_page) {
+    if (!w || !w->code_gen) return nullptr;
+    for (CodeTrack* t : g_code_tracks) {
+        if (t->gen.empty()) continue;
+        if (w->code_gen >= t->gen.data() &&
+            w->code_gen < t->gen.data() + t->gen.size()) {
+            *base_page = static_cast<uint32_t>(w->code_gen - t->gen.data());
+            return t;
+        }
+    }
+    return nullptr;
+}
+
+uint32_t* bus_code_watch(uint32_t page, uint64_t blocks) {
+    uint32_t off = 0u;
+    const NdsBusFastWin* w = nds_busf_classify(page, &off);
+    if (!w || !w->data) return nullptr;
+    uint32_t base_page = 0u;
+    CodeTrack* const t = code_track_for(w, &base_page);
+    if (!t) return nullptr;
+    const uint32_t index = base_page + (off >> kExecPageShift);
+    if (index >= t->gen.size()) return nullptr;
+    if (g_code_diag.enabled) [[unlikely]] {
+        const uint32_t track = static_cast<uint32_t>(t - g_code_tracks[0]);
+        for (uint32_t b = 0; b < 64u; ++b) {
+            if (!((blocks >> b) & 1u) || ((t->mask[index] >> b) & 1u))
+                continue;
+            auto& row = g_code_diag.blocks[(track << 24u) | (index << 6u) | b];
+            row.watch_pc = g_code_diag_watch_pc;
+            row.watch_addr = g_code_diag_watch_addr;
+            row.watch_size = g_code_diag_watch_size;
+        }
+    }
+    t->mask[index] |= blocks;
+    return t->gen.data() + index;
+}
+
+uint32_t* bus_code_store(const NdsBusFastWin* w, uint32_t offset,
+                         uint32_t width, uint32_t* count) {
+    *count = 0u;
+    if (g_code_diag.enabled) [[unlikely]] ++g_code_diag.store_calls;
+    uint32_t base_page = 0u;
+    CodeTrack* const t = code_track_for(w, &base_page);
+    if (width == 0u || !t) return nullptr;
+    // Window offsets are page-aligned relative to the backing (base_page),
+    // and the window's mask table is indexed like its code_gen cells.
+    const uint32_t limit = static_cast<uint32_t>(
+        (t->gen.size() - base_page) << kExecPageShift);
+    if (offset >= limit) return nullptr;
+    const uint32_t end = std::min<uint32_t>(offset + width - 1u, limit - 1u);
+    const uint64_t* const mask = w->code_mask;
+    uint32_t* const gen = w->code_gen;
+    uint32_t* first_bumped = nullptr;
+    for (uint32_t page = offset >> kExecPageShift;
+         page <= (end >> kExecPageShift); ++page) {
+        const uint32_t lo = std::max(offset, page << kExecPageShift);
+        const uint32_t hi = std::min(end, (page << kExecPageShift) | 0xFFFu);
+        const uint32_t lo_block = (lo >> 6u) & 63u;
+        const uint32_t hi_block = (hi >> 6u) & 63u;
+        const uint64_t blocks = (~0ull >> (63u - hi_block)) &
+                                (~0ull << lo_block);
+        if (!(mask[page] & blocks)) continue;
+        bump_code_gen(gen[page]);
+        if (g_code_diag.enabled) [[unlikely]] {
+            ++g_code_diag.store_bumps;
+            const uint32_t track = static_cast<uint32_t>(t - g_code_tracks[0]);
+            const uint64_t writer =
+                (uint64_t{g_nds_active == NDS_ARM7 ? 1u : 0u} << 32u) |
+                g_cpu.R[15];
+            for (uint32_t b = lo >> 6u; b <= hi >> 6u; ++b) {
+                if (!((mask[page] >> (b & 63u)) & 1u)) continue;
+                auto& row = g_code_diag.blocks[(track << 24u) |
+                                               ((base_page << 6u) + b)];
+                ++row.bumps;
+                ++row.writers[writer];
+            }
+        }
+        if (!first_bumped) first_bumped = gen + page;
+        *count = static_cast<uint32_t>(gen + page - first_bumped) + 1u;
+    }
+    return first_bumped;
+}
+
+uint32_t* bus_code_store_pages(const uint32_t* page_gen, uint32_t count) {
+    if (!page_gen || count == 0u) return nullptr;
+    const std::vector<uint32_t>* const page_gens[] = {
+        &g_main_ram_generation, &g_itcm_generation, &g_arm7_wram_generation};
+    for (size_t k = 0; k < 3u; ++k) {
+        const std::vector<uint32_t>& v = *page_gens[k];
+        CodeTrack& t = *g_code_tracks[k];
+        if (v.empty() || t.gen.size() != v.size()) continue;
+        const uintptr_t base = reinterpret_cast<uintptr_t>(v.data());
+        const uintptr_t p = reinterpret_cast<uintptr_t>(page_gen);
+        if (p < base) continue;
+        const uintptr_t index = (p - base) / sizeof(uint32_t);
+        if ((p - base) % sizeof(uint32_t) != 0u || index + count > v.size())
+            continue;
+        if (g_code_diag.enabled) [[unlikely]] ++g_code_diag.page_calls;
+        for (uint32_t i = 0u; i < count; ++i)
+            bump_code_gen(t.gen[index + i]);
+        return t.gen.data() + index;
+    }
+    return nullptr;
+}
+
+void bus_code_store_all() {
+    if (g_code_diag.enabled) [[unlikely]] ++g_code_diag.all_calls;
+    for (CodeTrack* t : g_code_tracks)
+        for (uint32_t& cell : t->gen) bump_code_gen(cell);
+}
+
+namespace {
 
 uint32_t page_generation_for_ptr(const uint8_t* ptr) {
     uint32_t offset = 0;
@@ -483,6 +716,24 @@ void bus_init() {
     g_dtcm_written.assign(g_dtcm.size(), 0u);
     g_shared_wram_written.assign(g_shared_wram.size(), 0u);
     g_arm7_wram_written.assign(g_arm7_wram.size(), 0u);
+    // Page generations restart at 0, so every cached snapshot must already
+    // be gone here (as for page generations). Code generations do not
+    // restart: bumping them keeps any snapshot that survived stale.
+    // Watched non-main pages stay watched (stale bits only publish more).
+    g_dtcm_code_mask.resize(g_dtcm_generation.size(), 0u);
+    {
+        const size_t pages[] = {g_main_ram_generation.size(),
+                                g_itcm_generation.size(),
+                                g_arm7_wram_generation.size()};
+        for (size_t k = 0; k < 3u; ++k) {
+            CodeTrack& t = *g_code_tracks[k];
+            if (t.gen.size() != pages[k]) {
+                t.gen.assign(pages[k], 1u);
+                t.mask.assign(pages[k], 0u);
+            }
+        }
+    }
+    // bus_fast_refresh below bumps every code generation.
     g_ring_w = 0;
     g_ring_seq = 0;
     g_watch_w = 0;
@@ -547,13 +798,33 @@ void bus_fast_refresh() {
         g_busf_itcm_limit = g_busf_dtcm_base = g_busf_dtcm_limit = 0u;
         return;
     }
+    static_assert(4u * 1024u * 1024u / kExecPageSize <= kCodeMaskPages);
+    // The Dynarmic ARM9 build observes every store through
+    // publish_code_write (nds_arm9_native_note_write_pages), so its main
+    // window keeps publishing all of them.
+#if defined(NDS_ARM9_DYNARMIC)
+    const uint64_t* const main_code_mask = g_code_mask_all;
+    const uint64_t* const itcm_code_mask = g_code_mask_all;
+    const uint64_t* const dtcm_code_mask = g_code_mask_all;
+    const uint64_t* const arm7_wram_code_mask = g_code_mask_all;
+#else
+    const uint64_t* const main_code_mask = g_code_main.mask.data();
+    const uint64_t* const itcm_code_mask = g_code_itcm.mask.data();
+    const uint64_t* const dtcm_code_mask = g_dtcm_code_mask.data();
+    const uint64_t* const arm7_wram_code_mask = g_code_arm7_wram.mask.data();
+#endif
+    // A snapshot holds a code-generation cell resolved under the mapping
+    // being replaced here; make every one of them stale.
+    bus_code_store_all();
     g_busf_main = {g_main_ram.data(), g_main_ram_written.data(),
-                   g_main_ram_generation.data(), 0x003FFFFFu};
+                   g_main_ram_generation.data(), 0x003FFFFFu,
+                   main_code_mask, g_code_main.gen.data()};
     // 0x03800000..0x03FFFFFF: resolve() serves the ARM7 WRAM backing for
     // BOTH CPUs (no arm9 branch there) — mirror that, not hardware lore.
     g_busf_wram_hi[0] = g_busf_wram_hi[1] =
         {g_arm7_wram.data(), g_arm7_wram_written.data(),
-         g_arm7_wram_generation.data(), 0x0000FFFFu};
+         g_arm7_wram_generation.data(), 0x0000FFFFu, arm7_wram_code_mask,
+         g_code_arm7_wram.gen.data()};
     // 0x03000000..0x037FFFFF per WRAMCNT, exactly resolve()'s split. The
     // 0x4000 window base is 4-KiB-page aligned, so the provenance arrays
     // can be offset the same way (page index stays region-consistent).
@@ -563,14 +834,15 @@ void bus_fast_refresh() {
                              g_shared_wram_written.data() + base,
                              g_shared_wram_generation.data() +
                                  (base >> kExecPageShift),
-                             mask};
+                             mask, g_code_mask_all, nullptr};
     };
     switch (mode) {
         case 0:
             g_busf_wram_lo[NDS_ARM9] = shared_win(0u, 0x7FFFu);
             g_busf_wram_lo[NDS_ARM7] =
                 {g_arm7_wram.data(), g_arm7_wram_written.data(),
-                 g_arm7_wram_generation.data(), 0x0000FFFFu};
+                 g_arm7_wram_generation.data(), 0x0000FFFFu, arm7_wram_code_mask,
+         g_code_arm7_wram.gen.data()};
             break;
         case 1:
             g_busf_wram_lo[NDS_ARM9] = shared_win(0x4000u, 0x3FFFu);
@@ -590,9 +862,11 @@ void bus_fast_refresh() {
     // NON-mirrored window — only the first 16 KiB of its virtual span is
     // backed, the rest falls through (to the slow path here).
     g_busf_itcm = {g_itcm.data(), g_itcm_written.data(),
-                   g_itcm_generation.data(), 0x00007FFFu};
+                   g_itcm_generation.data(), 0x00007FFFu, itcm_code_mask,
+                   g_code_itcm.gen.data()};
     g_busf_dtcm = {g_dtcm.data(), g_dtcm_written.data(),
-                   g_dtcm_generation.data(), 0x00003FFFu};
+                   g_dtcm_generation.data(), 0x00003FFFu, dtcm_code_mask,
+                   nullptr};
     g_busf_itcm_limit =
         (g_cp15.itcm_enable && g_cp15.itcm_size)
             ? std::min<uint32_t>(g_cp15.itcm_size, 0x02000000u)
@@ -780,6 +1054,31 @@ bool bus_range_has_write_provenance(uint32_t addr, uint32_t size) {
         offset += chunk;
     }
     return true;
+}
+
+void bus_code_watch_page(uint32_t addr) {
+    uint8_t* const ptr = resolve(addr, 1u);
+    if (!ptr) return;
+    const uintptr_t p = reinterpret_cast<uintptr_t>(ptr);
+    auto watch = [&](const std::vector<uint8_t>& bytes,
+                     std::vector<uint64_t>& mask) {
+        const uintptr_t base = reinterpret_cast<uintptr_t>(bytes.data());
+        if (p < base || p >= base + bytes.size()) return false;
+        const size_t page = (p - base) >> kExecPageShift;
+        if (page < mask.size()) mask[page] = ~0ull;
+        return true;
+    };
+    if (watch(g_main_ram, g_code_main.mask)) return;
+    if (watch(g_itcm, g_code_itcm.mask)) return;
+    if (watch(g_dtcm, g_dtcm_code_mask)) return;
+    watch(g_arm7_wram, g_code_arm7_wram.mask);
+}
+
+const uint32_t* bus_main_page_generation_cell(uint32_t addr) {
+    uint32_t off = 0u;
+    const NdsBusFastWin* w = nds_busf_classify(addr, &off);
+    if (!w || !w->data || !w->gen || !w->code_gen) return nullptr;
+    return w->gen + (off >> kExecPageShift);
 }
 
 uint32_t bus_exec_page_generation(uint32_t addr) {

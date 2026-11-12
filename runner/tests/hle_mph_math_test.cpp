@@ -269,6 +269,7 @@ NdsBusFastWin g_busf_itcm{}, g_busf_dtcm{};
 uint32_t g_busf_itcm_limit{}, g_busf_dtcm_base{}, g_busf_dtcm_limit{};
 void runtime_note_code_write() { throw std::runtime_error("unexpected fast bus write"); }
 void runtime_note_code_write_pages(const uint32_t*,uint32_t) { runtime_note_code_write(); }
+void runtime_note_code_store(const NdsBusFastWin*,uint32_t,uint32_t) { runtime_note_code_write(); }
 void runtime_note_live_write(uint32_t, uint32_t, uint32_t, uint32_t) {
     throw std::runtime_error("unexpected live code write");
 }

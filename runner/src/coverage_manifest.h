@@ -67,16 +67,24 @@
 
 #include <cstdint>
 
-// Bumped by runtime_note_code_write() on every guest RAM write. A change means
+// Bumped by publish_code_write() on every guest RAM write outside main RAM
+// and on main-RAM writes that touch watched code. A change means
 // "some page somewhere may have been rewritten", which is the cue to re-check
 // the cached page's generation -- not to re-hash it.
 extern uint64_t g_coverage_write_epoch;
+extern "C" uint64_t g_busf_mapping_generation;
 
 struct CoverageExecCache {
     uint32_t base = 0u;
     uint32_t generation = 0u;
     uint32_t stored_index = UINT32_MAX;
     uint64_t epoch = 0u;
+    // Code-tracked pages (main RAM, ITCM, ARM7 WRAM): the page-generation
+    // cell, compared directly, plus the fast-map generation it was resolved
+    // under. Their stores publish (and bump the epoch) only when they touch
+    // watched code. Other pages are watched whole and use the epoch.
+    const uint32_t* generation_ptr = nullptr;
+    uint64_t mapping_generation = 0u;
     bool valid = false;
 };
 extern CoverageExecCache g_coverage_exec_cache[2];
@@ -96,7 +104,10 @@ inline void coverage_note_exec(int cpu, uint32_t pc) {
     CoverageExecCache& cache = g_coverage_exec_cache[cpu & 1];
     const uint32_t base = pc & ~0xFFFu;
     if (cache.valid && cache.base == base &&
-        cache.epoch == g_coverage_write_epoch) {
+        (cache.generation_ptr
+             ? *cache.generation_ptr == cache.generation &&
+                   cache.mapping_generation == g_busf_mapping_generation
+             : cache.epoch == g_coverage_write_epoch)) {
         return;
     }
     coverage_capture_exec_page(cpu & 1, base, pc);
