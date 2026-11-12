@@ -13,7 +13,9 @@ class NDS;
 // Motion smoothing for games that draw 3D below the DS frame rate. A game at
 // 30 holds each image for two DS frames, so the second frame is free: the
 // renderer gets the image halfway between the last two, then the real image
-// one DS frame late.
+// one DS frame late. An image drawn right after the last one (a game at 60)
+// is shown one frame late too, as the last image again, so the halfway image
+// only fills the frames such a game misses.
 //
 // The halfway image is drawn again from the game's own commands
 // (gpu3d_gxstream.h): the newer image's command stream with its matrices

@@ -158,6 +158,18 @@ void nds_title_set_stacked_layout_query(NdsTitleStackedLayoutQuery query);
 // For the frontend: the query's answer (false with none registered).
 bool nds_title_stacked_layout_wanted();
 
+// Hands 3D motion smoothing (display.smooth_3d) to the title, for a title
+// whose own setting pairs it with its frame rate: while a query is
+// registered the frontend hides its Smooth 3D row, ignores the option and
+// smooths exactly while the query returns true. The query runs on the
+// frontend thread once per presented frame and may only read settings or
+// guest memory. Call it from a static initializer, like a setting.
+typedef bool (*NdsTitleSmooth3dQuery)();
+void nds_title_set_smooth_3d_query(NdsTitleSmooth3dQuery query);
+// For the frontend: whether a query is registered, and its answer.
+bool nds_title_smooth_3d_owned();
+bool nds_title_smooth_3d_wanted();
+
 // Binds the frontend's zoom inputs (mouse wheel, gamepad right stick up/down)
 // to a number setting: an add changes `value_id`, but only while the
 // setting `mode_id` holds `active_mode_value` (a title's "Manual" mode). Call

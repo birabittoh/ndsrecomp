@@ -120,6 +120,24 @@ bool nds_title_stacked_layout_wanted() {
     return query && query();
 }
 
+namespace {
+std::atomic<NdsTitleSmooth3dQuery> g_smooth_3d_query{nullptr};
+}  // namespace
+
+void nds_title_set_smooth_3d_query(NdsTitleSmooth3dQuery query) {
+    g_smooth_3d_query.store(query, std::memory_order_relaxed);
+}
+
+bool nds_title_smooth_3d_owned() {
+    return g_smooth_3d_query.load(std::memory_order_relaxed) != nullptr;
+}
+
+bool nds_title_smooth_3d_wanted() {
+    const NdsTitleSmooth3dQuery query =
+        g_smooth_3d_query.load(std::memory_order_relaxed);
+    return query && query();
+}
+
 int nds_title_display_height() {
     return g_display_height.load(std::memory_order_relaxed);
 }
