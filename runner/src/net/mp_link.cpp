@@ -182,7 +182,9 @@ public:
             }
         }
         const PeerAddr bind_addr{
-            config_.lan ? INADDR_ANY : INADDR_LOOPBACK, OwnPort()};
+            // Bionic defines these as unsigned long.
+            static_cast<uint32_t>(config_.lan ? INADDR_ANY : INADDR_LOOPBACK),
+            OwnPort()};
         sockaddr_in addr = ToSockaddr(bind_addr);
         if (::bind(s, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) !=
             0) {
