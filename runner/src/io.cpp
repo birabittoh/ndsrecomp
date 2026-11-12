@@ -2538,14 +2538,22 @@ void nds_tick_rtc(unsigned long long system_cycles) {
 }
 
 // ── Interrupt controller ────────────────────────────────────────────────
+// An unchanged IF leaves IME/IE/IF, and so the pending cache, exactly as
+// irq_recompute last derived them (every IE/IME/IF write recomputes), so
+// there is nothing to republish. The geometry engine re-asserts its FIFO
+// IRQ level on most command reads (GPU3D::CheckFIFOIRQ), almost always to
+// the value IF already holds; recomputing there dropped the per-instruction
+// fast limit mid-slice for no state change.
 void nds_raise_irq(int cpu, uint32_t bits) {
     cpu &= 1;
+    if ((g_if[cpu] | bits) == g_if[cpu]) return;
     g_if[cpu] |= bits;
     irq_recompute(cpu);
 }
 
 void nds_clear_irq(int cpu, uint32_t bits) {
     cpu &= 1;
+    if ((g_if[cpu] & ~bits) == g_if[cpu]) return;
     g_if[cpu] &= ~bits;
     irq_recompute(cpu);
 }

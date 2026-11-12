@@ -1801,22 +1801,30 @@ void GPU3D::VecTest(u32 param) noexcept
 
 
 
-void GPU3D::CmdFIFOWrite(const CmdFIFOEntry& entry) noexcept
+[[gnu::noinline]] void GPU3D::CmdFIFOStall(CmdFIFOEntry entry) noexcept
 {
+    // store it to the stall queue. stall the system.
+    // worst case is if a STMxx opcode causes this, which is why our stall queue
+    // has 64 entries. this is less complicated than trying to make STMxx stall-able.
+
+    CmdStallQueue.Write(entry);
+    NDS.GXFIFOStall();
+}
+
+// Inlined into every producer in this file (one per command word); the
+// stall branch stays out of line.
+[[gnu::always_inline]] inline void GPU3D::CmdFIFOWrite(CmdFIFOEntry entry) noexcept
+{
+    HostFIFOWrites++;
     if (CmdFIFO.IsEmpty() && !CmdPIPE.IsFull())
     {
         CmdPIPE.Write(entry);
     }
     else
     {
-        if (CmdFIFO.IsFull())
+        if (CmdFIFO.IsFull()) [[unlikely]]
         {
-            // store it to the stall queue. stall the system.
-            // worst case is if a STMxx opcode causes this, which is why our stall queue
-            // has 64 entries. this is less complicated than trying to make STMxx stall-able.
-
-            CmdStallQueue.Write(entry);
-            NDS.GXFIFOStall();
+            CmdFIFOStall(entry);
             return;
         }
 
@@ -1837,7 +1845,7 @@ void GPU3D::CmdFIFOWrite(const CmdFIFOEntry& entry) noexcept
     }
 }
 
-GPU3D::CmdFIFOEntry GPU3D::CmdFIFORead() noexcept
+[[gnu::always_inline]] inline GPU3D::CmdFIFOEntry GPU3D::CmdFIFORead() noexcept
 {
     CmdFIFOEntry ret = CmdPIPE.Read();
 
@@ -1872,24 +1880,20 @@ GPU3D::CmdFIFOEntry GPU3D::CmdFIFORead() noexcept
 
 void GPU3D::ExecuteCommand() noexcept
 {
+    HostFIFOExecuted++;
     ExecuteEntry(CmdFIFORead());
 }
 
 void GPU3D::ExecuteReplayCommand(u32 command, const u32* params, u32 count) noexcept
 {
     // The FIFO is bypassed: no IRQ, DMA or stall reaches the NDS.
-    CmdFIFOEntry entry {};
-    entry.Command = command;
     if (count == 0)
     {
-        ExecuteEntry(entry);
+        ExecuteEntry(MakeCmdFIFOEntry(command, 0));
         return;
     }
     for (u32 i = 0; i < count; i++)
-    {
-        entry.Param = params[i];
-        ExecuteEntry(entry);
-    }
+        ExecuteEntry(MakeCmdFIFOEntry(command, params[i]));
 }
 
 void GPU3D::ExecuteEntry(CmdFIFOEntry entry) noexcept
@@ -2796,6 +2800,7 @@ bool GPU3D::IsRendererAccelerated() const noexcept
 
 void GPU3D::WriteToGXFIFO(u32 val) noexcept
 {
+    HostGXFIFOWords++;
     if (NumCommands == 0)
     {
         NumCommands = 4;
@@ -2812,10 +2817,7 @@ void GPU3D::WriteToGXFIFO(u32 val) noexcept
     {
         if ((CurCommand & 0xFF) || (NumCommands == 4 && CurCommand == 0))
         {
-            CmdFIFOEntry entry;
-            entry.Command = CurCommand & 0xFF;
-            entry.Param = val;
-            CmdFIFOWrite(entry);
+            CmdFIFOWrite(MakeCmdFIFOEntry(CurCommand & 0xFF, val));
         }
 
         if (ParamCount >= TotalParams)
@@ -2836,13 +2838,9 @@ const u8* GPU3D::CommandParamCounts() noexcept { return CmdNumParams; }
 
 void GPU3D::WriteDecodedGXFIFO(u32 value, const u8* commands, u32 count) noexcept
 {
+    HostGXFIFOWords++;
     for (u32 i = 0; i < count; ++i)
-    {
-        CmdFIFOEntry entry;
-        entry.Command = commands[i];
-        entry.Param = value;
-        CmdFIFOWrite(entry);
-    }
+        CmdFIFOWrite(MakeCmdFIFOEntry(commands[i], value));
 }
 
 
@@ -3180,10 +3178,7 @@ void GPU3D::Write32(u32 addr, u32 val) noexcept
 
     if (addr >= 0x04000440 && addr < 0x040005CC)
     {
-        CmdFIFOEntry entry;
-        entry.Command = (addr & 0x1FC) >> 2;
-        entry.Param = val;
-        CmdFIFOWrite(entry);
+        CmdFIFOWrite(MakeCmdFIFOEntry((addr & 0x1FC) >> 2, val));
         return;
     }
 

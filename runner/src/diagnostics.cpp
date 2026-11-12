@@ -813,6 +813,7 @@ void nds_diagnostics_maybe_write_performance_sample(
         "\"transitions\":%llu,\"compute_readback_ms\":%.3f},"
         "\"gx\":{\"vblanks\":%llu,\"swaps\":%llu,\"new_images\":%llu,"
         "\"swap_polygons\":%llu,\"lcd_flips\":%llu,"
+        "\"fifo_words\":%llu,\"fifo_writes\":%llu,\"fifo_executed\":%llu,"
         "\"interp_images\":%llu,\"interp_units\":%llu,"
         "\"interp_blended_units\":%llu,\"interp_skipped\":%llu},"
         "\"cycles\":{\"arm9\":%llu,\"arm7\":%llu},"
@@ -861,6 +862,12 @@ void nds_diagnostics_maybe_write_performance_sample(
                                     g_prev_gpu3d.gx_swap_polygons),
         (unsigned long long)sub_u64(gpu3d.gx_lcd_flips,
                                     g_prev_gpu3d.gx_lcd_flips),
+        (unsigned long long)sub_u64(gpu3d.gx_fifo_words,
+                                    g_prev_gpu3d.gx_fifo_words),
+        (unsigned long long)sub_u64(gpu3d.gx_fifo_writes,
+                                    g_prev_gpu3d.gx_fifo_writes),
+        (unsigned long long)sub_u64(gpu3d.gx_fifo_executed,
+                                    g_prev_gpu3d.gx_fifo_executed),
         (unsigned long long)sub_u64(gpu3d.gx_interp_images,
                                     g_prev_gpu3d.gx_interp_images),
         (unsigned long long)sub_u64(gpu3d.gx_interp_units,
