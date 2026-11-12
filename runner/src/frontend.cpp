@@ -3329,6 +3329,17 @@ int nds_run_interactive_frontend(const NdsFrontendOptions& initial_options) {
     SDL_SetHint(SDL_HINT_APP_ID, options.app_name.empty()
                                      ? "ndsrecomp" : options.app_name.c_str());
 #endif
+#if defined(__ANDROID__)
+    // Any orientation the sensor reports: the window follows the rotation,
+    // and in portrait the single layout puts the second screen under the
+    // main one. Without the hint SDL picks one from the first window size.
+    SDL_SetHint(SDL_HINT_ORIENTATIONS,
+                "LandscapeLeft LandscapeRight Portrait PortraitUpsideDown");
+    // Always fullscreen (immersive, no status or navigation bar): a phone
+    // has no window to size, so settings.toml's fullscreen is not read and
+    // Alt+Enter does not toggle it.
+    options.fullscreen = NdsFullscreenMode::Borderless;
+#endif
     SDL_SetMainReady();
     // SDL_INIT_TIMER matters on Windows: it raises the OS timer resolution
     // to 1 ms (SDL_HINT_TIMER_RESOLUTION default). Without it SDL_Delay(1)
@@ -4604,6 +4615,10 @@ int nds_run_interactive_frontend(const NdsFrontendOptions& initial_options) {
                 const SDL_Scancode alt_key = sdl_event_scancode(event);
                 if (alt_key == SDL_SCANCODE_RETURN ||
                     alt_key == SDL_SCANCODE_KP_ENTER) {
+#if defined(__ANDROID__)
+                    // Always fullscreen there; the key is still swallowed.
+                    continue;
+#endif
                     if (event.type == SDL_KEYDOWN && !event.key.repeat &&
                         presentation.windows[0]) {
                         SDL_Window* window = presentation.windows[0];
