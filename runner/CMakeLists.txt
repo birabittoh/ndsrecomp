@@ -466,6 +466,13 @@ set(NDS_GAME_BANK_COMPILE_OPTIONS "-w;-O2;-g0")
 if(CMAKE_C_COMPILER_ID MATCHES "Clang" AND NOT WIN32 AND NOT APPLE)
     list(APPEND NDS_GAME_BANK_COMPILE_OPTIONS "-fdirect-access-external-data")
 endif()
+# A shared runner (Android) builds the banks -fPIC, where clang ignores the
+# flag above; declaring the runtime hidden gets the same direct access
+# (src/bank_hidden_visibility.h).
+if(ANDROID)
+    list(APPEND NDS_GAME_BANK_COMPILE_OPTIONS
+        "-include;${CMAKE_CURRENT_SOURCE_DIR}/src/bank_hidden_visibility.h")
+endif()
 if(SM64DS_BANK_SOURCES AND NOT MSVC)
     # Game banks are on the hot path (the ARM7 runtime-RAM bank carries the
     # sound engine); boot correctness is gate-proven (G1/G2/G3), so compile
