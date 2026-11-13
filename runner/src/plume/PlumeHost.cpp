@@ -192,6 +192,15 @@ bool g_resize_pending = false;
 // A resize failed for a reason other than a zero-sized window; logged once
 // per failure, and again when it recovers.
 bool g_resize_failing = false;
+#if defined(__ANDROID__)
+// Android takes the window's surface away whenever the app leaves the
+// foreground, and the window gets a new ANativeWindow when it comes back.
+// Between the two the old one is released and SDL's window property still
+// points at it, so no swap chain may be made until the foreground event
+// says the new one is in place.
+bool g_backgrounded = false;
+bool g_lifecycle_watch = false;
+#endif
 NdsWindowMode g_window_mode = NdsWindowMode::Letterbox;
 NdsScalingFilter g_scaling = NdsScalingFilter::Integer;
 const uint32_t* g_overlay_pixels = nullptr;
@@ -547,6 +556,76 @@ bool create_interface() {
 #endif
 }
 
+bool create_swap_chain(const RenderWindow& render_window) {
+    g_backend.swap_chain = g_backend.queue->createSwapChain(RenderSwapChainDesc(
+        render_window, kSwapChainFormat, kSwapChainBuffers));
+    if (!g_backend.swap_chain) return false;
+    // Vsync is always on, with no setting to turn it off. The frontend paces
+    // itself from the audio queue, so Vulkan prefers MAILBOX: the flip lands
+    // on a vblank (no tearing) but a present never blocks for a whole
+    // refresh. Without MAILBOX it falls back to FIFO.
+    g_backend.swap_chain->setVsyncEnabled(true);
+    return true;
+}
+
+#if defined(__ANDROID__)
+// The swap chain owns the VkSurfaceKHR, so dropping it lets go of the old
+// ANativeWindow. A frame in flight may still draw into its images.
+void release_swap_chain() {
+    if (!g_backend.swap_chain) return;
+    wait_all_slots();
+    g_backend.framebuffers.clear();
+    g_backend.swap_chain.reset();
+    g_resize_pending = false;
+    g_resize_failing = false;
+}
+
+// After a return to the foreground: a new swap chain on the window's new
+// surface, sized by the next resize_if_needed. False while there is still
+// nothing to make one on; the frame is skipped and the next one retries.
+bool rebuild_swap_chain() {
+    if (g_backgrounded || !g_window) return false;
+    const RenderWindow render_window = render_window_for(g_window);
+    if (!render_window_valid(render_window)) return false;
+    if (!create_swap_chain(render_window)) {
+        static bool logged = false;
+        if (!logged) {
+            logged = true;
+            std::fprintf(stderr, "[plume] no swap chain on the new surface; "
+                                 "retrying every frame\n");
+        }
+        return false;
+    }
+    g_resize_pending = true;
+    std::fprintf(stderr, "[plume] swap chain rebuilt on the new surface\n");
+    return true;
+}
+
+// SDL runs the lifecycle on the thread that pumps events, which is the one
+// that presents, so this never races a frame. The background events arrive
+// just before the pump starts blocking until the app is resumed, and SDL
+// resumes only once the new surface exists.
+bool SDLCALL lifecycle_watch(void*, SDL_Event* event) {
+    switch (event->type) {
+        case SDL_EVENT_WILL_ENTER_BACKGROUND:
+        case SDL_EVENT_DID_ENTER_BACKGROUND:
+            if (!g_backgrounded) {
+                g_backgrounded = true;
+                release_swap_chain();
+                std::fprintf(stderr, "[plume] surface lost (background)\n");
+            }
+            break;
+        case SDL_EVENT_WILL_ENTER_FOREGROUND:
+        case SDL_EVENT_DID_ENTER_FOREGROUND:
+            g_backgrounded = false;
+            break;
+        default:
+            break;
+    }
+    return true;
+}
+#endif
+
 bool start_presenter(SDL_Window* window) {
     if (!create_interface()) {
         std::fprintf(stderr, "[plume] no render interface could be created\n");
@@ -570,17 +649,10 @@ bool start_presenter(SDL_Window* window) {
                              "handle: %s\n", SDL_GetError());
         return false;
     }
-    g_backend.swap_chain = g_backend.queue->createSwapChain(RenderSwapChainDesc(
-        render_window, kSwapChainFormat, kSwapChainBuffers));
-    if (!g_backend.swap_chain) {
+    if (!create_swap_chain(render_window)) {
         std::fprintf(stderr, "[plume] no swap chain on the presentation window\n");
         return false;
     }
-    // Vsync is always on, with no setting to turn it off. The frontend paces
-    // itself from the audio queue, so Vulkan prefers MAILBOX: the flip lands
-    // on a vblank (no tearing) but a present never blocks for a whole
-    // refresh. Without MAILBOX it falls back to FIFO.
-    g_backend.swap_chain->setVsyncEnabled(true);
     // A swap chain has no images until its first resize. A window that
     // starts minimised has no size to give it yet: the first frame presented
     // after the restore resizes it.
@@ -594,6 +666,10 @@ bool start_presenter(SDL_Window* window) {
         g_resize_pending = true;
     }
     if (!g_backend.swap_chain->isEmpty()) create_framebuffers();
+#if defined(__ANDROID__)
+    if (!g_lifecycle_watch) g_lifecycle_watch = SDL_AddEventWatch(lifecycle_watch, nullptr);
+    g_backgrounded = false;
+#endif
     if (!create_pipelines()) {
         std::fprintf(stderr, "[plume] presenter pipeline creation failed\n");
         return false;
@@ -614,6 +690,11 @@ bool start_presenter(SDL_Window* window) {
 }
 
 void release_backend() {
+#if defined(__ANDROID__)
+    if (g_lifecycle_watch) SDL_RemoveEventWatch(lifecycle_watch, nullptr);
+    g_lifecycle_watch = false;
+    g_backgrounded = false;
+#endif
     if (g_backend.queue) wait_all_slots();
     nds_plume3d_stop();
     g_context = NdsPlumeContext{};
@@ -1017,7 +1098,11 @@ bool nds_compute_host_present_top(const unsigned int* fallback_pixels,
     const auto diagnostic_begin = ticks->diagnostic ? SDL_GetPerformanceCounter() : 0;
 
     // Minimised (zero-sized surface) or a resize still failing: nothing to
-    // present to, and not an error. The frame is skipped, not dropped.
+    // present to, and not an error. The frame is skipped, not dropped. So is
+    // one on Android with no surface yet after a return to the foreground.
+#if defined(__ANDROID__)
+    if (!g_backend.swap_chain && !rebuild_swap_chain()) return true;
+#endif
     if (!resize_if_needed()) return true;
     RenderSwapChain& chain = *g_backend.swap_chain;
     if (chain.isEmpty() || g_backend.framebuffers.empty()) return true;
