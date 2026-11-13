@@ -124,6 +124,12 @@ namespace nds_dispatch_timing_detail {
 #if defined(__x86_64__) || defined(__i386__) || defined(_M_X64) || \
     defined(_M_IX86)
 #define NDS_DISPATCH_TIMING_TSC 1
+#elif defined(__aarch64__)
+// The generic timer's virtual count, readable at EL0 on Linux and Android.
+// steady_clock went through clock_gettime: ~3.5 percent of the emulation
+// thread on a Cortex-A720, for these always-on regions alone. The count runs
+// at CNTFRQ_EL0 (19.2 MHz on Qualcomm), so ns_per_tick is ~52 rather than ~1.
+#define NDS_DISPATCH_TIMING_CNTVCT 1
 #endif
 
 uint64_t tick_now_slow();
@@ -131,6 +137,10 @@ uint64_t tick_now_slow();
 inline uint64_t tick_now() {
 #if defined(NDS_DISPATCH_TIMING_TSC)
     return __builtin_ia32_rdtsc();
+#elif defined(NDS_DISPATCH_TIMING_CNTVCT)
+    uint64_t t;
+    asm volatile("mrs %0, cntvct_el0" : "=r"(t));
+    return t;
 #else
     return tick_now_slow();
 #endif
