@@ -939,7 +939,11 @@ public:
         late_known_macs_ = 0;
         last_host_frame_wall_ = {};
         late_ack_only_ = 0;
-        late_active_ = false;
+        late_mask_used_ = 0;
+        late_aid_known_ = 0;
+        late_aid_online_ = 0;
+        for (JoinOrigin& o : join_origin_) o = {};
+        join_origin_next_ = 0;
         delayed_.clear();
         last_release_ = {};
         peers_.clear();
@@ -1018,20 +1022,28 @@ public:
     }
 
     uint16_t RecvReplies(uint8_t* data, uint64_t timestamp, uint16_t aidmask) {
-        const bool late = LateReplies();
-        if (late != late_active_) {
-            std::fprintf(stderr, "[local_mp] inst=%u late replies %s\n",
-                         static_cast<unsigned>(instance_),
-                         late ? "on" : "off");
-            late_active_ = late;
-            for (auto& q : late_queue_) q.clear();
-            late_last_mask_ = 0;
-            late_ack_only_ = 0;
+        const uint16_t late = LateMask(aidmask);
+        if (late != late_mask_used_) {
+            std::fprintf(stderr,
+                "[local_mp] inst=%u late replies for AIDs %04x, lockstep "
+                "for %04x\n", static_cast<unsigned>(instance_),
+                static_cast<unsigned>(late),
+                static_cast<unsigned>(aidmask & ~late));
+            // Coming from the plain lockstep path, which does not use the
+            // late queues: start them clean.
+            if (late_mask_used_ == 0) {
+                for (auto& q : late_queue_) q.clear();
+                late_last_mask_ = 0;
+                late_ack_only_ = 0;
+            }
+            late_mask_used_ = late;
         }
-        if (late) return RecvRepliesLate(data, timestamp, aidmask);
+        if (late)
+            return RecvRepliesLate(data, timestamp, aidmask,
+                                   static_cast<uint16_t>(aidmask & ~late));
         uint16_t received = 0;
         const auto start = std::chrono::steady_clock::now();
-        const auto deadline = start + std::chrono::milliseconds(25);
+        const auto deadline = start + kLockstepWait;
         stats_recv_replies_calls_.fetch_add(1, std::memory_order_relaxed);
         for (;;) {
             DrainSocket();
@@ -1090,11 +1102,17 @@ public:
     // arrive anyway, and collapsing a backlog to the newest reply loses
     // data that the ACK already confirmed; together those kept DQ9 on
     // "connecting" forever.
+    //
+    // The clients in `lockstep` (runners on the local network, see
+    // LateMask) are answered as RecvReplies does: their reply to this cmd
+    // is waited for up to kLockstepWait, a stale one is dropped, and one
+    // still missing is reported missing.
     uint16_t RecvRepliesLate(uint8_t* data, uint64_t timestamp,
-                             uint16_t aidmask) {
+                             uint16_t aidmask, uint16_t lockstep = 0) {
         const auto start = std::chrono::steady_clock::now();
         const auto deadline =
             start + std::chrono::microseconds(tuning_.reply_budget_us);
+        const auto lockstep_deadline = start + kLockstepWait;
         stats_recv_replies_calls_.fetch_add(1, std::memory_order_relaxed);
         bool gap_waited = false;
         for (;;) {
@@ -1102,10 +1120,24 @@ public:
             SortLateReplies(timestamp);
             uint16_t ready = 0;
             for (uint32_t aid = 1; aid < 16; ++aid) {
-                if (!late_queue_[aid].empty())
-                    ready |= static_cast<uint16_t>(1u << aid);
+                const uint16_t bit = static_cast<uint16_t>(1u << aid);
+                auto& q = late_queue_[aid];
+                if (lockstep & bit) DropLockstepStale(&q, timestamp);
+                if (!q.empty()) ready |= bit;
             }
             if ((ready & aidmask) == aidmask) break;
+            const uint16_t late_missing =
+                static_cast<uint16_t>(aidmask & ~lockstep & ~ready);
+            if ((aidmask & lockstep & ~ready) != 0) {
+                // A lockstep client's reply is due: wait for it. The late
+                // clients' replies keep arriving meanwhile.
+                if (!WaitForData(lockstep_deadline)) {
+                    stats_recv_replies_timeouts_.fetch_add(
+                        1, std::memory_order_relaxed);
+                    break;
+                }
+                continue;
+            }
             // A client whose next reply sits behind a lost datagram gets
             // waited for, not answered for: every reply fabricated below
             // while its real one is in flight leaves one more reply
@@ -1113,7 +1145,7 @@ public:
             // shed), and at 3 % loss that backlog grew past
             // kLateReplyWindowUs within seconds, so real replies were
             // dropped as stale and DQ9 hung on "connecting".
-            const bool gap = LateGapPending(aidmask & ~ready);
+            const bool gap = LateGapPending(late_missing);
             if (gap && !gap_waited) {
                 gap_waited = true;
                 stats_late_gap_waits_.fetch_add(1, std::memory_order_relaxed);
@@ -1145,7 +1177,9 @@ public:
             // Empty default replies carry no data, so they are the ones to
             // shed, wherever they sit: the replies with data keep their
             // order.
-            for (size_t i = 0; q.size() > kLateBacklogTarget && i < q.size();) {
+            if (lockstep & bit) DropLockstepStale(&q, timestamp);
+            for (size_t i = 0; (lockstep & bit) == 0 &&
+                               q.size() > kLateBacklogTarget && i < q.size();) {
                 if (!IsDefaultReply(q[i])) {
                     ++i;
                     continue;
@@ -1168,7 +1202,7 @@ public:
                          (frame.payload[12 + 23] << 8)) >> 4);
                 q.pop_front();
                 received |= bit;
-            } else if (LateClientPresent(aid, now)) {
+            } else if ((lockstep & bit) == 0 && LateClientPresent(aid, now)) {
                 // The client did get this cmd; its reply is still in
                 // flight. Hand WM the empty reply the client's radio sends
                 // on its own when nothing is queued: WM only treats a
@@ -1342,6 +1376,8 @@ private:
     // Longest the host waits for a client's reply held behind a lost
     // datagram (a retransmission takes about RTO + one-way delay).
     static constexpr std::chrono::milliseconds kLateGapWait{600};
+    // RecvReplies' wait for a lockstep client's reply.
+    static constexpr std::chrono::milliseconds kLockstepWait{25};
 
     // Whether a polled client with nothing queued still counts as having
     // answered (TakeLateAckOnly): heard from recently, or newly polled
@@ -1353,6 +1389,15 @@ private:
         if (seen.time_since_epoch().count() != 0 && seen >= polled)
             return now - seen < kLateAliveWindow;
         return now - polled < kLateJoinGrace;
+    }
+
+    // A lockstep client's replies to earlier cmds are not this one's
+    // (RecvReplies' own check).
+    void DropLockstepStale(std::deque<LocalMpFrame>* q, uint64_t timestamp) {
+        while (!q->empty() && q->front().timestamp + 32u < timestamp) {
+            q->pop_front();
+            stats_stale_reply_drops_.fetch_add(1, std::memory_order_relaxed);
+        }
     }
 
     // Some client in `mask` has frames held behind a gap in its stream.
@@ -1406,6 +1451,10 @@ private:
         late_channel_ = p[9];
         late_known_macs_ |= static_cast<uint16_t>(1u << aid);
         late_reply_seq_[aid] = 0;
+        late_aid_known_ &= static_cast<uint16_t>(~(1u << aid));
+        for (const JoinOrigin& o : join_origin_)
+            if (o.used && std::memcmp(o.mac, p + 12 + 4, 6) == 0)
+                SetAidOnline(aid, o.online);
     }
 
     // Writes the client hardware's automatic empty reply (the layout of
@@ -1688,14 +1737,23 @@ private:
 
     bool LinkOpen() const { return link_ && link_->IsOpen(); }
 
-    // Late replies (RecvRepliesLate) when asked for, and with Netplay on
-    // while a lobby member is in range. Not for runners on the local
-    // network alone: a host that does not wait for their replies runs
-    // ahead of a slower client until every reply it sends is older than
-    // kLateReplyWindowUs and dropped as stale, and the game disconnects.
-    // The lockstep wait of RecvReplies keeps them together.
-    bool LateReplies() const {
-        return tuning_.late_replies || (online_link_ && OnlinePeerInRange());
+    // The clients in `aidmask` to answer with late replies
+    // (RecvRepliesLate): all of them when asked for, and with Netplay on
+    // the lobby members. Not runners on the local network: a host that
+    // does not wait for their replies runs ahead of a slower client until
+    // every reply it sends is older than kLateReplyWindowUs and dropped as
+    // stale, and the game disconnects. They get the lockstep wait. A
+    // client whose link is not known yet counts as a lobby member while
+    // one is in range.
+    uint16_t LateMask(uint16_t aidmask) const {
+        if (tuning_.late_replies) return aidmask;
+        if (!online_link_) return 0;
+        const uint16_t unknown =
+            OnlinePeerInRange()
+                ? static_cast<uint16_t>(aidmask & ~late_aid_known_)
+                : 0;
+        return static_cast<uint16_t>(
+            aidmask & ((late_aid_known_ & late_aid_online_) | unknown));
     }
 
     // A lobby member's seat address (net/ice_link.h), not a LAN runner's.
@@ -1983,12 +2041,48 @@ private:
         if (tuning_.trace)
             TraceFrame("rx-ready", frame.type, frame.payload.data(),
                        static_cast<int>(frame.payload.size()));
+        NoteOrigin(frame);
         const bool queued = low_type == 2u
             ? reply_queue_.TryPush(std::move(frame))
             : packet_queue_.TryPush(std::move(frame));
         if (!queued && tuning_.trace)
             std::fprintf(stderr, "[local_mp] trace inst=%u queue full, "
                          "frame dropped\n", static_cast<unsigned>(instance_));
+    }
+
+    // Which link a client comes over, for LateMask: a join request names
+    // the client's MAC (the host's association response then names its
+    // AID, NoteAssocResponse), and every reply names its AID.
+    void NoteOrigin(const LocalMpFrame& frame) {
+        const bool online = IsOnlineAddr(frame.from);
+        const uint32_t low_type = frame.type & 0xFFFFu;
+        if (low_type == 2u) {
+            const uint32_t aid = frame.type >> 16u;
+            if (aid != 0 && aid < 16) SetAidOnline(aid, online);
+            return;
+        }
+        const std::vector<uint8_t>& p = frame.payload;
+        if (low_type != 0u ||
+            !IsJoinRequest(p.data(), static_cast<int>(p.size())))
+            return;
+        const uint8_t* mac = p.data() + 12 + 10;
+        JoinOrigin* slot = &join_origin_[join_origin_next_];
+        for (JoinOrigin& o : join_origin_)
+            if (o.used && std::memcmp(o.mac, mac, 6) == 0) slot = &o;
+        if (slot == &join_origin_[join_origin_next_])
+            join_origin_next_ = (join_origin_next_ + 1) % kJoinOrigins;
+        std::memcpy(slot->mac, mac, 6);
+        slot->online = online;
+        slot->used = true;
+    }
+
+    void SetAidOnline(uint32_t aid, bool online) {
+        const uint16_t bit = static_cast<uint16_t>(1u << aid);
+        late_aid_known_ |= bit;
+        if (online)
+            late_aid_online_ |= bit;
+        else
+            late_aid_online_ &= static_cast<uint16_t>(~bit);
     }
 
     // Payload = melonDS TX header (12 bytes: [8] rate, [9] channel,
@@ -2233,7 +2327,18 @@ private:
     uint16_t late_reply_seq_[16]{};
     uint32_t late_node_[16]{};  // node each AID's replies come from
     uint16_t late_ack_only_ = 0;
-    bool late_active_ = false;  // the mode the last RecvReplies used
+    uint16_t late_mask_used_ = 0;  // LateMask of the last RecvReplies
+    // Per AID: which link the client is on, once known (NoteOrigin).
+    uint16_t late_aid_known_ = 0;
+    uint16_t late_aid_online_ = 0;
+    struct JoinOrigin {
+        uint8_t mac[6]{};
+        bool online = false;
+        bool used = false;
+    };
+    static constexpr size_t kJoinOrigins = 16;
+    JoinOrigin join_origin_[kJoinOrigins];
+    size_t join_origin_next_ = 0;
     std::unique_ptr<mpnet::MpLink> link_;
     LocalMpTuning base_tuning_;  // as configured; tuning_ is what Begin chose
     uint32_t online_epoch_ = 0;
