@@ -1426,6 +1426,11 @@ elseif(ANDROID)
     # liblog: stdout/stderr forwarded to logcat (src/main.cpp); libandroid:
     # ANativeWindow, which Plume's Vulkan backend sizes its swapchain from.
     target_link_libraries(nds_runner PRIVATE log android)
+    # Bind the library's calls to its own functions at link time. Without it
+    # every call from the generated banks into the runtime (bus_read_u32,
+    # runtime_dispatch, ...) goes through a PLT stub: ~4 percent of the
+    # emulation thread on a Cortex-A720.
+    target_link_options(nds_runner PRIVATE -Wl,-Bsymbolic-functions)
 else()
     find_package(CURL REQUIRED)
     target_link_libraries(nds_runner PRIVATE CURL::libcurl)
