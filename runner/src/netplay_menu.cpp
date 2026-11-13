@@ -75,7 +75,7 @@ void nds_netplay_menu_append_items(std::vector<NdsMenuItem>* items) {
     enabled.key = kEnabledKey;
     enabled.section = kSection;
     enabled.label = "Netplay";
-    enabled.description = "Online lobbies. Off: the local network.";
+    enabled.description = "Online lobbies and the local network. Off: the local network only.";
     enabled.type = NdsMenuItemType::Bool;
     enabled.maximum = 1;
     enabled.step = 1;
