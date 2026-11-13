@@ -170,7 +170,8 @@ void nds_title_set_smooth_3d_query(NdsTitleSmooth3dQuery query);
 bool nds_title_smooth_3d_owned();
 bool nds_title_smooth_3d_wanted();
 
-// Binds the frontend's zoom inputs (mouse wheel, gamepad right stick up/down)
+// Binds the frontend's zoom inputs (mouse wheel, gamepad right stick up/down,
+// two-finger pinch on a touchscreen)
 // to a number setting: an add changes `value_id`, but only while the
 // setting `mode_id` holds `active_mode_value` (a title's "Manual" mode). Call
 // from a static initializer, like a setting. Unbound by default.
@@ -180,6 +181,9 @@ void nds_title_set_zoom_binding(int value_id, int mode_id,
 // to the bound value, clamped to its range. True when the value changed (the
 // frontend then saves the settings).
 bool nds_title_zoom_add(int delta);
+// For the frontend: the bound value, or -1 when unbound or not in the active
+// mode (then nds_title_zoom_add changes nothing).
+int nds_title_zoom_value();
 
 // For the frontend.
 size_t nds_title_setting_count();
