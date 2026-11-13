@@ -97,6 +97,11 @@ double measure_ns_per_tick() {
     // ticks as nanoseconds rather than publishing a wild scale factor.
     if (best < 0.1 || best > 10.0) return 1.0;
     return best;
+#elif defined(NDS_DISPATCH_TIMING_CNTVCT)
+    // The architecture publishes the count's frequency.
+    uint64_t freq;
+    asm volatile("mrs %0, cntfrq_el0" : "=r"(freq));
+    return freq ? 1e9 / static_cast<double>(freq) : 1.0;
 #else
     return 1.0;
 #endif
