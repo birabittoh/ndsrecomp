@@ -3788,6 +3788,34 @@ int nds_run_interactive_frontend(const NdsFrontendOptions& initial_options) {
     int zoom_stick_frames = 0;
     float zoom_stick_rem = 0.0f;
     bool zoom_save_pending = false;
+    // The right mouse button as the title sees it (title_settings.h) is held
+    // by the mouse or by two fingers on a touchscreen.
+    bool right_mouse_button_held = false;
+    bool touch_right_held = false;
+    // A two-finger tap stays held this long, so the title's per-frame hooks
+    // see it even when both fingers lift within one frame.
+    constexpr uint64_t kTouchRightMinHoldMs = 80;
+    uint64_t touch_right_since = 0;
+    bool touch_right_release_pending = false;
+    auto publish_right_mouse = [&]() {
+        nds_title_set_right_mouse_held(right_mouse_button_held ||
+                                       touch_right_held);
+    };
+#if defined(NDS_HAVE_SDL3)
+    // Fingers down on the touchscreen (window pixels), for the two-finger
+    // pinch (the title's zoom, like the mouse wheel) and two-finger tap (the
+    // right mouse button). Only the first two fingers count.
+    struct TouchFinger {
+        SDL_TouchID touch = 0;
+        SDL_FingerID id = 0;
+        float x = 0.0f;
+        float y = 0.0f;
+    };
+    std::vector<TouchFinger> touch_fingers;
+    float pinch_start_spread = 0.0f;
+    int pinch_start_zoom = -1;
+    bool pinch_changed_zoom = false;
+#endif
     auto publish_keys = [&]() {
         nds_set_key_mask(static_cast<uint16_t>(
             0x0FFFu &
@@ -4913,9 +4941,94 @@ int nds_run_interactive_frontend(const NdsFrontendOptions& initial_options) {
             if ((event.type == SDL_MOUSEBUTTONDOWN ||
                  event.type == SDL_MOUSEBUTTONUP) &&
                 event.button.button == SDL_BUTTON_RIGHT) {
-                nds_title_set_right_mouse_held(
-                    event.type == SDL_MOUSEBUTTONDOWN);
+                right_mouse_button_held = event.type == SDL_MOUSEBUTTONDOWN;
+                publish_right_mouse();
             }
+#if defined(NDS_HAVE_SDL3)
+            // Two fingers: held, they are the right mouse button (instant
+            // text, advance, cancel a choice, as in the title's hooks), and
+            // pinching them changes the title's zoom (title_settings.h):
+            // spreading them zooms in. Mouse- and pen-made touches are not
+            // fingers.
+            if ((event.type == SDL_EVENT_FINGER_DOWN ||
+                 event.type == SDL_EVENT_FINGER_UP ||
+                 event.type == SDL_EVENT_FINGER_CANCELED ||
+                 event.type == SDL_EVENT_FINGER_MOTION) &&
+                event.tfinger.touchID != SDL_MOUSE_TOUCHID &&
+                event.tfinger.touchID != SDL_PEN_TOUCHID) {
+                float finger_x = event.tfinger.x;
+                float finger_y = event.tfinger.y;
+                if (SDL_Window* window =
+                        SDL_GetWindowFromID(event.tfinger.windowID)) {
+                    int w = 0, h = 0;
+                    SDL_GetWindowSize(window, &w, &h);
+                    finger_x *= static_cast<float>(w);
+                    finger_y *= static_cast<float>(h);
+                }
+                auto finger = std::find_if(
+                    touch_fingers.begin(), touch_fingers.end(),
+                    [&](const TouchFinger& f) {
+                        return f.touch == event.tfinger.touchID &&
+                               f.id == event.tfinger.fingerID;
+                    });
+                auto spread = [&]() {
+                    return std::hypot(touch_fingers[0].x - touch_fingers[1].x,
+                                      touch_fingers[0].y - touch_fingers[1].y);
+                };
+                if (event.type == SDL_EVENT_FINGER_DOWN &&
+                    finger == touch_fingers.end() &&
+                    touch_fingers.size() < 2) {
+                    touch_fingers.push_back({event.tfinger.touchID,
+                                             event.tfinger.fingerID,
+                                             finger_x, finger_y});
+                    if (touch_fingers.size() == 2) {
+                        // The first finger's emulated mouse touch is not a
+                        // stylus press any more.
+                        if (mouse_down) {
+                            mouse_down = false;
+                            touch_release_pending = false;
+                            nds_set_touch(0, 0, false);
+                        }
+                        touch_right_held = true;
+                        touch_right_release_pending = false;
+                        touch_right_since = SDL_GetTicks();
+                        publish_right_mouse();
+                        pinch_start_spread = spread();
+                        pinch_start_zoom = nds_title_zoom_value();
+                        pinch_changed_zoom = false;
+                    }
+                } else if (event.type == SDL_EVENT_FINGER_MOTION &&
+                           finger != touch_fingers.end()) {
+                    finger->x = finger_x;
+                    finger->y = finger_y;
+                    const int current = nds_title_zoom_value();
+                    if (touch_fingers.size() == 2 && pinch_start_zoom > 0 &&
+                        pinch_start_spread > 1.0f && current > 0) {
+                        const float now_spread = std::max(spread(), 1.0f);
+                        // The distance scales as the fingers' spread
+                        // shrinks: halving it doubles the distance.
+                        const long target = std::lround(
+                            static_cast<double>(pinch_start_zoom) *
+                            pinch_start_spread / now_spread);
+                        if (nds_title_zoom_add(
+                                static_cast<int>(target - current)))
+                            pinch_changed_zoom = true;
+                    }
+                } else if ((event.type == SDL_EVENT_FINGER_UP ||
+                            event.type == SDL_EVENT_FINGER_CANCELED) &&
+                           finger != touch_fingers.end()) {
+                    const bool was_pair = touch_fingers.size() == 2;
+                    touch_fingers.erase(finger);
+                    if (was_pair) {
+                        if (pinch_changed_zoom)
+                            runtime_menu_save(&runtime_menu_state);
+                        pinch_changed_zoom = false;
+                        pinch_start_zoom = -1;
+                        touch_right_release_pending = true;
+                    }
+                }
+            }
+#endif
             const bool primary_left_down =
                 event.type == SDL_MOUSEBUTTONDOWN &&
                 event.button.button == SDL_BUTTON_LEFT &&
@@ -5191,6 +5304,12 @@ int nds_run_interactive_frontend(const NdsFrontendOptions& initial_options) {
             if (sdl_window_event_is(event, SDL_EVENT_WINDOW_MOUSE_LEAVE) &&
                 event.window.windowID == presentation.window_ids[0])
                 nds_title_set_top_pointer(0, 0, false);
+        }
+        if (touch_right_release_pending &&
+            SDL_GetTicks() - touch_right_since >= kTouchRightMinHoldMs) {
+            touch_right_release_pending = false;
+            touch_right_held = false;
+            publish_right_mouse();
         }
         if (focus_release_pending) {
             if (!any_presentation_window_focused()) {

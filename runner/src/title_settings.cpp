@@ -106,6 +106,13 @@ bool nds_title_zoom_add(int delta) {
     return nds_title_setting_set(b.value_id, static_cast<int>(next));
 }
 
+int nds_title_zoom_value() {
+    const ZoomBinding b = g_zoom_binding;
+    if (!nds_title_setting_at(b.value_id)) return -1;
+    if (nds_title_setting_value(b.mode_id) != b.active_mode_value) return -1;
+    return nds_title_setting_value(b.value_id);
+}
+
 namespace {
 std::atomic<NdsTitleStackedLayoutQuery> g_stacked_layout_query{nullptr};
 }  // namespace
