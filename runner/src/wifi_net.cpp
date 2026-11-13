@@ -740,6 +740,13 @@ public:
 
     void Clear() { queue_.clear(); }
 
+    template <typename Pred>
+    bool Any(Pred pred) const {
+        for (const LocalMpFrame& f : queue_)
+            if (pred(f)) return true;
+        return false;
+    }
+
 private:
     std::deque<LocalMpFrame> queue_;
     size_t capacity_;
@@ -1227,6 +1234,10 @@ private:
     static constexpr size_t kMaxPeers = 15;
     static constexpr std::chrono::milliseconds kHelloInterval{1000};
     static constexpr std::chrono::milliseconds kPeerTimeout{5000};
+    // Longest a join request holds the guest (AwaitJoinAnswer): well
+    // above a LAN or internet round trip, short enough that a host that
+    // never answers costs one hitch.
+    static constexpr std::chrono::milliseconds kJoinAnswerWait{500};
     static constexpr size_t kDelayedCapacity = 8192;
     static constexpr uint64_t kLateReplyWindowUs = 1000000;
     static constexpr size_t kLateQueueCapacity = 256;
@@ -1419,6 +1430,74 @@ private:
     // in range: an authentication or association request to a replayed
     // beacon's BSSID asks to join that lobby. The frame is kept and sent
     // once the host is in range, so the game's first attempt can work.
+    // An authentication request (transaction sequence 1 or 3) or a
+    // (re)association request: a client asking a host to let it join.
+    static bool IsJoinRequest(const uint8_t* p, int len) {
+        if (len < 12 + 24 + 4) return false;
+        const unsigned fc = p[12] | (p[13] << 8);
+        if ((fc & 0x000C) != 0) return false;  // management only
+        const unsigned subtype = fc & 0x00F0;
+        if (subtype == 0x0000 || subtype == 0x0020) return true;
+        if (subtype != 0x00B0) return false;
+        return ((p[12 + 24 + 2] | (p[12 + 24 + 3] << 8)) & 1u) != 0;
+    }
+
+    // What ends a client's wait after a join request: the host's
+    // authentication answer (even sequence), its (re)association response,
+    // or a deauthentication / disassociation, addressed to `client`.
+    static bool IsJoinAnswer(const LocalMpFrame& frame,
+                             const uint8_t* client) {
+        const std::vector<uint8_t>& p = frame.payload;
+        if ((frame.type & 0xFFFFu) != 0u || p.size() < 12 + 24 + 4)
+            return false;
+        const unsigned fc = p[12] | (p[13] << 8);
+        if ((fc & 0x000C) != 0) return false;
+        if (std::memcmp(p.data() + 12 + 4, client, 6) != 0) return false;
+        switch (fc & 0x00F0) {
+        case 0x0010: case 0x0030: case 0x00A0: case 0x00C0:
+            return true;
+        case 0x00B0:
+            return ((p[12 + 24 + 2] | (p[12 + 24 + 3] << 8)) & 1u) == 0;
+        default:
+            return false;
+        }
+    }
+
+    // A join request was just sent to a peer in range. Hold the guest until
+    // the host's answer is in the queue (or kJoinAnswerWait passes): on
+    // hardware it comes back within microseconds, while the client's
+    // firmware still listens for it. Over a real network, and more so on a
+    // runner below full speed whose radio sleeps between beacons, it came
+    // back ~100 ms of guest time later. The game ignored that late answer,
+    // never sent its association request and showed a communication error.
+    // Stopping guest time for the round trip makes the answer arrive as
+    // it would on hardware.
+    void AwaitJoinAnswer(const uint8_t* client) {
+        const auto start = std::chrono::steady_clock::now();
+        const auto deadline = start + kJoinAnswerWait;
+        bool answered = false;
+        for (;;) {
+            DrainSocket();
+            if (!LinkOpen()) break;
+            if (packet_queue_.Any([client](const LocalMpFrame& f) {
+                    return IsJoinAnswer(f, client);
+                })) {
+                answered = true;
+                break;
+            }
+            if (std::chrono::steady_clock::now() >= deadline ||
+                !WaitForData(deadline))
+                break;
+        }
+        if (tuning_.trace || !answered)
+            std::fprintf(stderr,
+                "[local_mp] inst=%u join request: %s after %.1f ms\n",
+                static_cast<unsigned>(instance_),
+                answered ? "answered" : "no answer",
+                std::chrono::duration<double, std::milli>(
+                    std::chrono::steady_clock::now() - start).count());
+    }
+
     void NoteJoinAttempt(const LocalMpFrame& frame) {
         const std::vector<uint8_t>& p = frame.payload;
         if (!online_link_ || p.size() < 12 + 24) return;
@@ -1578,6 +1657,8 @@ private:
 
         if (low_type == 0u) NoteAssocResponse(data, len);
         if (tuning_.trace) TraceFrame("tx", type, data, len);
+        if (low_type == 0u && !peers_.empty() && IsJoinRequest(data, len))
+            AwaitJoinAnswer(data + 12 + 10);
         // Per logical frame, not per peer.
         stats_sent_by_type_[low_type & 3u].fetch_add(
             1, std::memory_order_relaxed);
@@ -1823,10 +1904,14 @@ private:
                           p[36] | (p[37] << 8), p[38] | (p[39] << 8),
                           p[40] | (p[41] << 8));
         }
+        // Guest time too: the game's own handshake timeouts run on it,
+        // and a slow host stretches wall time against it.
+        const double guest_ms =
+            static_cast<double>(scheduler_system_timestamp()) / 33513.982;
         std::fprintf(stderr,
-            "[local_mp] trace inst=%u t=%.1f %s fc=%04x chan=%u seq=%u "
-            "to=%s from=%s%s\n",
-            static_cast<unsigned>(instance_), ms, what, fc,
+            "[local_mp] trace inst=%u t=%.1f g=%.3f %s fc=%04x chan=%u "
+            "seq=%u to=%s from=%s%s\n",
+            static_cast<unsigned>(instance_), ms, guest_ms, what, fc,
             static_cast<unsigned>(p[9]),
             static_cast<unsigned>((p[34] | (p[35] << 8)) >> 4), a1, a2,
             body);
