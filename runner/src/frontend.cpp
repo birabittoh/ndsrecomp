@@ -3394,7 +3394,7 @@ int nds_run_interactive_frontend(const NdsFrontendOptions& initial_options) {
 #endif
 #if defined(__ANDROID__)
     // Any orientation the sensor reports: the window follows the rotation,
-    // and in portrait the single layout puts the second screen under the
+    // and in portrait the single layout puts the second screen above the
     // main one. Without the hint SDL picks one from the first window size.
     SDL_SetHint(SDL_HINT_ORIENTATIONS,
                 "LandscapeLeft LandscapeRight Portrait PortraitUpsideDown");

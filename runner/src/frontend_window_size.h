@@ -118,8 +118,8 @@ inline NdsPresentRect nds_present_rect(NdsWindowMode mode,
 
 // The single-screen layout's two rects. With inset_percent above zero the
 // other LCD is shown at that percent of its size: to the right of the main one
-// and bottom-aligned, or, in a portrait drawable (taller than wide), just below
-// it and centred. The pair is laid out as one image through nds_present_rect,
+// and bottom-aligned, or, in a portrait drawable (taller than wide), just above
+// it and centred, so the main screen sits at the bottom, under the thumbs. The pair is laid out as one image through nds_present_rect,
 // so window_mode and scaling apply to it unchanged, the main screen is never
 // covered, and the window spends its bars on the inset before shrinking the
 // main screen. inset_percent is therefore a minimum: in Letterbox, space left
@@ -138,8 +138,8 @@ inline std::atomic<bool>& nds_stack_vertically_flag() {
 }
 
 //
-// stack_vertically puts the inset below the main screen whatever the
-// drawable's shape (what a title forces on some game modes, with
+// stack_vertically puts the inset below the main screen (as on the DS: the
+// top screen above the touchscreen) whatever the drawable's shape (what a title forces on some game modes, with
 // inset_percent 100: both screens the same size, one above the other).
 inline NdsSingleLayout nds_single_layout(NdsWindowMode mode,
                                          NdsScalingFilter scaling,
@@ -176,6 +176,11 @@ inline NdsSingleLayout nds_single_layout(NdsWindowMode mode,
             layout.inset.x =
                 layout.main.x + (layout.main.w - layout.inset.w) / 2;
             layout.inset.y = layout.main.y + layout.main.h;
+        }
+        if (!stack_vertically) {
+            const int top = layout.main.y;
+            layout.inset.y = top;
+            layout.main.y = top + layout.inset.h;
         }
         return layout;
     }
