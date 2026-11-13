@@ -770,6 +770,83 @@ struct LocalMpTuning {
     std::vector<mpnet::PeerAddr> peers;
 };
 
+#if NDS_ONLINE
+// Netplay on: the online lobby's link and the UDP link side by side, so the
+// runners on the local network stay in range next to the lobby's members.
+// Lobby members have seat addresses (mpnet::SeatOf), everyone else is on
+// the UDP link. Either link may fail to open; the other still works.
+class DualLink : public mpnet::MpLink {
+public:
+    DualLink(std::unique_ptr<mpnet::MpLink> udp,
+             std::unique_ptr<mpnet::MpLink> online)
+        : udp_(std::move(udp)), online_(std::move(online)) {}
+
+    bool Open() override {
+        const bool udp = udp_->Open();
+        const bool online = online_->Open();
+        return udp || online;
+    }
+    void Close() override {
+        udp_->Close();
+        online_->Close();
+    }
+    bool IsOpen() const override {
+        return udp_->IsOpen() || online_->IsOpen();
+    }
+    bool SendTo(const mpnet::PeerAddr& to, const uint8_t* data,
+                size_t len) override {
+        mpnet::MpLink& link = mpnet::SeatOf(to) >= 0 ? *online_ : *udp_;
+        return link.IsOpen() && link.SendTo(to, data, len);
+    }
+    void SendDiscovery(const uint8_t* data, size_t len) override {
+        if (udp_->IsOpen()) udp_->SendDiscovery(data, len);
+        if (online_->IsOpen()) online_->SendDiscovery(data, len);
+    }
+    // Takes turns at which link goes first, so a busy one cannot starve
+    // the other.
+    int Recv(uint8_t* data, size_t capacity,
+             mpnet::PeerAddr* from) override {
+        mpnet::MpLink* first = udp_first_ ? udp_.get() : online_.get();
+        mpnet::MpLink* second = udp_first_ ? online_.get() : udp_.get();
+        udp_first_ = !udp_first_;
+        int got = first->IsOpen() ? first->Recv(data, capacity, from) : 0;
+        if (got > 0) return got;
+        const int other =
+            second->IsOpen() ? second->Recv(data, capacity, from) : 0;
+        return other != 0 ? other : got;
+    }
+    // Waits on the UDP socket in short slices and checks the online queue
+    // between them: a LAN datagram still wakes the wait at once, one from
+    // the lobby within a slice (well below the relay's own latency).
+    bool WaitReadable(int64_t timeout_us) override {
+        if (!udp_->IsOpen()) return online_->WaitReadable(timeout_us);
+        if (!online_->IsOpen()) return udp_->WaitReadable(timeout_us);
+        const auto deadline = std::chrono::steady_clock::now() +
+                              std::chrono::microseconds(
+                                  timeout_us > 0 ? timeout_us : 0);
+        for (;;) {
+            if (online_->WaitReadable(0)) return true;
+            const int64_t left =
+                std::chrono::duration_cast<std::chrono::microseconds>(
+                    deadline - std::chrono::steady_clock::now()).count();
+            if (udp_->WaitReadable(std::min<int64_t>(
+                    left > 0 ? left : 0, kSliceUs)))
+                return true;
+            if (left <= kSliceUs) return online_->WaitReadable(0);
+        }
+    }
+    std::string Describe() const override {
+        return udp_->Describe() + " + " + online_->Describe();
+    }
+
+private:
+    static constexpr int64_t kSliceUs = 1000;
+    std::unique_ptr<mpnet::MpLink> udp_;
+    std::unique_ptr<mpnet::MpLink> online_;
+    bool udp_first_ = true;
+};
+#endif
+
 // Set once from a title's static initializer (nds_netplay_set_host_decoder).
 std::atomic<NdsNetplayHostDecoder> g_netplay_host_decoder{nullptr};
 
@@ -796,26 +873,25 @@ public:
         if (LinkOpen()) return;
 
         tuning_ = base_tuning_;
+        mpnet::UdpLinkConfig link_config;
+        link_config.lan = tuning_.lan;
+        link_config.instance = instance_;
+        link_config.base_port = base_port_;
+        link_config.peers = tuning_.peers;
+        link_ = mpnet::MakeUdpLink(link_config);
 #if NDS_ONLINE
-        // Netplay on: the lobby's members are the only ones in range, and
-        // internet latency needs late replies and a radio that stays awake
-        // (HANDOFF_ONLINE_LOBBY.md Phase 0).
+        // Netplay on: the lobby's members come into range next to the
+        // runners on the local network, and internet latency needs a radio
+        // that stays awake and, while a lobby member is in range, late
+        // replies (HANDOFF_ONLINE_LOBBY.md Phase 0; LateReplies()).
         online_epoch_ = nds_online_link_epoch();
         if (std::shared_ptr<mpnet::IceLink> online = nds_online_link()) {
-            link_ = mpnet::MakeLinkView(std::move(online));
-            tuning_.late_replies = true;
+            link_ = std::make_unique<DualLink>(
+                std::move(link_), mpnet::MakeLinkView(std::move(online)));
             tuning_.stay_awake = true;
             online_link_ = true;
-        } else
-#endif
-        {
-            mpnet::UdpLinkConfig link_config;
-            link_config.lan = tuning_.lan;
-            link_config.instance = instance_;
-            link_config.base_port = base_port_;
-            link_config.peers = tuning_.peers;
-            link_ = mpnet::MakeUdpLink(link_config);
         }
+#endif
         if (!link_->Open()) {
             link_.reset();
             return;
@@ -863,6 +939,7 @@ public:
         late_known_macs_ = 0;
         last_host_frame_wall_ = {};
         late_ack_only_ = 0;
+        late_active_ = false;
         delayed_.clear();
         last_release_ = {};
         peers_.clear();
@@ -941,8 +1018,17 @@ public:
     }
 
     uint16_t RecvReplies(uint8_t* data, uint64_t timestamp, uint16_t aidmask) {
-        if (tuning_.late_replies)
-            return RecvRepliesLate(data, timestamp, aidmask);
+        const bool late = LateReplies();
+        if (late != late_active_) {
+            std::fprintf(stderr, "[local_mp] inst=%u late replies %s\n",
+                         static_cast<unsigned>(instance_),
+                         late ? "on" : "off");
+            late_active_ = late;
+            for (auto& q : late_queue_) q.clear();
+            late_last_mask_ = 0;
+            late_ack_only_ = 0;
+        }
+        if (late) return RecvRepliesLate(data, timestamp, aidmask);
         uint16_t received = 0;
         const auto start = std::chrono::steady_clock::now();
         const auto deadline = start + std::chrono::milliseconds(25);
@@ -1409,10 +1495,11 @@ private:
     }
 
     // A lobby beacon due on the channel the guest listens on, or 0. Only on
-    // the Netplay link with nobody in range: once a lobby is joined, its
-    // host's own beacons come through the link.
+    // the Netplay link with no lobby member in range: once a lobby is
+    // joined, its host's own beacons come through the link. Runners on the
+    // local network do not count.
     int GiveReplayBeacon(uint8_t* data) {
-        if (!online_link_ || !LinkOpen() || !peers_.empty()) return 0;
+        if (!online_link_ || !LinkOpen() || OnlinePeerInRange()) return 0;
         const int channel = rx_channel_.load(std::memory_order_relaxed);
         const auto now = std::chrono::steady_clock::now();
         std::lock_guard<std::mutex> lock(replay_mutex_);
@@ -1601,6 +1688,32 @@ private:
 
     bool LinkOpen() const { return link_ && link_->IsOpen(); }
 
+    // Late replies (RecvRepliesLate) when asked for, and with Netplay on
+    // while a lobby member is in range. Not for runners on the local
+    // network alone: a host that does not wait for their replies runs
+    // ahead of a slower client until every reply it sends is older than
+    // kLateReplyWindowUs and dropped as stale, and the game disconnects.
+    // The lockstep wait of RecvReplies keeps them together.
+    bool LateReplies() const {
+        return tuning_.late_replies || (online_link_ && OnlinePeerInRange());
+    }
+
+    // A lobby member's seat address (net/ice_link.h), not a LAN runner's.
+    static bool IsOnlineAddr(const mpnet::PeerAddr& addr) {
+#if NDS_ONLINE
+        return mpnet::SeatOf(addr) >= 0;
+#else
+        (void)addr;
+        return false;
+#endif
+    }
+
+    bool OnlinePeerInRange() const {
+        for (const auto& [node, peer] : peers_)
+            if (IsOnlineAddr(peer.addr)) return true;
+        return false;
+    }
+
     // Datagrams from the reliability layer, addressed by node.
     mpnet::Reliable::SendFn PeerSender() {
         return [this](uint32_t node, const uint8_t* data, size_t len) {
@@ -1755,7 +1868,8 @@ private:
                      static_cast<unsigned>(frame.node),
                      mpnet::FormatPeerAddress(frame.from).c_str());
         rel_.SendControl(frame.node, mpnet::kFlagHello, now, PeerSender());
-        FlushHeld(now);
+        // Held join requests are for the lobby host, not a LAN runner.
+        if (IsOnlineAddr(frame.from)) FlushHeld(now);
         return true;
     }
 
@@ -2119,6 +2233,7 @@ private:
     uint16_t late_reply_seq_[16]{};
     uint32_t late_node_[16]{};  // node each AID's replies come from
     uint16_t late_ack_only_ = 0;
+    bool late_active_ = false;  // the mode the last RecvReplies used
     std::unique_ptr<mpnet::MpLink> link_;
     LocalMpTuning base_tuning_;  // as configured; tuning_ is what Begin chose
     uint32_t online_epoch_ = 0;

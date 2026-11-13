@@ -1,8 +1,9 @@
 // online_lobby.h -- Netplay: local wireless with the players of an online
 // lobby (HANDOFF_ONLINE_LOBBY.md in DQ9Recomp, "The goal").
 //
-// With Netplay on, the lobby replaces LAN discovery: only the members of
-// the lobby this runner sits in are in radio range. Hosting is automatic:
+// With Netplay on, the members of the lobby this runner sits in come into
+// radio range next to the runners found by LAN discovery (wifi_net.cpp's
+// DualLink). Hosting is automatic:
 // when the game becomes an MP host that takes players (nds_netplay_host_info,
 // the title's beacon decoder) a lobby opens with one seat per free player
 // slot, and it closes when hosting ends. Joining a lobby only puts the two
