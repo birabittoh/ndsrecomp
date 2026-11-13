@@ -368,6 +368,7 @@ std::filesystem::path exe_dir_from_argv(const char* argv0) {
 
 #if defined(__ANDROID__)
 #include <android/log.h>
+#include <sys/system_properties.h>
 #include <unistd.h>
 
 namespace {
@@ -1582,12 +1583,25 @@ int main(int argc, char** argv) {
     resolved_network.local_wireless_peers =
         frontend_options.local_wireless.peers;
     {
-        const char* stats = std::getenv("NDS_LOCAL_MP_STATS");
-        resolved_network.local_wireless_stats_log =
-            stats && stats[0] && std::strcmp(stats, "0") != 0;
-        const char* trace = std::getenv("NDS_LOCAL_MP_TRACE");
-        resolved_network.local_wireless_trace =
-            trace && trace[0] && std::strcmp(trace, "0") != 0;
+        // An app gets no environment on Android: there the switches are
+        // also read from debug.ndsrecomp.local_mp_{stats,trace}, which
+        // `adb shell setprop` sets without root.
+        const auto switch_on = [](const char* env, const char* prop) {
+            const char* value = std::getenv(env);
+            if (value && value[0]) return std::strcmp(value, "0") != 0;
+#if defined(__ANDROID__)
+            char buf[PROP_VALUE_MAX] = "";
+            if (__system_property_get(prop, buf) > 0)
+                return std::strcmp(buf, "0") != 0;
+#else
+            (void)prop;
+#endif
+            return false;
+        };
+        resolved_network.local_wireless_stats_log = switch_on(
+            "NDS_LOCAL_MP_STATS", "debug.ndsrecomp.local_mp_stats");
+        resolved_network.local_wireless_trace = switch_on(
+            "NDS_LOCAL_MP_TRACE", "debug.ndsrecomp.local_mp_trace");
     }
 
     // Resolve the user-facing backend name to the bridge enum. Replay is
