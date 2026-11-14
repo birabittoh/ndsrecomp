@@ -612,18 +612,38 @@ bool nds_player_prepare(int argc, char** argv, NdsFrontendOptions* options,
     const fs::path root = data_directory(app);
     const fs::path settings = root / "settings.toml";
     std::error_code fs_error;
+    for (const fs::path& dir : {root / "saves", root / "savestates"}) {
+        fs::create_directories(dir, fs_error);
+        if (fs_error) {
+            nds_player_error("Cannot create " + dir.string() + ": " +
+                             fs_error.message());
+            return false;
+        }
+    }
     // Logs sit next to the executable whatever the data directory is, so a
     // bug report never means hunting through Documents. Not on Android,
-    // where the "executable" is the system's read-only app_process.
-#if defined(__ANDROID__)
-    const fs::path logs = root / "logs";
+    // where the "executable" is the system's read-only app_process, nor on
+    // macOS, where it is inside the .app bundle: Gatekeeper runs a
+    // downloaded app from a read-only translocated copy (as does opening it
+    // straight from the DMG), and writing into a signed bundle breaks its
+    // signature. Anywhere else, a read-only install falls back to the data
+    // directory too.
+#if defined(__ANDROID__) || defined(__APPLE__)
+    fs::path logs = root / "logs";
 #else
-    const fs::path logs = executable_dir() / "logs";
-#endif
-    for (const fs::path& dir : {root / "saves", root / "savestates", logs})
-        fs::create_directories(dir, fs_error);
+    fs::path logs = executable_dir() / "logs";
+    fs::create_directories(logs, fs_error);
     if (fs_error) {
-        nds_player_error("Cannot create " + root.string() + ": " +
+        std::fprintf(stderr, "[player] cannot create %s (%s), logging to the "
+                             "data directory\n",
+                     logs.string().c_str(), fs_error.message().c_str());
+        fs_error.clear();
+        logs = root / "logs";
+    }
+#endif
+    fs::create_directories(logs, fs_error);
+    if (fs_error) {
+        nds_player_error("Cannot create " + logs.string() + ": " +
                          fs_error.message());
         return false;
     }
