@@ -158,6 +158,12 @@ void nds_title_set_stacked_layout_query(NdsTitleStackedLayoutQuery query);
 // For the frontend: the query's answer (false with none registered).
 bool nds_title_stacked_layout_wanted();
 
+// A game mode that wants the second screen below the main one in a portrait
+// window (the default puts it above), at the usual second_screen_size.
+typedef bool (*NdsTitleInsetBelowQuery)();
+void nds_title_set_inset_below_query(NdsTitleInsetBelowQuery query);
+bool nds_title_inset_below_wanted();
+
 // Hands 3D motion smoothing (display.smooth_3d) to the title, for a title
 // whose own setting pairs it with its frame rate: while a query is
 // registered the frontend hides its Smooth 3D row, ignores the option and

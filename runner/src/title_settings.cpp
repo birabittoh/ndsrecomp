@@ -128,6 +128,20 @@ bool nds_title_stacked_layout_wanted() {
 }
 
 namespace {
+std::atomic<NdsTitleInsetBelowQuery> g_inset_below_query{nullptr};
+}  // namespace
+
+void nds_title_set_inset_below_query(NdsTitleInsetBelowQuery query) {
+    g_inset_below_query.store(query, std::memory_order_relaxed);
+}
+
+bool nds_title_inset_below_wanted() {
+    const NdsTitleInsetBelowQuery query =
+        g_inset_below_query.load(std::memory_order_relaxed);
+    return query && query();
+}
+
+namespace {
 std::atomic<NdsTitleSmooth3dQuery> g_smooth_3d_query{nullptr};
 }  // namespace
 

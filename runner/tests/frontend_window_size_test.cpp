@@ -218,6 +218,14 @@ int main() {
         check(rect_is(full_tall.inset, 0, 150, 1080, 810) &&
                   rect_is(full_tall.main, 0, 960, 1080, 810),
               "100% portrait inset matches the main screen, above it");
+        // A game mode can keep the inset below the main screen in portrait.
+        nds_inset_below_flag().store(true);
+        const auto below = nds_single_layout(M::Letterbox, S::Nearest, 480,
+                                             640, 256, 192, 25);
+        nds_inset_below_flag().store(false);
+        check(rect_is(below.main, 0, 0, 480, 360) &&
+                  rect_is(below.inset, 53, 360, 373, 280),
+              "inset-below flag keeps the inset under the main screen");
         // A forced stack keeps the DS order: the inset below the main one.
         const auto stacked_tall = nds_single_layout(
             M::Letterbox, S::Nearest, 1080, 1920, 256, 192, 100, true);

@@ -5796,6 +5796,8 @@ int nds_run_interactive_frontend(const NdsFrontendOptions& initial_options) {
                 presentation.stacked = nds_title_stacked_layout_wanted();
                 nds_stack_vertically_flag().store(
                     presentation.stacked, std::memory_order_relaxed);
+                nds_inset_below_flag().store(nds_title_inset_below_wanted(),
+                                             std::memory_order_relaxed);
                 const int shown = presentation.stacked
                     ? 0
                     : nds_single_shown_screen(

@@ -137,6 +137,15 @@ inline std::atomic<bool>& nds_stack_vertically_flag() {
     return flag;
 }
 
+// Set while a game mode wants the second screen below the main one in a
+// portrait drawable, as before the inset moved above it (see title_settings.h,
+// nds_title_set_inset_below_query). Unlike the stacked layout it keeps the
+// inset_percent size.
+inline std::atomic<bool>& nds_inset_below_flag() {
+    static std::atomic<bool> flag{false};
+    return flag;
+}
+
 //
 // stack_vertically puts the inset below the main screen (as on the DS: the
 // top screen above the touchscreen) whatever the drawable's shape (what a title forces on some game modes, with
@@ -177,7 +186,8 @@ inline NdsSingleLayout nds_single_layout(NdsWindowMode mode,
                 layout.main.x + (layout.main.w - layout.inset.w) / 2;
             layout.inset.y = layout.main.y + layout.main.h;
         }
-        if (!stack_vertically) {
+        if (!stack_vertically &&
+            !nds_inset_below_flag().load(std::memory_order_relaxed)) {
             const int top = layout.main.y;
             layout.inset.y = top;
             layout.main.y = top + layout.inset.h;
