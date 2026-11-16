@@ -99,6 +99,21 @@ public:
     void SetEnabled(bool geometry, bool rendering) noexcept;
 
     void ExecuteCommand() noexcept;
+    // Host-only replay: runs one whole command on this instance's geometry
+    // state, bypassing the FIFO, so no IRQ, DMA or stall reaches the NDS.
+    // For a second, private GPU3D that redraws recorded command streams.
+    void ExecuteReplayCommand(u32 command, const u32* params, u32 count) noexcept;
+    // Host-only, not hardware state: sees each command with all its
+    // parameters as it executes (count is the command's parameter count).
+    using CommandObserver = void (*)(void* context, u32 command, const u32* params, u32 count);
+    CommandObserver ExecObserver = nullptr;
+    // Host-only counters, not hardware state and not serialized: packed
+    // GXFIFO words received, entries entering the FIFO/PIPE (or stall
+    // queue), and entries executed from the FIFO.
+    u64 HostGXFIFOWords = 0;
+    u64 HostFIFOWrites = 0;
+    u64 HostFIFOExecuted = 0;
+    void* ExecObserverContext = nullptr;
 
     s32 CyclesToRunFor() const noexcept;
     void Run() noexcept;
@@ -157,6 +172,15 @@ private:
 
     } CmdFIFOEntry;
     static_assert(sizeof(CmdFIFOEntry) == sizeof(u64));
+    // One 8-byte value, so producers and the FIFO move an entry in a
+    // register instead of two 4-byte stores read back as one 8-byte load
+    // (a store-forwarding stall on every command word).
+    static CmdFIFOEntry MakeCmdFIFOEntry(u32 command, u32 param) noexcept
+    {
+        CmdFIFOEntry entry;
+        entry._contents = (u64(command) << 32) | param;
+        return entry;
+    }
 
     void UpdateClipMatrix() noexcept;
     void ResetRenderingState() noexcept;
@@ -169,8 +193,10 @@ private:
     void BoxTest(const u32* params) noexcept;
     void PosTest() noexcept;
     void VecTest(u32 param) noexcept;
-    void CmdFIFOWrite(const CmdFIFOEntry& entry) noexcept;
+    void CmdFIFOWrite(CmdFIFOEntry entry) noexcept;
+    void CmdFIFOStall(CmdFIFOEntry entry) noexcept;
     CmdFIFOEntry CmdFIFORead() noexcept;
+    void ExecuteEntry(CmdFIFOEntry entry) noexcept;
     void FinishWork(s32 cycles) noexcept;
     void VertexPipelineSubmitCmd() noexcept
     {

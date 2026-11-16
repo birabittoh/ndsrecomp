@@ -9,6 +9,7 @@
 #include <cstdio>
 #include <cstring>
 #include <ctime>
+#include <string>
 #include <vector>
 
 #include "battery_save.h"
@@ -373,7 +374,7 @@ bool card_register_address(uint32_t addr) {
 }
 
 uint64_t active_system_timestamp() {
-    return (g_nds_active == NDS_ARM9) ? (g_runtime_cycles >> 1u)
+    return (g_nds_active == NDS_ARM9) ? (g_runtime_cycles >> g_nds_arm9_clock_shift)
                                        : g_runtime_cycles;
 }
 
@@ -531,6 +532,10 @@ void math_reg_write(uint32_t addr, uint32_t value, uint32_t width) {
 }
 
 void schedule_card_event(uint64_t delay, bool end_event) {
+    // nds_request_card_speedup: the transfer keeps its shape (a delay before
+    // each word, a longer one before each block), only shorter.
+    const unsigned speedup = nds_requested_card_speedup();
+    if (speedup > 1u) delay = std::max<uint64_t>(1u, delay / speedup);
     g_card_deadline = active_system_timestamp() + delay;
     g_card_end_event = end_event;
     nds_reschedule_slice(g_card_deadline);
@@ -641,6 +646,8 @@ inline void brk_check() {
 // Armed at startup because g_runtime_deep_trace defaults on;
 // nds_insn_hook_recompute keeps it consistent from then on.
 extern "C" uint64_t g_insn_count[2] = {0, 0};
+extern "C" uint32_t g_hook_resume_pc[2] = {0xFFFFFFFFu, 0xFFFFFFFFu};
+extern "C" unsigned char g_hook_resume_result[2] = {0u, 0u};
 extern "C" uint32_t g_insn_hook_armed = 1u;
 
 // Keep the generated code's per-insn slow-path gate consistent with its two
@@ -650,6 +657,11 @@ void nds_insn_hook_recompute() {
     // Device event counters already check their own anchors. Only an
     // instruction-count anchor needs the per-instruction callback.
     g_insn_hook_armed = (g_runtime_deep_trace || g_brk_is_insn) ? 1u : 0u;
+    // Banks emitted at codegen version 4 skip the armed test while the clock
+    // is under g_nds_fast_limit (runtime_insn_enter), so an armed hook must
+    // force every instruction onto runtime_insn_enter_slow. publish_fast_limit
+    // keeps the limit at zero from here on.
+    if (g_insn_hook_armed) runtime_clear_fast_limit();
 }
 
 // Armed per-insn payload for new-emission banks: the deep-trace register
@@ -674,6 +686,15 @@ extern "C" void runtime_insn_slow(void) {
         std::memcpy(e.r, g_cpu.R, sizeof(e.r));
     }
     brk_check();
+}
+
+// Codegen version 4 instruction entry at or over g_nds_fast_limit: the
+// original yield check, counter bump and armed payload, in that order.
+extern "C" bool runtime_insn_enter_slow(void) {
+    if (runtime_should_yield_slow()) return true;
+    ++g_insn_count[(g_nds_active == NDS_ARM7) ? 1 : 0];
+    if (g_insn_hook_armed) runtime_insn_slow();
+    return false;
 }
 
 namespace {
@@ -1730,7 +1751,7 @@ void auxspi_write_data(uint8_t val) {
     // One bit per SPI clock, 8 bits per byte: 8*(8<<speed) system cycles,
     // based at the writing CPU's live timestamp (melonDS ScheduleEvent).
     const uint32_t delay = 8u * (8u << (g_auxspicnt & 3u));
-    const uint64_t now = active() == 0 ? (g_runtime_cycles >> 1)
+    const uint64_t now = active() == 0 ? (g_runtime_cycles >> g_nds_arm9_clock_shift)
                                        : g_runtime_cycles;
     g_auxspi_deadline = now + delay;
     nds_reschedule_slice(g_auxspi_deadline);
@@ -1781,6 +1802,31 @@ bool g_nds_insn_stop = false;
 
 // --rtc-host (see io.h): main.cpp sets this before the initial boot.
 bool g_nds_rtc_host = false;
+unsigned g_nds_arm9_clock_shift = 1u;
+static std::atomic<unsigned> g_arm9_clock_shift_request{1u};
+void nds_request_arm9_overclock(unsigned multiple) {
+    const unsigned shift = multiple == 1u ? 1u : multiple == 2u ? 2u
+                         : multiple == 4u ? 3u : 0u;
+    if (shift) g_arm9_clock_shift_request.store(shift, std::memory_order_relaxed);
+}
+unsigned nds_requested_arm9_clock_shift() {
+    return g_arm9_clock_shift_request.load(std::memory_order_relaxed);
+}
+static std::atomic<bool> g_event_windows_request{false};
+void nds_request_event_windows(bool enabled) {
+    g_event_windows_request.store(enabled, std::memory_order_relaxed);
+}
+bool nds_event_windows_requested() {
+    return g_event_windows_request.load(std::memory_order_relaxed);
+}
+static std::atomic<unsigned> g_card_speedup_request{1u};
+void nds_request_card_speedup(unsigned factor) {
+    g_card_speedup_request.store(factor ? factor : 1u,
+                                 std::memory_order_relaxed);
+}
+unsigned nds_requested_card_speedup() {
+    return g_card_speedup_request.load(std::memory_order_relaxed);
+}
 
 void nds_io_reset() {
     for (int i = 0; i < 2; ++i) {
@@ -1798,6 +1844,7 @@ void nds_io_reset() {
     g_in_vblank = false;
     g_counts = {};
     g_insn_count[0] = g_insn_count[1] = 0;
+    g_hook_resume_pc[0] = g_hook_resume_pc[1] = 0xFFFFFFFFu;
     std::memset(g_dma, 0, sizeof(g_dma));
     g_dma_entry_cycle[0] = g_dma_entry_cycle[1] = 0;
     std::memset(g_spi_trace, 0, sizeof(g_spi_trace));
@@ -2035,6 +2082,31 @@ bool nds_io_flush_cartridge_save() {
     g_cart_backup.dirty = false;
     std::fprintf(stderr, "[save] wrote %zu bytes to %s\n",
                  g_cart_backup.sram.size(), g_cart_save_path.c_str());
+    return true;
+}
+
+const char* nds_io_cartridge_save_path() {
+    return g_cart_save_path.c_str();
+}
+
+bool nds_io_replace_cartridge_save(const uint8_t* data, uint32_t size,
+                                   std::string* error) {
+    if (g_cart_backup.sram.empty() || size != g_cart_backup.sram.size()) {
+        if (error)
+            *error = "the save must be " +
+                     std::to_string(g_cart_backup.sram.size()) + " bytes";
+        return false;
+    }
+    std::copy(data, data + size, g_cart_backup.sram.begin());
+    g_cart_backup.dirty = true;
+    // A save the player picked is the canonical one again, even after a
+    // historical savestate load detached this session from the file.
+    g_cart_persistence_detached = false;
+    g_cart_detached_warning_emitted = false;
+    if (!nds_io_flush_cartridge_save()) {
+        if (error) *error = "could not write " + g_cart_save_path;
+        return false;
+    }
     return true;
 }
 
@@ -2492,14 +2564,22 @@ void nds_tick_rtc(unsigned long long system_cycles) {
 }
 
 // ── Interrupt controller ────────────────────────────────────────────────
+// An unchanged IF leaves IME/IE/IF, and so the pending cache, exactly as
+// irq_recompute last derived them (every IE/IME/IF write recomputes), so
+// there is nothing to republish. The geometry engine re-asserts its FIFO
+// IRQ level on most command reads (GPU3D::CheckFIFOIRQ), almost always to
+// the value IF already holds; recomputing there dropped the per-instruction
+// fast limit mid-slice for no state change.
 void nds_raise_irq(int cpu, uint32_t bits) {
     cpu &= 1;
+    if ((g_if[cpu] | bits) == g_if[cpu]) return;
     g_if[cpu] |= bits;
     irq_recompute(cpu);
 }
 
 void nds_clear_irq(int cpu, uint32_t bits) {
     cpu &= 1;
+    if ((g_if[cpu] & ~bits) == g_if[cpu]) return;
     g_if[cpu] &= ~bits;
     irq_recompute(cpu);
 }
@@ -3043,12 +3123,19 @@ void nds_dma_run(int cpu, unsigned long long target_cycles) {
 #endif
             const uint32_t unit = dma_unit_cycles(cpu, d, width);
             g_runtime_cycles += uint64_t{unit} << (cpu == 0 ? 1u : 0u);
-            if (width == 4u) {
-                const uint32_t v = bus_read_u32(d.cur_src & ~3u);
-                bus_write_u32(d.cur_dst & ~3u, v);
-            } else {
-                const uint16_t v = bus_read_u16(d.cur_src & ~1u);
-                bus_write_u16(d.cur_dst & ~1u, v);
+            {
+                // ARM9 DMA does not reach ITCM/DTCM (they are inside the
+                // core; melonDS routes DMA through the bus only). Without
+                // this, DQ9's dummy channel-0 DMA (0 -> 0, 0x020C9F1C)
+                // rewrote ITCM[0] 380k times a session.
+                BusDmaScope dma_bus(cpu);
+                if (width == 4u) {
+                    const uint32_t v = bus_read_u32(d.cur_src & ~3u);
+                    bus_write_u32(d.cur_dst & ~3u, v);
+                } else {
+                    const uint16_t v = bus_read_u16(d.cur_src & ~1u);
+                    bus_write_u16(d.cur_dst & ~1u, v);
+                }
             }
             d.cur_src = static_cast<uint32_t>(
                 int64_t{d.cur_src} + int64_t{d.src_inc} * width);
@@ -3195,8 +3282,9 @@ void nds_tick_display(unsigned long long cyc) {
 
 void nds_tick_timers(int cpu, unsigned long long cpu_cycles) {
     cpu &= 1;
-    // ARM9 timestamps are in the 2x CPU clock; timers use system cycles.
-    const unsigned long long cyc = cpu == 0 ? (cpu_cycles >> 1u) : cpu_cycles;
+    // ARM9 timestamps are in the ARM9 clock; timers use system cycles.
+    const unsigned long long cyc =
+        cpu == 0 ? (cpu_cycles >> g_nds_arm9_clock_shift) : cpu_cycles;
     // Timers. Advance each enabled, non-cascade timer by the elapsed cycles
     // and raise its overflow IRQ (IF bit 3+N). Cascade (count-up) timers
     // are driven by the preceding timer's overflow.
@@ -3241,7 +3329,7 @@ void nds_tick_timers(int cpu, unsigned long long cpu_cycles) {
 }
 
 uint32_t nds_io_read(uint32_t addr, uint32_t width) {
-    scheduler_performance_io_fence();
+    scheduler_performance_io_fence(addr, width, false);
     const int cpu = active();
     const uint32_t m = mask_for(width);
     if (card_register_address(addr) && !card_owned_by(cpu)) return 0;
@@ -3399,7 +3487,7 @@ uint32_t nds_io_read(uint32_t addr, uint32_t width) {
 }
 
 void nds_io_write(uint32_t addr, uint32_t value, uint32_t width) {
-    scheduler_performance_io_fence();
+    scheduler_performance_io_fence(addr, width, true);
     const int cpu = active();
     if (card_register_address(addr) && !card_owned_by(cpu)) return;
     if (cpu == 0 && gpu2d_reg_addr(addr)) {

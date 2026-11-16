@@ -170,6 +170,7 @@ NDS_MACHINERY_INLINE uint32_t nds_region_shift(uint32_t*f,uint32_t v,uint32_t n,
 #define g_insn_count _region.insn_counts
 #define g_insn_hook_armed 0
 #define runtime_should_yield() false
+#define runtime_insn_enter() (++g_insn_count[g_nds_active], false)
 #define runtime_unwinding() false
 #define runtime_tick(n) nds_region_charge(&_region,(n))
 #define nds_code_numc(pc,k) ((k)==0u?0u:1u)

@@ -7,6 +7,7 @@
 #include <filesystem>
 #include <fstream>
 #include <vector>
+#include <sstream>
 
 #include "toml.hpp"
 
@@ -98,14 +99,55 @@ bool nds_parse_screen_layout(const std::string& value,
                              NdsScreenLayout* out) {
     if (!out) return false;
     const std::string normalized = lower_ascii(value);
-    if (normalized == "stacked" || normalized == "combined" ||
-        normalized == "single") {
+    if (normalized == "stacked" || normalized == "combined") {
         *out = NdsScreenLayout::Stacked;
+        return true;
+    }
+    if (normalized == "single" || normalized == "main") {
+        *out = NdsScreenLayout::Single;
         return true;
     }
     if (normalized == "separate" || normalized == "two-window" ||
         normalized == "two_windows") {
         *out = NdsScreenLayout::Separate;
+        return true;
+    }
+    return false;
+}
+
+bool nds_parse_window_mode(const std::string& value, NdsWindowMode* out) {
+    if (!out) return false;
+    const std::string normalized = lower_ascii(value);
+    if (normalized == "letterbox" || normalized == "fit") {
+        *out = NdsWindowMode::Letterbox;
+        return true;
+    }
+    // Letterbox is the only window mode; the old names fall back to it.
+    if (normalized == "stretch" || normalized == "original" ||
+        normalized == "1:1" || normalized == "native") {
+        *out = NdsWindowMode::Letterbox;
+        return true;
+    }
+    return false;
+}
+
+bool nds_parse_scaling_filter(const std::string& value,
+                              NdsScalingFilter* out) {
+    if (!out) return false;
+    const std::string normalized = lower_ascii(value);
+    if (normalized == "integer" || normalized == "pixel-perfect" ||
+        normalized == "pixel_perfect") {
+        *out = NdsScalingFilter::Integer;
+        return true;
+    }
+    if (normalized == "bilinear" || normalized == "linear") {
+        *out = NdsScalingFilter::Bilinear;
+        return true;
+    }
+    if (normalized == "nearest" || normalized == "nearest-neighbor" ||
+        normalized == "nearest_neighbor" || normalized == "nearest-neighbour" ||
+        normalized == "nearest_neighbour" || normalized == "point") {
+        *out = NdsScalingFilter::Nearest;
         return true;
     }
     return false;
@@ -197,8 +239,44 @@ bool nds_parse_internal_resolution(const std::string& value, uint8_t* out) {
     if (!out || value.empty()) return false;
     char* end = nullptr;
     const long parsed = std::strtol(value.c_str(), &end, 10);
-    if (!end || *end != '\0' || parsed < 1 || parsed > 12) return false;
+    if (!end || *end != '\0' || parsed < 1 || parsed > kNdsMaxInternalScale) return false;
     *out = static_cast<uint8_t>(parsed);
+    return true;
+}
+
+bool nds_parse_second_screen_size(const std::string& value, uint8_t* out) {
+    if (!out || value.empty()) return false;
+    char* end = nullptr;
+    const long parsed = std::strtol(value.c_str(), &end, 10);
+    if (!end || *end != '\0' || parsed < kNdsMinSecondScreenSize ||
+        parsed > kNdsMaxSecondScreenSize)
+        return false;
+    *out = static_cast<uint8_t>(parsed);
+    return true;
+}
+
+bool nds_parse_gamepad_layout(const std::string& value, bool* positional) {
+    if (!positional) return false;
+    const std::string normalized = lower_ascii(value);
+    if (normalized == "labels") {
+        *positional = false;
+    } else if (normalized == "positional") {
+        *positional = true;
+    } else {
+        return false;
+    }
+    return true;
+}
+
+bool nds_parse_resolution_scale(const std::string& value, uint16_t* out) {
+    if (!out || value.empty()) return false;
+    std::string digits = value;
+    if (digits.back() == '%') digits.pop_back();
+    if (digits.empty()) return false;
+    char* end = nullptr;
+    const long parsed = std::strtol(digits.c_str(), &end, 10);
+    if (!end || *end != '\0' || parsed < 10 || parsed > 1000) return false;
+    *out = static_cast<uint16_t>(parsed);
     return true;
 }
 
@@ -467,6 +545,46 @@ bool nds_parse_boot_mode(const std::string& value, NdsBootMode* out) {
     return false;
 }
 
+bool nds_parse_firmware_language(const std::string& value,
+                                 NdsFirmwareLanguage* out) {
+    if (!out) return false;
+    const std::string normalized = lower_ascii(value);
+    static const struct {
+        const char* name;
+        const char* code;
+        NdsFirmwareLanguage language;
+    } kLanguages[] = {
+        {"preserve", "firmware", NdsFirmwareLanguage::Preserve},
+        {"japanese", "ja", NdsFirmwareLanguage::Japanese},
+        {"english", "en", NdsFirmwareLanguage::English},
+        {"french", "fr", NdsFirmwareLanguage::French},
+        {"german", "de", NdsFirmwareLanguage::German},
+        {"italian", "it", NdsFirmwareLanguage::Italian},
+        {"spanish", "es", NdsFirmwareLanguage::Spanish},
+        {"chinese", "zh", NdsFirmwareLanguage::Chinese},
+    };
+    for (const auto& entry : kLanguages) {
+        if (normalized == entry.name || normalized == entry.code) {
+            *out = entry.language;
+            return true;
+        }
+    }
+    return false;
+}
+
+const char* nds_firmware_language_name(NdsFirmwareLanguage value) {
+    switch (value) {
+        case NdsFirmwareLanguage::Japanese: return "japanese";
+        case NdsFirmwareLanguage::English: return "english";
+        case NdsFirmwareLanguage::French: return "french";
+        case NdsFirmwareLanguage::German: return "german";
+        case NdsFirmwareLanguage::Italian: return "italian";
+        case NdsFirmwareLanguage::Spanish: return "spanish";
+        case NdsFirmwareLanguage::Chinese: return "chinese";
+        default: return "preserve";
+    }
+}
+
 bool nds_parse_instance_index(const std::string& value, uint32_t* out) {
     if (!out || value.empty()) return false;
     char* end = nullptr;
@@ -487,8 +605,123 @@ bool nds_parse_local_wireless_base_port(const std::string& value,
     return true;
 }
 
+namespace {
+
+bool parse_u32_in_range(const std::string& value, uint32_t max,
+                        uint32_t* out) {
+    if (value.empty()) return false;
+    char* end = nullptr;
+    const long long parsed = std::strtoll(value.c_str(), &end, 10);
+    if (!end || *end != '\0' || parsed < 0 ||
+        parsed > static_cast<long long>(max))
+        return false;
+    *out = static_cast<uint32_t>(parsed);
+    return true;
+}
+
+}  // namespace
+
+constexpr size_t kMaxLocalWirelessPeers = 8;
+
+bool nds_is_local_wireless_tuning_flag(const std::string& flag) {
+    return flag == "--local-wireless-delay-ms" ||
+           flag == "--local-wireless-jitter-ms" ||
+           flag == "--local-wireless-loss-pct" ||
+           flag == "--local-wireless-late-replies" ||
+           flag == "--local-wireless-reply-budget-us" ||
+           flag == "--local-wireless-stay-awake" ||
+           flag == "--local-wireless-link" ||
+           flag == "--local-wireless-peer" ||
+           flag == "--netplay" || flag == "--netplay-sign-in" ||
+           flag == "--netplay-join" || flag == "--netplay-lobby-name" ||
+           flag == "--netplay-lobby-url";
+}
+
+bool nds_parse_local_wireless_tuning(const std::string& flag,
+                                     const std::string& value,
+                                     NdsLocalWirelessOptions* out,
+                                     std::string* error) {
+    const auto fail = [&](const char* range) {
+        if (error) *error = "invalid " + flag + " (expected " + range + ")";
+        return false;
+    };
+    if (flag == "--local-wireless-delay-ms")
+        return parse_u32_in_range(value, 2000, &out->delay_ms) ||
+               fail("0..2000");
+    if (flag == "--local-wireless-jitter-ms")
+        return parse_u32_in_range(value, 2000, &out->jitter_ms) ||
+               fail("0..2000");
+    if (flag == "--local-wireless-loss-pct")
+        return parse_u32_in_range(value, 100, &out->loss_pct) ||
+               fail("0..100");
+    if (flag == "--local-wireless-reply-budget-us")
+        return parse_u32_in_range(value, 25000, &out->reply_budget_us) ||
+               fail("0..25000");
+    if (flag == "--local-wireless-late-replies")
+        return nds_parse_on_off(value, &out->late_replies) ||
+               fail("on or off");
+    if (flag == "--local-wireless-stay-awake")
+        return nds_parse_on_off(value, &out->stay_awake) ||
+               fail("on or off");
+    if (flag == "--local-wireless-link") {
+        if (value == "lan") out->lan = true;
+        else if (value == "loopback") out->lan = false;
+        else return fail("lan or loopback");
+        return true;
+    }
+    if (flag == "--local-wireless-peer") {
+        if (value.empty() || out->peers.size() >= kMaxLocalWirelessPeers)
+            return fail("HOST or HOST:PORT, at most 8 peers");
+        out->peers.push_back(value);
+        return true;
+    }
+    if (flag == "--netplay")
+        return nds_parse_on_off(value, &out->online.enabled) ||
+               fail("on or off");
+    if (flag == "--netplay-sign-in")
+        return nds_parse_on_off(value, &out->online.sign_in) ||
+               fail("on or off");
+    if (flag == "--netplay-join") {
+        if (value.empty()) return fail("a lobby id or first");
+        out->online.join = value;
+        return true;
+    }
+    if (flag == "--netplay-lobby-name") {
+        out->online.lobby_name = value;
+        return true;
+    }
+    if (flag == "--netplay-lobby-url") {
+        if (value.rfind("ws://", 0) != 0) return fail("a ws:// URL");
+        out->online.lobby_url = value;
+        return true;
+    }
+    if (error) *error = "unknown flag " + flag;
+    return false;
+}
+
 const char* nds_screen_layout_name(NdsScreenLayout value) {
-    return value == NdsScreenLayout::Separate ? "separate" : "stacked";
+    switch (value) {
+        case NdsScreenLayout::Separate: return "separate";
+        case NdsScreenLayout::Single: return "single";
+        default: return "stacked";
+    }
+}
+
+const char* nds_window_mode_name(NdsWindowMode value) {
+    switch (value) {
+        case NdsWindowMode::Stretch: return "stretch";
+        case NdsWindowMode::Original: return "original";
+        default: return "letterbox";
+    }
+}
+
+const char* nds_scaling_filter_name(NdsScalingFilter value) {
+    switch (value) {
+        case NdsScalingFilter::Bilinear: return "bilinear";
+        case NdsScalingFilter::Nearest: return "nearest";
+        case NdsScalingFilter::Integer:
+        default: return "integer";
+    }
 }
 
 const char* nds_frame_interpolation_name(NdsFrameInterpolation value) {
@@ -524,6 +757,10 @@ const char* nds_adaptive_screens_name(uint8_t value) {
     }
 }
 
+static bool apply_frontend_config(toml::table& root,
+                                  NdsFrontendOptions* options,
+                                  std::string* error);
+
 bool nds_load_frontend_config(const std::string& path,
                               NdsFrontendOptions* options,
                               std::string* error) {
@@ -538,8 +775,193 @@ bool nds_load_frontend_config(const std::string& path,
         if (error) *error = e.what();
         return false;
     }
+    return apply_frontend_config(root, options, error);
+}
 
+bool nds_load_frontend_config_text(const std::string& text,
+                                   NdsFrontendOptions* options,
+                                   std::string* error) {
+    if (!options) return false;
+    toml::table root;
+    try {
+        root = toml::parse(text);
+    } catch (const toml::parse_error& e) {
+        if (error) *error = e.description();
+        return false;
+    }
+    return apply_frontend_config(root, options, error);
+}
+
+bool nds_load_settings_file(const std::string& path,
+                            NdsFrontendOptions* options,
+                            std::string* error) {
+    if (!options) return false;
+    toml::table root;
+    try {
+        root = toml::parse_file(path);
+    } catch (const toml::parse_error& e) {
+        if (error) {
+            std::ostringstream message;
+            message << "line " << e.source().begin.line << ": "
+                    << e.description();
+            *error = message.str();
+        }
+        return false;
+    } catch (const std::exception& e) {
+        if (error) *error = e.what();
+        return false;
+    }
+    root.erase("game");
+    root.erase("cartridge");
+    if (const toml::table* paths = root["paths"].as_table()) {
+        options->paths.rom = (*paths)["rom"].value_or(std::string());
+        options->paths.bios = (*paths)["bios"].value_or(std::string());
+        options->paths.save = (*paths)["save"].value_or(std::string());
+    }
+    return apply_frontend_config(root, options, error);
+}
+
+std::string nds_toml_string(const std::string& value) {
+    std::string out = "\"";
+    for (const char c : value) {
+        if (c == '\\' || c == '"') out.push_back('\\');
+        out.push_back(c);
+    }
+    out.push_back('"');
+    return out;
+}
+
+namespace {
+
+std::string trim_ascii(const std::string& value) {
+    const size_t first = value.find_first_not_of(" \t\r");
+    if (first == std::string::npos) return {};
+    return value.substr(first, value.find_last_not_of(" \t\r") - first + 1u);
+}
+
+// "[name]" on a line of its own, optionally followed by a comment.
+bool settings_section_header(const std::string& line, std::string* name) {
+    const std::string text = trim_ascii(line);
+    if (text.size() < 3u || text[0] != '[' || text[1] == '[') return false;
+    const size_t close = text.find(']');
+    if (close == std::string::npos) return false;
+    *name = trim_ascii(text.substr(1u, close - 1u));
+    return true;
+}
+
+// Replace the value of a `key = value  # comment` line, comment included.
+std::string with_settings_value(const std::string& line, size_t equals,
+                                const std::string& value) {
+    size_t begin = line.find_first_not_of(" \t", equals + 1u);
+    if (begin == std::string::npos) begin = line.size();
+    size_t end = begin;
+    if (begin < line.size() && (line[begin] == '"' || line[begin] == '\'')) {
+        const char quote = line[begin];
+        end = begin + 1u;
+        while (end < line.size() && line[end] != quote)
+            end += line[end] == '\\' && quote == '"' ? 2u : 1u;
+        end = std::min(end + 1u, line.size());
+    } else {
+        while (end < line.size() && line[end] != '#' && line[end] != ' ' &&
+               line[end] != '\t' && line[end] != '\r')
+            ++end;
+    }
+    return line.substr(0, equals) + "= " + value + line.substr(end);
+}
+
+}  // namespace
+
+bool nds_update_settings_file(const std::string& path,
+                              const std::vector<NdsSettingUpdate>& updates,
+                              std::string* error) {
+    std::vector<std::string> lines;
+    {
+        std::ifstream in(path);
+        std::string line;
+        while (std::getline(in, line)) lines.push_back(line);
+    }
+
+    std::vector<bool> done(updates.size(), false);
+    std::string section;
+    std::vector<std::string> edited;
+    edited.reserve(lines.size());
+    for (const std::string& line : lines) {
+        if (settings_section_header(line, &section)) {
+            edited.push_back(line);
+            continue;
+        }
+        const size_t equals = line.find('=');
+        const size_t comment = line.find('#');
+        bool removed = false;
+        std::string out = line;
+        if (equals != std::string::npos &&
+            (comment == std::string::npos || comment > equals)) {
+            const std::string key = trim_ascii(line.substr(0, equals));
+            for (size_t i = 0; i < updates.size(); ++i) {
+                if (updates[i].section != section || updates[i].key != key)
+                    continue;
+                done[i] = true;
+                if (updates[i].remove)
+                    removed = true;
+                else
+                    out = with_settings_value(line, equals, updates[i].value);
+            }
+        }
+        if (!removed) edited.push_back(out);
+    }
+
+    for (size_t i = 0; i < updates.size(); ++i) {
+        if (done[i] || updates[i].remove) continue;
+        const std::string entry = updates[i].key + " = " + updates[i].value;
+        // After the last non-blank line of the section, if it exists.
+        std::string current;
+        size_t insert = edited.size() + 1u;
+        for (size_t line = 0; line < edited.size(); ++line) {
+            if (settings_section_header(edited[line], &current)) {
+                if (current == updates[i].section) insert = line + 1u;
+            } else if (current == updates[i].section &&
+                       !trim_ascii(edited[line]).empty()) {
+                insert = line + 1u;
+            }
+        }
+        if (insert > edited.size()) {
+            if (!edited.empty() && !trim_ascii(edited.back()).empty())
+                edited.push_back("");
+            edited.push_back("[" + updates[i].section + "]");
+            edited.push_back(entry);
+        } else {
+            edited.insert(edited.begin() + static_cast<std::ptrdiff_t>(insert),
+                          entry);
+        }
+    }
+
+    const std::string temporary = path + ".tmp";
+    {
+        std::ofstream out(temporary, std::ios::trunc);
+        for (const std::string& line : edited) out << line << '\n';
+        out.flush();
+        if (!out) {
+            if (error) *error = "cannot write " + temporary;
+            return false;
+        }
+    }
+    std::error_code rename_error;
+    std::filesystem::rename(temporary, path, rename_error);
+    if (rename_error) {
+        if (error) *error = rename_error.message();
+        return false;
+    }
+    return true;
+}
+
+static bool apply_frontend_config(toml::table& root,
+                                  NdsFrontendOptions* options,
+                                  std::string* error) {
     if (const toml::table* game = root["game"].as_table()) {
+        if (const auto value = (*game)["name"].value<std::string>())
+            options->game_name = *value;
+        if (const auto value = (*game)["app_name"].value<std::string>())
+            options->app_name = *value;
         if (const auto value = (*game)["sha1"].value<std::string>()) {
             const bool invalid_length = value->size() != 40u;
             const bool invalid_character = std::any_of(
@@ -593,6 +1015,17 @@ bool nds_load_frontend_config(const std::string& path,
         if (const auto value = (*system)["player_name"].value<std::string>()) {
             options->player_name = *value;
         }
+        if (const auto value = (*system)["language"].value<std::string>()) {
+            if (!nds_parse_firmware_language(*value,
+                                             &options->firmware_language)) {
+                if (error) {
+                    *error =
+                        "system.language must be preserve, japanese, english, "
+                        "french, german, italian, spanish, or chinese";
+                }
+                return false;
+            }
+        }
         if (const auto value = (*system)["instance_index"].value<int64_t>()) {
             if (!nds_parse_instance_index(std::to_string(*value),
                                           &options->instance_index)) {
@@ -604,7 +1037,21 @@ bool nds_load_frontend_config(const std::string& path,
         }
     }
 
+    if (const toml::table* audio = root["audio"].as_table()) {
+        if (const auto value = (*audio)["volume"].value<int64_t>()) {
+            if (*value < 0 || *value > 100) {
+                if (error) *error = "audio.volume must be 0..100";
+                return false;
+            }
+            options->audio_volume = static_cast<uint8_t>(*value);
+        }
+        if (const auto value = (*audio)["mute"].value<bool>())
+            options->audio_muted = *value;
+    }
+
     if (const toml::table* display = root["display"].as_table()) {
+        if (const auto value = (*display)["discrete_gpu"].value<bool>())
+            options->discrete_gpu = *value;
         if (const auto value = (*display)["fullscreen"].value<std::string>()) {
             if (!nds_parse_fullscreen_mode(*value, &options->fullscreen)) {
                 if (error) {
@@ -620,7 +1067,36 @@ bool nds_load_frontend_config(const std::string& path,
                                          &options->screen_layout)) {
                 if (error) {
                     *error =
-                        "display.screen_layout must be stacked or separate";
+                        "display.screen_layout must be single, stacked, or "
+                        "separate";
+                }
+                return false;
+            }
+        }
+        if (const auto value =
+                (*display)["window_mode"].value<std::string>()) {
+            if (!nds_parse_window_mode(*value, &options->window_mode)) {
+                if (error) {
+                    *error =
+                        "display.window_mode must be letterbox, stretch, or "
+                        "original";
+                }
+                return false;
+            }
+        }
+        for (const auto& [key, target] :
+             {std::pair<const char*, int*>{"window_width",
+                                           &options->window_width},
+              std::pair<const char*, int*>{"window_height",
+                                           &options->window_height}}) {
+            if (const auto value = (*display)[key].value<int64_t>())
+                *target = (*value >= 160 && *value <= 8192)
+                              ? static_cast<int>(*value) : 0;
+        }
+        if (const auto value = (*display)["scaling"].value<std::string>()) {
+            if (!nds_parse_scaling_filter(*value, &options->scaling)) {
+                if (error) {
+                    *error = "display.scaling must be integer, bilinear, or nearest";
                 }
                 return false;
             }
@@ -770,15 +1246,68 @@ bool nds_load_frontend_config(const std::string& path,
             }
         }
         if (const auto value =
-                (*display)["internal_resolution"].value<int64_t>()) {
-            if (!nds_parse_internal_resolution(
-                    std::to_string(*value), &options->internal_resolution)) {
+                (*display)["performance_governor"].value<std::string>()) {
+            if (!nds_parse_perf_governor_mode(
+                    value->c_str(), &options->perf_governor_mode)) {
                 if (error) {
-                    *error = "display.internal_resolution must be 1..12";
+                    *error = "display.performance_governor must be auto, off, "
+                             "stage1 or stage2";
                 }
                 return false;
             }
         }
+        const auto internal_resolution =
+            (*display)["internal_resolution"].value<int64_t>();
+        const auto resolution_scale =
+            (*display)["resolution_scale"].value<int64_t>();
+        // resolution_scale = 0 is the runtime menu's "Original": it keeps
+        // whatever multiplier internal_resolution gives.
+        const bool scale_off = resolution_scale && *resolution_scale == 0;
+        if (internal_resolution && resolution_scale && !scale_off) {
+            if (error) {
+                *error = "display.internal_resolution and "
+                         "display.resolution_scale are exclusive";
+            }
+            return false;
+        }
+        if (internal_resolution) {
+            if (!nds_parse_internal_resolution(
+                    std::to_string(*internal_resolution),
+                    &options->internal_resolution)) {
+                if (error) {
+                    *error = "display.internal_resolution must be 1..16";
+                }
+                return false;
+            }
+            options->resolution_scale = 0;
+        }
+        if (scale_off) {
+            options->resolution_scale = 0;
+        } else if (resolution_scale) {
+            if (!nds_parse_resolution_scale(
+                    std::to_string(*resolution_scale),
+                    &options->resolution_scale)) {
+                if (error) {
+                    *error = "display.resolution_scale must be 0 or 10..1000";
+                }
+                return false;
+            }
+            options->internal_resolution = 1;
+        }
+        if (const auto value =
+                (*display)["second_screen_size"].value<int64_t>()) {
+            if (!nds_parse_second_screen_size(
+                    std::to_string(*value), &options->second_screen_size)) {
+                if (error) {
+                    *error = "display.second_screen_size must be 10..100";
+                }
+                return false;
+            }
+        }
+        if (const auto value = (*display)["show_fps"].value<bool>())
+            options->show_fps = *value;
+        if (const auto value = (*display)["smooth_3d"].value<bool>())
+            options->smooth_3d = *value;
     }
 
     if (const toml::table* cartridge = root["cartridge"].as_table()) {
@@ -912,9 +1441,76 @@ bool nds_load_frontend_config(const std::string& path,
                 return false;
             }
         }
+        if (const auto value = (*local)["link"].value<std::string>()) {
+            if (*value != "lan" && *value != "loopback") {
+                if (error)
+                    *error = "local_wireless.link must be lan or loopback";
+                return false;
+            }
+            options->local_wireless.lan = *value == "lan";
+        }
+        if (const toml::array* peers = (*local)["peers"].as_array()) {
+            options->local_wireless.peers.clear();
+            for (const auto& entry : *peers) {
+                const auto text = entry.value<std::string>();
+                if (!text || text->empty() ||
+                    options->local_wireless.peers.size() >=
+                        kMaxLocalWirelessPeers) {
+                    if (error) {
+                        *error = "local_wireless.peers must be at most 8 "
+                                 "\"HOST\" or \"HOST:PORT\" strings";
+                    }
+                    return false;
+                }
+                options->local_wireless.peers.push_back(*text);
+            }
+        }
+    }
+    if (const toml::table* online = root["online"].as_table()) {
+        NdsOnlineOptions& o = options->local_wireless.online;
+        if (const auto value = (*online)["enabled"].value<bool>())
+            o.enabled = *value;
+        if (const auto value = (*online)["lobby_url"].value<std::string>()) {
+            if (!value->empty() && value->rfind("ws://", 0) != 0) {
+                if (error) *error = "online.lobby_url must be a ws:// URL";
+                return false;
+            }
+            o.lobby_url = *value;
+        }
+        if (const auto value = (*online)["game_name"].value<std::string>())
+            o.game_name = *value;
+        if (const auto value = (*online)["lobby_name"].value<std::string>())
+            o.lobby_name = *value;
     }
 
     if (const toml::table* controls = root["controls"].as_table()) {
+        if (const auto value =
+                (*controls)["screen_toggle"].value<std::string>()) {
+            if (!nds_set_virtual_stylus_binding(
+                    &options->screen_toggle_binding, *value)) {
+                if (error) *error = "controls.screen_toggle is too long";
+                return false;
+            }
+        }
+        if (const auto value =
+                (*controls)["gamepad_layout"].value<std::string>()) {
+            if (!nds_parse_gamepad_layout(*value,
+                                          &options->gamepad_positional)) {
+                if (error) {
+                    *error = "controls.gamepad_layout must be labels or "
+                             "positional";
+                }
+                return false;
+            }
+        }
+        if (const auto value = (*controls)["mouse_sensitivity"].value<int64_t>()) {
+            if (!nds_parse_mouse_sensitivity(
+                    std::to_string(*value),
+                    &options->relative_mouse_sensitivity)) {
+                if (error) *error = "controls.mouse_sensitivity must be 10..400";
+                return false;
+            }
+        }
         if (const toml::table* virtual_stylus =
                 (*controls)["virtual_stylus"].as_table()) {
             if (const auto value =
@@ -1057,6 +1653,25 @@ bool nds_load_frontend_config(const std::string& path,
                     }
                 }
             }
+        }
+    }
+    if (const toml::table* title = root["title"].as_table()) {
+        for (const auto& item : *title) {
+            int value = 0;
+            if (const auto b = item.second.value_exact<bool>()) {
+                value = *b ? 1 : 0;
+            } else if (const auto n = item.second.value_exact<int64_t>()) {
+                if (*n < INT32_MIN || *n > INT32_MAX) {
+                    if (error) *error = "title values must be 32-bit integers";
+                    return false;
+                }
+                value = static_cast<int>(*n);
+            } else {
+                if (error) *error = "title values must be integers or booleans";
+                return false;
+            }
+            options->title_settings.emplace_back(std::string(item.first.str()),
+                                                 value);
         }
     }
     return true;

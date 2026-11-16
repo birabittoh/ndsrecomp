@@ -3,6 +3,7 @@
 #include <cstdlib>
 #include <filesystem>
 #include <fstream>
+#include <iterator>
 #include <string>
 
 namespace {
@@ -22,20 +23,115 @@ bool set_fullscreen_environment(const char* value) {
 
 }  // namespace
 
+static bool settings_file_test() {
+    const std::filesystem::path path =
+        std::filesystem::temp_directory_path() / "nds_settings_file_test.toml";
+    {
+        std::ofstream out(path);
+        out << "# top comment\n[paths]\nrom = \"\"   # keep me\n\n"
+               "[display]\nscaling = \"nearest\"   # nearest | bilinear\n"
+               "internal_resolution = 4\n# resolution_scale = 50\n\n"
+               "[audio]\nvolume = 100\n";
+    }
+    std::string error;
+    if (!nds_update_settings_file(
+            path.string(),
+            {{"paths", "rom", nds_toml_string("C:\\roms\\my \"game\".nds")},
+             {"display", "scaling", nds_toml_string("bilinear")},
+             {"display", "internal_resolution", "", true},
+             {"display", "resolution_scale", "150"},
+             {"audio", "mute", "true"},
+             {"controls", "gamepad_layout", nds_toml_string("labels")}},
+            &error))
+        return false;
+    std::ifstream in(path);
+    const std::string text((std::istreambuf_iterator<char>(in)),
+                           std::istreambuf_iterator<char>());
+    // Closed before the remove below: Windows can't delete an open file.
+    in.close();
+    NdsFrontendOptions options{};
+    options.resolution_scale = 100;
+    const bool loaded =
+        nds_load_settings_file(path.string(), &options, &error);
+    bool ok =
+        loaded && text.find("# top comment") != std::string::npos &&
+        text.find("   # keep me") != std::string::npos &&
+        text.find("scaling = \"bilinear\"   # nearest | bilinear") !=
+            std::string::npos &&
+        text.find("# resolution_scale = 50") != std::string::npos &&
+        text.find("internal_resolution") == std::string::npos &&
+        options.paths.rom == "C:\\roms\\my \"game\".nds" &&
+        options.scaling == NdsScalingFilter::Bilinear &&
+        options.resolution_scale == 150 && options.audio_muted &&
+        options.audio_volume == 100 && !options.gamepad_positional;
+
+    // The menu's "Original", layered over a title default.
+    ok = ok && nds_update_settings_file(
+                   path.string(), {{"display", "resolution_scale", "0"}},
+                   &error);
+    ok = ok && nds_load_settings_file(path.string(), &options, &error) &&
+         options.resolution_scale == 0;
+
+    // Title-owned sections stay out of a player's hands.
+    {
+        std::ofstream out(path);
+        out << "[game]\nsha1 = \"bad\"\n[cartridge]\nsave_size = 3\n";
+    }
+    options.expected_rom_sha1 = "kept";
+    ok = ok && nds_load_settings_file(path.string(), &options, &error) &&
+         options.expected_rom_sha1 == "kept";
+
+    // [title] values layer in file order; the frontend applies them.
+    {
+        std::ofstream out(path);
+        out << "[title]\ncamera_distance = 150\nflag = true\n";
+    }
+    options.title_settings = {{"camera_distance", 100}};
+    ok = ok && nds_load_settings_file(path.string(), &options, &error) &&
+         options.title_settings.size() == 3 &&
+         options.title_settings[1].first == "camera_distance" &&
+         options.title_settings[1].second == 150 &&
+         options.title_settings[2].second == 1;
+    {
+        std::ofstream out(path);
+        out << "[title]\ncamera_distance = \"far\"\n";
+    }
+    ok = ok && !nds_load_settings_file(path.string(), &options, &error);
+    std::filesystem::remove(path);
+    return ok;
+}
+
 int main() {
-    uint8_t high_internal = 1;
-    if (!require(nds_parse_internal_resolution("12", &high_internal)) ||
-        !require(high_internal == 12) ||
-        !require(!nds_parse_internal_resolution("13", &high_internal)) ||
-        !require(!nds_parse_internal_resolution("0", &high_internal)))
-        return 129;
+    if (!settings_file_test()) return 1;
     NdsScreenLayout layout = NdsScreenLayout::Stacked;
     if (!require(nds_parse_screen_layout("separate", &layout)) ||
         !require(layout == NdsScreenLayout::Separate) ||
         !require(nds_parse_screen_layout("combined", &layout)) ||
         !require(layout == NdsScreenLayout::Stacked) ||
+        !require(nds_parse_screen_layout("single", &layout)) ||
+        !require(layout == NdsScreenLayout::Single) ||
+        !require(std::string(nds_screen_layout_name(layout)) == "single") ||
         !require(!nds_parse_screen_layout("sideways", &layout)))
         return 1;
+
+    NdsWindowMode window_mode = NdsWindowMode::Letterbox;
+    NdsScalingFilter scaling = NdsScalingFilter::Integer;
+    if (!require(nds_parse_window_mode("Stretch", &window_mode)) ||
+        !require(window_mode == NdsWindowMode::Letterbox) ||
+        !require(nds_parse_window_mode("1:1", &window_mode)) ||
+        !require(window_mode == NdsWindowMode::Letterbox) ||
+        !require(nds_parse_window_mode("letterbox", &window_mode)) ||
+        !require(window_mode == NdsWindowMode::Letterbox) ||
+        !require(!nds_parse_window_mode("zoom", &window_mode)) ||
+        !require(nds_parse_scaling_filter("bilinear", &scaling)) ||
+        !require(scaling == NdsScalingFilter::Bilinear) ||
+        !require(nds_parse_scaling_filter("pixel-perfect", &scaling)) ||
+        !require(scaling == NdsScalingFilter::Integer) ||
+        !require(nds_parse_scaling_filter("Nearest-Neighbor", &scaling)) ||
+        !require(scaling == NdsScalingFilter::Nearest) ||
+        !require(std::string(nds_scaling_filter_name(scaling)) == "nearest") ||
+        !require(!nds_parse_scaling_filter("smooth", &scaling)))
+        return 40;
 
     NdsFullscreenMode fullscreen = NdsFullscreenMode::Off;
     if (!require(nds_parse_fullscreen_mode("off", &fullscreen)) ||
@@ -67,6 +163,18 @@ int main() {
     bool toggle = false;
     uint16_t mouse_value = 0;
     uint16_t local_wireless_port = 0;
+    uint8_t second_screen_size = 0;
+    if (!require(nds_parse_second_screen_size("30", &second_screen_size)) ||
+        !require(second_screen_size == 30) ||
+        !require(nds_parse_second_screen_size("10", &second_screen_size)) ||
+        !require(second_screen_size == 10) ||
+        !require(nds_parse_second_screen_size("100", &second_screen_size)) ||
+        !require(second_screen_size == 100) ||
+        !require(!nds_parse_second_screen_size("0", &second_screen_size)) ||
+        !require(!nds_parse_second_screen_size("9", &second_screen_size)) ||
+        !require(!nds_parse_second_screen_size("101", &second_screen_size)) ||
+        !require(!nds_parse_second_screen_size("-1", &second_screen_size)))
+        return 1;
     if (!require(nds_parse_on_off("on", &toggle)) || !require(toggle) ||
         !require(nds_parse_on_off("false", &toggle)) || require(toggle) ||
         !require(!nds_parse_on_off("maybe", &toggle)) ||
@@ -134,6 +242,8 @@ int main() {
                 "[display]\n"
                 "screen_layout = \"separate\"\n"
                 "fullscreen = \"borderless\"\n"
+                "show_fps = true\n"
+                "smooth_3d = true\n"
                 "adaptive_widescreen = \"top\"\n"
                 "adaptive_capability = \"top\"\n"
                 "adaptive_width = 448\n"
@@ -175,6 +285,8 @@ int main() {
                  "90164d1ac127ee5f9815ea4ae7de798c7b5fc629") ||
         !require(options.screen_layout == NdsScreenLayout::Separate) ||
         !require(options.fullscreen == NdsFullscreenMode::Borderless) ||
+        !require(options.show_fps) ||
+        !require(options.smooth_3d) ||
         !require(options.startup_mode == NdsStartupMode::Automatic) ||
         !require(options.adaptive_screens == NDS_ADAPTIVE_TOP) ||
         !require(options.adaptive_supported == NDS_ADAPTIVE_TOP) ||
@@ -470,6 +582,98 @@ int main() {
         !require(nds_load_runtime_quality_setting(&restarted)) ||
         !require(restarted.perf_governor_mode == NdsPerfGovernorMode::Auto))
         return 157;
+    {
+        std::ofstream file(path);
+        file << "[display]\n"
+                "window_mode = \"original\"\n"
+                "scaling = \"bilinear\"\n";
+    }
+    options = {};
+    if (!require(nds_load_frontend_config(path.string(), &options, &error)) ||
+        !require(options.window_mode == NdsWindowMode::Letterbox) ||
+        !require(options.scaling == NdsScalingFilter::Bilinear))
+        return 41;
+
+    {
+        std::ofstream file(path);
+        file << "[display]\n"
+                "scaling = \"smooth\"\n";
+    }
+    options = {};
+    if (!require(
+            !nds_load_frontend_config(path.string(), &options, &error)))
+        return 42;
+    options = {};
+    if (!require(options.window_mode == NdsWindowMode::Letterbox) ||
+        !require(options.scaling == NdsScalingFilter::Integer))
+        return 43;
+
+    uint16_t resolution_scale = 0;
+    uint8_t internal_resolution = 1;
+    if (!require(nds_parse_resolution_scale("100", &resolution_scale)) ||
+        !require(resolution_scale == 100) ||
+        !require(nds_parse_resolution_scale("150%", &resolution_scale)) ||
+        !require(resolution_scale == 150) ||
+        !require(!nds_parse_resolution_scale("5", &resolution_scale)) ||
+        !require(!nds_parse_resolution_scale("%", &resolution_scale)) ||
+        !require(!nds_parse_resolution_scale("1001", &resolution_scale)) ||
+        !require(nds_parse_internal_resolution("16", &internal_resolution)) ||
+        !require(internal_resolution == 16) ||
+        !require(!nds_parse_internal_resolution("17", &internal_resolution)))
+        return 44;
+
+    {
+        std::ofstream file(path);
+        file << "[display]\n"
+                "resolution_scale = 75\n";
+    }
+    options = {};
+    if (!require(nds_load_frontend_config(path.string(), &options, &error)) ||
+        !require(options.resolution_scale == 75) ||
+        !require(options.internal_resolution == 1))
+        return 45;
+
+    {
+        std::ofstream file(path);
+        file << "[display]\n"
+                "resolution_scale = 100\n"
+                "internal_resolution = 2\n";
+    }
+    options = {};
+    if (!require(
+            !nds_load_frontend_config(path.string(), &options, &error)))
+        return 46;
+    options = {};
+    if (!require(options.resolution_scale == 0))
+        return 47;
+
+    {
+        std::ofstream file(path);
+        file << "[controls]\n"
+                "gamepad_layout = \"positional\"\n";
+    }
+    options = {};
+    if (!require(nds_load_frontend_config(path.string(), &options, &error)) ||
+        !require(options.gamepad_positional) ||
+        !require(!options.custom_gamepad_bindings))
+        return 48;
+    {
+        std::ofstream file(path);
+        file << "[controls]\n"
+                "gamepad_layout = \"labels\"\n";
+    }
+    options = {};
+    if (!require(nds_load_frontend_config(path.string(), &options, &error)) ||
+        !require(!options.gamepad_positional))
+        return 50;
+    {
+        std::ofstream file(path);
+        file << "[controls]\n"
+                "gamepad_layout = \"diagonal\"\n";
+    }
+    options = {};
+    if (!require(!nds_load_frontend_config(path.string(), &options, &error)))
+        return 51;
     std::filesystem::remove(path);
     return 0;
 }

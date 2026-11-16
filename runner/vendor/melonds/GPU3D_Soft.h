@@ -40,6 +40,19 @@ public:
     void RenderFrame(GPU& gpu) override;
     void RestartFrame(GPU& gpu) override;
     u32* GetLine(int line) override;
+
+    // RenderFrame in two steps, for a host that presents 3D from another
+    // renderer. DeferFrame latches the frame (flat texture views, identical
+    // test) without drawing it; RenderDeferredFrame draws it when something
+    // reads the raster after all, and returns whether it had to. Nothing the
+    // draw reads changes before the next VBlank, so a frame drawn late is the
+    // frame RenderFrame would have drawn. VBlank latches the next frame's
+    // list: the host has to DropDeferredFrame before it, and the buffers
+    // then keep the last frame that was drawn.
+    void DeferFrame(GPU& gpu);
+    bool RenderDeferredFrame(GPU& gpu);
+    bool DropDeferredFrame() noexcept;
+    bool FrameDeferred() const noexcept { return Deferred; }
     const u32* GetAttrLine(int line) override;
     void SetRenderWidth(u32 width) override;
 
@@ -496,6 +509,12 @@ private:
     bool Enabled;
 
     bool FrameIdentical = false;
+
+    void LatchFrame(GPU& gpu);
+    void StartFrame(GPU& gpu);
+    bool Deferred = false;       // latched, not drawn
+    bool BuffersStale = false;   // a deferred frame was dropped
+    bool PastVCount144 = false;  // since the last latch
 
     // threading
 

@@ -1,6 +1,7 @@
 #include "frontend.h"
 #include "host_profile.h"
 #include "frontend_window_size.h"
+#include "frontend_screen_route.h"
 #include "arm9_native.h"
 #include "cpu_render_handoff.h"
 
@@ -18,11 +19,16 @@
 #include <initializer_list>
 #include <limits>
 #include <memory>
+#include <mutex>
+#include <optional>
 #include <stdexcept>
 #include <string>
 #include <thread>
+#include <type_traits>
+#include <utility>
 #include <vector>
 
+#include "battery_save.h"
 #include "debug_server.h"
 #include "diagnostics.h"
 #include "gpu2d.h"
@@ -36,9 +42,23 @@
 #include "savestate_slots.h"
 #include "spu.h"
 #include "title_patches.h"
+#include "title_menu.h"
+#include "title_save.h"
+#include "title_settings.h"
+#include "title_update.h"
+#include "update/self_update.h"
+#include "wifi_net.h"
 #if defined(NDS_HAVE_COMPUTE_RENDERER)
 #include "melonds_compute/ComputeHost.h"
 #endif
+
+namespace {
+std::function<void()> g_frontend_reset;
+}  // namespace
+
+void nds_frontend_set_reset(std::function<void()> reset) {
+    g_frontend_reset = std::move(reset);
+}
 
 namespace {
 // Written per presented frame by the frontend loop, read from the same
@@ -213,7 +233,10 @@ void observe_top_black_bands(const uint32_t* pixels, uint64_t frame,
 #else
 #include <SDL.h>
 #endif
-#include "recomp_runtime_ui.h"
+#include "runtime_menu_item.h"
+#if NDS_ONLINE
+#include "netplay_menu.h"
+#endif
 
 #include "frontend_latency.h"
 #include "frontend_window_pair.h"
@@ -257,6 +280,7 @@ namespace {
 #undef SDL_MOUSEBUTTONDOWN
 #undef SDL_MOUSEBUTTONUP
 #undef SDL_MOUSEMOTION
+#undef SDL_MOUSEWHEEL
 #undef SDL_QUIT
 #undef SDL_FALSE
 #undef SDL_TRUE
@@ -300,6 +324,7 @@ namespace {
 #define SDL_MOUSEBUTTONDOWN SDL_EVENT_MOUSE_BUTTON_DOWN
 #define SDL_MOUSEBUTTONUP SDL_EVENT_MOUSE_BUTTON_UP
 #define SDL_MOUSEMOTION SDL_EVENT_MOUSE_MOTION
+#define SDL_MOUSEWHEEL SDL_EVENT_MOUSE_WHEEL
 #define SDL_QUIT SDL_EVENT_QUIT
 #define SDL_FALSE false
 #define SDL_TRUE true
@@ -312,6 +337,7 @@ namespace {
 #define SDL_EVENT_WINDOW_FOCUS_GAINED SDL_WINDOWEVENT_FOCUS_GAINED
 #define SDL_EVENT_WINDOW_FOCUS_LOST SDL_WINDOWEVENT_FOCUS_LOST
 #define SDL_EVENT_WINDOW_MOUSE_LEAVE SDL_WINDOWEVENT_LEAVE
+#define SDL_EVENT_WINDOW_RESIZED SDL_WINDOWEVENT_SIZE_CHANGED
 #endif
 
 constexpr int kScreenWidth = 256;
@@ -438,6 +464,9 @@ SDL_Scancode scancode_from_binding_name(const std::string& value) {
         return SDL_SCANCODE_RSHIFT;
     if (normalized == "space")
         return SDL_SCANCODE_SPACE;
+    if (normalized == "grave" || normalized == "backtick" ||
+        normalized == "backquote")
+        return SDL_SCANCODE_GRAVE;
     if (normalized == "tab")
         return SDL_SCANCODE_TAB;
     if (normalized == "enter" || normalized == "return")
@@ -732,6 +761,8 @@ struct AudioQueue {
     // Host output only. Consumption, guest mixing and pacing remain active.
     bool output_muted = false;
 #if !defined(NDS_HAVE_SDL3)
+    // Read by the audio callback; SDL3 applies it as the stream gain instead.
+    std::atomic<float> gain{1.0f};
     std::array<int16_t, kAudioCapacityFrames * 2> samples{};
     uint32_t read = 0;
     uint32_t write = 0;
@@ -794,8 +825,13 @@ void SDLCALL audio_callback(void* userdata, Uint8* stream, int len) {
                     (take - first) * kAudioFrameBytes);
     queue->read = (queue->read + take) % kAudioCapacityFrames;
     queue->count -= take;
-    if (queue->output_muted)
+    if (queue->output_muted) {
         std::memset(stream, 0, static_cast<size_t>(len));
+    } else if (const float gain = queue->gain.load(std::memory_order_relaxed);
+               gain < 1.0f) {
+        for (uint32_t i = 0; i < take * 2u; ++i)
+            output[i] = static_cast<int16_t>(output[i] * gain);
+    }
     if (take < requested && queue->started.load(std::memory_order_relaxed)) {
         queue->underruns.fetch_add(1, std::memory_order_relaxed);
         nds_frontend_latency::shortage(
@@ -844,6 +880,14 @@ SDL_Scancode sdl_event_scancode(const SDL_Event& event) {
     return event.key.scancode;
 #else
     return event.key.keysym.scancode;
+#endif
+}
+
+bool sdl_event_alt(const SDL_Event& event) {
+#if defined(NDS_HAVE_SDL3)
+    return (event.key.mod & SDL_KMOD_ALT) != 0;
+#else
+    return (event.key.keysym.mod & KMOD_ALT) != 0;
 #endif
 }
 
@@ -935,10 +979,19 @@ uint16_t controller_bit(SDL_GameControllerButton button) {
         case SDL_CONTROLLER_BUTTON_DPAD_DOWN:     return 1u << 7;
         case SDL_CONTROLLER_BUTTON_RIGHTSHOULDER: return 1u << 8;
         case SDL_CONTROLLER_BUTTON_LEFTSHOULDER:  return 1u << 9;
-        case SDL_CONTROLLER_BUTTON_X:             return 1u << 10;
+        case SDL_CONTROLLER_BUTTON_X:         return 1u << 10;
         case SDL_CONTROLLER_BUTTON_Y:             return 1u << 11;
         default:                                  return 0;
     }
+}
+
+uint16_t gamepad_button_mask(const NdsFrontendOptions& options,
+                             SDL_GameControllerButton button) {
+    if (options.custom_gamepad_bindings)
+        return nds_binding_mask(options.gamepad_bindings, button + 1);
+    if (options.gamepad_positional)
+        return nds_binding_mask(kNdsPositionalPad, button + 1);
+    return controller_bit(button);
 }
 
 SDL_GameController* open_first_controller() {
@@ -970,11 +1023,49 @@ SDL_GameController* open_first_controller() {
 #endif
 }
 
+// The fixed-size layers (a title's UI shrunk by nds_gpu2d_set_fixed_size_layers)
+// as the touchscreen last showed them: scale 1 when it showed none. The
+// shrunken layer is where the player sees (and points at) the menus, so the
+// mouse has to be mapped back through it to reach the DS coordinates the
+// guest's UI uses. Written by the presenter, read by the event loop.
+std::atomic<float> g_touch_ui_scale{1.0f};
+std::atomic<float> g_touch_ui_anchor_x{0.0f};
+std::atomic<float> g_touch_ui_anchor_y{0.0f};
+
+// Maps a point on the touchscreen (DS pixels, as displayed) back to the DS
+// pixel of the unscaled layer under it. False when the point is outside the
+// DS screen after the mapping, which is where the shrunken UI has nothing.
+bool touch_ui_unscale(float* x, float* y) {
+    const float s = g_touch_ui_scale.load(std::memory_order_relaxed);
+    if (s >= 1.0f || s <= 0.0f || nds_title_touch_unscaled()) return true;
+    const float ax = g_touch_ui_anchor_x.load(std::memory_order_relaxed);
+    const float ay = g_touch_ui_anchor_y.load(std::memory_order_relaxed);
+    // Something the title draws at its native place (DQ9's Menu button) is
+    // hit where it is shown, unless the shrunken UI is shown there too.
+    int rx0, ry0, rx1, ry1;
+    if (nds_title_unscaled_touch_rect(&rx0, &ry0, &rx1, &ry1) &&
+        *x >= float(rx0) && *x < float(rx1) &&
+        *y >= float(ry0) && *y < float(ry1)) {
+        const float inside_x0 = ax * (1.0f - s);
+        const float inside_y0 = ay * (1.0f - s);
+        const bool in_scaled = *x >= inside_x0 &&
+            *x < inside_x0 + kScreenWidth * s && *y >= inside_y0 &&
+            *y < inside_y0 + kScreenHeight * s;
+        if (!in_scaled) return true;
+    }
+    *x = ax + (*x - ax) / s;
+    *y = ay + (*y - ay) / s;
+    return *x >= 0.0f && *x < kScreenWidth && *y >= 0.0f &&
+           *y < kScreenHeight;
+}
+
 void set_touch_from_mouse(float x, float y, bool down,
                           NdsScreenLayout layout, int logical_width) {
     // Coordinates are expected in the renderer's logical DS-space.
     const float bottom_origin =
-        layout == NdsScreenLayout::Separate ? 0.0f : kScreenHeight;
+        layout == NdsScreenLayout::Separate ||
+                layout == NdsScreenLayout::Single
+            ? 0.0f : kScreenHeight;
     const float left =
         static_cast<float>((logical_width - kScreenWidth) / 2);
     if (!down || x < left || x >= left + kScreenWidth ||
@@ -982,11 +1073,55 @@ void set_touch_from_mouse(float x, float y, bool down,
         nds_set_touch(0, 0, false);
         return;
     }
+    float ds_x = x - left;
+    float ds_y = y - bottom_origin;
+    if (!touch_ui_unscale(&ds_x, &ds_y)) {
+        nds_set_touch(0, 0, false);
+        return;
+    }
     const auto touch_x = static_cast<uint16_t>(std::clamp<int>(
-        static_cast<int>(x - left), 0, kScreenWidth - 1));
+        static_cast<int>(ds_x), 0, kScreenWidth - 1));
     const auto touch_y = static_cast<uint16_t>(std::clamp<int>(
-        static_cast<int>(y - bottom_origin), 0, kScreenHeight - 1));
+        static_cast<int>(ds_y), 0, kScreenHeight - 1));
     nds_set_touch(touch_x, touch_y, true);
+}
+
+// The pointer position for nds_title_pointer_hover, from the same logical
+// coordinates and touchscreen rectangle as set_touch_from_mouse.
+void set_hover_from_mouse(float x, float y, bool hovering,
+                          NdsScreenLayout layout, int logical_width) {
+    const float bottom_origin =
+        layout == NdsScreenLayout::Separate ||
+                layout == NdsScreenLayout::Single
+            ? 0.0f : kScreenHeight;
+    const float left =
+        static_cast<float>((logical_width - kScreenWidth) / 2);
+    if (!hovering || x < left || x >= left + kScreenWidth ||
+        y < bottom_origin || y >= bottom_origin + kScreenHeight) {
+        nds_title_set_pointer_hover(0, 0, false);
+        return;
+    }
+    float ds_x = x - left;
+    float ds_y = y - bottom_origin;
+    if (!touch_ui_unscale(&ds_x, &ds_y)) {
+        nds_title_set_pointer_hover(0, 0, false);
+        return;
+    }
+    nds_title_set_pointer_hover(static_cast<int>(ds_x),
+                                static_cast<int>(ds_y), true);
+}
+
+// The mouse position on the top screen in DS pixels, for
+// nds_title_top_pointer / nds_title_top_click. `left` is where the top
+// screen's 256 pixels start in the window's logical x; the top screen always
+// starts at the window's top. False when the point is outside the screen.
+bool top_screen_point(float x, float y, int left, int* ds_x, int* ds_y) {
+    const float fx = x - static_cast<float>(left);
+    if (fx < 0.0f || fx >= kScreenWidth || y < 0.0f || y >= kScreenHeight)
+        return false;
+    *ds_x = static_cast<int>(fx);
+    *ds_y = static_cast<int>(y);
+    return true;
 }
 
 uint32_t audio_queue_count(const NdsAudioDevice& device, AudioQueue& queue) {
@@ -1151,6 +1286,23 @@ NdsAudioDevice open_audio_device(AudioQueue& queue,
 #endif
 }
 
+// Sets the host output level. Guest mixing, queue consumption and audio pacing
+// carry on untouched, so muting never changes timing. NDS_FRONTEND_AUDIO_MUTE
+// (output_muted) always wins.
+void apply_audio_output_level(const NdsAudioDevice& device, AudioQueue& queue,
+                              uint8_t volume, bool muted) {
+    if (!device) return;
+    const float gain = muted || queue.output_muted
+        ? 0.0f : static_cast<float>(volume) / 100.0f;
+#if defined(NDS_HAVE_SDL3)
+    if (!SDL_SetAudioStreamGain(device.stream, gain))
+        std::fprintf(stderr, "[sdl] cannot set audio volume: %s\n",
+                     SDL_GetError());
+#else
+    queue.gain.store(gain, std::memory_order_relaxed);
+#endif
+}
+
 void discard_spu_output() {
     std::array<int16_t, 2048> samples{};
     while (nds_spu_read_output(samples.data(), 1024) != 0) {}
@@ -1182,188 +1334,739 @@ uint64_t framebuffer_rgb_fnv(int screen) {
     return hash;
 }
 
-constexpr const char* kRuntimeMouseSensitivityKey =
-    "input.mouse_sensitivity";
-constexpr const char* kRuntimeAutomaticQualityKey = "graphics.automatic_quality";
-constexpr const char* kRuntimeResolutionNowKey = "graphics.resolution_now";
-constexpr const char* kRuntimeSupersamplingNowKey = "graphics.supersampling_now";
-constexpr const char* kRuntimeResumeKey = "system.resume";
-constexpr const char* kRuntimeQuitKey = "system.quit";
+constexpr const char* kRuntimeGamepadLayoutKey = "input.gamepad_layout";
+constexpr const char* kRuntimeScalingKey = "display.scaling";
+constexpr const char* kRuntimeResolutionScaleKey = "display.resolution_scale";
+// Menu steps for resolution_scale; 0 is "off" (the fixed multiplier). TOML
+// and the CLI take any percentage, which the menu shows as the nearest step.
+constexpr int kResolutionScaleChoiceValues[] = {0, 25, 50, 75, 100, 150, 200};
+constexpr const char* kRuntimeSecondScreenKey = "display.second_screen_size";
+constexpr const char* kRuntimeShowFpsKey = "display.show_fps";
+constexpr const char* kRuntimeFullscreenKey = "display.fullscreen";
+constexpr const char* kRuntimeSmooth3dKey = "display.smooth_3d";
+constexpr const char* kRuntimeVolumeKey = "audio.volume";
+constexpr const char* kRuntimeMuteKey = "audio.mute";
+// Rows for the title's own settings (title_settings.h): "title.<key>".
+constexpr const char* kRuntimeTitlePrefix = "title.";
 
 struct FrontendPresentation;
 
 struct RuntimeMenuState {
     NdsFrontendOptions* options = nullptr;
-    bool* running = nullptr;
-    bool close_requested = false;
-    FrontendPresentation* presentation = nullptr;
-    NdsPerfGovernorState* governor = nullptr;
-    bool mouse_changed = false;
-    bool quality_changed = false;
+    // Resolution scale needs the GL presenter on the compute renderer.
+    bool resolution_scale_available = false;
+    const NdsAudioDevice* audio = nullptr;
+    AudioQueue* audio_queue = nullptr;
+    // options->fullscreen changed from the settings; the frontend applies it
+    // to the window (and saves it) on its next frame.
+    bool fullscreen_pending = false;
+    NdsFullscreenMode fullscreen_on_mode = NdsFullscreenMode::Borderless;
 };
 
-int runtime_menu_set_automatic_quality(RuntimeMenuState* state, int value);
-int runtime_menu_get_quality_text(void* context, const RecompRuntimeUiItem* item,
-                                  char* text, size_t size);
+// The title setting behind a "title.<key>" row, or -1.
+int runtime_menu_title_setting(const NdsMenuItem* item) {
+    const size_t prefix = std::strlen(kRuntimeTitlePrefix);
+    if (std::strncmp(item->key, kRuntimeTitlePrefix, prefix) != 0) return -1;
+    return nds_title_setting_find(item->key + prefix);
+}
 
-int runtime_menu_get_value(void* context, const RecompRuntimeUiItem* item,
+// Rewrites (or appends) each key=value pair in the launcher-owned settings
+// file, keeping every other line as it was.
+bool save_runtime_settings(
+        const std::string& path,
+        const std::vector<std::pair<std::string, std::string>>& values) {
+    if (path.empty()) return false;
+    std::filesystem::path settings(path);
+    std::error_code error;
+    if (!settings.parent_path().empty()) {
+        std::filesystem::create_directories(settings.parent_path(), error);
+        if (error) return false;
+    }
+
+    std::vector<std::string> lines;
+    std::vector<bool> found(values.size(), false);
+    bool saw_version = false;
+    {
+        std::ifstream in(settings);
+        std::string line;
+        while (std::getline(in, line)) {
+            const size_t equals = line.find('=');
+            if (equals != std::string::npos) {
+                const std::string key = line.substr(0, equals);
+                if (key == "settings_version") saw_version = true;
+                for (size_t i = 0; i < values.size(); ++i) {
+                    if (key != values[i].first) continue;
+                    line = values[i].first + "=" + values[i].second;
+                    found[i] = true;
+                }
+            }
+            lines.push_back(line);
+        }
+    }
+    if (!saw_version)
+        lines.insert(lines.begin(), "settings_version=12");
+    for (size_t i = 0; i < values.size(); ++i) {
+        if (!found[i])
+            lines.push_back(values[i].first + "=" + values[i].second);
+    }
+
+    std::ofstream out(settings, std::ios::trunc);
+    if (!out) return false;
+    for (const std::string& line : lines)
+        out << line << '\n';
+    return static_cast<bool>(out);
+}
+
+int runtime_menu_get_value(RuntimeMenuState* state, const NdsMenuItem* item,
                            int* value_out) {
-    auto* state = static_cast<RuntimeMenuState*>(context);
     if (!state || !state->options || !item || !value_out) return 0;
-    if (std::strcmp(item->key, kRuntimeMouseSensitivityKey) == 0) {
-        *value_out = state->options->relative_mouse_sensitivity;
+#if NDS_ONLINE
+    if (nds_netplay_menu_owns(item))
+        return nds_netplay_menu_get_value(item, value_out);
+#endif
+    if (const int title = runtime_menu_title_setting(item); title >= 0) {
+        *value_out = nds_title_setting_value(title);
         return 1;
     }
-    if (std::strcmp(item->key, kRuntimeAutomaticQualityKey) == 0) {
-        *value_out = state->options->perf_governor_mode != NdsPerfGovernorMode::Off;
+    if (std::strcmp(item->key, kRuntimeGamepadLayoutKey) == 0) {
+        *value_out = state->options->gamepad_positional ? 1 : 0;
+        return 1;
+    }
+    if (std::strcmp(item->key, kRuntimeResolutionScaleKey) == 0) {
+        // 0 is "Original" (the fixed multiplier); a percent reads as the
+        // nearest percent choice.
+        const int current = state->options->resolution_scale;
+        int best = 0;
+        if (current > 0) {
+            best = kResolutionScaleChoiceValues[1];
+            for (const int v : kResolutionScaleChoiceValues) {
+                if (v > 0 && std::abs(v - current) < std::abs(best - current))
+                    best = v;
+            }
+        }
+        *value_out = best;
+        return 1;
+    }
+    if (std::strcmp(item->key, kRuntimeScalingKey) == 0) {
+        *value_out = static_cast<int>(state->options->scaling);
+        return 1;
+    }
+    if (std::strcmp(item->key, kRuntimeSecondScreenKey) == 0) {
+        *value_out = state->options->second_screen_size;
+        return 1;
+    }
+    if (std::strcmp(item->key, kRuntimeShowFpsKey) == 0) {
+        *value_out = state->options->show_fps ? 1 : 0;
+        return 1;
+    }
+    if (std::strcmp(item->key, kRuntimeFullscreenKey) == 0) {
+        *value_out = state->options->fullscreen != NdsFullscreenMode::Off;
+        return 1;
+    }
+    if (std::strcmp(item->key, kRuntimeSmooth3dKey) == 0) {
+        *value_out = state->options->smooth_3d ? 1 : 0;
+        return 1;
+    }
+    if (std::strcmp(item->key, kRuntimeVolumeKey) == 0) {
+        *value_out = state->options->audio_volume;
+        return 1;
+    }
+    if (std::strcmp(item->key, kRuntimeMuteKey) == 0) {
+        *value_out = state->options->audio_muted ? 1 : 0;
         return 1;
     }
     return 0;
 }
 
-int runtime_menu_set_value(void* context, const RecompRuntimeUiItem* item,
+int runtime_menu_set_value(RuntimeMenuState* state, const NdsMenuItem* item,
                            int value) {
-    auto* state = static_cast<RuntimeMenuState*>(context);
     if (!state || !state->options || !item) return 0;
-    if (std::strcmp(item->key, kRuntimeAutomaticQualityKey) == 0)
-        return runtime_menu_set_automatic_quality(state, value);
-    if (std::strcmp(item->key, kRuntimeMouseSensitivityKey) == 0) {
-        if (value < 10 || value > 400) return 0;
-        state->options->relative_mouse_sensitivity =
-            static_cast<uint16_t>(value);
-        state->mouse_changed = true;
-        std::fprintf(stderr, "[sdl] mouse sensitivity set to %d%%\n", value);
+#if NDS_ONLINE
+    if (nds_netplay_menu_owns(item))
+        return nds_netplay_menu_set_value(item, value);
+#endif
+    if (const int title = runtime_menu_title_setting(item); title >= 0) {
+        if (!nds_title_setting_set(title, value)) return 0;
+        std::fprintf(stderr, "[title] %s -> %d\n",
+                     nds_title_setting_at(title)->key, value);
+        return 1;
+    }
+    if (std::strcmp(item->key, kRuntimeGamepadLayoutKey) == 0) {
+        if (value < 0 || value > 1) return 0;
+        state->options->gamepad_positional = value != 0;
+        std::fprintf(stderr, "[sdl] gamepad layout -> %s\n",
+                     value ? "positional" : "labels");
+        return 1;
+    }
+    if (std::strcmp(item->key, kRuntimeResolutionScaleKey) == 0) {
+        if (value != 0 && (value < 10 || value > 1000)) return 0;
+        state->options->resolution_scale = static_cast<uint16_t>(value);
+        if (value == 0)
+            std::fprintf(stderr,
+                         "[display] resolution scale -> original (fixed %ux)\n",
+                         static_cast<unsigned>(
+                             state->options->internal_resolution));
+        else
+            std::fprintf(stderr, "[display] resolution scale -> %d%%\n",
+                         value);
+        return 1;
+    }
+    if (std::strcmp(item->key, kRuntimeScalingKey) == 0) {
+        if (value < 0 || value > static_cast<int>(NdsScalingFilter::Nearest))
+            return 0;
+        state->options->scaling = static_cast<NdsScalingFilter>(value);
+        std::fprintf(stderr, "[display] scaling -> %s\n",
+                     nds_scaling_filter_name(state->options->scaling));
+        return 1;
+    }
+    if (std::strcmp(item->key, kRuntimeSecondScreenKey) == 0) {
+        if (value < kNdsMinSecondScreenSize ||
+            value > kNdsMaxSecondScreenSize)
+            return 0;
+        state->options->second_screen_size = static_cast<uint8_t>(value);
+        std::fprintf(stderr, "[display] second screen size -> %d%%\n", value);
+        return 1;
+    }
+    if (std::strcmp(item->key, kRuntimeShowFpsKey) == 0) {
+        if (value < 0 || value > 1) return 0;
+        state->options->show_fps = value != 0;
+        return 1;
+    }
+    if (std::strcmp(item->key, kRuntimeFullscreenKey) == 0) {
+        if (value < 0 || value > 1) return 0;
+        const bool on = state->options->fullscreen != NdsFullscreenMode::Off;
+        if ((value != 0) == on) return 1;
+        // On is the mode Alt+Enter uses: the configured one, else borderless.
+        state->options->fullscreen = value ? state->fullscreen_on_mode
+                                           : NdsFullscreenMode::Off;
+        state->fullscreen_pending = true;
+        return 1;
+    }
+    if (std::strcmp(item->key, kRuntimeSmooth3dKey) == 0) {
+        if (value < 0 || value > 1) return 0;
+        state->options->smooth_3d = value != 0;
+        return 1;
+    }
+    if (std::strcmp(item->key, kRuntimeVolumeKey) == 0 ||
+        std::strcmp(item->key, kRuntimeMuteKey) == 0) {
+        // The volume is a stored setting: it is kept (and saved) while muted
+        // or with no device, and is what plays once there is output again.
+        if (std::strcmp(item->key, kRuntimeVolumeKey) == 0) {
+            if (value < 0 || value > 100) return 0;
+            state->options->audio_volume = static_cast<uint8_t>(value);
+        } else {
+            if (!state->audio || !*state->audio) return 0;
+            state->options->audio_muted = value != 0;
+        }
+        if (state->audio && state->audio_queue)
+            apply_audio_output_level(*state->audio, *state->audio_queue,
+                                     state->options->audio_volume,
+                                     state->options->audio_muted);
         return 1;
     }
     return 0;
 }
 
-int runtime_menu_run_action(void* context, const RecompRuntimeUiItem* item) {
-    auto* state = static_cast<RuntimeMenuState*>(context);
-    if (!state || !item) return 0;
-    if (std::strcmp(item->key, kRuntimeResumeKey) == 0) {
-        state->close_requested = true;
-        return 1;
-    }
-    if (std::strcmp(item->key, kRuntimeQuitKey) == 0) {
-        if (state->running) *state->running = false;
-        return 1;
-    }
+int runtime_menu_run_action(const NdsMenuItem* item) {
+    if (!item) return 0;
+#if NDS_ONLINE
+    if (nds_netplay_menu_owns(item)) return nds_netplay_menu_run_action(item);
+#endif
     return 0;
 }
 
-int runtime_menu_is_enabled(void* context, const RecompRuntimeUiItem* item) {
-    auto* state = static_cast<RuntimeMenuState*>(context);
+int runtime_menu_is_enabled(const RuntimeMenuState* state,
+                            const NdsMenuItem* item) {
     if (!state || !state->options || !item) return 0;
-    if (std::strcmp(item->key, kRuntimeMouseSensitivityKey) == 0)
-        return state->options->relative_mouse_touch ? 1 : 0;
-    if (std::strcmp(item->key, kRuntimeResolutionNowKey) == 0 ||
-        std::strcmp(item->key, kRuntimeSupersamplingNowKey) == 0)
-        return 0;  // Live readouts, not editable target settings.
+#if NDS_ONLINE
+    if (nds_netplay_menu_owns(item)) return nds_netplay_menu_is_enabled(item);
+#endif
+    if (std::strcmp(item->key, kRuntimeGamepadLayoutKey) == 0)
+        return state->options->custom_gamepad_bindings ? 0 : 1;
+#if defined(__ANDROID__)
+    // Always fullscreen there (nds_run_interactive_frontend).
+    if (std::strcmp(item->key, kRuntimeFullscreenKey) == 0) return 0;
+#endif
+    if (std::strcmp(item->key, kRuntimeResolutionScaleKey) == 0)
+        return state->resolution_scale_available ? 1 : 0;
+    if (std::strcmp(item->key, kRuntimeSecondScreenKey) == 0)
+        return state->options->screen_layout == NdsScreenLayout::Single
+            ? 1 : 0;
+    // Volume stays enabled while muted or with no device (see set_value);
+    // only Mute needs a device to act on.
+    if (std::strcmp(item->key, kRuntimeMuteKey) == 0)
+        return state->audio && *state->audio ? 1 : 0;
     return 1;
 }
 
-void runtime_menu_save(void* context) {
-    auto* state = static_cast<RuntimeMenuState*>(context);
+void runtime_menu_save(const RuntimeMenuState* state) {
     if (!state || !state->options) return;
-    if (!nds_save_runtime_settings(*state->options,
-                                  state->mouse_changed, state->quality_changed)) {
-        std::fprintf(stderr, "[sdl] could not save runtime settings\n");
+    const NdsFrontendOptions& options = *state->options;
+    if (save_runtime_settings(
+            options.runtime_settings_path,
+            {{"mouse_sensitivity",
+              std::to_string(options.relative_mouse_sensitivity)},
+             {"gamepad_layout",
+              options.gamepad_positional ? "positional" : "labels"},
+             {"scaling", nds_scaling_filter_name(options.scaling)},
+             {"resolution_scale",
+              std::to_string(options.resolution_scale)},
+             {"second_screen_size",
+              std::to_string(options.second_screen_size)},
+             {"audio_volume", std::to_string(options.audio_volume)},
+             {"audio_muted", options.audio_muted ? "1" : "0"}})) {
+        std::fprintf(stderr, "[sdl] saved runtime settings\n");
+    }
+    if (options.settings_path.empty()) return;
+    const auto quoted = [](const char* name) {
+        return nds_toml_string(name);
+    };
+    std::vector<NdsSettingUpdate> updates = {
+        {"display", "scaling", quoted(nds_scaling_filter_name(options.scaling))},
+        {"display", "resolution_scale",
+         std::to_string(options.resolution_scale)},
+        {"display", "second_screen_size",
+         std::to_string(options.second_screen_size)},
+        {"display", "show_fps", options.show_fps ? "true" : "false"},
+        {"display", "smooth_3d", options.smooth_3d ? "true" : "false"},
+        {"audio", "volume", std::to_string(options.audio_volume)},
+        {"audio", "mute", options.audio_muted ? "true" : "false"},
+        {"controls", "gamepad_layout",
+         quoted(options.gamepad_positional ? "positional" : "labels")},
+    };
+    // The two are exclusive in TOML unless the scale is off.
+    if (options.resolution_scale != 0)
+        updates.push_back({"display", "internal_resolution", "", true});
+    for (size_t i = 0; i < nds_title_setting_count(); ++i) {
+        const int id = static_cast<int>(i);
+        updates.push_back({"title", nds_title_setting_at(id)->key,
+                           std::to_string(nds_title_setting_value(id))});
+    }
+    if (options.relative_mouse_touch)
+        updates.push_back({"controls", "mouse_sensitivity",
+                           std::to_string(options.relative_mouse_sensitivity)});
+#if NDS_ONLINE
+    bool netplay = false;
+    std::string lobby_name;
+    if (nds_netplay_menu_settings(&netplay, &lobby_name)) {
+        updates.push_back({"online", "enabled", netplay ? "true" : "false"});
+        updates.push_back({"online", "lobby_name", quoted(lobby_name.c_str())});
+    }
+#endif
+    std::string error;
+    if (!nds_update_settings_file(options.settings_path, updates, &error))
+        std::fprintf(stderr, "[settings] could not save %s: %s\n",
+                     options.settings_path.c_str(), error.c_str());
+}
+
+// Writes the window's current logical size to [display] window_width/height.
+// Fullscreen and minimized sizes are not worth coming back to, and the logical
+// unit (not pixels) is what SDL_SetWindowSize reads, so a scaled display does
+// not grow the window on every launch. `saved` caches what the file holds.
+void persist_window_size(NdsFrontendOptions& options, SDL_Window* window) {
+    if (options.settings_path.empty() || !window) return;
+    const auto flags = SDL_GetWindowFlags(window);
+#if defined(NDS_HAVE_SDL3)
+    if (flags & (SDL_WINDOW_FULLSCREEN | SDL_WINDOW_MINIMIZED)) return;
+#else
+    if (flags & (SDL_WINDOW_FULLSCREEN | SDL_WINDOW_FULLSCREEN_DESKTOP |
+                 SDL_WINDOW_MINIMIZED))
+        return;
+#endif
+    int width = 0, height = 0;
+    SDL_GetWindowSize(window, &width, &height);
+    if (width < 160 || height < 160 || width > 8192 || height > 8192) return;
+    if (width == options.window_width && height == options.window_height)
+        return;
+    options.window_width = width;
+    options.window_height = height;
+    std::string error;
+    if (!nds_update_settings_file(
+            options.settings_path,
+            {{"display", "window_width", std::to_string(width)},
+             {"display", "window_height", std::to_string(height)}},
+            &error))
+        std::fprintf(stderr, "[settings] could not save %s: %s\n",
+                     options.settings_path.c_str(), error.c_str());
+}
+
+// Writes [display] fullscreen so the next launch starts in the mode the window
+// was last left in.
+void persist_fullscreen(const NdsFrontendOptions& options) {
+    if (options.settings_path.empty()) return;
+    std::string error;
+    if (!nds_update_settings_file(
+            options.settings_path,
+            {{"display", "fullscreen",
+              nds_toml_string(nds_fullscreen_mode_name(options.fullscreen))}},
+            &error))
+        std::fprintf(stderr, "[settings] could not save %s: %s\n",
+                     options.settings_path.c_str(), error.c_str());
+}
+
+// Save import and export asked for by a title hook (title_save.h). The
+// dialog runs asynchronously; its result is handled on a later frame.
+struct TitleSaveDialog {
+    std::mutex mutex;
+    bool open = false;
+    bool done = false;
+    bool unavailable = false;
+    std::string path;
+    NdsTitleSaveRequest request;
+};
+
+TitleSaveDialog g_title_save_dialog;
+
+#if defined(NDS_HAVE_SDL3)
+void SDLCALL title_save_dialog_finished(void* userdata,
+                                        const char* const* files, int) {
+    auto* dialog = static_cast<TitleSaveDialog*>(userdata);
+    std::lock_guard<std::mutex> lock(dialog->mutex);
+    dialog->unavailable = files == nullptr;
+    dialog->path = files && files[0] ? files[0] : "";
+    dialog->done = true;
+    std::fprintf(stderr, "[save] file dialog closed: %s\n",
+                 files ? (files[0] ? files[0] : "cancelled")
+                       : SDL_GetError());
+}
+#endif
+
+#if defined(NDS_HAVE_SDL3)
+// On Android the dialogs hand out content:// URIs, not paths: only SDL's I/O
+// (through the ContentResolver) can open those.
+bool title_save_is_uri(const std::string& path) {
+    return path.rfind("content://", 0) == 0;
+}
+#endif
+
+std::string title_save_import(const std::string& path,
+                              NdsTitleSaveConvert convert, bool* reset) {
+    std::vector<uint8_t> file;
+#if defined(NDS_HAVE_SDL3)
+    size_t size = 0;
+    void* data = SDL_LoadFile(path.c_str(), &size);
+    if (!data) {
+        std::fprintf(stderr, "[save] could not read %s: %s\n", path.c_str(),
+                     SDL_GetError());
+        return "Could not open the selected file";
+    }
+    file.assign(static_cast<const uint8_t*>(data),
+                static_cast<const uint8_t*>(data) + size);
+    SDL_free(data);
+#else
+    std::ifstream in(path, std::ios::binary);
+    if (!in) return "Could not open " + path;
+    file.assign(std::istreambuf_iterator<char>(in),
+                std::istreambuf_iterator<char>());
+#endif
+    std::vector<uint8_t> image;
+    std::string error;
+    if (convert) {
+        if (!convert(file, &image, &error))
+            return "Not imported: " + error;
     } else {
-        state->mouse_changed = false;
-        state->quality_changed = false;
+        image = file;
     }
+    if (!nds_io_replace_cartridge_save(
+            image.data(), static_cast<uint32_t>(image.size()), &error))
+        return "Not imported: " + error;
+    *reset = true;
+    return "Save file imported";
 }
 
-bool runtime_menu_key_input(SDL_Scancode scancode,
-                            RecompRuntimeUiInput* input) {
-    if (!input) return false;
-    switch (scancode) {
-        case SDL_SCANCODE_ESCAPE:
-            *input = RECOMP_RUNTIME_UI_INPUT_TOGGLE;
-            return true;
-        case SDL_SCANCODE_BACKSPACE:
-            *input = RECOMP_RUNTIME_UI_INPUT_BACK;
-            return true;
-        case SDL_SCANCODE_UP:
-            *input = RECOMP_RUNTIME_UI_INPUT_UP;
-            return true;
-        case SDL_SCANCODE_DOWN:
-            *input = RECOMP_RUNTIME_UI_INPUT_DOWN;
-            return true;
-        case SDL_SCANCODE_LEFT:
-            *input = RECOMP_RUNTIME_UI_INPUT_LEFT;
-            return true;
-        case SDL_SCANCODE_RIGHT:
-            *input = RECOMP_RUNTIME_UI_INPUT_RIGHT;
-            return true;
-        case SDL_SCANCODE_RETURN:
-        case SDL_SCANCODE_KP_ENTER:
-            *input = RECOMP_RUNTIME_UI_INPUT_ACCEPT;
-            return true;
-        default:
+std::string title_save_export(const std::string& path) {
+    nds_io_flush_cartridge_save();
+    const uint8_t* data = nullptr;
+    uint32_t size = 0;
+    bool dirty = false;
+    if (!nds_io_cartridge_save_snapshot(&data, &size, &dirty))
+        return "No save to export";
+#if defined(NDS_HAVE_SDL3)
+    // A URI cannot be written beside and renamed over, so no atomic write.
+    if (title_save_is_uri(path)) {
+        SDL_IOStream* out = SDL_IOFromFile(path.c_str(), "wb");
+        const bool ok = out && SDL_WriteIO(out, data, size) == size;
+        if (out && !SDL_CloseIO(out)) {
+            std::fprintf(stderr, "[save] could not close %s: %s\n",
+                         path.c_str(), SDL_GetError());
+            return "Not exported: the file could not be written";
+        }
+        if (!ok) {
+            std::fprintf(stderr, "[save] could not write %s: %s\n",
+                         path.c_str(), SDL_GetError());
+            return "Not exported: the file could not be written";
+        }
+        return "Save file exported";
+    }
+#endif
+    std::string error;
+    if (!nds_battery_save_write_atomic(path, data, size, &error))
+        return "Not exported: " + error;
+    return "Save file exported to " + path;
+}
+
+// Once per frame. Returns the notice to show ("" for none); *reset is set
+// when the console has to be reset to load an imported save.
+std::string serve_title_save(SDL_Window* parent, bool* reset) {
+    TitleSaveDialog& dialog = g_title_save_dialog;
+    std::unique_lock<std::mutex> lock(dialog.mutex);
+    if (!dialog.open) {
+        NdsTitleSaveRequest request;
+        if (!nds_title_save_take_request(&request)) return "";
+#if defined(NDS_HAVE_SDL3)
+        dialog.open = true;
+        dialog.done = false;
+        dialog.request = request;
+        lock.unlock();
+        static const SDL_DialogFileFilter kFilters[] = {
+            {"Save files", "sav;dsv;duc;bin"},
+            {"All files", "*"},
+        };
+        const bool importing = request.action == NdsTitleSaveAction::Import;
+        const SDL_PropertiesID properties = SDL_CreateProperties();
+        SDL_SetStringProperty(properties, SDL_PROP_FILE_DIALOG_TITLE_STRING,
+                              importing ? "Import save file"
+                                        : "Export save file");
+        SDL_SetPointerProperty(properties, SDL_PROP_FILE_DIALOG_WINDOW_POINTER,
+                               parent);
+        SDL_SetPointerProperty(properties,
+                               SDL_PROP_FILE_DIALOG_FILTERS_POINTER,
+                               const_cast<SDL_DialogFileFilter*>(kFilters));
+        SDL_SetNumberProperty(properties, SDL_PROP_FILE_DIALOG_NFILTERS_NUMBER,
+                              2);
+        std::string location;
+        if (!importing) {
+            // An absolute path: the xdg portal refuses a relative folder,
+            // and SDL turns a bare file name into one (".").
+            const std::filesystem::path save = nds_io_cartridge_save_path();
+            const char* folder = SDL_GetUserFolder(SDL_FOLDER_DOCUMENTS);
+            if (!folder) folder = SDL_GetUserFolder(SDL_FOLDER_HOME);
+            const std::string name =
+                save.empty() ? "save.sav" : save.filename().string();
+            location = folder ? (std::filesystem::path(folder) / name).string()
+                              : name;
+            SDL_SetStringProperty(properties,
+                                  SDL_PROP_FILE_DIALOG_LOCATION_STRING,
+                                  location.c_str());
+        }
+        std::fprintf(stderr, "[save] opening the %s file dialog\n",
+                     importing ? "import" : "export");
+        SDL_ClearError();
+        SDL_ShowFileDialogWithProperties(
+            importing ? SDL_FILEDIALOG_OPENFILE : SDL_FILEDIALOG_SAVEFILE,
+            title_save_dialog_finished, &dialog, properties);
+        if (const char* error = SDL_GetError(); error && *error)
+            std::fprintf(stderr, "[save] file dialog: %s\n", error);
+        SDL_DestroyProperties(properties);
+        return "";
+#else
+        (void)parent;
+        nds_title_save_finish();
+        return "File dialogs need the SDL3 build";
+#endif
+    }
+    if (!dialog.done) return "";
+    dialog.open = false;
+    const std::string path = dialog.path;
+    const bool unavailable = dialog.unavailable;
+    const NdsTitleSaveRequest request = dialog.request;
+    lock.unlock();
+    nds_title_save_finish();
+    if (unavailable) return "Could not open a file dialog";
+    if (path.empty()) return "";  // cancelled
+    std::string notice =
+        request.action == NdsTitleSaveAction::Import
+            ? title_save_import(path, request.convert, reset)
+            : title_save_export(path);
+    std::fprintf(stderr, "[save] %s\n", notice.c_str());
+    return notice;
+}
+
+// The menu's rows for title hooks (title_menu.h): publishes a copy with the
+// current values, then applies what the hooks asked for since last frame.
+void runtime_menu_serve_title(RuntimeMenuState* state,
+                              const std::vector<NdsMenuItem>& items) {
+#if NDS_ONLINE
+    nds_netplay_menu_tick();
+#endif
+    bool changed = false;
+    for (const NdsTitleMenuRequest& request : nds_title_menu_take_requests()) {
+        for (const NdsMenuItem& item : items) {
+            if (request.key != item.key) continue;
+            if (!runtime_menu_is_enabled(state, &item)) break;
+            if (request.run) {
+                if (item.type == NdsMenuItemType::Action)
+                    changed |= runtime_menu_run_action(&item) != 0;
+            } else {
+                changed |=
+                    runtime_menu_set_value(state, &item, request.value) != 0;
+            }
+            break;
+        }
+    }
+    if (changed) runtime_menu_save(state);
+
+    std::vector<NdsTitleMenuRow> rows;
+    rows.reserve(items.size());
+    for (const NdsMenuItem& item : items) {
+        NdsTitleMenuRow row;
+        row.key = item.key ? item.key : "";
+        row.section = item.section ? item.section : "";
+        row.label = item.label ? item.label : "";
+        row.description = item.description ? item.description : "";
+        switch (item.type) {
+        case NdsMenuItemType::Bool:
+            row.type = NdsTitleMenuRowType::Bool; break;
+        case NdsMenuItemType::Int:
+            row.type = NdsTitleMenuRowType::Int; break;
+        case NdsMenuItemType::Choice:
+            row.type = NdsTitleMenuRowType::Choice; break;
+        case NdsMenuItemType::Action:
+            row.type = NdsTitleMenuRowType::Action; break;
+        }
+        row.minimum = item.minimum;
+        row.maximum = item.maximum;
+        row.step = item.step > 0 ? item.step : 1;
+        for (size_t i = 0; item.choices && i < item.choice_count; ++i) {
+            row.choices.emplace_back(item.choices[i] ? item.choices[i] : "");
+            row.choice_values.push_back(
+                item.choice_values ? item.choice_values[i]
+                                   : item.minimum + static_cast<int>(i));
+        }
+        runtime_menu_get_value(state, &item, &row.value);
+        row.enabled = runtime_menu_is_enabled(state, &item) != 0;
+        rows.push_back(std::move(row));
+    }
+    nds_title_menu_publish(std::move(rows));
+}
+
+// The self-updater for title hooks (title_update.h): checks once at
+// startup, takes the hooks' install request, and applies a staged update
+// at once. Returns the notice to show ("" for none); *quit is set when the
+// update helper has been started and the frontend has to exit so it can
+// swap the files.
+std::string serve_title_update(bool* quit) {
+    using nds::update::SelfUpdater;
+    static SelfUpdater updater(nds::update::BuildConfig());
+    static const std::filesystem::path install_root = SelfUpdater::InstallRoot();
+    static bool started = false;
+    static bool installing = false;
+    static bool applied = false;
+    static std::string failure;
+    const nds::update::Config config = nds::update::BuildConfig();
+
+    if (!started) {
+        started = true;
+        if (updater.Enabled() && !install_root.empty()) {
+            // Also drops a stale staged APK on Android.
+            SelfUpdater::HasPendingSelfUpdate(install_root, config.current_version);
+            updater.CheckAsync();
+        }
+    }
+
+    std::string notice;
+    const std::optional<nds::update::UpdateInfo> info = updater.Available();
+    // Hands a staged update over; on desktop that ends this process.
+    // Android keeps running behind the package installer, and if the player
+    // backs out of it the row stays, so asking again reopens the installer.
+    auto apply = [&]() {
+        if (!SelfUpdater::ApplyAndRestart(install_root,
+                                          SelfUpdater::ExecutablePath()))
             return false;
-    }
-}
+        if (SelfUpdater::RestartsItself()) {
+            applied = true;
+            std::fprintf(stderr, "[update] restarting into %s\n",
+                         info ? info->version.c_str() : "the update");
+            *quit = true;
+        }
+        return true;
+    };
 
-bool runtime_menu_controller_input(SDL_GameControllerButton button,
-                                   RecompRuntimeUiInput* input) {
-    if (!input) return false;
-    switch (button) {
-        case SDL_CONTROLLER_BUTTON_START:
-            *input = RECOMP_RUNTIME_UI_INPUT_TOGGLE;
-            return true;
-        case SDL_CONTROLLER_BUTTON_BACK:
-        case SDL_CONTROLLER_BUTTON_B:
-            *input = RECOMP_RUNTIME_UI_INPUT_BACK;
-            return true;
-        case SDL_CONTROLLER_BUTTON_DPAD_UP:
-            *input = RECOMP_RUNTIME_UI_INPUT_UP;
-            return true;
-        case SDL_CONTROLLER_BUTTON_DPAD_DOWN:
-            *input = RECOMP_RUNTIME_UI_INPUT_DOWN;
-            return true;
-        case SDL_CONTROLLER_BUTTON_DPAD_LEFT:
-            *input = RECOMP_RUNTIME_UI_INPUT_LEFT;
-            return true;
-        case SDL_CONTROLLER_BUTTON_DPAD_RIGHT:
-            *input = RECOMP_RUNTIME_UI_INPUT_RIGHT;
-            return true;
-        case SDL_CONTROLLER_BUTTON_A:
-            *input = RECOMP_RUNTIME_UI_INPUT_ACCEPT;
-            return true;
-        default:
-            return false;
+    if (nds_title_update_take_install_request() && info && !installing &&
+        !applied) {
+        failure.clear();
+        const std::filesystem::path apk = SelfUpdater::StagedApkPath(install_root);
+        if (!SelfUpdater::RestartsItself() && !apk.empty() &&
+            SelfUpdater::StagedApkVersion(apk) == info->version) {
+            // Already downloaded: straight to the installer.
+            if (!apply()) failure = "the staged update could not be applied";
+        } else {
+            std::fprintf(stderr, "[update] installing %s\n", info->version.c_str());
+            installing = true;
+            updater.InstallAsync(*info, install_root);
+        }
     }
-}
 
-std::thread::id g_frontend_thread;
-RecompRuntimeUi* g_runtime_menu_ui = nullptr;
-std::vector<uint32_t> g_runtime_menu_surface;
-unsigned g_runtime_menu_width = 0, g_runtime_menu_height = 0;
-
-const uint32_t* runtime_menu_overlay(RecompRuntimeUi* ui,
-                                     const uint32_t* pixels,
-                                     int width,
-                                     int height) {
-    if (!ui || !recomp_runtime_ui_is_open(ui) || !pixels ||
-        width <= 0 || height <= 0) {
-        return pixels;
+    const nds::update::InstallResult install = updater.InstallSnapshot();
+    if (installing && install.done) {
+        installing = false;
+        if (!install.ok) {
+            failure = install.message;
+            notice = "Update failed: " + install.message;
+        } else if (apply()) {
+            if (SelfUpdater::RestartsItself())
+                notice = "Restarting into the update";
+        } else {
+            failure = "the staged update could not be applied";
+            notice = "Update failed: " + failure;
+        }
+    } else if (installing) {
+        char text[64];
+        if (install.total_bytes > 0) {
+            std::snprintf(text, sizeof(text), "Downloading update %d%%",
+                          static_cast<int>(100.0 *
+                                           static_cast<double>(install.downloaded_bytes) /
+                                           static_cast<double>(install.total_bytes)));
+        } else {
+            std::snprintf(text, sizeof(text), "Downloading update");
+        }
+        notice = text;
     }
-    const size_t count = static_cast<size_t>(width) *
-                         static_cast<size_t>(height);
-    auto& surface = g_runtime_menu_surface;
-    surface.assign(pixels, pixels + count);
-    recomp_runtime_ui_render_argb8888(
-        ui, surface.data(), width, height, width * sizeof(uint32_t));
-    g_runtime_menu_ui = ui;
-    g_runtime_menu_width = static_cast<unsigned>(width);
-    g_runtime_menu_height = static_cast<unsigned>(height);
-    return surface.data();
+
+    NdsTitleUpdateStatus status;
+    status.current_version = config.current_version;
+    status.restarts = SelfUpdater::RestartsItself();
+    if (info) status.available_version = info->version;
+    status.downloaded_bytes = install.downloaded_bytes;
+    status.total_bytes = install.total_bytes;
+    if (!updater.Enabled() || install_root.empty()) {
+        status.state = NdsTitleUpdateState::Off;
+    } else if (applied) {
+        status.state = NdsTitleUpdateState::Applying;
+    } else if (installing) {
+        status.state = NdsTitleUpdateState::Downloading;
+    } else if (!failure.empty()) {
+        status.state = NdsTitleUpdateState::Failed;
+        status.message = failure;
+    } else {
+        switch (updater.state()) {
+        case nds::update::CheckState::kIdle:
+        case nds::update::CheckState::kChecking:
+            status.state = NdsTitleUpdateState::Checking; break;
+        case nds::update::CheckState::kUpToDate:
+            status.state = NdsTitleUpdateState::UpToDate; break;
+        case nds::update::CheckState::kUpdateAvailable:
+            status.state = NdsTitleUpdateState::Available; break;
+        case nds::update::CheckState::kFailed:
+            status.state = NdsTitleUpdateState::Failed;
+            status.message = "the update check failed"; break;
+        }
+    }
+    nds_title_update_publish(std::move(status));
+    return notice;
 }
 
 struct FrontendPresentation {
     bool separate = false;
+    // Single-screen layout: one window (windows[1] aliases windows[0]) that
+    // shows the physical LCD `shown_screen`. With gl_top it is the GL window.
+    bool single = false;
+    int shown_screen = 0;
+    // The other LCD's size beside it, percent; 0 hides it.
+    int inset_percent = 0;
+    // A game mode forces both screens stacked at the same size (single
+    // layout only): inset_percent is 100 and the top LCD is the main one.
+    bool stacked = false;
     bool gl_top = false;
     SDL_Window* windows[2]{};
     SDL_Renderer* renderers[2]{};
@@ -1375,7 +2078,44 @@ struct FrontendPresentation {
     int configured_sample_scale = 1;
     int sample_scale = 1;
     uint8_t antialiasing = 0;
+    // Live copies of the [display] geometry options; the runtime menu edits
+    // the options and the frame loop syncs them here before each present.
+    NdsWindowMode window_mode = NdsWindowMode::Letterbox;
+    NdsScalingFilter scaling = NdsScalingFilter::Integer;
+    // Live [display] resolution_scale / internal_resolution, for hosts that
+    // size the 3D raster from the presented rect (Plume).
+    uint16_t resolution_scale = 0;
+    uint8_t internal_resolution = 1;
 };
+
+// The top window's host presenter composes the 3D layer itself (direct OBJ and
+// HD frames). Only then are those surfaces worth emitting; otherwise the CPU
+// composite carries the 3D layer, as on the SDL path.
+bool presenter_composes_3d(const FrontendPresentation& presentation) {
+#if defined(NDS_HAVE_COMPUTE_RENDERER)
+    return presentation.gl_top && nds_compute_host_composes_3d();
+#else
+    (void)presentation;
+    return false;
+#endif
+}
+
+// The window flag the accelerated top-window presenter needs: a GL context,
+// a Vulkan surface for Plume on Linux, or a Metal view for Plume on Apple
+// (MoltenVK draws into its CAMetalLayer). Plume on Windows presents through
+// D3D12 on the plain HWND, and a Vulkan-flagged window would make SDL require
+// a Vulkan loader there for nothing.
+uint64_t accelerated_window_flag() {
+#if defined(NDS_USE_PLUME) && defined(__linux__)
+    return static_cast<uint64_t>(SDL_WINDOW_VULKAN);
+#elif defined(NDS_USE_PLUME) && defined(__APPLE__)
+    return static_cast<uint64_t>(SDL_WINDOW_METAL);
+#elif defined(NDS_USE_PLUME)
+    return 0u;
+#else
+    return static_cast<uint64_t>(SDL_WINDOW_OPENGL);
+#endif
+}
 
 // docs/frame_interpolation.md, MVP blend mode. Holds the previous DS frame's
 // post-compositor ARGB pixels per screen plus the scratch the blend is built
@@ -1499,6 +2239,33 @@ SDL_Renderer* create_renderer(SDL_Window* window) {
     return renderer;
 }
 
+// The cartridge icon for every window we open. SDL applies it per backend:
+// the Win32 class icon, X11 _NET_WM_ICON, and Wayland's xdg-toplevel-icon
+// where the compositor offers it (others take the icon from the .desktop
+// file matching the app id above).
+const std::vector<uint8_t>* g_window_icon = nullptr;
+
+void apply_window_icon(SDL_Window* window) {
+    if (!window || !g_window_icon || g_window_icon->size() != 256 * 256 * 4)
+        return;
+    void* pixels = const_cast<uint8_t*>(g_window_icon->data());
+#if defined(NDS_HAVE_SDL3)
+    SDL_Surface* icon = SDL_CreateSurfaceFrom(
+        256, 256, SDL_PIXELFORMAT_RGBA32, pixels, 256 * 4);
+#else
+    SDL_Surface* icon = SDL_CreateRGBSurfaceWithFormatFrom(
+        pixels, 256, 256, 32, 256 * 4, SDL_PIXELFORMAT_RGBA32);
+#endif
+    if (!icon)
+        return;
+    SDL_SetWindowIcon(window, icon);
+#if defined(NDS_HAVE_SDL3)
+    SDL_DestroySurface(icon);
+#else
+    SDL_FreeSurface(icon);
+#endif
+}
+
 SDL_Window* create_window(const char* title, int x, int y, int w, int h,
                           uint64_t flags) {
     // Unattended frontend/GPU checks must not show or activate desktop windows.
@@ -1510,10 +2277,12 @@ SDL_Window* create_window(const char* title, int x, int y, int w, int h,
         title, w, h, static_cast<SDL_WindowFlags>(flags));
     if (window)
         SDL_SetWindowPosition(window, x, y);
-    return window;
 #else
-    return SDL_CreateWindow(title, x, y, w, h, static_cast<uint32_t>(flags));
+    SDL_Window* window =
+        SDL_CreateWindow(title, x, y, w, h, static_cast<uint32_t>(flags));
 #endif
+    apply_window_icon(window);
+    return window;
 }
 
 bool set_window_fullscreen(SDL_Window* window, NdsFullscreenMode mode) {
@@ -1524,13 +2293,116 @@ bool set_window_fullscreen(SDL_Window* window, NdsFullscreenMode mode) {
 #endif
 }
 
-bool set_render_logical_size(SDL_Renderer* renderer, int width, int height) {
+// Presentation works in drawable (physical) pixels: no SDL logical
+// presentation, because SDL has no mode for a centred, unscaled 1:1 image.
+// Every rect comes from nds_present_rect(), which the GL presenter and the
+// mouse-to-touch inversion share.
+void window_drawable_size(const FrontendPresentation& presentation,
+                          int screen, int* width, int* height) {
+    *width = *height = 0;
+    SDL_Window* window = presentation.windows[screen];
+    if (!window) return;
 #if defined(NDS_HAVE_SDL3)
-    return SDL_SetRenderLogicalPresentation(
-        renderer, width, height, SDL_LOGICAL_PRESENTATION_INTEGER_SCALE);
+    SDL_GetWindowSizeInPixels(window, width, height);
 #else
-    return SDL_RenderSetLogicalSize(renderer, width, height) == 0;
+    if (presentation.renderers[screen])
+        SDL_GetRendererOutputSize(presentation.renderers[screen], width,
+                                  height);
+    else
+        SDL_GL_GetDrawableSize(window, width, height);
 #endif
+}
+
+// The DS-space content a window shows: one screen in the separate layout,
+// both screens stacked on one canvas otherwise.
+void window_content_size(const FrontendPresentation& presentation,
+                         int screen, int* width, int* height) {
+    if (presentation.separate) {
+        *width = presentation.screen_widths[screen];
+        *height = kScreenHeight;
+    } else if (presentation.single) {
+        *width = presentation.screen_widths[presentation.shown_screen & 1];
+        *height = kScreenHeight;
+    } else {
+        *width = presentation.canvas_width;
+        *height = kScreenHeight * 2;
+    }
+}
+
+NdsPresentRect window_present_rect(const FrontendPresentation& presentation,
+                                   int screen, int drawable_w,
+                                   int drawable_h) {
+    int content_w = 0, content_h = 0;
+    window_content_size(presentation, screen, &content_w, &content_h);
+    if (presentation.single)
+        return nds_single_layout(presentation.window_mode,
+                                 presentation.scaling, drawable_w, drawable_h,
+                                 content_w, content_h,
+                                 presentation.inset_percent,
+                                 presentation.stacked).main;
+    return nds_present_rect(presentation.window_mode, presentation.scaling,
+                            drawable_w, drawable_h, content_w, content_h);
+}
+
+// How tall window 0 shows the main DS screen, in window points
+// (nds_title_display_height). 0 when it cannot tell, e.g. minimized.
+int presented_screen_points(const FrontendPresentation& presentation) {
+    if (!presentation.windows[0]) return 0;
+    int drawable_w = 0, drawable_h = 0;
+    window_drawable_size(presentation, 0, &drawable_w, &drawable_h);
+    int content_w = 0, content_h = 0;
+    window_content_size(presentation, 0, &content_w, &content_h);
+    if (drawable_w <= 0 || drawable_h <= 0 || content_h <= 0) return 0;
+    const NdsPresentRect rect =
+        window_present_rect(presentation, 0, drawable_w, drawable_h);
+    double density = 1.0;
+#if defined(NDS_HAVE_SDL3)
+    const float window_density =
+        SDL_GetWindowPixelDensity(presentation.windows[0]);
+    if (window_density > 0) density = window_density;
+#endif
+    return static_cast<int>(std::lround(
+        static_cast<double>(rect.h) * kScreenHeight / content_h / density));
+}
+
+// The 3D multiplier the options ask for: with resolution_scale, that percent
+// of the GL window's presented rect (window_mode/scaling from the options, so
+// a menu change counts at once); otherwise the fixed internal_resolution.
+uint8_t requested_internal_scale_for(const FrontendPresentation& presentation,
+                                     const NdsFrontendOptions& options,
+                                     NdsPresentRect* rect_out = nullptr) {
+    if (options.resolution_scale == 0u || !presentation.windows[0])
+        return options.internal_resolution;
+    int drawable_w = 0, drawable_h = 0;
+    window_drawable_size(presentation, 0, &drawable_w, &drawable_h);
+    int content_w = 0, content_h = 0;
+    window_content_size(presentation, 0, &content_w, &content_h);
+    const NdsPresentRect rect = nds_single_layout(
+        options.window_mode, options.scaling, drawable_w, drawable_h,
+        content_w, content_h,
+        presentation.single
+            ? (presentation.stacked ? 100 : options.second_screen_size)
+            : 0,
+        presentation.stacked).main;
+    if (rect_out) *rect_out = rect;
+    return nds_auto_internal_scale(rect.h, content_h, options.scaling,
+                                   options.resolution_scale,
+                                   kNdsMaxInternalScale);
+}
+
+// A DS-space sub-rect of a window's content, mapped into drawable pixels.
+SDL_Rect content_sub_rect(const NdsPresentRect& rect, int content_w,
+                          int content_h, int x, int y, int w, int h) {
+    auto map_x = [&](int v) {
+        return rect.x + static_cast<int>(
+            static_cast<long long>(v) * rect.w / content_w);
+    };
+    auto map_y = [&](int v) {
+        return rect.y + static_cast<int>(
+            static_cast<long long>(v) * rect.h / content_h);
+    };
+    const int x0 = map_x(x), y0 = map_y(y);
+    return SDL_Rect{x0, y0, map_x(x + w) - x0, map_y(y + h) - y0};
 }
 
 // Current refresh rate of the display the window sits on, in whole Hz, or 0
@@ -1556,44 +2428,109 @@ int window_refresh_hz(SDL_Window* window) {
 #endif
 }
 
+// Mouse positions arrive in window coordinates. Everything downstream (touch,
+// the stacked-layout routing, the self-tests) works in the window's logical
+// DS-space content coordinates, so convert here through the same rect the
+// presenter draws into: window -> drawable pixels -> content. Clicks on the
+// bars land outside [0, content) and are therefore never touches. Relative
+// motion (xrel/yrel) is left in window units.
+// Where the last converted mouse event lies on the top screen's content (the
+// window's logical x and y), when it does. With the top LCD shown and the
+// touchscreen inset over it, the event itself is converted for the inset
+// (bottom LCD coordinates), so the top position is kept here.
+struct TopLogicalHit {
+    bool valid = false;
+    float x = 0.0f;
+    float y = 0.0f;
+};
+TopLogicalHit g_top_logical_hit;
+// A left drag that started on the top screen is under way
+// (nds_title_top_drag).
+bool g_top_dragging = false;
+
 void convert_mouse_event_to_logical_coordinates(
     SDL_Event& event, const FrontendPresentation& presentation) {
-#if defined(NDS_HAVE_SDL3)
-    auto renderer_for_window = [&](uint32_t window_id) -> SDL_Renderer* {
+    auto screen_for_window = [&](uint32_t window_id) -> int {
         for (int screen = 0; screen < 2; ++screen) {
-            if (window_id == presentation.window_ids[screen])
-                return presentation.renderers[screen];
+            if (window_id == presentation.window_ids[screen] &&
+                presentation.windows[screen])
+                return screen;
         }
-        return nullptr;
+        return -1;
+    };
+    auto convert = [&](uint32_t window_id, auto& x, auto& y) {
+        const int screen = screen_for_window(window_id);
+        if (screen < 0) return;
+        int window_w = 0, window_h = 0;
+        SDL_GetWindowSize(presentation.windows[screen], &window_w, &window_h);
+        int drawable_w = 0, drawable_h = 0;
+        window_drawable_size(presentation, screen, &drawable_w, &drawable_h);
+        if (window_w <= 0 || window_h <= 0 || drawable_w <= 0 ||
+            drawable_h <= 0)
+            return;
+        const float px = static_cast<float>(x) * drawable_w / window_w;
+        const float py = static_cast<float>(y) * drawable_h / window_h;
+        int content_w = 0, content_h = 0;
+        window_content_size(presentation, screen, &content_w, &content_h);
+        NdsPresentRect rect = window_present_rect(
+            presentation, screen, drawable_w, drawable_h);
+        // With the top LCD shown, the touchscreen is the inset. Either way
+        // the result is bottom-LCD coordinates.
+        if (presentation.single && presentation.shown_screen == 0 &&
+            presentation.inset_percent > 0) {
+            rect = nds_single_layout(presentation.window_mode,
+                                     presentation.scaling, drawable_w,
+                                     drawable_h, content_w, content_h,
+                                     presentation.inset_percent,
+                                     presentation.stacked).inset;
+        }
+        float cx = 0.0f, cy = 0.0f;
+        nds_present_rect_to_content(rect, content_w, content_h, px, py,
+                                    &cx, &cy);
+        g_top_logical_hit = {};
+        if (presentation.single && presentation.shown_screen == 0 &&
+            presentation.inset_percent > 0) {
+            // The main rect is the top LCD; the inset covers part of it.
+            const NdsPresentRect main_rect = window_present_rect(
+                presentation, screen, drawable_w, drawable_h);
+            float tx = 0.0f, ty = 0.0f;
+            nds_present_rect_to_content(main_rect, content_w, content_h, px,
+                                        py, &tx, &ty);
+            const bool in_inset = cx >= 0.0f && cx < content_w &&
+                                  cy >= 0.0f && cy < content_h;
+            g_top_logical_hit = {!in_inset, tx, ty};
+        } else if (presentation.single && presentation.shown_screen == 1 &&
+                   presentation.inset_percent > 0) {
+            // The touchscreen is the main rect; the top LCD is the inset,
+            // over it. A point in the inset is the top screen's, never a
+            // touch.
+            const NdsPresentRect inset_rect = nds_single_layout(
+                presentation.window_mode, presentation.scaling, drawable_w,
+                drawable_h, content_w, content_h,
+                presentation.inset_percent, presentation.stacked).inset;
+            float tx = 0.0f, ty = 0.0f;
+            nds_present_rect_to_content(inset_rect, content_w, content_h, px,
+                                        py, &tx, &ty);
+            const bool in_inset = tx >= 0.0f && tx < content_w &&
+                                  ty >= 0.0f && ty < content_h;
+            g_top_logical_hit = {in_inset, tx, ty};
+            if (in_inset) {
+                cx = -1.0f;
+                cy = -1.0f;
+            }
+        } else {
+            g_top_logical_hit = {true, cx, cy};
+        }
+        using Coordinate = std::remove_reference_t<decltype(x)>;
+        x = static_cast<Coordinate>(std::floor(cx));
+        y = static_cast<Coordinate>(std::floor(cy));
     };
     if (event.type == SDL_MOUSEBUTTONDOWN ||
         event.type == SDL_MOUSEBUTTONUP) {
-        if (SDL_Renderer* renderer =
-                renderer_for_window(event.button.windowID)) {
-            float x = event.button.x;
-            float y = event.button.y;
-            if (SDL_RenderCoordinatesFromWindow(
-                    renderer, event.button.x, event.button.y, &x, &y)) {
-                event.button.x = x;
-                event.button.y = y;
-            }
-        }
+        convert(event.button.windowID, event.button.x, event.button.y);
     } else if (event.type == SDL_MOUSEMOTION) {
-        if (SDL_Renderer* renderer =
-                renderer_for_window(event.motion.windowID)) {
-            float x = event.motion.x;
-            float y = event.motion.y;
-            if (SDL_RenderCoordinatesFromWindow(
-                    renderer, event.motion.x, event.motion.y, &x, &y)) {
-                event.motion.x = x;
-                event.motion.y = y;
-            }
-        }
+        convert(event.motion.windowID, event.motion.x, event.motion.y);
     }
-#else
-    (void)event;
-    (void)presentation;
-#endif
 }
 
 bool set_texture_scale_nearest(SDL_Texture* texture) {
@@ -1601,6 +2538,15 @@ bool set_texture_scale_nearest(SDL_Texture* texture) {
     return SDL_SetTextureScaleMode(texture, SDL_SCALEMODE_NEAREST);
 #else
     return SDL_SetTextureScaleMode(texture, SDL_ScaleModeNearest) == 0;
+#endif
+}
+
+bool set_texture_scale_linear(SDL_Texture* texture, bool linear) {
+    if (!linear) return set_texture_scale_nearest(texture);
+#if defined(NDS_HAVE_SDL3)
+    return SDL_SetTextureScaleMode(texture, SDL_SCALEMODE_LINEAR);
+#else
+    return SDL_SetTextureScaleMode(texture, SDL_ScaleModeLinear) == 0;
 #endif
 }
 
@@ -1619,15 +2565,6 @@ void render_texture(SDL_Renderer* renderer, SDL_Texture* texture,
     SDL_RenderTexture(renderer, texture, nullptr, dst_ptr);
 #else
     SDL_RenderCopy(renderer, texture, nullptr, destination);
-#endif
-}
-
-void render_line(SDL_Renderer* renderer, int x1, int y1, int x2, int y2) {
-#if defined(NDS_HAVE_SDL3)
-    SDL_RenderLine(renderer, static_cast<float>(x1), static_cast<float>(y1),
-                   static_cast<float>(x2), static_cast<float>(y2));
-#else
-    SDL_RenderDrawLine(renderer, x1, y1, x2, y2);
 #endif
 }
 
@@ -1693,21 +2630,83 @@ const char* notice_glyph(char ch) {
     }
 }
 
-void draw_savestate_notice(SDL_Renderer* renderer,
-                           const SDL_Rect& screen,
-                           const char* text) {
-    if (!renderer || !text || !*text) return;
+// Overlays are authored in DS-space pixels of one screen and drawn scaled
+// into that screen's rect, so they keep their size relative to the image in
+// every window mode. The target is either an SDL renderer (rect in drawable
+// pixels) or a CPU ARGB overlay buffer for the GL presenter (rect in buffer
+// pixels, alpha 0 = transparent).
+struct DsCanvas {
+    SDL_Rect dest;
+    int width;   // DS-space width the dest rect represents
+    int height;  // DS-space height the dest rect represents
+};
+
+struct DsTarget {
+    SDL_Renderer* renderer = nullptr;
+    uint32_t* pixels = nullptr;
+    int pixels_width = 0;
+    int pixels_height = 0;
+    DsCanvas canvas{};
+    uint32_t color = 0xFFFFFFFFu;
+
+    void set_color(uint8_t r, uint8_t g, uint8_t b) {
+        if (renderer) SDL_SetRenderDrawColor(renderer, r, g, b, 255);
+        color = 0xFF000000u | (uint32_t(r) << 16) | (uint32_t(g) << 8) | b;
+    }
+    void fill(int x, int y, int w, int h) const {
+        if (canvas.width <= 0 || canvas.height <= 0) return;
+        auto map_x = [&](int v) {
+            return canvas.dest.x + static_cast<int>(std::floor(
+                static_cast<double>(v) * canvas.dest.w / canvas.width));
+        };
+        auto map_y = [&](int v) {
+            return canvas.dest.y + static_cast<int>(std::floor(
+                static_cast<double>(v) * canvas.dest.h / canvas.height));
+        };
+        const int x0 = map_x(x), y0 = map_y(y);
+        const SDL_Rect rect{x0, y0, std::max(1, map_x(x + w) - x0),
+                            std::max(1, map_y(y + h) - y0)};
+        if (renderer) {
+            fill_rect(renderer, rect);
+            return;
+        }
+        if (!pixels) return;
+        const int left = std::max(rect.x, 0);
+        const int top = std::max(rect.y, 0);
+        const int right = std::min(rect.x + rect.w, pixels_width);
+        const int bottom = std::min(rect.y + rect.h, pixels_height);
+        // Wholly off the buffer: left > right would make std::fill below
+        // write backwards through memory.
+        if (left >= right || top >= bottom) return;
+        for (int py = top; py < bottom; ++py)
+            std::fill(pixels + size_t(py) * pixels_width + left,
+                      pixels + size_t(py) * pixels_width + right, color);
+    }
+};
+
+void draw_notice_glyph(const DsTarget& target, int x, int y, char ch) {
+    const char* glyph = notice_glyph(ch);
+    for (int gy = 0; gy < 7; ++gy) {
+        for (int gx = 0; gx < 5; ++gx) {
+            if (glyph[gy * 5 + gx] == '1')
+                target.fill(x + gx, y + gy, 1, 1);
+        }
+    }
+}
+
+void draw_savestate_notice(DsTarget target, const char* text) {
+    if ((!target.renderer && !target.pixels) || !text || !*text) return;
     constexpr int kColumns = 40;
     constexpr int kRows = 5;
     constexpr int kGlyphWidth = 6;
     constexpr int kGlyphHeight = 8;
-    const SDL_Rect background{screen.x + 5,
-                              screen.y + screen.h - kRows * kGlyphHeight - 5,
+    const SDL_Rect background{5,
+                              target.canvas.height - kRows * kGlyphHeight - 5,
                               kColumns * kGlyphWidth + 6,
                               kRows * kGlyphHeight + 4};
-    SDL_SetRenderDrawColor(renderer, 10, 10, 10, 255);
-    fill_rect(renderer, background);
-    SDL_SetRenderDrawColor(renderer, 255, 255, 255, 255);
+    target.set_color(10, 10, 10);
+    target.fill(background.x, background.y, background.w, background.h);
+    target.set_color(255, 255, 255);
     int row = 0;
     int column = 0;
     for (const char* p = text; *p && row < kRows; ++p) {
@@ -1717,18 +2716,42 @@ void draw_savestate_notice(SDL_Renderer* renderer,
             if (*p == '\n') continue;
             if (row >= kRows) break;
         }
-        const char* glyph = notice_glyph(*p);
-        for (int gy = 0; gy < 7; ++gy) {
-            for (int gx = 0; gx < 5; ++gx) {
-                if (glyph[gy * 5 + gx] != '1') continue;
-                const SDL_Rect pixel{
-                    background.x + 3 + column * kGlyphWidth + gx,
-                    background.y + 2 + row * kGlyphHeight + gy, 1, 1};
-                fill_rect(renderer, pixel);
-            }
-        }
+        draw_notice_glyph(target, background.x + 3 + column * kGlyphWidth,
+                          background.y + 2 + row * kGlyphHeight, *p);
         ++column;
     }
+}
+
+void draw_fps_counter(DsTarget target, const char* text) {
+    if ((!target.renderer && !target.pixels) || !text || !*text) return;
+    constexpr int kGlyphWidth = 6;
+    const int columns = static_cast<int>(std::strlen(text));
+    target.set_color(10, 10, 10);
+    target.fill(2, 2, columns * kGlyphWidth + 3, 11);
+    target.set_color(255, 255, 255);
+    for (int column = 0; column < columns; ++column)
+        draw_notice_glyph(target, 4 + column * kGlyphWidth, 4, text[column]);
+}
+
+// The stylus lives in the 256x192 touch space spread over the screen's rect.
+void draw_virtual_stylus(DsTarget target, float stylus_x, float stylus_y) {
+    target.canvas.width = 256;
+    target.canvas.height = 192;
+    const int x = static_cast<int>(std::lround(stylus_x));
+    const int y = static_cast<int>(std::lround(stylus_y));
+    target.set_color(255, 255, 255);
+    target.fill(x - 5, y, 4, 1);
+    target.fill(x + 2, y, 4, 1);
+    target.fill(x, y - 5, 1, 4);
+    target.fill(x, y + 2, 1, 4);
+}
+
+DsTarget sdl_ds_target(SDL_Renderer* renderer, const SDL_Rect& dest,
+                       int ds_width) {
+    DsTarget target{};
+    target.renderer = renderer;
+    target.canvas = {dest, ds_width, kScreenHeight};
+    return target;
 }
 
 bool create_presentation(const NdsFrontendOptions& options,
@@ -1736,22 +2759,32 @@ bool create_presentation(const NdsFrontendOptions& options,
                          bool allow_gl_top = true) {
     presentation.separate =
         options.screen_layout == NdsScreenLayout::Separate;
+    presentation.single = options.screen_layout == NdsScreenLayout::Single;
 #if defined(NDS_HAVE_COMPUTE_RENDERER)
     const char* direct_selection =
         std::getenv("NDS_COMPUTE_DIRECT_PRESENT");
     const bool direct_enabled =
         !direct_selection || !*direct_selection ||
         std::strcmp(direct_selection, "1") == 0;
-    const bool direct_top_requested =
-        (options.adaptive_screens & NDS_ADAPTIVE_TOP) != 0u ||
-        options.internal_resolution > 1u;
-    presentation.gl_top = presentation.separate &&
+    // The GL presenter is asked for up front, whatever the startup
+    // multiplier, even at the menu's "Original" (resolution_scale 0): the
+    // menu can pick a percent at runtime (it is only offered with this
+    // presenter), auto scale can move between 1x and HD, and the presenter
+    // runs at 1x too, so a change never recreates windows. Gating it on
+    // resolution_scale > 0 made "Original" stick: saved as 0, the next launch
+    // had no presenter and the setting greyed out.
+    presentation.gl_top = (presentation.separate || presentation.single) &&
         allow_gl_top &&
-        direct_top_requested &&
         nds_gpu3d_renderer_prefers_compute() &&
         direct_enabled;
 #endif
     presentation.antialiasing = options.antialiasing;
+    presentation.window_mode = options.window_mode;
+    presentation.scaling = options.scaling;
+    presentation.resolution_scale = options.resolution_scale;
+    presentation.internal_resolution = options.internal_resolution;
+    presentation.inset_percent =
+        presentation.single ? options.second_screen_size : 0;
     const int aa_scale = presentation.gl_top ? 1 : options.antialiasing >= 8 ? 4 :
                          options.antialiasing >= 4 ? 3 :
                          options.antialiasing >= 2 ? 2 : 1;
@@ -1769,19 +2802,22 @@ bool create_presentation(const NdsFrontendOptions& options,
     presentation.canvas_width = std::max(
         presentation.screen_widths[0],
         presentation.screen_widths[1]);
-    const int first_height = presentation.separate
+    const int first_height = presentation.separate || presentation.single
         ? kScreenHeight * kWindowScale
         : kScreenHeight * 2 * kWindowScale;
     const uint64_t top_window_flags =
         SDL_WINDOW_RESIZABLE | SDL_WINDOW_ALLOW_HIGHDPI |
-        (presentation.gl_top
-             ? static_cast<uint64_t>(SDL_WINDOW_OPENGL) : 0u);
+        (presentation.gl_top ? accelerated_window_flag() : 0u);
+    const std::string single_title =
+        options.game_name.empty() ? "ndsrecomp" : options.game_name;
     presentation.windows[0] = create_window(
         presentation.separate ? "ndsrecomp - Top Screen"
-                               : "ndsrecomp firmware preview",
+        : presentation.single ? single_title.c_str()
+                              : "ndsrecomp firmware preview",
         SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED,
         (presentation.separate ? presentation.screen_widths[0]
-                               : presentation.canvas_width) * kWindowScale,
+                               : presentation.canvas_width) * kWindowScale *
+            (100 + presentation.inset_percent) / 100,
         first_height,
         top_window_flags);
     if (!presentation.windows[0]) {
@@ -1807,10 +2843,12 @@ bool create_presentation(const NdsFrontendOptions& options,
         initial_size = nds_initial_window_size(
             presentation.screen_widths[0], presentation.screen_widths[1],
             presentation.separate, options.window_scale, coordinate_scale,
-            usable.w, usable.h);
+            usable.w, usable.h, presentation.single,
+            presentation.inset_percent);
         SDL_SetWindowSize(presentation.windows[0],
             presentation.separate ? initial_size.top_width
-                : std::max(initial_size.top_width, initial_size.bottom_width),
+                : std::max(initial_size.top_width, initial_size.bottom_width) *
+                      (100 + presentation.inset_percent) / 100,
             initial_size.height);
         SDL_SetWindowPosition(presentation.windows[0],
             SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED);
@@ -1824,6 +2862,17 @@ bool create_presentation(const NdsFrontendOptions& options,
             "[sdl] initial window scale=%u dpi=%.3f top=%dx%d bottom=%dx%d\n",
             options.window_scale, coordinate_scale, initial_size.top_width,
             initial_size.height, initial_size.bottom_width, initial_size.height);
+    }
+    // The size the user last left the window at wins over the scale-derived
+    // one. The two-window layout has no single size to restore.
+    if (!presentation.separate && options.window_width >= 160 &&
+        options.window_height >= 160) {
+        SDL_SetWindowSize(presentation.windows[0], options.window_width,
+                          options.window_height);
+        SDL_SetWindowPosition(presentation.windows[0],
+            SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED);
+        std::fprintf(stderr, "[sdl] restored window size %dx%d\n",
+                     options.window_width, options.window_height);
     }
     if (!presentation.gl_top) {
         presentation.renderers[0] = create_renderer(presentation.windows[0]);
@@ -1881,25 +2930,11 @@ bool create_presentation(const NdsFrontendOptions& options,
     }
 
     for (int screen = 0; screen < 2; ++screen) {
-        if (screen == 0 && presentation.gl_top) {
+        // The single GL window presents both LCDs through the GL presenter.
+        if ((screen == 0 || presentation.single) && presentation.gl_top) {
             presentation.window_ids[screen] =
                 SDL_GetWindowID(presentation.windows[screen]);
             continue;
-        }
-        const int logical_height =
-            !presentation.separate && screen == 0
-                ? kScreenHeight * 2 : kScreenHeight;
-        if (screen == 0 || presentation.separate) {
-            set_render_logical_size(
-                presentation.renderers[screen],
-                presentation.separate
-                    ? presentation.screen_widths[screen]
-                    : presentation.canvas_width,
-                logical_height);
-#if !defined(NDS_HAVE_SDL3)
-            SDL_RenderSetIntegerScale(presentation.renderers[screen],
-                                      SDL_TRUE);
-#endif
         }
         presentation.textures[screen] = SDL_CreateTexture(
             presentation.renderers[screen], SDL_PIXELFORMAT_ARGB8888,
@@ -1951,7 +2986,12 @@ void render_screen(FrontendPresentation& presentation, int screen,
                    const SDL_Rect& destination) {
     SDL_Renderer* renderer = presentation.renderers[screen];
     SDL_Texture* source = presentation.textures[screen];
+    // The supersample target is an exact multiple of the native texture, so
+    // that hop stays nearest; only the final draw into `destination` follows
+    // the scaling filter.
+    const bool linear = presentation.scaling == NdsScalingFilter::Bilinear;
     if (presentation.sample_scale > 1 && presentation.sample_targets[screen]) {
+        set_texture_scale_nearest(source);
         SDL_SetRenderTarget(renderer, presentation.sample_targets[screen]);
         SDL_SetRenderDrawColor(renderer, 0, 0, 0, 255);
         SDL_RenderClear(renderer);
@@ -1959,6 +2999,7 @@ void render_screen(FrontendPresentation& presentation, int screen,
         SDL_SetRenderTarget(renderer, nullptr);
         source = presentation.sample_targets[screen];
     }
+    set_texture_scale_linear(source, linear);
     render_texture(renderer, source, &destination);
 }
 
@@ -1976,11 +3017,11 @@ struct PresentationTicks {
 // as the currently installed stage left them, so the caller can report the
 // stage that is actually running.
 bool apply_performance_governor_stage(
-        const NdsFrontendOptions& options,
         FrontendPresentation& presentation,
-        uint8_t stage) {
-    const uint8_t target_scale =
-        stage >= 2u ? 1u : options.internal_resolution;
+        uint8_t stage, uint8_t requested_scale) {
+    // The governor caps the requested multiplier (fixed or auto); it never
+    // raises it.
+    const uint8_t target_scale = stage >= 2u ? 1u : requested_scale;
     if (!nds_gpu3d_set_runtime_internal_scale(target_scale)) {
         std::fprintf(stderr,
                      "[governor] could not apply internal scale %u\n",
@@ -1990,62 +3031,9 @@ bool apply_performance_governor_stage(
     nds_gpu3d_set_display_readback_latency(stage >= 1u);
     presentation.sample_scale =
         stage >= 2u ? 1 : presentation.configured_sample_scale;
-    nds_gpu2d_set_hd_emit(target_scale > 1u && presentation.gl_top);
+    nds_gpu2d_set_hd_emit(target_scale > 1u &&
+                          presenter_composes_3d(presentation));
     return true;
-}
-
-int runtime_menu_set_automatic_quality(RuntimeMenuState* state, int value) {
-    if (!state || !state->options || !state->presentation || !state->governor ||
-        (value != 0 && value != 1)) return 0;
-    // Rebuild the actual renderer first. A failure leaves policy, installed
-    // stage and the player's selected targets unchanged.
-    if (!apply_performance_governor_stage(*state->options, *state->presentation, 0))
-        return 0;
-    const uint8_t before = state->governor->stage;
-    const auto mode = value ? NdsPerfGovernorMode::Auto : NdsPerfGovernorMode::Off;
-    const auto config = state->governor->config;
-    nds_perf_governor_init(state->governor, mode, config);
-    state->options->perf_governor_mode = mode;
-    state->quality_changed = true;
-    if (before != state->governor->stage)
-        nds_perf_governor_record_transition(before, state->governor->stage,
-            state->governor->last_reason, g_live_stats.frames, false, false);
-    std::fprintf(stderr, "[graphics] automatic quality %s; requested quality restored\n",
-                 value ? "on" : "off");
-    return 1;
-}
-
-int runtime_menu_get_quality_text(void* context, const RecompRuntimeUiItem* item,
-                                  char* text, size_t size) {
-    const auto* state = static_cast<const RuntimeMenuState*>(context);
-    if (!state || !state->options || !state->presentation || !item || !text || !size)
-        return 0;
-    if (std::strcmp(item->key, kRuntimeResolutionNowKey) == 0) {
-        std::snprintf(text, size, "%ux (target %ux)",
-            static_cast<unsigned>(nds_gpu3d_internal_scale()),
-            static_cast<unsigned>(state->options->internal_resolution));
-        return 1;
-    }
-    if (std::strcmp(item->key, kRuntimeSupersamplingNowKey) == 0) {
-        std::snprintf(text, size, "%dx (target %ux)", state->presentation->sample_scale,
-            static_cast<unsigned>(state->options->supersampling));
-        return 1;
-    }
-    return 0;
-}
-
-void draw_virtual_stylus(SDL_Renderer* renderer, const SDL_Rect& destination,
-                         float stylus_x, float stylus_y) {
-    const int x = destination.x + static_cast<int>(
-        std::lround(stylus_x * destination.w / 256.0f));
-    const int y = destination.y + static_cast<int>(
-        std::lround(stylus_y * destination.h / 192.0f));
-
-    SDL_SetRenderDrawColor(renderer, 255, 255, 255, 255);
-    render_line(renderer, x - 5, y, x - 2, y);
-    render_line(renderer, x + 2, y, x + 5, y);
-    render_line(renderer, x, y - 5, x, y - 2);
-    render_line(renderer, x, y + 2, x, y + 5);
 }
 
 #if defined(NDS_HAVE_COMPUTE_RENDERER)
@@ -2116,21 +3104,190 @@ struct OwnedPresentationFrame {
 };
 #endif
 
+#if defined(NDS_HAVE_COMPUTE_RENDERER)
+// Hands the presenter this frame's fixed-size layers, if gpu2d split them:
+// the layer at its scale about its native anchor, and the image without it.
+// Returns whether it did; the caller clears it after the present.
+bool set_fixed_layers(int width) {
+    NdsGpu2dFixedLayersFrame fixed{};
+    if (width != 256 || !nds_gpu2d_fixed_layers_frame(&fixed)) return false;
+    const float s = fixed.scale;
+    nds_compute_host_set_layer(fixed.layer, fixed.base, 256u,
+                               float(fixed.anchor_x) / 256.0f * (1.0f - s),
+                               float(fixed.anchor_y) / 192.0f * (1.0f - s),
+                               s, s);
+    return true;
+}
+#endif
+
+// One separate-layout window: clear, draw its screen into the presentation
+// rect, then the overlays that belong to it. Does not present.
+void draw_separate_screen(FrontendPresentation& presentation, int screen,
+                          bool virtual_stylus_visible, float virtual_stylus_x,
+                          float virtual_stylus_y,
+                          const char* savestate_notice,
+                          const char* fps_counter) {
+    SDL_Renderer* renderer = presentation.renderers[screen];
+    SDL_SetRenderDrawColor(renderer, 20, 20, 20, 255);
+    SDL_RenderClear(renderer);
+    int drawable_w = 0, drawable_h = 0;
+    window_drawable_size(presentation, screen, &drawable_w, &drawable_h);
+    const NdsPresentRect rect =
+        window_present_rect(presentation, screen, drawable_w, drawable_h);
+    const SDL_Rect screen_rect{rect.x, rect.y, rect.w, rect.h};
+    render_screen(presentation, screen, screen_rect);
+    const DsTarget target = sdl_ds_target(
+        renderer, screen_rect, presentation.screen_widths[screen]);
+    if (virtual_stylus_visible)
+        draw_virtual_stylus(target, virtual_stylus_x, virtual_stylus_y);
+    draw_savestate_notice(target, savestate_notice);
+    draw_fps_counter(target, fps_counter);
+}
+
+// Single-screen layout: present presentation.shown_screen, with the other LCD
+// as an optional inset next to it, and the virtual stylus (bottom LCD only)
+// and savestate notice on the shown screen.
+// The GL window has no SDL renderer, so there the stylus and notice go
+// through the presenter's overlay layer.
+PresentationTicks present_single_screen(FrontendPresentation& presentation,
+                                        const uint32_t* top_pixels,
+                                        int top_width,
+                                        const uint32_t* bottom_pixels,
+                                        int bottom_width,
+                                        bool virtual_stylus_visible,
+                                        float virtual_stylus_x,
+                                        float virtual_stylus_y,
+                                        const char* savestate_notice,
+                                        const char* fps_counter) {
+    PresentationTicks ticks{};
+    const int shown = presentation.shown_screen & 1;
+    const uint32_t* pixels = shown ? bottom_pixels : top_pixels;
+    const int width = shown ? bottom_width : top_width;
+    const uint32_t* other_pixels = shown ? top_pixels : bottom_pixels;
+    const int other_width = shown ? top_width : bottom_width;
+    const bool stylus = virtual_stylus_visible && shown == 1;
+    if (presentation.gl_top) {
+#if defined(NDS_HAVE_COMPUTE_RENDERER)
+        // The OBJ-only direct path draws engine A on the top LCD only.
+        NdsGpu2dDirectFrame direct_frame{};
+        const bool direct = shown == 0 && nds_gpu2d_direct_frame(&direct_frame);
+        static std::vector<uint32_t> overlay;
+        const bool want_overlay =
+            stylus || (savestate_notice && *savestate_notice) ||
+            (fps_counter && *fps_counter);
+        if (want_overlay) {
+            overlay.assign(size_t(width) * kScreenHeight, 0u);
+            DsTarget target{};
+            target.pixels = overlay.data();
+            target.pixels_width = width;
+            target.pixels_height = kScreenHeight;
+            target.canvas = {SDL_Rect{0, 0, width, kScreenHeight}, width,
+                             kScreenHeight};
+            if (stylus)
+                draw_virtual_stylus(target, virtual_stylus_x,
+                                    virtual_stylus_y);
+            draw_savestate_notice(target, savestate_notice);
+            draw_fps_counter(target, fps_counter);
+        }
+        nds_compute_host_set_overlay(want_overlay ? overlay.data() : nullptr,
+                                     static_cast<unsigned>(width));
+        NdsComputePresentTicks gl_ticks{};
+        gl_ticks.diagnostic =
+            nds_frontend_latency::enabled.load(std::memory_order_relaxed);
+        nds_compute_host_set_present_mode(presentation.window_mode,
+                                          presentation.scaling);
+        nds_compute_host_set_raster_request(presentation.resolution_scale,
+                                            presentation.internal_resolution);
+        nds_compute_host_set_inset(other_pixels,
+                                   static_cast<unsigned>(other_width),
+                                   presentation.inset_percent);
+        const bool layer_set = !direct && set_fixed_layers(width);
+        NdsGpu2dFixedLayersFrame fixed_shown{};
+        if (layer_set && shown == 1 &&
+            nds_gpu2d_fixed_layers_frame(&fixed_shown)) {
+            g_touch_ui_anchor_x.store(float(fixed_shown.anchor_x));
+            g_touch_ui_anchor_y.store(float(fixed_shown.anchor_y));
+            g_touch_ui_scale.store(fixed_shown.scale);
+        } else {
+            g_touch_ui_scale.store(1.0f);
+        }
+        const bool ok = nds_compute_host_present_top(
+            pixels, static_cast<uint16_t>(width),
+            direct ? &direct_frame : nullptr, &gl_ticks,
+            presentation.antialiasing);
+        nds_compute_host_set_overlay(nullptr, 0);
+        nds_compute_host_set_inset(nullptr, 0, 0);
+        nds_compute_host_set_layer(nullptr, nullptr, 0, 0, 0, 0, 0);
+        if (!ok) {
+            std::fprintf(stderr, "[gpu3d] single-screen presentation failed\n");
+            ticks.ok = false;
+            return ticks;
+        }
+        ticks.upload += gl_ticks.upload;
+        ticks.draw += gl_ticks.draw;
+        ticks.swap += gl_ticks.swap;
+        ticks.gl_setup = gl_ticks.setup;
+        ticks.gl_error = gl_ticks.error;
+#endif
+        return ticks;
+    }
+    uint64_t start = SDL_GetPerformanceCounter();
+    SDL_UpdateTexture(presentation.textures[shown], nullptr, pixels,
+                      width * sizeof(uint32_t));
+    if (presentation.inset_percent > 0)
+        SDL_UpdateTexture(presentation.textures[shown ^ 1], nullptr,
+                          other_pixels, other_width * sizeof(uint32_t));
+    ticks.upload += SDL_GetPerformanceCounter() - start;
+    SDL_Renderer* renderer = presentation.renderers[0];
+    start = SDL_GetPerformanceCounter();
+    SDL_SetRenderDrawColor(renderer, 20, 20, 20, 255);
+    SDL_RenderClear(renderer);
+    int drawable_w = 0, drawable_h = 0;
+    window_drawable_size(presentation, 0, &drawable_w, &drawable_h);
+    const NdsSingleLayout layout = nds_single_layout(
+        presentation.window_mode, presentation.scaling, drawable_w, drawable_h,
+        width, kScreenHeight, presentation.inset_percent,
+        presentation.stacked);
+    const NdsPresentRect& rect = layout.main;
+    const SDL_Rect screen_rect{rect.x, rect.y, rect.w, rect.h};
+    render_screen(presentation, shown, screen_rect);
+    if (layout.inset.w > 0 && layout.inset.h > 0) {
+        const SDL_Rect inset_rect{layout.inset.x, layout.inset.y,
+                                  layout.inset.w, layout.inset.h};
+        render_screen(presentation, shown ^ 1, inset_rect);
+    }
+    const DsTarget target = sdl_ds_target(renderer, screen_rect, width);
+    if (stylus)
+        draw_virtual_stylus(target, virtual_stylus_x, virtual_stylus_y);
+    draw_savestate_notice(target, savestate_notice);
+    draw_fps_counter(target, fps_counter);
+    ticks.draw += SDL_GetPerformanceCounter() - start;
+    start = SDL_GetPerformanceCounter();
+    SDL_RenderPresent(renderer);
+    ticks.swap += SDL_GetPerformanceCounter() - start;
+    return ticks;
+}
+
 PresentationTicks present_screens(FrontendPresentation& presentation,
                                   const uint32_t* top_pixels,
                                   int top_width,
                                   const uint32_t* bottom_pixels,
                                   int bottom_width,
-                                  RecompRuntimeUi* runtime_ui,
                                   bool virtual_stylus_visible,
                                   float virtual_stylus_x,
                                   float virtual_stylus_y,
-                                  const char* savestate_notice
+                                  const char* savestate_notice,
+                                  const char* fps_counter
 #if defined(NDS_HAVE_COMPUTE_RENDERER)
                                   ,const NdsComputePresentationFrame* owned = nullptr
 #endif
                                   ) {
     PresentationTicks ticks{};
+    if (presentation.single)
+        return present_single_screen(
+            presentation, top_pixels, top_width, bottom_pixels, bottom_width,
+            virtual_stylus_visible, virtual_stylus_x,
+            virtual_stylus_y, savestate_notice, fps_counter);
     if (presentation.gl_top) {
 #if defined(NDS_HAVE_COMPUTE_RENDERER)
         NdsGpu2dDirectFrame direct_frame{};
@@ -2141,10 +3298,18 @@ PresentationTicks present_screens(FrontendPresentation& presentation,
         if (latency) ticks.pool_wait = SDL_GetPerformanceCounter() - pool_begin;
         NdsComputePresentTicks gl_ticks{};
         gl_ticks.diagnostic = latency;
-        if (!nds_compute_host_present_top(
+        nds_compute_host_set_present_mode(presentation.window_mode,
+                                          presentation.scaling);
+        nds_compute_host_set_raster_request(presentation.resolution_scale,
+                                            presentation.internal_resolution);
+        g_touch_ui_scale.store(1.0f);  // the touchscreen has its own window
+        if (!owned && !direct) set_fixed_layers(top_width);
+        const bool top_ok = nds_compute_host_present_top(
                 top_pixels, static_cast<uint16_t>(top_width),
                 direct ? &direct_frame : nullptr, &gl_ticks,
-                presentation.antialiasing,owned)) {
+                presentation.antialiasing,owned);
+        nds_compute_host_set_layer(nullptr, nullptr, 0, 0, 0, 0, 0);
+        if (!top_ok) {
             std::fprintf(stderr, "[gpu3d] direct top presentation failed\n");
             ticks.ok = false;
             return ticks;
@@ -2154,25 +3319,15 @@ PresentationTicks present_screens(FrontendPresentation& presentation,
         ticks.swap += gl_ticks.swap;
         ticks.gl_setup = gl_ticks.setup;
         ticks.gl_error = gl_ticks.error;
-        const auto overlay_begin = latency ? SDL_GetPerformanceCounter() : 0;
-        bottom_pixels = runtime_menu_overlay(
-            runtime_ui, bottom_pixels, bottom_width, kScreenHeight);
-        if (latency) ticks.overlay = SDL_GetPerformanceCounter() - overlay_begin;
         uint64_t start = SDL_GetPerformanceCounter();
         SDL_UpdateTexture(presentation.textures[1], nullptr, bottom_pixels,
                           bottom_width * sizeof(uint32_t));
         ticks.upload += SDL_GetPerformanceCounter() - start;
-        const SDL_Rect screen_rect{
-            0, 0, presentation.screen_widths[1], kScreenHeight};
         SDL_Renderer* renderer = presentation.renderers[1];
         start = SDL_GetPerformanceCounter();
-        SDL_SetRenderDrawColor(renderer, 20, 20, 20, 255);
-        SDL_RenderClear(renderer);
-        render_screen(presentation, 1, screen_rect);
-        if (virtual_stylus_visible)
-            draw_virtual_stylus(renderer, screen_rect,
-                                virtual_stylus_x, virtual_stylus_y);
-        draw_savestate_notice(renderer, screen_rect, savestate_notice);
+        draw_separate_screen(presentation, 1, virtual_stylus_visible,
+                             virtual_stylus_x, virtual_stylus_y,
+                             savestate_notice, fps_counter);
         ticks.draw += SDL_GetPerformanceCounter() - start;
         start = SDL_GetPerformanceCounter();
         SDL_RenderPresent(renderer);
@@ -2180,8 +3335,6 @@ PresentationTicks present_screens(FrontendPresentation& presentation,
 #endif
         return ticks;
     }
-    top_pixels = runtime_menu_overlay(
-        runtime_ui, top_pixels, top_width, kScreenHeight);
     uint64_t start = SDL_GetPerformanceCounter();
     SDL_UpdateTexture(presentation.textures[0], nullptr, top_pixels,
                       top_width * sizeof(uint32_t));
@@ -2193,20 +3346,28 @@ PresentationTicks present_screens(FrontendPresentation& presentation,
         start = SDL_GetPerformanceCounter();
         SDL_SetRenderDrawColor(renderer, 20, 20, 20, 255);
         SDL_RenderClear(renderer);
-        const SDL_Rect top_rect{
-            (presentation.canvas_width -
-             presentation.screen_widths[0]) / 2,
-            0, presentation.screen_widths[0], kScreenHeight};
-        const SDL_Rect bottom_rect{
-            (presentation.canvas_width -
-             presentation.screen_widths[1]) / 2,
-            kScreenHeight, presentation.screen_widths[1], kScreenHeight};
+        int drawable_w = 0, drawable_h = 0;
+        window_drawable_size(presentation, 0, &drawable_w, &drawable_h);
+        const NdsPresentRect rect =
+            window_present_rect(presentation, 0, drawable_w, drawable_h);
+        const int canvas_w = presentation.canvas_width;
+        const int canvas_h = kScreenHeight * 2;
+        const SDL_Rect top_rect = content_sub_rect(
+            rect, canvas_w, canvas_h,
+            (canvas_w - presentation.screen_widths[0]) / 2, 0,
+            presentation.screen_widths[0], kScreenHeight);
+        const SDL_Rect bottom_rect = content_sub_rect(
+            rect, canvas_w, canvas_h,
+            (canvas_w - presentation.screen_widths[1]) / 2, kScreenHeight,
+            presentation.screen_widths[1], kScreenHeight);
         render_screen(presentation, 0, top_rect);
         render_screen(presentation, 1, bottom_rect);
+        const DsTarget target = sdl_ds_target(
+            renderer, bottom_rect, presentation.screen_widths[1]);
         if (virtual_stylus_visible)
-            draw_virtual_stylus(renderer, bottom_rect,
-                                virtual_stylus_x, virtual_stylus_y);
-        draw_savestate_notice(renderer, bottom_rect, savestate_notice);
+            draw_virtual_stylus(target, virtual_stylus_x, virtual_stylus_y);
+        draw_savestate_notice(target, savestate_notice);
+        draw_fps_counter(target, fps_counter);
         ticks.draw += SDL_GetPerformanceCounter() - start;
         start = SDL_GetPerformanceCounter();
         SDL_RenderPresent(renderer);
@@ -2215,18 +3376,13 @@ PresentationTicks present_screens(FrontendPresentation& presentation,
     }
 
     for (int screen = 0; screen < 2; ++screen) {
-        const SDL_Rect screen_rect{
-            0, 0, presentation.screen_widths[screen], kScreenHeight};
         SDL_Renderer* renderer = presentation.renderers[screen];
         start = SDL_GetPerformanceCounter();
-        SDL_SetRenderDrawColor(renderer, 20, 20, 20, 255);
-        SDL_RenderClear(renderer);
-        render_screen(presentation, screen, screen_rect);
-        if (screen == 1 && virtual_stylus_visible)
-            draw_virtual_stylus(renderer, screen_rect,
-                                virtual_stylus_x, virtual_stylus_y);
-        if (screen == 1)
-            draw_savestate_notice(renderer, screen_rect, savestate_notice);
+        draw_separate_screen(presentation, screen,
+                             screen == 1 && virtual_stylus_visible,
+                             virtual_stylus_x, virtual_stylus_y,
+                             screen == 1 ? savestate_notice : nullptr,
+                             screen == 1 ? fps_counter : nullptr);
         ticks.draw += SDL_GetPerformanceCounter() - start;
         start = SDL_GetPerformanceCounter();
         SDL_RenderPresent(renderer);
@@ -2238,8 +3394,24 @@ PresentationTicks present_screens(FrontendPresentation& presentation,
 } // namespace
 
 int nds_run_interactive_frontend(const NdsFrontendOptions& initial_options) {
-    g_frontend_thread = std::this_thread::get_id();
     NdsFrontendOptions options = initial_options;
+    g_window_icon = &options.window_icon_rgba;
+    // Wayland identifies a window by app id, not by title or icon.
+#if defined(NDS_HAVE_SDL3)
+    SDL_SetHint(SDL_HINT_APP_ID, options.app_name.empty()
+                                     ? "ndsrecomp" : options.app_name.c_str());
+#endif
+#if defined(__ANDROID__)
+    // Any orientation the sensor reports: the window follows the rotation,
+    // and in portrait the single layout puts the second screen above the
+    // main one. Without the hint SDL picks one from the first window size.
+    SDL_SetHint(SDL_HINT_ORIENTATIONS,
+                "LandscapeLeft LandscapeRight Portrait PortraitUpsideDown");
+    // Always fullscreen (immersive, no status or navigation bar): a phone
+    // has no window to size, so settings.toml's fullscreen is not read and
+    // Alt+Enter does not toggle it.
+    options.fullscreen = NdsFullscreenMode::Borderless;
+#endif
     SDL_SetMainReady();
     // SDL_INIT_TIMER matters on Windows: it raises the OS timer resolution
     // to 1 ms (SDL_HINT_TIMER_RESOLUTION default). Without it SDL_Delay(1)
@@ -2266,7 +3438,8 @@ int nds_run_interactive_frontend(const NdsFrontendOptions& initial_options) {
         SDL_Quit();
         return 1;
     }
-    const int bottom_logical_width = presentation.separate
+    const int bottom_logical_width =
+        presentation.separate || presentation.single
         ? presentation.screen_widths[1]
         : presentation.canvas_width;
     const int bottom_content_left =
@@ -2278,10 +3451,12 @@ int nds_run_interactive_frontend(const NdsFrontendOptions& initial_options) {
     const NdsLogicalRect stacked_bottom_touch{
         bottom_content_left, kScreenHeight, kScreenWidth, kScreenHeight};
     std::fprintf(stderr,
-        "[sdl] layout=%s fullscreen=%s adaptive=%s supersampling=%ux aa=%ux "
-        "internal=%ux\n",
+        "[sdl] layout=%s fullscreen=%s window_mode=%s scaling=%s "
+        "adaptive=%s supersampling=%ux aa=%ux internal=%ux\n",
         nds_screen_layout_name(options.screen_layout),
         nds_fullscreen_mode_name(options.fullscreen),
+        nds_window_mode_name(options.window_mode),
+        nds_scaling_filter_name(options.scaling),
         nds_adaptive_screens_name(options.adaptive_screens),
         static_cast<unsigned>(options.supersampling),
         static_cast<unsigned>(options.antialiasing),
@@ -2305,10 +3480,32 @@ int nds_run_interactive_frontend(const NdsFrontendOptions& initial_options) {
     // the same native surface every faithful consumer reads, so a run without
     // the GPU presenter is a valid way to prove that invariance holds. Only
     // the visible benefit needs gl_top, so that is what the notice says.
+    // The multiplier the user asked for (fixed, or resolution_scale of the
+    // presented rect). The perf governor caps it; the auto-scale controller
+    // in the frame loop moves it as the window changes.
+    const bool resolution_scale_live =
+        options.resolution_scale > 0u && presentation.gl_top;
+    if (options.resolution_scale > 0u && !presentation.gl_top) {
+        std::fprintf(stderr,
+            "[display] resolution_scale ignored: needs the OpenGL compute "
+            "renderer and the separate or single layout\n");
+    }
+    uint8_t requested_internal_scale = options.internal_resolution;
+    if (resolution_scale_live) {
+        NdsPresentRect rect{};
+        requested_internal_scale =
+            requested_internal_scale_for(presentation, options, &rect);
+        std::fprintf(stderr,
+                     "[display] resolution scale %u%%: internal %ux "
+                     "(presented %dx%d)\n",
+                     static_cast<unsigned>(options.resolution_scale),
+                     static_cast<unsigned>(requested_internal_scale),
+                     rect.w, rect.h);
+    }
     const uint8_t initial_internal_resolution =
         options.perf_governor_mode == NdsPerfGovernorMode::ForceStage2
             ? 1u
-            : options.internal_resolution;
+            : requested_internal_scale;
     if (!nds_gpu3d_set_internal_scale(initial_internal_resolution)) {
         std::fprintf(stderr,
                      "[sdl] internal resolution %ux is unavailable\n",
@@ -2324,16 +3521,19 @@ int nds_run_interactive_frontend(const NdsFrontendOptions& initial_options) {
             "presenter\n",
             static_cast<unsigned>(options.internal_resolution));
     }
-    // The adaptive compositor only pays for the extra per-pixel stores when
-    // something can consume them.
-    nds_gpu2d_set_hd_emit(initial_internal_resolution > 1 &&
-                          presentation.gl_top);
     nds_texture_upscale_set_factor(options.texture_upscale);
 
 #if defined(NDS_HAVE_COMPUTE_RENDERER)
     // Activate only after every fallible visible-frontend allocation. From
     // here onward teardown always destroys the compute renderer while this
     // context is current.
+    if (!options.settings_path.empty()) {
+        // Driver pipeline caches live beside settings.toml.
+        const std::string path = options.settings_path;
+        const size_t slash = path.find_last_of("/\\");
+        nds_compute_host_set_cache_directory(
+            slash == std::string::npos ? "." : path.substr(0, slash).c_str());
+    }
     if (!nds_compute_host_start(
             presentation.gl_top ? presentation.windows[0] : nullptr)) {
         destroy_presentation(presentation);
@@ -2352,10 +3552,12 @@ int nds_run_interactive_frontend(const NdsFrontendOptions& initial_options) {
         }
     }
     nds_gpu2d_set_direct_present(
-        nds_compute_host_has_visible_context());
+        nds_compute_host_has_visible_context() &&
+        nds_compute_host_composes_3d() && nds_compute_host_presents_direct());
     const char* window_direct = std::getenv("NDS_COMPUTE_WINDOW_DIRECT");
     nds_gpu2d_set_direct_windows(window_direct &&
-        std::strcmp(window_direct, "1") == 0 && options.internal_resolution == 1u);
+        std::strcmp(window_direct, "1") == 0 && options.internal_resolution == 1u &&
+        options.resolution_scale == 0u);
 #else
     if (nds_gpu3d_renderer_policy() == NdsGpu3dRendererPolicy::Auto) {
         std::fprintf(stderr,
@@ -2363,17 +3565,38 @@ int nds_run_interactive_frontend(const NdsFrontendOptions& initial_options) {
             "automatic fallback to threaded soft\n");
     }
 #endif
+    // The adaptive compositor only pays for the extra per-pixel stores when
+    // something can consume them. Decided only now: whether the presenter
+    // composes 3D depends on the renderer having started, and before that it
+    // always reads false, which left the HD path off (a 1x, pixelated
+    // picture) until a resize changed the multiplier and asked again.
+    nds_gpu2d_set_hd_emit(initial_internal_resolution > 1 &&
+                          presenter_composes_3d(presentation));
 
     NdsPerfGovernorState perf_governor{};
+    // Auto-scale controller state (see the frame loop's join point).
+    bool auto_scale_enabled = true;
+    uint8_t auto_scale_candidate = 0u;
+    uint64_t auto_scale_since = 0u;
+    // Stage 2 drops 3D to 1x, which only relieves a GPU-bound frame; a
+    // CPU-bound title (DQ9 runs ~13 ms of ARM per frame) would otherwise be
+    // pinned at 1x by load the multiplier does not cause.
+    NdsPerfGovernorConfig perf_governor_config{};
+    // 4 ms is about the headroom such a frame has left. Boot reads 1-4 ms
+    // with no real GPU load, and DQ9 plays at ~0.4 ms even with HD frames.
+    perf_governor_config.min_stage2_gpu_wait_ms = 4.0;
+    // Five minutes at 60 fps, then a flapping machine gets another try.
+    perf_governor_config.flap_hold_frames = 18000;
     nds_perf_governor_init(&perf_governor,
-                           options.perf_governor_mode);
+                           options.perf_governor_mode,
+                           perf_governor_config);
     // Governor off is byte-identical to the pre-governor frontend: the scale,
     // the HD emit flag and the readback latency were all already established
     // above from the options, so there is nothing to apply and no new way to
     // fail at startup.
     if (options.perf_governor_mode != NdsPerfGovernorMode::Off &&
         !apply_performance_governor_stage(
-            options, presentation, perf_governor.stage)) {
+            presentation, perf_governor.stage, requested_internal_scale)) {
         destroy_presentation(presentation);
         SDL_Quit();
         return 1;
@@ -2456,10 +3679,12 @@ int nds_run_interactive_frontend(const NdsFrontendOptions& initial_options) {
     else
         std::fprintf(stderr, "[sdl] audio driver: %s, output muted: %s\n",
             SDL_GetCurrentAudioDriver(), audio_queue.output_muted ? "yes" : "no");
+    apply_audio_output_level(audio, audio_queue, options.audio_volume,
+                             options.audio_muted);
 
     std::fprintf(stderr,
         "[sdl] controls: gamepad=Player 1 | bottom mouse=touch | "
-        "Esc=settings%s\n",
+        "Esc=settings | hold Shift=fast-forward%s\n",
         options.tab_turbo ? " | hold Tab=turbo" : "");
     std::fputs("[sdl] keyboard:", stderr);
     for (size_t row = 0; row < options.keyboard_bindings.size(); ++row)
@@ -2502,6 +3727,19 @@ int nds_run_interactive_frontend(const NdsFrontendOptions& initial_options) {
     }
     MphPrimeBinding virtual_stylus_binding =
         parse_mph_prime_binding(options.virtual_stylus.binding);
+    const MphPrimeBinding screen_toggle_binding =
+        parse_mph_prime_binding(options.screen_toggle_binding);
+    if (presentation.single &&
+        screen_toggle_binding.kind != MphPrimeInputKind::Key &&
+        binding_name_lower(options.screen_toggle_binding) != "none") {
+        std::fprintf(stderr,
+                     "[display] screen toggle binding \"%s\" is not a key; "
+                     "toggle disabled\n",
+                     options.screen_toggle_binding.c_str());
+    }
+    // Single-screen layout state: the debounced main LCD and the toggle.
+    NdsMainScreenDebounce main_screen{};
+    bool screen_toggled = false;
     MphPrimeBinding virtual_stylus_tap_binding =
         parse_mph_prime_binding(options.virtual_stylus.tap_binding);
     bool virtual_stylus_hold_recognized = true;
@@ -2556,6 +3794,37 @@ int nds_run_interactive_frontend(const NdsFrontendOptions& initial_options) {
     // everywhere), kept separate from button-event state so a wobbling
     // stick never fights explicit D-pad presses.
     uint16_t stick_pressed = 0;
+    int zoom_stick_frames = 0;
+    float zoom_stick_rem = 0.0f;
+    bool zoom_save_pending = false;
+    // The right mouse button as the title sees it (title_settings.h) is held
+    // by the mouse or by two fingers on a touchscreen.
+    bool right_mouse_button_held = false;
+    bool touch_right_held = false;
+    // A two-finger tap stays held this long, so the title's per-frame hooks
+    // see it even when both fingers lift within one frame.
+    constexpr uint64_t kTouchRightMinHoldMs = 80;
+    uint64_t touch_right_since = 0;
+    bool touch_right_release_pending = false;
+    auto publish_right_mouse = [&]() {
+        nds_title_set_right_mouse_held(right_mouse_button_held ||
+                                       touch_right_held);
+    };
+#if defined(NDS_HAVE_SDL3)
+    // Fingers down on the touchscreen (window pixels), for the two-finger
+    // pinch (the title's zoom, like the mouse wheel) and two-finger tap (the
+    // right mouse button). Only the first two fingers count.
+    struct TouchFinger {
+        SDL_TouchID touch = 0;
+        SDL_FingerID id = 0;
+        float x = 0.0f;
+        float y = 0.0f;
+    };
+    std::vector<TouchFinger> touch_fingers;
+    float pinch_start_spread = 0.0f;
+    int pinch_start_zoom = -1;
+    bool pinch_changed_zoom = false;
+#endif
     auto publish_keys = [&]() {
         nds_set_key_mask(static_cast<uint16_t>(
             0x0FFFu &
@@ -2565,48 +3834,102 @@ int nds_run_interactive_frontend(const NdsFrontendOptions& initial_options) {
     publish_keys();
     nds_set_touch(0, 0, false);
     bool running = true;
-    RuntimeMenuState runtime_menu_state{&options, &running, false, &presentation, &perf_governor};
-    static const RecompRuntimeUiItem runtime_menu_items[] = {
-        {kRuntimeAutomaticQualityKey, "Graphics", "Automatic quality",
-         "Off restores your selected quality.",
-         RECOMP_RUNTIME_UI_BOOL, 0, 1, 1, nullptr, 0, nullptr},
-        {kRuntimeResolutionNowKey, "Graphics", "Resolution now",
-         "Actual internal resolution, followed by your selected target.",
-         RECOMP_RUNTIME_UI_TEXT, 0, 0, 0, nullptr, 0, nullptr},
-        {kRuntimeSupersamplingNowKey, "Graphics", "SSAA now",
-         "Actual supersampling, followed by your selected target.",
-         RECOMP_RUNTIME_UI_TEXT, 0, 0, 0, nullptr, 0, nullptr},
-        {kRuntimeMouseSensitivityKey, "Input", "Mouse sensitivity",
-         "Prime Controls relative aim speed.",
-         RECOMP_RUNTIME_UI_INT, 10, 400, 1, nullptr, 0, nullptr},
-        {kRuntimeResumeKey, "System", "Resume game",
-         "Close settings and return to the game.",
-         RECOMP_RUNTIME_UI_ACTION, 0, 0, 0, nullptr, 0, nullptr},
-        {kRuntimeQuitKey, "System", "Quit",
-         "Close the runner.",
-         RECOMP_RUNTIME_UI_ACTION, 0, 0, 0, nullptr, 0, nullptr},
+    RuntimeMenuState runtime_menu_state{&options};
+    runtime_menu_state.audio = &audio;
+    runtime_menu_state.audio_queue = &audio_queue;
+    if (options.fullscreen != NdsFullscreenMode::Off)
+        runtime_menu_state.fullscreen_on_mode = options.fullscreen;
+#if defined(NDS_HAVE_COMPUTE_RENDERER)
+    runtime_menu_state.resolution_scale_available =
+        presentation.gl_top && nds_compute_host_active();
+#endif
+    static const char* const scaling_choices[] = {
+        "Integer (pixel-perfect)", "Bilinear", "Nearest neighbor"};
+    static const char* const resolution_scale_choices[] = {
+        "Original", "25%", "50%", "75%", "100%", "150%", "200%"};
+    static const char* const gamepad_layout_choices[] = {
+        "By label", "By position"};
+    static const NdsMenuItem runtime_menu_items[] = {
+        {kRuntimeFullscreenKey, "Display", "Fullscreen",
+         "Fill the whole screen. Alt+Enter also toggles it.",
+         NdsMenuItemType::Bool, 0, 1, 1, nullptr, 0, nullptr},
+        {kRuntimeScalingKey, "Display", "Scaling",
+         "Integer keeps whole-pixel multiples; bilinear smooths to any size; "
+         "nearest stays pixelated at any size.",
+         NdsMenuItemType::Choice, 0, 2, 1, scaling_choices, 3, nullptr},
+        {kRuntimeResolutionScaleKey, "Display", "Resolution scale",
+         "3D detail relative to the window: 100% matches the screen, "
+         "less is coarser, more supersamples.",
+         NdsMenuItemType::Choice, 0, 200, 1, resolution_scale_choices, 7,
+         kResolutionScaleChoiceValues},
+        {kRuntimeSecondScreenKey, "Display", "Second screen size",
+         "The other screen beside the main one, as a percent of its size.",
+         NdsMenuItemType::Int, kNdsMinSecondScreenSize,
+         kNdsMaxSecondScreenSize, 10, nullptr, 0, nullptr},
+        {kRuntimeShowFpsKey, "Display", "Show FPS",
+         "New 3D images per second in the corner of the screen, updated "
+         "once a second. Reads 0 when nothing 3D is moving.",
+         NdsMenuItemType::Bool, 0, 1, 1, nullptr, 0, nullptr},
+        {kRuntimeSmooth3dKey, "Display", "Smooth 3D",
+         "Blends in-between 3D images for games that draw below 60. Shows 3D "
+         "one frame later; may glitch.",
+         NdsMenuItemType::Bool, 0, 1, 1, nullptr, 0, nullptr},
+        {kRuntimeVolumeKey, "Audio", "Volume",
+         "Host output level in percent; the game keeps running at full mix.",
+         NdsMenuItemType::Int, 0, 100, 5, nullptr, 0, nullptr},
+        {kRuntimeMuteKey, "Audio", "Mute",
+         "Silence all audio output.",
+         NdsMenuItemType::Bool, 0, 1, 1, nullptr, 0, nullptr},
+        {kRuntimeGamepadLayoutKey, "Input", "Gamepad layout",
+         "By label, pad A is DS A. By position, the pad's right button is "
+         "DS A, as on a DS.",
+         NdsMenuItemType::Choice, 0, 1, 1, gamepad_layout_choices, 2,
+         nullptr},
     };
-    RecompRuntimeUiConfig runtime_menu_config{};
-    runtime_menu_config.title = "Metroid Prime Hunters";
-    runtime_menu_config.subtitle = "Runtime Settings";
-    runtime_menu_config.items = runtime_menu_items;
-    runtime_menu_config.item_count =
-        sizeof(runtime_menu_items) / sizeof(runtime_menu_items[0]);
-    runtime_menu_config.callbacks.context = &runtime_menu_state;
-    runtime_menu_config.callbacks.get_value = runtime_menu_get_value;
-    runtime_menu_config.callbacks.set_value = runtime_menu_set_value;
-    runtime_menu_config.callbacks.run_action = runtime_menu_run_action;
-    runtime_menu_config.callbacks.is_enabled = runtime_menu_is_enabled;
-    runtime_menu_config.callbacks.save = runtime_menu_save;
-    runtime_menu_config.callbacks.get_text = runtime_menu_get_quality_text;
-    runtime_menu_config.theme = "nds";
-    runtime_menu_config.accept_label = "A / Enter";
-    runtime_menu_config.back_label = "B / Backspace";
-    RecompRuntimeUi* runtime_ui =
-        recomp_runtime_ui_create(&runtime_menu_config);
-    if (!runtime_ui) {
-        std::fprintf(stderr, "[sdl] runtime menu unavailable\n");
+    // Then the title's own settings, then Netplay when the lobby thread runs.
+    std::vector<NdsMenuItem> runtime_menu_list(
+        std::begin(runtime_menu_items), std::end(runtime_menu_items));
+    // A title that decides smoothing itself (title_settings.h) shows its own
+    // setting for it instead.
+    if (nds_title_smooth_3d_owned())
+        runtime_menu_list.erase(
+            std::remove_if(runtime_menu_list.begin(), runtime_menu_list.end(),
+                           [](const NdsMenuItem& item) {
+                               return std::strcmp(item.key,
+                                                  kRuntimeSmooth3dKey) == 0;
+                           }),
+            runtime_menu_list.end());
+    for (const auto& [key, value] : options.title_settings) {
+        const int id = nds_title_setting_find(key.c_str());
+        if (id < 0)
+            std::fprintf(stderr, "[title] ignoring unknown setting %s\n",
+                         key.c_str());
+        else if (!nds_title_setting_set(id, value))
+            std::fprintf(stderr, "[title] ignoring %s = %d (out of range)\n",
+                         key.c_str(), value);
     }
+    static std::vector<std::string> title_menu_keys;
+    title_menu_keys.clear();
+    for (size_t i = 0; i < nds_title_setting_count(); ++i)
+        title_menu_keys.push_back(
+            std::string(kRuntimeTitlePrefix) +
+            nds_title_setting_at(static_cast<int>(i))->key);
+    for (size_t i = 0; i < nds_title_setting_count(); ++i) {
+        const NdsTitleSetting& setting =
+            *nds_title_setting_at(static_cast<int>(i));
+        if (setting.hidden) continue;
+        const bool choice = setting.choices && setting.choice_count;
+        runtime_menu_list.push_back(
+            {title_menu_keys[i].c_str(), "Game", setting.label,
+             setting.description,
+             choice ? NdsMenuItemType::Choice : NdsMenuItemType::Int,
+             setting.minimum, setting.maximum, setting.step, setting.choices,
+             setting.choice_count, setting.choice_values});
+    }
+#if NDS_ONLINE
+    if (nds_netplay_menu_available())
+        nds_netplay_menu_append_items(&runtime_menu_list);
+#endif
     bool compute_failed = false;
     bool mouse_down = false;
     bool touch_release_pending = false;
@@ -2643,10 +3966,6 @@ int nds_run_interactive_frontend(const NdsFrontendOptions& initial_options) {
     bool mph_pad_trigger_left_held = false;
     bool mph_pad_trigger_right_held = false;
     uint64_t mph_pad_aim_writes = 0;
-    bool runtime_stick_held = false;
-    RecompRuntimeUiInput runtime_stick_input =
-        RECOMP_RUNTIME_UI_INPUT_DOWN;
-    uint32_t runtime_stick_frames = 0;
     auto mph_prime_active = [&]() {
         return mph_prime_controls_available &&
                (relative_mouse.captured() || mph_prime_pad_engaged);
@@ -2899,6 +4218,8 @@ int nds_run_interactive_frontend(const NdsFrontendOptions& initial_options) {
     FrameBlendCache blend_cache{};
     uint64_t fps_frames = 0;
     uint64_t fps_start = SDL_GetPerformanceCounter();
+    uint64_t fps_images = 0;
+    std::string fps_counter;  // empty until the first second has passed
     const uint64_t frequency = SDL_GetPerformanceFrequency();
     const uint64_t soak_frames = environment_u64("NDS_FRONTEND_MAX_FRAMES");
     const bool print_stats = std::getenv("NDS_FRONTEND_STATS") != nullptr;
@@ -2928,39 +4249,26 @@ int nds_run_interactive_frontend(const NdsFrontendOptions& initial_options) {
         return presentation_window_focused[0] ||
                (presentation.separate && presentation_window_focused[1]);
     };
-    auto clear_tab_turbo = [&]() {
-        if (options.tab_turbo) turbo_pressed = false;
-    };
-    auto runtime_menu_open = [&]() {
-        return runtime_ui && recomp_runtime_ui_is_open(runtime_ui);
-    };
-    auto clear_gameplay_input_for_runtime_menu = [&]() {
-        release_relative_mouse();
-        keyboard_pressed = 0;
-        controller_pressed = 0;
-        stick_pressed = 0;
-        mouse_pressed = 0;
-        mph_prime_pressed = 0;
-        mph_prime_pad_engaged = false;
-        mph_pad_trigger_left_held = false;
-        mph_pad_trigger_right_held = false;
-        virtual_stylus_pad_trigger_left_held = false;
-        virtual_stylus_pad_trigger_right_held = false;
-        turbo_pressed = false;
-        clear_mph_prime_controls();
-        clear_virtual_stylus();
-        nds_set_touch(0, 0, false);
-        publish_keys();
-    };
-    auto finish_runtime_menu_input = [&](bool was_open) {
-        if (runtime_menu_state.close_requested) {
-            runtime_menu_state.close_requested = false;
-            if (runtime_ui) recomp_runtime_ui_close(runtime_ui);
-        }
-        if (!was_open && runtime_menu_open())
-            clear_gameplay_input_for_runtime_menu();
+    // Both turbo sources (Shift, and the developer Tab) drop on focus loss so
+    // a key released in another window cannot leave fast-forward latched.
+    auto clear_tab_turbo = [&]() { turbo_pressed = false; };
+    auto is_shift_key = [](SDL_Scancode key) {
+        return key == SDL_SCANCODE_LSHIFT || key == SDL_SCANCODE_RSHIFT;
     };
     uint32_t audio_pace_floor = kAudioQueueFrames;
+    // The steady-state queue target. kAudioQueueFrames (~63 ms) leaves about
+    // one late frame of runway once a frame's emulation and the device's own
+    // pull are taken out, so a host that drops a frame now and then hears a
+    // gap each time. Every frame that saw an underrun raises the target one
+    // step (~16 ms, a 60 Hz frame), up to ~156 ms; it comes back down a step
+    // for every two minutes without one. A host that never underruns keeps
+    // the 63 ms latency.
+    constexpr uint32_t kAudioSteadyStepFrames = 512;
+    constexpr uint32_t kAudioSteadyMaxFrames = 5120;
+    constexpr uint64_t kAudioSteadyDecayFrames = 2u * 60u * 60u;
+    uint32_t audio_steady_floor = kAudioQueueFrames;
+    uint64_t audio_steady_underruns = 0;
+    uint64_t audio_steady_quiet_frames = 0;
     uint32_t audio_min_queue = std::numeric_limits<uint32_t>::max();
     uint32_t audio_max_queue = 0;
     uint64_t host_key_presses = 0;
@@ -3046,6 +4354,14 @@ int nds_run_interactive_frontend(const NdsFrontendOptions& initial_options) {
     const uint64_t soak_start = SDL_GetPerformanceCounter();
     std::string savestate_notice;
     uint64_t savestate_notice_until = 0;
+    // A resize is saved once it has been still for half a second, so dragging
+    // a corner writes the settings file once, not per event.
+    uint64_t window_resize_save_at = 0;
+    // What Alt+Enter enters: the configured fullscreen mode, or borderless
+    // when the setting is off.
+    const NdsFullscreenMode last_fullscreen_mode =
+        options.fullscreen != NdsFullscreenMode::Off
+            ? options.fullscreen : NdsFullscreenMode::Borderless;
 
     auto show_savestate_result = [&](const NdsSavestateSlotResult& result) {
         savestate_notice = result.message;
@@ -3078,7 +4394,8 @@ int nds_run_interactive_frontend(const NdsFrontendOptions& initial_options) {
     handoff_title_supported=options.savestate_rom_sha1=="691e00d9a5dd80b04f80cc7559503e8b06848785";
 #endif
     const std::string backend=nds_gpu3d_compiled_accelerated_backend();
-    if (handoff_requested && handoff_title_supported && presentation.gl_top && backend=="compute" &&
+    if (handoff_requested && handoff_title_supported && presentation.gl_top &&
+        !presentation.single && backend=="compute" &&
         !interpolation_active && options.perf_governor_mode==NdsPerfGovernorMode::Off &&
         !selftest_menu && !selftest_relative_mouse &&
         !std::getenv("NDS_GUEST_JOB_PROFILE_OUTPUT")) {
@@ -3307,6 +4624,56 @@ int nds_run_interactive_frontend(const NdsFrontendOptions& initial_options) {
                 relative_mouse_selftest_stage = 10;
             }
         }
+        runtime_menu_serve_title(&runtime_menu_state, runtime_menu_list);
+        if (runtime_menu_state.fullscreen_pending) {
+            runtime_menu_state.fullscreen_pending = false;
+            if (presentation.windows[0] &&
+                set_window_fullscreen(presentation.windows[0],
+                                      options.fullscreen)) {
+                persist_fullscreen(options);
+            } else {
+                std::fprintf(stderr, "[sdl] cannot set fullscreen %s: %s\n",
+                             nds_fullscreen_mode_name(options.fullscreen),
+                             SDL_GetError());
+                options.fullscreen = options.fullscreen == NdsFullscreenMode::Off
+                                         ? runtime_menu_state.fullscreen_on_mode
+                                         : NdsFullscreenMode::Off;
+            }
+        }
+        {
+            bool reset_console = false;
+            const std::string notice =
+                serve_title_save(presentation.windows[0], &reset_console);
+            if (!notice.empty()) {
+                savestate_notice = notice;
+                savestate_notice_until =
+                    SDL_GetPerformanceCounter() + frequency * 4u;
+            }
+            if (reset_console && g_frontend_reset) {
+                finish_pending_save(true);
+                g_frontend_reset();
+                blend_cache.valid = false;
+                publish_keys();
+            }
+        }
+        {
+            bool quit_for_update = false;
+            const std::string notice = serve_title_update(&quit_for_update);
+            if (!notice.empty()) {
+                savestate_notice = notice;
+                savestate_notice_until =
+                    SDL_GetPerformanceCounter() + frequency * 4u;
+            }
+            if (quit_for_update) {
+                release_relative_mouse();
+                running = false;
+            }
+        }
+        if (window_resize_save_at &&
+            SDL_GetPerformanceCounter() >= window_resize_save_at) {
+            window_resize_save_at = 0;
+            persist_window_size(options, presentation.windows[0]);
+        }
         SDL_Event event{};
         while (SDL_PollEvent(&event)) {
             convert_mouse_event_to_logical_coordinates(event, presentation);
@@ -3318,6 +4685,12 @@ int nds_run_interactive_frontend(const NdsFrontendOptions& initial_options) {
                 release_relative_mouse();
                 running = false;
             }
+            if (sdl_window_event_is(event, SDL_EVENT_WINDOW_RESIZED) &&
+                !presentation.separate && presentation.windows[0] &&
+                event.window.windowID ==
+                    SDL_GetWindowID(presentation.windows[0]))
+                window_resize_save_at =
+                    SDL_GetPerformanceCounter() + frequency / 2u;
             if (sdl_window_event_is(event, SDL_EVENT_WINDOW_FOCUS_LOST) &&
                 is_presentation_window(event.window.windowID)) {
                 const int index =
@@ -3355,21 +4728,38 @@ int nds_run_interactive_frontend(const NdsFrontendOptions& initial_options) {
                              (int)sdl_event_scancode(event),
                              (int)event.key.repeat);
             }
-            if (event.type == SDL_KEYDOWN || event.type == SDL_KEYUP) {
-                RecompRuntimeUiInput menu_input{};
-                const SDL_Scancode scancode = sdl_event_scancode(event);
-                const bool was_open = runtime_menu_open();
-                const bool known = runtime_menu_key_input(
-                    scancode, &menu_input);
-                if (known && runtime_ui &&
-                    recomp_runtime_ui_handle_input(
-                        runtime_ui, menu_input, event.type == SDL_KEYDOWN,
-                        event.key.repeat)) {
-                    finish_runtime_menu_input(was_open);
+            // Alt+Enter toggles fullscreen on the primary window, whatever
+            // the game is doing; the key never reaches it.
+            if ((event.type == SDL_KEYDOWN || event.type == SDL_KEYUP) &&
+                sdl_event_alt(event)) {
+                const SDL_Scancode alt_key = sdl_event_scancode(event);
+                if (alt_key == SDL_SCANCODE_RETURN ||
+                    alt_key == SDL_SCANCODE_KP_ENTER) {
+#if defined(__ANDROID__)
+                    // Always fullscreen there; the key is still swallowed.
                     continue;
-                }
-                if (was_open) {
-                    finish_runtime_menu_input(was_open);
+#endif
+                    if (event.type == SDL_KEYDOWN && !event.key.repeat &&
+                        presentation.windows[0]) {
+                        SDL_Window* window = presentation.windows[0];
+                        const auto window_flags = SDL_GetWindowFlags(window);
+#if defined(NDS_HAVE_SDL3)
+                        const bool is_fullscreen =
+                            (window_flags & SDL_WINDOW_FULLSCREEN) != 0;
+#else
+                        const bool is_fullscreen =
+                            (window_flags & (SDL_WINDOW_FULLSCREEN |
+                                             SDL_WINDOW_FULLSCREEN_DESKTOP)) != 0;
+#endif
+                        const NdsFullscreenMode mode =
+                            is_fullscreen ? NdsFullscreenMode::Off
+                                          : last_fullscreen_mode;
+                        if (set_window_fullscreen(window, mode)) {
+                            // Remembered across launches, like the size.
+                            options.fullscreen = mode;
+                            persist_fullscreen(options);
+                        }
+                    }
                     continue;
                 }
             }
@@ -3406,8 +4796,8 @@ int nds_run_interactive_frontend(const NdsFrontendOptions& initial_options) {
                             options.perf_governor_mode !=
                                 NdsPerfGovernorMode::Off &&
                             !apply_performance_governor_stage(
-                                options, presentation,
-                                perf_governor.stage)) {
+                                presentation, perf_governor.stage,
+                                requested_internal_scale)) {
                             nds_perf_governor_mark_apply_failed(
                                 &perf_governor);
                             nds_perf_governor_record_transition(
@@ -3439,13 +4829,18 @@ int nds_run_interactive_frontend(const NdsFrontendOptions& initial_options) {
                             nds_set_touch(0, 0, false);
                         }
                     }
-                } else if (scancode == SDL_SCANCODE_ESCAPE) {
-                    if (relative_mouse.captured() || virtual_stylus_active())
-                        release_relative_mouse();
-                    else
-                        running = false;
+                } else if (scancode == SDL_SCANCODE_ESCAPE &&
+                           (relative_mouse.captured() ||
+                            virtual_stylus_active())) {
+                    release_relative_mouse();
                 } else if (process_virtual_stylus_key(scancode, true)) {
                     // Consumed by the generic lower-screen pointer helper.
+                } else if (presentation.single &&
+                           binding_matches_key(screen_toggle_binding,
+                                               scancode)) {
+                    screen_toggled = !screen_toggled;
+                    std::fprintf(stderr, "[display] showing the %s screen\n",
+                                 screen_toggled ? "other" : "main");
                 } else if (process_mph_prime_key(
                                scancode, true, false)) {
                     // Consumed by the MPH-specific keyboard/mouse layer.
@@ -3459,6 +4854,14 @@ int nds_run_interactive_frontend(const NdsFrontendOptions& initial_options) {
                     ++host_key_presses;
                     keyboard_pressed |= bit;
                     publish_keys();
+                } else if (is_shift_key(scancode)) {
+                    // Hold Shift to fast-forward, unless the user bound Shift
+                    // to a DS button above.
+                    turbo_pressed = true;
+                } else if (scancode == SDL_SCANCODE_M) {
+                    // Marks the moment in an NDS_GX_CMD_TRACE (smooth_3d
+                    // debugging); nothing without one.
+                    nds_gpu3d_mark_interp();
                 }
             }
             if (event.type == SDL_KEYUP && !event.key.repeat) {
@@ -3477,6 +4880,8 @@ int nds_run_interactive_frontend(const NdsFrontendOptions& initial_options) {
                 } else if (const uint16_t bit = nds_binding_mask(options.keyboard_bindings, scancode)) {
                     keyboard_pressed &= static_cast<uint16_t>(~bit);
                     publish_keys();
+                } else if (is_shift_key(scancode)) {
+                    turbo_pressed = false;
                 }
             }
             if (event.type == SDL_CONTROLLERDEVICEADDED && !controller) {
@@ -3501,25 +4906,6 @@ int nds_run_interactive_frontend(const NdsFrontendOptions& initial_options) {
                 clear_virtual_stylus();
                 publish_keys();
             }
-            if (event.type == SDL_CONTROLLERBUTTONDOWN ||
-                event.type == SDL_CONTROLLERBUTTONUP) {
-                RecompRuntimeUiInput menu_input{};
-                const bool was_open = runtime_menu_open();
-                const auto button = static_cast<SDL_GameControllerButton>(
-                    sdl_controller_button(event));
-                if (runtime_menu_controller_input(button, &menu_input) &&
-                    runtime_ui &&
-                    recomp_runtime_ui_handle_input(
-                        runtime_ui, menu_input,
-                        event.type == SDL_CONTROLLERBUTTONDOWN, false)) {
-                    finish_runtime_menu_input(was_open);
-                    continue;
-                }
-                if (was_open) {
-                    finish_runtime_menu_input(was_open);
-                    continue;
-                }
-            }
             if (event.type == SDL_CONTROLLERBUTTONDOWN) {
                 const auto button = static_cast<SDL_GameControllerButton>(
                     sdl_controller_button(event));
@@ -3529,9 +4915,8 @@ int nds_run_interactive_frontend(const NdsFrontendOptions& initial_options) {
                 } else if (process_mph_prime_pad(MphPadInputKind::Button, button,
                                           true)) {
                     // Consumed by Prime Controls.
-                } else if (const uint16_t bit = options.custom_gamepad_bindings
-                        ? nds_binding_mask(options.gamepad_bindings, button + 1)
-                        : controller_bit(button)) {
+                } else if (const uint16_t bit =
+                        gamepad_button_mask(options, button)) {
                     controller_pressed |= bit;
                     publish_keys();
                 }
@@ -3545,19 +4930,114 @@ int nds_run_interactive_frontend(const NdsFrontendOptions& initial_options) {
                 } else if (process_mph_prime_pad(MphPadInputKind::Button, button,
                                           false)) {
                     // Consumed by Prime Controls.
-                } else if (const uint16_t bit = options.custom_gamepad_bindings
-                        ? nds_binding_mask(options.gamepad_bindings, button + 1)
-                        : controller_bit(button)) {
+                } else if (const uint16_t bit =
+                        gamepad_button_mask(options, button)) {
                     controller_pressed &= static_cast<uint16_t>(~bit);
                     publish_keys();
                 }
             }
-            if (runtime_menu_open() &&
-                (event.type == SDL_MOUSEBUTTONDOWN ||
-                 event.type == SDL_MOUSEBUTTONUP ||
-                 event.type == SDL_MOUSEMOTION)) {
-                continue;
+            // Wheel up/down raises/lowers a title's zoom value (title_settings.h).
+            if (event.type == SDL_MOUSEWHEEL) {
+                // Scroll up lowers the value (zooms in), down raises it.
+                const float wheel = static_cast<float>(event.wheel.y) *
+                    (event.wheel.direction == 1 ? -1.0f : 1.0f);
+                // 50 units (5%) per notch, smaller for a hi-res wheel's fractions.
+                int delta = static_cast<int>(std::lround(-wheel * 50.0f));
+                if (delta == 0 && wheel != 0.0f) delta = wheel > 0.0f ? -1 : 1;
+                if (nds_title_zoom_add(delta))
+                    runtime_menu_save(&runtime_menu_state);
             }
+            if ((event.type == SDL_MOUSEBUTTONDOWN ||
+                 event.type == SDL_MOUSEBUTTONUP) &&
+                event.button.button == SDL_BUTTON_RIGHT) {
+                right_mouse_button_held = event.type == SDL_MOUSEBUTTONDOWN;
+                publish_right_mouse();
+            }
+#if defined(NDS_HAVE_SDL3)
+            // Two fingers: held, they are the right mouse button (instant
+            // text, advance, cancel a choice, as in the title's hooks), and
+            // pinching them changes the title's zoom (title_settings.h):
+            // spreading them zooms in. Mouse- and pen-made touches are not
+            // fingers.
+            if ((event.type == SDL_EVENT_FINGER_DOWN ||
+                 event.type == SDL_EVENT_FINGER_UP ||
+                 event.type == SDL_EVENT_FINGER_CANCELED ||
+                 event.type == SDL_EVENT_FINGER_MOTION) &&
+                event.tfinger.touchID != SDL_MOUSE_TOUCHID &&
+                event.tfinger.touchID != SDL_PEN_TOUCHID) {
+                float finger_x = event.tfinger.x;
+                float finger_y = event.tfinger.y;
+                if (SDL_Window* window =
+                        SDL_GetWindowFromID(event.tfinger.windowID)) {
+                    int w = 0, h = 0;
+                    SDL_GetWindowSize(window, &w, &h);
+                    finger_x *= static_cast<float>(w);
+                    finger_y *= static_cast<float>(h);
+                }
+                auto finger = std::find_if(
+                    touch_fingers.begin(), touch_fingers.end(),
+                    [&](const TouchFinger& f) {
+                        return f.touch == event.tfinger.touchID &&
+                               f.id == event.tfinger.fingerID;
+                    });
+                auto spread = [&]() {
+                    return std::hypot(touch_fingers[0].x - touch_fingers[1].x,
+                                      touch_fingers[0].y - touch_fingers[1].y);
+                };
+                if (event.type == SDL_EVENT_FINGER_DOWN &&
+                    finger == touch_fingers.end() &&
+                    touch_fingers.size() < 2) {
+                    touch_fingers.push_back({event.tfinger.touchID,
+                                             event.tfinger.fingerID,
+                                             finger_x, finger_y});
+                    if (touch_fingers.size() == 2) {
+                        // The first finger's emulated mouse touch is not a
+                        // stylus press any more.
+                        if (mouse_down) {
+                            mouse_down = false;
+                            touch_release_pending = false;
+                            nds_set_touch(0, 0, false);
+                        }
+                        touch_right_held = true;
+                        touch_right_release_pending = false;
+                        touch_right_since = SDL_GetTicks();
+                        publish_right_mouse();
+                        pinch_start_spread = spread();
+                        pinch_start_zoom = nds_title_zoom_value();
+                        pinch_changed_zoom = false;
+                    }
+                } else if (event.type == SDL_EVENT_FINGER_MOTION &&
+                           finger != touch_fingers.end()) {
+                    finger->x = finger_x;
+                    finger->y = finger_y;
+                    const int current = nds_title_zoom_value();
+                    if (touch_fingers.size() == 2 && pinch_start_zoom > 0 &&
+                        pinch_start_spread > 1.0f && current > 0) {
+                        const float now_spread = std::max(spread(), 1.0f);
+                        // The distance scales as the fingers' spread
+                        // shrinks: halving it doubles the distance.
+                        const long target = std::lround(
+                            static_cast<double>(pinch_start_zoom) *
+                            pinch_start_spread / now_spread);
+                        if (nds_title_zoom_add(
+                                static_cast<int>(target - current)))
+                            pinch_changed_zoom = true;
+                    }
+                } else if ((event.type == SDL_EVENT_FINGER_UP ||
+                            event.type == SDL_EVENT_FINGER_CANCELED) &&
+                           finger != touch_fingers.end()) {
+                    const bool was_pair = touch_fingers.size() == 2;
+                    touch_fingers.erase(finger);
+                    if (was_pair) {
+                        if (pinch_changed_zoom)
+                            runtime_menu_save(&runtime_menu_state);
+                        pinch_changed_zoom = false;
+                        pinch_start_zoom = -1;
+                        touch_right_release_pending = true;
+                    }
+                }
+            }
+#endif
             const bool primary_left_down =
                 event.type == SDL_MOUSEBUTTONDOWN &&
                 event.button.button == SDL_BUTTON_LEFT &&
@@ -3571,7 +5051,8 @@ int nds_run_interactive_frontend(const NdsFrontendOptions& initial_options) {
                 primary_left_down ||
                 (bottom_left_down && mph_prime_unified_window_focus);
             const NdsStackedRelativeMouseRoute stacked_left_route =
-                primary_left_down && !presentation.separate
+                primary_left_down && !presentation.separate &&
+                        !presentation.single
                     ? nds_route_stacked_relative_mouse_button(
                         options.relative_mouse_touch,
                         relative_mouse.captured(), stacked_top_screen,
@@ -3656,9 +5137,14 @@ int nds_run_interactive_frontend(const NdsFrontendOptions& initial_options) {
                 event.button.windowID == presentation.window_ids[1] &&
                 !(mph_prime_unified_window_focus &&
                   relative_mouse.captured()) &&
-                (presentation.separate
-                    ? event.button.x >= bottom_content_left &&
-                          event.button.x < bottom_content_left + kScreenWidth
+                (presentation.separate || presentation.single
+                    ? (!presentation.single ||
+                       presentation.shown_screen == 1 ||
+                       presentation.inset_percent > 0) &&
+                          event.button.x >= bottom_content_left &&
+                          event.button.x < bottom_content_left + kScreenWidth &&
+                          event.button.y >= 0 &&
+                          event.button.y < kScreenHeight
                     : stacked_left_route ==
                           NdsStackedRelativeMouseRoute::Touchscreen)) {
                 mouse_down = true;
@@ -3692,6 +5178,85 @@ int nds_run_interactive_frontend(const NdsFrontendOptions& initial_options) {
                 set_touch_from_mouse(event.motion.x, event.motion.y, true,
                                      options.screen_layout,
                                      bottom_logical_width);
+            // The pointer over the touchscreen with no button held, for
+            // titles that highlight the menu entry under it.
+            if (event.type == SDL_MOUSEMOTION ||
+                event.type == SDL_MOUSEBUTTONDOWN ||
+                event.type == SDL_MOUSEBUTTONUP) {
+                const bool motion = event.type == SDL_MOUSEMOTION;
+                const uint32_t window = motion ? event.motion.windowID
+                                               : event.button.windowID;
+                const bool touchscreen_shown =
+                    !presentation.single || presentation.shown_screen == 1 ||
+                    presentation.inset_percent > 0;
+                const bool hovering =
+                    window == presentation.window_ids[1] &&
+                    touchscreen_shown && !mouse_down &&
+                    !touch_release_pending && !relative_mouse.captured() &&
+                    !virtual_stylus_active() &&
+                    (motion ? event.motion.state == 0
+                            : event.type == SDL_MOUSEBUTTONUP &&
+                                  SDL_GetMouseState(nullptr, nullptr) == 0);
+                set_hover_from_mouse(
+                    motion ? event.motion.x : event.button.x,
+                    motion ? event.motion.y : event.button.y, hovering,
+                    options.screen_layout, bottom_logical_width);
+            }
+            // The pointer over the top screen, which the guest never polls
+            // as a touchscreen: titles read it to make the top screen
+            // hoverable and clickable. Single layout shows it only when it
+            // is the shown screen and not forced stacked with the other.
+            if (event.type == SDL_MOUSEMOTION ||
+                event.type == SDL_MOUSEBUTTONDOWN ||
+                event.type == SDL_MOUSEBUTTONUP) {
+                const bool motion = event.type == SDL_MOUSEMOTION;
+                const uint32_t window = motion ? event.motion.windowID
+                                               : event.button.windowID;
+                const bool top_shown =
+                    window == presentation.window_ids[0] &&
+                    g_top_logical_hit.valid &&
+                    !relative_mouse.captured() && !virtual_stylus_active() &&
+                    (!presentation.single ||
+                     (!presentation.stacked &&
+                      (presentation.shown_screen == 0 ||
+                       presentation.inset_percent > 0)));
+                int top_x = 0, top_y = 0;
+                const int top_left =
+                    (presentation.screen_widths[0] - kScreenWidth) / 2 +
+                    (presentation.separate || presentation.single
+                         ? 0 : top_content_left);
+                const bool over = top_shown &&
+                    top_screen_point(g_top_logical_hit.x,
+                                     g_top_logical_hit.y, top_left,
+                                     &top_x, &top_y);
+                nds_title_set_top_pointer(top_x, top_y, over);
+                if (over && event.type == SDL_MOUSEBUTTONDOWN &&
+                    event.button.button == SDL_BUTTON_LEFT)
+                    nds_title_note_top_click(top_x, top_y);
+                // A drag that starts on the top screen follows the pointer
+                // until the release, also off the screen (the window keeps
+                // the mouse while the button is held). It never touches the
+                // touchscreen: the press was not on it.
+                if (over && event.type == SDL_MOUSEBUTTONDOWN &&
+                    event.button.button == SDL_BUTTON_LEFT) {
+                    g_top_dragging = true;
+                    nds_title_set_top_drag(top_x, top_y, true);
+                } else if (g_top_dragging &&
+                           ((event.type == SDL_MOUSEBUTTONUP &&
+                             event.button.button == SDL_BUTTON_LEFT) ||
+                            (motion &&
+                             !(event.motion.state & SDL_BUTTON_LMASK)))) {
+                    g_top_dragging = false;
+                    nds_title_set_top_drag(0, 0, false);
+                } else if (g_top_dragging && motion &&
+                           window == presentation.window_ids[0]) {
+                    nds_title_set_top_drag(
+                        static_cast<int>(std::floor(g_top_logical_hit.x)) -
+                            top_left,
+                        static_cast<int>(std::floor(g_top_logical_hit.y)),
+                        true);
+                }
+            }
             if (event.type == SDL_MOUSEMOTION &&
                 virtual_stylus_active() &&
                 (event.motion.windowID == presentation.window_ids[0] ||
@@ -3742,6 +5307,18 @@ int nds_run_interactive_frontend(const NdsFrontendOptions& initial_options) {
                 else
                     nds_set_touch(0, 0, false);
             }
+            if (sdl_window_event_is(event, SDL_EVENT_WINDOW_MOUSE_LEAVE) &&
+                event.window.windowID == presentation.window_ids[1])
+                nds_title_set_pointer_hover(0, 0, false);
+            if (sdl_window_event_is(event, SDL_EVENT_WINDOW_MOUSE_LEAVE) &&
+                event.window.windowID == presentation.window_ids[0])
+                nds_title_set_top_pointer(0, 0, false);
+        }
+        if (touch_right_release_pending &&
+            SDL_GetTicks() - touch_right_since >= kTouchRightMinHoldMs) {
+            touch_right_release_pending = false;
+            touch_right_held = false;
+            publish_right_mouse();
         }
         if (focus_release_pending) {
             if (!any_presentation_window_focused()) {
@@ -3754,6 +5331,17 @@ int nds_run_interactive_frontend(const NdsFrontendOptions& initial_options) {
         // ── Gamepad dual-stick poll (once per shown frame) ───────────────
         mph_pad_frame_x = 0;
         mph_pad_frame_y = 0;
+        // The raw left stick for title hooks, while it drives the D-pad.
+        if (!controller) {
+            nds_title_set_left_stick(0, 0, false);
+        } else {
+            nds_title_set_left_stick(
+                SDL_GameControllerGetAxis(controller,
+                                          SDL_CONTROLLER_AXIS_LEFTX),
+                SDL_GameControllerGetAxis(controller,
+                                          SDL_CONTROLLER_AXIS_LEFTY),
+                true);
+        }
         if (controller) {
             // Left stick -> D-pad, with hysteresis so a stick resting near
             // a threshold never flickers a direction.
@@ -3761,66 +5349,61 @@ int nds_run_interactive_frontend(const NdsFrontendOptions& initial_options) {
                 controller, SDL_CONTROLLER_AXIS_LEFTX) / 32767.0f;
             const float ly = SDL_GameControllerGetAxis(
                 controller, SDL_CONTROLLER_AXIS_LEFTY) / 32767.0f;
-            const bool menu_open = runtime_menu_open();
-            if (menu_open) {
-                if (stick_pressed != 0) {
-                    stick_pressed = 0;
+            auto stick_dir = [&](float value, uint16_t bit, bool positive) {
+                const float v = positive ? value : -value;
+                const bool held = (stick_pressed & bit) != 0;
+                const bool next = v > (held ? 0.35f : 0.5f);
+                if (next != held) {
+                    if (next) stick_pressed |= bit;
+                    else stick_pressed &= static_cast<uint16_t>(~bit);
                     publish_keys();
                 }
-                bool have_stick_input = false;
-                RecompRuntimeUiInput stick_input =
-                    RECOMP_RUNTIME_UI_INPUT_DOWN;
-                const float ax = std::fabs(lx);
-                const float ay = std::fabs(ly);
-                if (std::max(ax, ay) > 0.5f) {
-                    have_stick_input = true;
-                    if (ax > ay)
-                        stick_input = lx > 0.0f
-                            ? RECOMP_RUNTIME_UI_INPUT_RIGHT
-                            : RECOMP_RUNTIME_UI_INPUT_LEFT;
-                    else
-                        stick_input = ly > 0.0f
-                            ? RECOMP_RUNTIME_UI_INPUT_DOWN
-                            : RECOMP_RUNTIME_UI_INPUT_UP;
+            };
+            stick_dir(lx, 1u << 4, true);    // Right
+            stick_dir(lx, 1u << 5, false);   // Left
+            stick_dir(ly, 1u << 6, false);   // Up (SDL Y axis points down)
+            stick_dir(ly, 1u << 7, true);    // Down
+
+            // Right stick up/down -> a title's zoom (title_settings.h): up
+            // lowers the value, down raises it, at a speed that follows the
+            // deflection (up to 15 units, 1.5%, a frame). The stick belongs to the
+            // virtual stylus while it is held (LT) and to Prime's aim. The
+            // settings are saved when the stick is released, and every half
+            // second meanwhile.
+            {
+                float ry = 0.0f;
+                if (!virtual_stylus_active() &&
+                    !mph_prime_controls_available) {
+                    ry = SDL_GameControllerGetAxis(
+                        controller, SDL_CONTROLLER_AXIS_RIGHTY) / 32767.0f;
                 }
-                if (have_stick_input) {
-                    const bool same = runtime_stick_held &&
-                                      runtime_stick_input == stick_input;
-                    if (!same) {
-                        runtime_stick_held = true;
-                        runtime_stick_input = stick_input;
-                        runtime_stick_frames = 0;
-                        recomp_runtime_ui_handle_input(
-                            runtime_ui, stick_input, 1, 0);
-                    } else if (++runtime_stick_frames >= 18 &&
-                               ((runtime_stick_frames - 18) % 5) == 0) {
-                        recomp_runtime_ui_handle_input(
-                            runtime_ui, stick_input, 1, 1);
+                constexpr float kZoomDeadzone = 0.25f;
+                const float mag = std::fabs(ry);
+                if (mag > kZoomDeadzone) {
+                    const float curved =
+                        (mag - kZoomDeadzone) / (1.0f - kZoomDeadzone);
+                    // Stick up (negative Y) lowers the value (zooms in).
+                    zoom_stick_rem += (ry < 0.0f ? -1.0f : 1.0f) * curved *
+                                      15.0f;
+                    const int delta = static_cast<int>(zoom_stick_rem);
+                    zoom_stick_rem -= static_cast<float>(delta);
+                    if (nds_title_zoom_add(delta)) zoom_save_pending = true;
+                    if (zoom_save_pending && ++zoom_stick_frames >= 30) {
+                        zoom_stick_frames = 0;
+                        zoom_save_pending = false;
+                        runtime_menu_save(&runtime_menu_state);
                     }
                 } else {
-                    runtime_stick_held = false;
-                    runtime_stick_frames = 0;
-                }
-            } else {
-                runtime_stick_held = false;
-                runtime_stick_frames = 0;
-                auto stick_dir = [&](float value, uint16_t bit, bool positive) {
-                    const float v = positive ? value : -value;
-                    const bool held = (stick_pressed & bit) != 0;
-                    const bool next = v > (held ? 0.35f : 0.5f);
-                    if (next != held) {
-                        if (next) stick_pressed |= bit;
-                        else stick_pressed &= static_cast<uint16_t>(~bit);
-                        publish_keys();
+                    zoom_stick_rem = 0.0f;
+                    zoom_stick_frames = 0;
+                    if (zoom_save_pending) {
+                        zoom_save_pending = false;
+                        runtime_menu_save(&runtime_menu_state);
                     }
-                };
-                stick_dir(lx, 1u << 4, true);    // Right
-                stick_dir(lx, 1u << 5, false);   // Left
-                stick_dir(ly, 1u << 6, false);   // Up (SDL Y axis points down)
-                stick_dir(ly, 1u << 7, true);    // Down
+                }
             }
 
-            if (!menu_open && virtual_stylus_available) {
+            if (virtual_stylus_available) {
                 const float rx = SDL_GameControllerGetAxis(
                     controller, SDL_CONTROLLER_AXIS_RIGHTX) / 32767.0f;
                 const float ry = SDL_GameControllerGetAxis(
@@ -3868,7 +5451,7 @@ int nds_run_interactive_frontend(const NdsFrontendOptions& initial_options) {
                 }
             }
 
-            if (!menu_open && mph_prime_controls_available) {
+            if (mph_prime_controls_available) {
                 // Right stick -> camera aim; triggers act as bindable
                 // pseudo-buttons (defaults: RT shoot, LT scan-fire).
                 const float rx = SDL_GameControllerGetAxis(
@@ -3929,8 +5512,6 @@ int nds_run_interactive_frontend(const NdsFrontendOptions& initial_options) {
                 }
             }
         } else {
-            runtime_stick_held = false;
-            runtime_stick_frames = 0;
             if (stick_pressed != 0) {
                 stick_pressed = 0;
                 publish_keys();
@@ -4014,9 +5595,13 @@ int nds_run_interactive_frontend(const NdsFrontendOptions& initial_options) {
             relative_delta_y = 0;
         }
         if (generic_virtual_stylus) {
+            // A single-screen peek at the top LCD hides the touchscreen, so
+            // taps do not reach it.
+            const bool stylus_on_touchscreen =
+                !presentation.single || presentation.shown_screen == 1;
             nds_set_touch(static_cast<uint16_t>(std::lround(mph_virtual_x)),
                           static_cast<uint16_t>(std::lround(mph_virtual_y)),
-                          virtual_stylus_tap_held);
+                          virtual_stylus_tap_held && stylus_on_touchscreen);
         } else if (mph_prime_is_active) {
             if (mph_touch_sequence.active()) {
                 mph_touch_sequence.tick();
@@ -4048,7 +5633,7 @@ int nds_run_interactive_frontend(const NdsFrontendOptions& initial_options) {
                 const int binding = options.gamepad_bindings[row];
                 if (binding < 100 || binding > 111) continue;
                 axis_rows |= kNdsButtonMasks[row];
-                if (!controller || runtime_menu_open() || virtual_stylus_active() ||
+                if (!controller || virtual_stylus_active() ||
                     mph_prime_controls_available) continue;
                 const int value = SDL_GameControllerGetAxis(controller,
                     static_cast<decltype(SDL_CONTROLLER_AXIS_LEFTX)>((binding - 100) / 2));
@@ -4203,13 +5788,58 @@ int nds_run_interactive_frontend(const NdsFrontendOptions& initial_options) {
             native_top=nds_gpu2d_framebuffer(0);
             top_pixels=native_top; bottom_pixels=nds_gpu2d_framebuffer(1);
             nds_gpu2d_invalidate_hd_frame();
+            // The window that consumes HD surfaces: the top one, or in the
+            // single-screen layout whichever LCD it shows. gpu2d emits them
+            // only while engine A drew that LCD.
+            int hd_screen = 0;
+            if (presentation.single) {
+                if (nds_main_screen_update(
+                        main_screen, nds_gpu2d_presented_main_screen(),
+                        nds_gpu2d_presented_both_blank())) {
+                    std::fprintf(stderr,
+                                 "[display] main screen -> %s (frame %llu)\n",
+                                 main_screen.main ? "bottom" : "top",
+                                 static_cast<unsigned long long>(shown_frames));
+                    screen_toggled = false;
+                }
+                presentation.stacked = nds_title_stacked_layout_wanted();
+                nds_stack_vertically_flag().store(
+                    presentation.stacked, std::memory_order_relaxed);
+                const int shown = presentation.stacked
+                    ? 0
+                    : nds_single_shown_screen(
+                          main_screen.main, screen_toggled,
+                          mph_prime_virtual_stylus ||
+                              generic_virtual_stylus);
+                if (shown != presentation.shown_screen) {
+                    // A held mouse touch belongs to the LCD it started on.
+                    if (mouse_down) {
+                        mouse_down = false;
+                        touch_release_pending = false;
+                        nds_set_touch(0, 0, false);
+                    }
+                    presentation.shown_screen = shown;
+                }
+                hd_screen = shown;
+            }
+            nds_gpu2d_set_hd_screen(hd_screen);
             const bool native_hd=presentation.gl_top && nds_gpu3d_internal_scale()>1u &&
                                  nds_gpu3d_output_width()==256u;
             direct_present=nds_gpu2d_direct_present_frame_active();
-            if (((options.adaptive_screens & NDS_ADAPTIVE_TOP) || native_hd) && !direct_present)
+            // Fixed-size layers are split only for a presenter that draws
+            // them: the GPU host's window, for engine A's LCD (hd_screen,
+            // also at 1x, without HD).
+#if defined(NDS_HAVE_COMPUTE_RENDERER)
+            nds_gpu2d_set_fixed_layers_consumer(
+                presentation.gl_top && nds_compute_host_supports_layer());
+#endif
+            const bool fixed_layers=nds_gpu2d_fixed_layers_requested();
+            if (((options.adaptive_screens & NDS_ADAPTIVE_TOP) ||
+                 ((native_hd || fixed_layers) && hd_screen == 0)) && !direct_present)
                 top_pixels=nds_gpu2d_adaptive_framebuffer(0,&top_width);
             else if (direct_present) top_width=nds_gpu3d_output_width();
-            if (options.adaptive_screens & NDS_ADAPTIVE_BOTTOM)
+            if ((options.adaptive_screens & NDS_ADAPTIVE_BOTTOM) ||
+                ((native_hd || fixed_layers) && hd_screen == 1))
                 bottom_pixels=nds_gpu2d_adaptive_framebuffer(1,&bottom_width);
             phase_adaptive_ticks+=SDL_GetPerformanceCounter()-adaptive_start;
             observe_top_black_bands(native_top,shown_frames);
@@ -4232,13 +5862,20 @@ int nds_run_interactive_frontend(const NdsFrontendOptions& initial_options) {
             blend_half(blend_cache.previous[1].data(), bottom_pixels,
                        blend_cache.blended[1].data(),
                        blend_cache.previous[1].size());
+            presentation.window_mode = options.window_mode;
+            presentation.scaling = options.scaling;
+            presentation.resolution_scale = options.resolution_scale;
+            presentation.internal_resolution = options.internal_resolution;
+            presentation.inset_percent =
+                !presentation.single ? 0 : presentation.stacked ? 100
+                : options.second_screen_size;
             const PresentationTicks synthetic_ticks = present_screens(
                 presentation, blend_cache.blended[0].data(), top_width,
                 blend_cache.blended[1].data(), bottom_width,
-                runtime_ui,
                 mph_prime_virtual_stylus || generic_virtual_stylus,
                 mph_virtual_x, mph_virtual_y,
-                savestate_notice.empty() ? nullptr : savestate_notice.c_str());
+                savestate_notice.empty() ? nullptr : savestate_notice.c_str(),
+                options.show_fps ? fps_counter.c_str() : nullptr);
             if (!synthetic_ticks.ok) {
                 compute_failed = true;
                 running = false;
@@ -4256,13 +5893,28 @@ int nds_run_interactive_frontend(const NdsFrontendOptions& initial_options) {
             // extra present.
             SDL_PumpEvents();
         }
+        // Fast-forward shows the game's own 3D images only: building and
+        // drawing the halfway image costs host time that turbo would rather
+        // spend running more DS frames, and at turbo speed it is not seen.
+        // A title that owns smoothing replaces display.smooth_3d.
+        const bool smooth_3d = nds_title_smooth_3d_owned()
+                                   ? nds_title_smooth_3d_wanted()
+                                   : options.smooth_3d;
+        nds_gpu3d_set_interpolation(smooth_3d && !turbo_active);
+        presentation.window_mode = options.window_mode;
+        presentation.scaling = options.scaling;
+        presentation.resolution_scale = options.resolution_scale;
+        presentation.internal_resolution = options.internal_resolution;
+        presentation.inset_percent =
+            !presentation.single ? 0 : presentation.stacked ? 100
+            : options.second_screen_size;
         const PresentationTicks presentation_ticks = present_screens(
             presentation, top_pixels, top_width,
             bottom_pixels, bottom_width,
-            runtime_ui,
             mph_prime_virtual_stylus || generic_virtual_stylus,
             mph_virtual_x, mph_virtual_y,
-            savestate_notice.empty() ? nullptr : savestate_notice.c_str()
+            savestate_notice.empty() ? nullptr : savestate_notice.c_str(),
+            options.show_fps ? fps_counter.c_str() : nullptr
 #if defined(NDS_HAVE_COMPUTE_RENDERER)
             ,cpu_handoff ? &presented->gl : nullptr
 #endif
@@ -4349,10 +6001,33 @@ int nds_run_interactive_frontend(const NdsFrontendOptions& initial_options) {
         // 63 ms target, shedding the extra startup latency over a couple of
         // seconds without ever forcing the queue down during a slow stretch.
         constexpr uint32_t kGlideStepFrames = 300;
-        if (audio_pace_floor > kAudioQueueFrames + kGlideStepFrames)
+        if (audio_started && !turbo_active) {
+            const uint64_t underruns =
+                audio_queue.underruns.load(std::memory_order_relaxed);
+            if (underruns != audio_steady_underruns) {
+                audio_steady_quiet_frames = 0;
+                if (audio_steady_floor < kAudioSteadyMaxFrames) {
+                    audio_steady_floor += kAudioSteadyStepFrames;
+                    std::fprintf(stderr,
+                                 "[sdl] audio underrun: queue target raised "
+                                 "to %u frames (%u ms)\n",
+                                 audio_steady_floor,
+                                 audio_steady_floor * 1000u / kAudioFrequency);
+                }
+            } else if (++audio_steady_quiet_frames >= kAudioSteadyDecayFrames) {
+                audio_steady_quiet_frames = 0;
+                if (audio_steady_floor > kAudioQueueFrames)
+                    audio_steady_floor -= kAudioSteadyStepFrames;
+            }
+            audio_steady_underruns = underruns;
+        } else {
+            audio_steady_underruns =
+                audio_queue.underruns.load(std::memory_order_relaxed);
+        }
+        if (audio_pace_floor > audio_steady_floor + kGlideStepFrames)
             audio_pace_floor -= kGlideStepFrames;
         else
-            audio_pace_floor = kAudioQueueFrames;
+            audio_pace_floor = audio_steady_floor;
         uint32_t queued = audio_queue_count(audio, audio_queue);
         const uint32_t latency_queue_before_drain = queued;
         if (turbo_active) {
@@ -4409,18 +6084,81 @@ int nds_run_interactive_frontend(const NdsFrontendOptions& initial_options) {
                 : 0u;
         governor_sample.compute_map_ms =
             static_cast<double>(frame_compute_map_ns) / 1000000.0;
+        governor_sample.gpu_wait_ms =
+            governor_sample.compute_map_ms +
+            static_cast<double>(presentation_ticks.swap) * 1000.0 /
+                static_cast<double>(frequency);
         // The drain is only a headroom signal when it is actually the pacing
         // sleep this frame: no device, pre-playback and turbo frames all read
         // ~0 for reasons that have nothing to do with load.
         governor_sample.headroom_valid =
             static_cast<bool>(audio) && audio_started && !turbo_active;
         governor_last_underruns = current_underruns;
+        // For title settings that follow the window size; a minimized
+        // window keeps the last size.
+        if (const int points = presented_screen_points(presentation);
+            points > 0)
+            nds_title_set_display_height(points);
+#if defined(NDS_HAVE_COMPUTE_RENDERER)
+        // Auto scale. Runs here, with the producer joined, like the governor:
+        // a renderer rebuild must not land between a frame's capture and its
+        // present. The target must hold for 250 ms (a drag-resize sends many
+        // sizes) before the costly rebuild, which happens only on an integer
+        // multiplier change.
+        if (runtime_menu_state.resolution_scale_available &&
+            auto_scale_enabled && !perf_governor.apply_failed) {
+            NdsPresentRect rect{};
+            const uint8_t target =
+                requested_internal_scale_for(presentation, options, &rect);
+            const uint64_t now = SDL_GetPerformanceCounter();
+            if (target == requested_internal_scale) {
+                auto_scale_candidate = 0u;
+            } else if (target != auto_scale_candidate) {
+                auto_scale_candidate = target;
+                auto_scale_since = now;
+            } else if (now - auto_scale_since >= frequency / 4u) {
+                auto_scale_candidate = 0u;
+                const uint8_t effective =
+                    perf_governor.stage >= 2u ? 1u : target;
+                if (nds_gpu3d_set_runtime_internal_scale(effective)) {
+                    nds_gpu2d_set_hd_emit(
+                        effective > 1u && presenter_composes_3d(presentation));
+                    std::fprintf(stderr,
+                                 "[display] internal %ux -> %ux "
+                                 "(presented %dx%d, resolution scale "
+                                 "%u%%%s) frame %llu\n",
+                                 static_cast<unsigned>(
+                                     requested_internal_scale),
+                                 static_cast<unsigned>(target), rect.w,
+                                 rect.h,
+                                 static_cast<unsigned>(
+                                     options.resolution_scale),
+                                 effective != target
+                                     ? ", governor holds 1x" : "",
+                                 static_cast<unsigned long long>(
+                                     shown_frames));
+                    requested_internal_scale = target;
+                    blend_cache.valid = false;
+                } else {
+                    // Same terminal rule as the governor: a failing rebuild
+                    // is not retried every frame.
+                    auto_scale_enabled = false;
+                    std::fprintf(stderr,
+                                 "[display] internal %ux could not be "
+                                 "applied; auto scale disabled at %ux\n",
+                                 static_cast<unsigned>(target),
+                                 static_cast<unsigned>(
+                                     nds_gpu3d_internal_scale()));
+                }
+            }
+        }
+#endif
         const uint8_t governor_stage_before = perf_governor.stage;
         if (nds_perf_governor_update(&perf_governor, governor_sample)) {
             const uint8_t requested_stage = perf_governor.stage;
             NdsPerfGovernorReason reason = perf_governor.last_reason;
             bool applied = apply_performance_governor_stage(
-                options, presentation, requested_stage);
+                presentation, requested_stage, requested_internal_scale);
             if (!applied) {
                 // Nothing was mutated by the failed apply, so the previously
                 // installed stage is still the live one. Report that stage and
@@ -4498,12 +6236,26 @@ int nds_run_interactive_frontend(const NdsFrontendOptions& initial_options) {
         g_live_stats.now_ticks = counter;
         g_live_stats.freq = frequency;
         nds_diagnostics_maybe_write_performance_sample(g_live_stats);
+        nds_wifi_frame_tick();
         if (counter - fps_start >= frequency) {
             const double seconds = static_cast<double>(counter - fps_start) /
                                    static_cast<double>(frequency);
             const double fps = static_cast<double>(fps_frames) / seconds;
             const std::string fps_text =
                 std::to_string(fps).substr(0, 4) + " FPS";
+            NdsGpu3dProfile gpu3d_profile{};
+            nds_gpu3d_profile(&gpu3d_profile);
+            // Loading a savestate resets the profile.
+            const uint64_t images = gpu3d_profile.gx_new_images +
+                                    gpu3d_profile.gx_interp_images;
+            const uint64_t new_images =
+                images >= fps_images ? images - fps_images : 0;
+            char fps_counter_text[24];
+            std::snprintf(fps_counter_text, sizeof(fps_counter_text),
+                          "3D %.1f FPS",
+                          static_cast<double>(new_images) / seconds);
+            fps_counter = fps_counter_text;
+            fps_images = images;
             const std::string governor_text =
                 perf_governor.apply_failed
                     ? " - Gov disabled (apply failed, S" +
@@ -4514,6 +6266,10 @@ int nds_run_interactive_frontend(const NdsFrontendOptions& initial_options) {
                     : "";
             const std::string top_title = !savestate_notice.empty()
                 ? "ndsrecomp - " + savestate_notice
+                : presentation.single
+                ? (options.game_name.empty() ? std::string("ndsrecomp")
+                                             : options.game_name) +
+                      " - " + fps_text + governor_text
                 : presentation.separate
                 ? "ndsrecomp - Top Screen - " + fps_text + governor_text
                 : "ndsrecomp firmware preview - " + fps_text +
@@ -4579,11 +6335,9 @@ int nds_run_interactive_frontend(const NdsFrontendOptions& initial_options) {
     nds_compute_host_stop();
 #endif
     if (controller) SDL_GameControllerClose(controller);
-    if (runtime_ui) {
-        g_runtime_menu_ui = nullptr;
-        recomp_runtime_ui_destroy(runtime_ui);
-        runtime_ui = nullptr;
-    }
+    // A resize still inside its settle window when the user quit.
+    if (window_resize_save_at && !presentation.separate)
+        persist_window_size(options, presentation.windows[0]);
     destroy_presentation(presentation);
     SDL_Quit();
     std::fprintf(stderr, "[sdl] closed after %llu presented frames\n",
@@ -4671,23 +6425,6 @@ int nds_run_interactive_frontend(const NdsFrontendOptions&) {
 }
 
 #endif
-
-bool nds_frontend_read_runtime_menu(std::vector<uint32_t>& pixels,
-                                    unsigned* width, unsigned* height) {
-#if defined(NDS_HAVE_SDL3) || defined(NDS_HAVE_SDL2)
-    if (std::this_thread::get_id() != g_frontend_thread || !g_live_stats.active ||
-        !width || !height || !g_runtime_menu_ui ||
-        !recomp_runtime_ui_is_open(g_runtime_menu_ui) || g_runtime_menu_surface.empty())
-        return false;
-    pixels = g_runtime_menu_surface;
-    *width = g_runtime_menu_width;
-    *height = g_runtime_menu_height;
-    return true;
-#else
-    (void)pixels; (void)width; (void)height;
-    return false;
-#endif
-}
 
 bool nds_frontend_request_exit() {
 #if defined(NDS_HAVE_SDL3) || defined(NDS_HAVE_SDL2)
@@ -4887,7 +6624,8 @@ void nds_frontend_black_band_scan(bool enabled, bool reset) {
     g_black_band.enabled = enabled ? 1 : 0;
 #if defined(NDS_HAVE_COMPUTE_RENDERER)
     nds_gpu2d_set_direct_present(
-        !enabled && nds_compute_host_has_visible_context());
+        !enabled && nds_compute_host_has_visible_context() &&
+        nds_compute_host_composes_3d() && nds_compute_host_presents_direct());
 #endif
 }
 

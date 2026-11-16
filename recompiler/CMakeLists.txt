@@ -39,6 +39,15 @@ target_include_directories(hle_manifest_test PRIVATE
 ndsrecomp_link_tomlpp(hle_manifest_test)
 add_test(NAME hle_manifest_test COMMAND hle_manifest_test)
 
+add_executable(hook_manifest_test
+    tests/hook_manifest_test.cpp
+    finder/config.cpp
+    support/sha1.cpp)
+target_include_directories(hook_manifest_test PRIVATE
+    finder support ${NDS_ARM_RECOMP_INCLUDE_DIRS})
+ndsrecomp_link_tomlpp(hook_manifest_test)
+add_test(NAME hook_manifest_test COMMAND hook_manifest_test)
+
 # The recompiler driver: config + function finder + audit/emit.
 add_executable(nds_recompile
     src/main.cpp
@@ -51,6 +60,28 @@ target_include_directories(nds_recompile PRIVATE
     finder support armv4t ${NDS_ARM_RECOMP_INCLUDE_DIRS})
 ndsrecomp_link_tomlpp(nds_recompile)
 target_link_libraries(nds_recompile PRIVATE nds_armv4t)
+
+# Pins cross-block register-constant carrying in the function finder (the
+# crt0 `ldr r1,=main; tst; bne; b; sub sp; bx r1` shape) and its soundness
+# rules for conditional writes and call-clobbered registers.
+add_executable(finder_carry_state_test
+    tests/finder_carry_state_test.cpp
+    finder/function_finder.cpp)
+target_include_directories(finder_carry_state_test PRIVATE
+    finder ${NDS_ARM_RECOMP_INCLUDE_DIRS})
+target_link_libraries(finder_carry_state_test PRIVATE nds_armv4t)
+add_test(NAME finder_carry_state COMMAND finder_carry_state_test)
+
+# Pins the whole-image static scan (PointerHarvest, GapFill, validated
+# cross-image candidates) and the return-slot ladder / base-relative jump
+# table idioms, including the precision rejects found on DQ9.
+add_executable(finder_static_scan_test
+    tests/finder_static_scan_test.cpp
+    finder/function_finder.cpp)
+target_include_directories(finder_static_scan_test PRIVATE
+    finder ${NDS_ARM_RECOMP_INCLUDE_DIRS})
+target_link_libraries(finder_static_scan_test PRIVATE nds_armv4t)
+add_test(NAME finder_static_scan COMMAND finder_static_scan_test)
 
 # Pins the interior-entry fail-closed contract: every generated body's resume
 # switch must keep its `default: runtime_dispatch_bad_entry(...); return;` arm.
@@ -95,6 +126,19 @@ if(Python3_Interpreter_FOUND)
         --runtime-include "${CMAKE_CURRENT_LIST_DIR}/armv4t"
         --core-include "${CMAKE_CURRENT_LIST_DIR}/../external/arm-recomp-core/common"
         --work "${CMAKE_CURRENT_BINARY_DIR}/flat-execution-work")
+  endif()
+  if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang" AND NOT MSVC)
+    # Compiles and executes a hooked fixture bank (docs/midasm-hooks.md).
+    # The bank is C; the test drives the same toolchain with `-x c`.
+    add_test(NAME hooks_end_to_end
+      COMMAND "${Python3_EXECUTABLE}"
+        "${CMAKE_CURRENT_LIST_DIR}/tests/test_hooks.py"
+        --recompiler $<TARGET_FILE:nds_recompile>
+        --compiler "${CMAKE_CXX_COMPILER}"
+        --runtime-include "${CMAKE_CURRENT_LIST_DIR}/armv4t"
+        --core-include
+            "${CMAKE_CURRENT_LIST_DIR}/../external/arm-recomp-core/common"
+        --work "${CMAKE_CURRENT_BINARY_DIR}/hooks-work")
   endif()
   add_test(
       NAME live_shard_identity_test

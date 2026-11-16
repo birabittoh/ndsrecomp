@@ -207,6 +207,91 @@ void test_patches_compose() {
     }
 }
 
+void test_language() {
+    std::vector<uint8_t> fw = make_firmware();
+    check(nds_apply_startup_mode(fw, NdsStartupMode::Automatic),
+          "startup applies before language");
+    const std::vector<uint8_t> before = fw;
+    check(nds_apply_firmware_language(fw, NdsFirmwareLanguage::Preserve),
+          "preserve language succeeds");
+    check(fw == before, "preserve language is a byte-exact no-op");
+    check(nds_apply_firmware_language(fw, NdsFirmwareLanguage::German),
+          "german applies");
+    for (unsigned copy = 0; copy < 2; ++copy) {
+        const size_t base = user_base(fw, copy);
+        check((read16(fw, base + 0x64u) & 0x7u) == 3u, "language is german");
+        check((read16(fw, base + 0x64u) & (1u << 6u)) != 0u,
+              "startup flag survives the language patch");
+        check((read16(fw, base + 0x64u) & (3u << 4u)) == (3u << 4u),
+              "backlight bits survive the language patch");
+        check(checksum_valid(fw, copy), "language resealed checksum");
+    }
+
+    // iQue/DSi-style extended settings get their own language and CRC.
+    std::vector<uint8_t> ext = make_firmware();
+    for (unsigned copy = 0; copy < 2; ++copy) {
+        const size_t base = user_base(ext, copy);
+        ext[base + 0x74u] = 1u;
+        ext[base + 0x75u] = 1u;
+        ext[base + 0x76u] = 0x02u;
+        ext[base + 0x77u] = 0x00u;
+    }
+    check(nds_apply_firmware_language(ext, NdsFirmwareLanguage::Italian),
+          "italian applies to extended settings");
+    for (unsigned copy = 0; copy < 2; ++copy) {
+        const size_t base = user_base(ext, copy);
+        check(ext[base + 0x75u] == 4u, "extended language is italian");
+        check(read16(ext, base + 0x76u) == (0x02u | (1u << 4u)),
+              "italian added to supported-language mask");
+        check(read16(ext, base + 0xFEu) ==
+                  nds_firmware_crc16(ext.data() + base + 0x74u, 0x8Au,
+                                     0xFFFFu),
+              "extended settings checksum resealed");
+        check(checksum_valid(ext, copy), "extended copy base checksum valid");
+    }
+
+    std::vector<uint8_t> tiny(0x10u, 0u);
+    check(!nds_apply_firmware_language(tiny, NdsFirmwareLanguage::English),
+          "undersized image refused");
+}
+
+// A slot set up under melonDS ("melonAP") is retargeted to the runner's AP,
+// keeping its other bytes; with no matching slot, a free one is set up.
+void test_wifi_ap_slot() {
+    std::vector<uint8_t> fw = make_firmware();
+    const size_t slot1 = user_base(fw, 0) - 0x400u;
+    const auto slot_crc_ok = [&](size_t slot) {
+        return read16(fw, slot + 0xFEu) ==
+               nds_firmware_crc16(fw.data() + slot, 0xFEu, 0u);
+    };
+    bool changed = true;
+    std::vector<uint8_t> before = fw;
+    check(nds_apply_wifi_ap_slot(fw, &changed), "generated image applies");
+    check(!changed && fw == before, "generated image is already a no-op");
+
+    std::memset(fw.data() + slot1 + 0x40u, 0, 0x20u);
+    std::memcpy(fw.data() + slot1 + 0x40u, "melonAP", 7u);
+    fw[slot1 + 0xF0u] = 0xA5u;  // stands in for the WFC user ID
+    check(nds_apply_wifi_ap_slot(fw, &changed), "melonAP slot applies");
+    check(changed, "melonAP slot reported changed");
+    check(std::memcmp(fw.data() + slot1 + 0x40u, "ndsrecomp\0", 10u) == 0,
+          "melonAP SSID retargeted");
+    check(fw[slot1 + 0xF0u] == 0xA5u, "rest of the slot kept");
+    check(slot_crc_ok(slot1), "retargeted slot resealed");
+
+    std::memset(fw.data() + slot1 + 0x40u, 0, 0x20u);
+    std::memcpy(fw.data() + slot1 + 0x40u, "HomeRouter", 10u);
+    before = fw;
+    check(nds_apply_wifi_ap_slot(fw, &changed), "foreign slot applies");
+    check(std::memcmp(fw.data() + slot1, before.data() + slot1, 0x100u) == 0,
+          "foreign slot left alone");
+    const size_t slot2 = slot1 + 0x100u;
+    check(fw[slot2 + 0xE7u] == 0x00u &&
+              std::memcmp(fw.data() + slot2 + 0x40u, "ndsrecomp", 9u) == 0,
+          "free slot set up for the runner AP");
+    check(slot_crc_ok(slot2), "new slot sealed");
+}
+
 }  // namespace
 
 int main() {
@@ -218,6 +303,8 @@ int main() {
     test_malformed_layout();
     test_hoisted_patches();
     test_patches_compose();
+    test_language();
+    test_wifi_ap_slot();
     if (g_failures != 0) {
         std::fprintf(stderr, "firmware_user_settings_test: %d failure(s)\n",
                      g_failures);

@@ -80,7 +80,8 @@ void profile_add(uint64_t& dst, ProfileClock::time_point start) {
 // is in SYSTEM cycles (= ARM7 cycles = ARM9 cycles >> kArm9ClockShift).
 // g_slot[0].cycles is the ARM9 timestamp (ARM9 cycles); g_slot[1].cycles the ARM7.
 uint64_t           g_sys_timestamp = 0;
-constexpr int      kArm9ClockShift = 1;    // ARM9 runs at 2x the system clock
+// ARM9 runs at 2x the system clock on hardware (io.h).
+#define kArm9ClockShift g_nds_arm9_clock_shift
 bool performance_window_active=false;
 uint64_t performance_windows=0,performance_fences=0;
 constexpr uint64_t kIterCap        = 64;   // system cycles per outer iteration
@@ -301,7 +302,14 @@ void run_slice(int cpu, uint32_t quantum) {
 
 }  // namespace
 
+namespace {
+bool g_gx_test_wait = false;
+uint64_t g_gx_test_wait_requests = 0, g_gx_test_wait_rounds = 0;
+}  // namespace
+bool gx_test_wait_holds();
+
 void scheduler_init() {
+    g_gx_test_wait = false;
     g_slot[0] = CpuSlot{};
     g_slot[1] = CpuSlot{};
     g_cur = -1;
@@ -340,8 +348,27 @@ void scheduler_set_cpu_boot(int cpu, uint32_t entry, uint32_t sp,
     st.banked_sp[ARM_BANK_SUPERVISOR] = sp_svc;
 }
 
+// Moves the ARM9 timeline to another clock shift (io.h): between rounds the
+// only ARM9-clock state is the slot's timestamp and its HALT debt (in the
+// runtime while the ARM9 is the loaded CPU), and the system time they stand
+// for is kept.
+static void set_arm9_clock_shift(unsigned shift) {
+    const unsigned old = g_nds_arm9_clock_shift;
+    if (shift == old) return;
+    const auto rescale = [&](uint64_t cycles) {
+        return static_cast<uint32_t>((cycles << shift) >> old);
+    };
+    g_slot[0].cycles = (g_slot[0].cycles >> old) << shift;
+    g_slot[0].deferred_cycles = rescale(g_slot[0].deferred_cycles);
+    if (g_cur == 0)
+        runtime_deferred_cycles_set(rescale(runtime_deferred_cycles()));
+    g_nds_arm9_clock_shift = shift;
+    nds_gpu3d_set_arm9_clock_shift(shift);
+}
+
 void scheduler_run_round() {
     RoundActivityGuard round_activity;
+    set_arm9_clock_shift(nds_requested_arm9_clock_shift());
     // melonDS-faithful interleave (docs/scheduler_design.md, Commit A). Each
     // outer iteration is capped at kIterCap SYSTEM cycles (or the next scheduled
     // event, whichever is sooner). ARM9 runs FIRST up to its target and may
@@ -391,7 +418,8 @@ void scheduler_run_round() {
     auto phase_start = round_start;
 
     const uint64_t quantum=nds_native_event_quantum(
-        nds_performance_execution()&&nds_native_options().events&&g_slot[0].started&&g_slot[1].started,
+        ((nds_performance_execution()&&nds_native_options().events)||
+         nds_event_windows_requested())&&g_slot[0].started&&g_slot[1].started,
         nds_cpu_halted(1),nds_halt_wake_pending(1),
         nds_dma_cpu_stalled(0)||nds_dma_cpu_stalled(1),nds_gxfifo_stalled());
     performance_window_active=quantum>kIterCap;
@@ -463,6 +491,17 @@ void scheduler_run_round() {
             // here explains an EXEC_ARM9 fall without a workload change --
             // the confound that would otherwise read as "the CPU got faster".
             nds_emu_note_gxstall_round();
+        } else if (gx_test_wait_holds()) {
+            // A title asked the ARM9 to wait for a box/position/vector test
+            // instead of polling GXSTAT for it (scheduler_request_gx_test_wait).
+            // Same advance as the stall branch; with no command in flight
+            // (the test queued behind a pending SwapBuffers, say) the round
+            // passes, as a halted ARM9's would.
+            uint64_t step = static_cast<uint64_t>(nds_gpu3d_cycles_to_run())
+                            << kArm9ClockShift;
+            if (step == 0u) step = arm9_target - g_slot[0].cycles;
+            g_slot[0].cycles = std::min(arm9_target, g_slot[0].cycles + step);
+            ++g_gx_test_wait_rounds;
         } else {
             run_slice(0, static_cast<uint32_t>(arm9_target - g_slot[0].cycles));
         }
@@ -566,10 +605,69 @@ void scheduler_run_round() {
     // run_due_system_events(rendezvous);  // Commit B+
 }
 
-void scheduler_performance_io_fence() {
+// ARM9 I/O that neither the ARM7 nor a device shared with it can observe:
+// the display engines, DMA, timers, the IRQ registers, the VRAM banks the
+// ARM7 cannot map, the divider and square root, and the 3D engine. An
+// access to one of these inside an event window changes nothing the
+// sleeping ARM7 could see or be woken by, so it need not end the window.
+// IPC, the card and SPI, WRAMCNT, VRAMCNT_C/D, VCOUNT writes and everything
+// else still do.
+static bool arm9_private_io(uint32_t addr, uint32_t width, bool write) {
+    if ((addr >> 16) != 0x0400u) return false;
+    const uint32_t first = addr & 0xFFFFu;
+    const uint32_t last = first + (width ? width - 1u : 0u);
+    const auto within = [&](uint32_t lo, uint32_t hi) {
+        return first >= lo && last <= hi;
+    };
+    if (within(0x000u, 0x06Fu))
+        return !(write && first <= 0x007u && last >= 0x006u);  // VCOUNT
+    return within(0x0B0u, 0x0EFu) || within(0x100u, 0x10Fu) ||
+           within(0x208u, 0x217u) || within(0x240u, 0x241u) ||
+           within(0x244u, 0x246u) || within(0x248u, 0x249u) ||
+           within(0x280u, 0x2BFu) || within(0x320u, 0x6A3u) ||
+           within(0x1000u, 0x106Fu);
+}
+
+// Title-requested wait for a geometry test (title_settings.h
+// nds_title_wait_gx_test). Holds while GXSTAT bit 0 is set and no ARM9 IRQ
+// is pending: an IRQ ends it so the guest takes the interrupt in its poll
+// loop, as on hardware, and the title's hook simply asks again.
+bool gx_test_wait_holds() {
+    if (!g_gx_test_wait) return false;
+    if (!nds_gpu3d_test_busy() || g_nds_irq_pending_cache[0] != 0u) {
+        g_gx_test_wait = false;
+        return false;
+    }
+    return true;
+}
+void scheduler_request_gx_test_wait() {
+    if (g_nds_active != NDS_ARM9 || g_nds_irq_pending_cache[0] != 0u) return;
+    // Bring the engine to the ARM9's present, as the guest's own GXSTAT
+    // read would, then end the slice at this instruction boundary.
+    nds_gpu3d_run(g_runtime_cycles);
+    if (!nds_gpu3d_test_busy()) return;
+    g_gx_test_wait = true;
+    ++g_gx_test_wait_requests;
+    nds_reschedule_slice(
+        (g_runtime_cycles+(1ull<<kArm9ClockShift)-1u)>>kArm9ClockShift);
+}
+void scheduler_gx_test_wait_counts(uint64_t* requests, uint64_t* rounds) {
+    *requests = g_gx_test_wait_requests; *rounds = g_gx_test_wait_rounds;
+}
+void scheduler_performance_io_fence(uint32_t addr, uint32_t width, bool write) {
     if(performance_window_active&&g_nds_active==NDS_ARM9) {
+        // Only for the title-requested windows: the performance model's own
+        // keep their every-access fence. A GXFIFO stall must still end the
+        // slice: the ARM9 does not run while it is asserted (the scheduler's
+        // stall branch owns it), and the geometry engine's 64-entry stall
+        // queue drops every command written past it, which showed as models
+        // and sprites missing from random 3D frames.
+        if (nds_event_windows_requested() && !nds_gxfifo_stalled() &&
+            arm9_private_io(addr, width, write))
+            return;
         ++performance_fences;
-        nds_reschedule_slice((g_runtime_cycles+1u)>>1u);
+        nds_reschedule_slice(
+            (g_runtime_cycles+(1ull<<kArm9ClockShift)-1u)>>kArm9ClockShift);
     }
 }
 void scheduler_performance_window_counts(uint64_t* windows,uint64_t* fences) {
@@ -676,7 +774,7 @@ bool scheduler_savestate_begin() {
     return scheduler_savestate_quiescent();
 }
 
-void scheduler_savestate_end() {}
+void scheduler_savestate_end() { g_gx_test_wait = false; }
 
 bool scheduler_savestate_export(NdsSchedulerSaveState* out) {
     if (!out) return false;
@@ -698,6 +796,24 @@ bool scheduler_savestate_export(NdsSchedulerSaveState* out) {
 
 bool scheduler_savestate_import(const NdsSchedulerSaveState& in,
                                 std::string* error) {
+    // The ARM9 timestamp is system time << the ARM9 clock shift the state
+    // was saved under, which the state does not record: it is the shift that
+    // brings the timestamp closest to the system time. The timeline is moved
+    // to the current shift below.
+    unsigned saved_shift = kArm9ClockShift;
+    if (in.started[0]) {
+        uint64_t best = UINT64_MAX;
+        for (unsigned shift = 1u; shift <= 3u; ++shift) {
+            const uint64_t arm9_system = in.cycles[0] >> shift;
+            const uint64_t apart = arm9_system > in.system_timestamp
+                                       ? arm9_system - in.system_timestamp
+                                       : in.system_timestamp - arm9_system;
+            if (apart < best) {
+                best = apart;
+                saved_shift = shift;
+            }
+        }
+    }
     for (int cpu = 0; cpu < 2; ++cpu) {
         if (in.crs_depth[cpu] > NDS_RUNTIME_CALL_STACK_CAPACITY) {
             if (error) *error = "savestate call-return stack depth is invalid";
@@ -718,5 +834,8 @@ bool scheduler_savestate_import(const NdsSchedulerSaveState& in,
     g_cur = -1;
     runtime_call_stack_restore(nullptr, 0);
     runtime_deferred_cycles_set(0);
+    const unsigned current_shift = g_nds_arm9_clock_shift;
+    g_nds_arm9_clock_shift = saved_shift;
+    set_arm9_clock_shift(current_shift);
     return true;
 }

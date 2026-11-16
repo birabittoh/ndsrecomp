@@ -56,8 +56,11 @@ Prime Hunters early gameplay footage:
   scenes.
 - Experimental Nintendo WFC plumbing for title projects, demonstrated with
   Mario Kart DS reaching Wiimmfi multiplayer.
-- Experimental same-machine local wireless multiplayer for MKDS through a
-  localhost transport. LAN/across-machine play is not validated or claimed.
+- Experimental local wireless multiplayer, validated for MKDS between
+  instances on one machine. The transport also finds runners on the local
+  network (UDP broadcast on ports 26710-26725; allow the runner through the
+  firewall, or use `--local-wireless-link loopback`) and delivers frames
+  reliably, but LAN/across-machine play is not validated yet.
 - A separate melonDS-based accuracy oracle and machine-readable traversal
   evidence for differential testing.
 
@@ -106,7 +109,11 @@ An opt-in no-dump path also exists (`--freebios --generated-firmware
 (the DraStic BIOS replacement, BSD-2-Clause, vendored as the
 `third_party/freebios` submodule) plus a synthesized firmware image with a
 persisted per-install identity. The retail dumps remain the default and the
-oracle-diffed source of truth.
+oracle-diffed source of truth. A title that only uses this path can configure
+the runner with `-DNDS_RETAIL_BIOS_BANKS=OFF` (plus
+`-DNDS_BOOTSTRAP_FIRMWARE=ON`, which it needs): the retail BIOS banks are
+then left out, so building needs no `generated/arm{9,7}_bios.c` and no dumps,
+and the runner refuses to start without `--freebios`.
 
 Interactive frontends should also pass `--firmware-state-path <file>`. The
 runner seeds that mutable profile from the verified retail or generated image,
@@ -214,6 +221,31 @@ Dispatch tables are discovered at configure time, classified by `_arm9_` or
 the configured SHA-1. Live-byte validation remains the boundary for mutable
 or overlay code.
 
+`NDS_BOOTSTRAP_FIRMWARE=ON` leaves the framework's captured firmware banks out,
+so the firmware's boot code needs banks of its own. `tools/fw_extract.py` decodes
+it from the dump and the ARM7 BIOS, retail or FlashMe, and lists the code it
+relocates, which a title's bank build can use directly.
+
+### Building without the interpreter
+
+`-DNDS_INTERPRETER=OFF` links `runner/src/tier3_absent.cpp` in place of Tier 3, so
+the binary contains no interpreter at all. Code with no live bank then stops
+both CPUs with `[no-interpreter] no live bank for pc=...` and the usual dispatch
+miss report, instead of quietly running slower. Use it once a title's banks cover
+everything it runs: an unrecompiled path is a fatal error here, not a slowdown.
+
+### No-argument launch
+
+Configure the runner with `-DNDS_TITLE_CONFIG=/path/to/game.toml` to embed the
+title's config, and set `[game] app_name`. Starting that executable with no
+arguments (or only a `.nds` path) then asks for the ROM once and plays, with
+`settings.toml`, saves, savestates and logs in one per-title folder:
+`~/.local/share/<app_name>`, `Documents\<app_name>` on Windows,
+`~/Library/Application Support/<app_name>` on macOS, or the executable's own
+folder if `portable.txt` sits next to it. Runtime settings changed in game are
+written to `settings.toml`, keeping comments. Any other command line ignores that file.
+See `runner/src/player_launch.h`.
+
 ### Interactive display configuration
 
 The interactive runner reads an optional `game.toml` in its working directory,
@@ -226,7 +258,9 @@ independent:
 sha1 = "40-lowercase-hex-digits"
 
 [display]
-screen_layout = "stacked"          # stacked | separate
+screen_layout = "stacked"          # single | stacked | separate
+window_mode = "letterbox"          # letterbox | stretch | original (1:1)
+scaling = "integer"                # integer (pixel-perfect) | bilinear | nearest
 adaptive_widescreen = "none"       # none | top | bottom | both
 adaptive_capability = "top"        # exact-ROM capability; same choices
 adaptive_width = 448               # even width from 256 through 448
@@ -248,11 +282,11 @@ window; keyboard input remains shared by the DS session. Adaptive widescreen
 is a title capability, not framebuffer stretching: unsupported screen choices
 are rejected. A title may expose the top screen, bottom screen, or both
 independently. The native 256x192 compositor remains the parity path; adaptive
-output is opt-in. The default `auto` renderer policy prefers the OpenGL 4.3
-compute backend and its direct GPU-resident adaptive path when eligible, with
-startup fallback to threaded software. `NDS_3D_RENDERER=soft` forces the
-faithful floor; `NDS_3D_RENDERER=compute` forces OpenGL and fails loudly if it
-cannot start. HUD sprites can be anchored to the widened left/right corners
+output is opt-in. The default `auto` renderer policy prefers the compiled
+accelerated backend (Plume unless the build picked a GL one, see
+`docs/plume-renderer.md`), with startup fallback to threaded software.
+`NDS_3D_RENDERER=soft` forces the faithful floor; `NDS_3D_RENDERER=compute`
+forces the accelerated backend and fails loudly if it cannot start. HUD sprites can be anchored to the widened left/right corners
 while center overlays remain centered. `adaptive_capability` requires an exact
 `[game].sha1`, allowing new
 title projects to opt into audited screens without adding their ROM hashes to
@@ -268,6 +302,80 @@ overrides are
 `NDS_SCREEN_LAYOUT` / `NDS_ADAPTIVE_WIDESCREEN` and the
 `--screen-layout` / `--adaptive-widescreen` CLI flags. Precedence is TOML,
 then environment, then CLI.
+
+`screen_layout = "single"` opens one window showing only the DS main screen:
+the LCD engine A is routed to (POWCNT1 bit 15), followed after the routing
+has held for 4 frames (both-blank fade frames do not count) and logged as
+`[display] main screen -> top|bottom`. The `[controls] screen_toggle` key
+(default `Grave`, the backtick) shows the other LCD until the main screen
+next changes. Holding the virtual stylus key shows the other LCD for as long
+as it is held: the bottom one while engine A is on top, the top one while
+engine A is on the bottom. Mouse clicks and virtual stylus taps are touches
+only while the bottom LCD is shown. With internal resolution above 1x, the
+HD 3D compose follows engine A to whichever LCD it is on.
+
+`window_mode` places the image in each window: `letterbox` is the largest
+aspect-correct fit, `stretch` fills the window, and `original` is a strict
+1:1 image in physical pixels, centred. `scaling = "integer"` keeps whole-pixel
+multiples with nearest filtering (in `stretch`, independent X and Y factors;
+never below 1x); `bilinear` filters linearly to the exact rect, and `nearest`
+point-samples into that same rect (pixelated at any size, with uneven pixel
+widths when the factor is not whole). With the GL
+presenter, bilinear resamples the composed frame at its own sample density,
+so HD 3D keeps its detail. Both are runtime settings, which a title can show
+in its own menus (`runner/src/title_menu.h`), and have
+`NDS_WINDOW_MODE` / `NDS_SCALING` and `--window-mode` / `--scaling`
+overrides.
+
+`resolution_scale` (a percentage) renders 3D relative to the presented rect
+instead of at a fixed multiplier: `100` matches the screen (the 3D raster is
+at least as tall as the rect, e.g. 6x for a 1080-line letterbox), lower is
+coarser down to native 1x, and higher supersamples (box-resolved under
+`scaling = "integer"`, mip-filtered under `bilinear`). Under integer scaling
+the multiplier is a divisor or multiple of the integer factor, so 3D texels
+land on whole screen pixels. It follows window resizes, fullscreen and
+window-mode changes, applied 250 ms after the size settles and only when the
+whole multiplier changes (each change rebuilds the 3D renderer). Only 3D
+gains density; the 2D layers stay native and are upscaled. It needs the
+OpenGL compute renderer with the `separate` or `single` layout, is a
+runtime setting, and has `NDS_RESOLUTION_SCALE` / `--resolution-scale`
+overrides. `internal_resolution` (1..16) instead pins the multiplier; the two
+are exclusive within one source, and the later source (TOML < env < CLI)
+wins. The performance governor drops 3D to 1x when frames wait on the GPU, and
+restores it once that wait falls again. `[display] performance_governor`
+(`auto`, the default, `off`, `stage1` or `stage2`) sets its mode;
+`NDS_PERFORMANCE_GOVERNOR` and `--performance-governor` override it.
+
+`[controls] gamepad_layout` picks how the pad's face buttons reach the DS:
+`labels` (the default) matches names, so a pad's A is DS A; `positional`
+matches the diamond instead, so the bottom button is DS B and the right one
+DS A, which is what Xbox-style pads need to feel like a DS. An explicit
+`--gamepad-bindings` wins over it and disables the Input > Gamepad layout
+runtime setting, which otherwise switches it live.
+
+`second_screen_size` (10..100, default 30) shows the other LCD in the `single`
+layout, to the right of the main screen and bottom-aligned, as a percent of its
+size; 100 shows both screens at the same size. In a portrait window (taller
+than wide) it goes just above the main screen, centred. The pair is fitted as one image, so `window_mode` and
+`scaling` apply to it and the main screen is never covered. The percent is a
+minimum: with `window_mode = "letterbox"`, space the main screen can't use goes
+to the second screen too, up to the main screen's size. Clicking the inset
+touches the bottom LCD when that is the screen it shows. It is also a runtime
+setting, along with the audio volume and mute.
+
+`show_fps` (default false) draws the 3D frame rate in the top-left of the
+screen, updated once a second: how many new 3D images the game finished, not
+how many frames were presented, so a game drawing 3D at 30 reads 30 on a 60 Hz
+DS screen, and a still or 2D scene reads 0. It is also a runtime setting,
+under Display. With two screens showing, the counter is on the bottom one.
+
+`smooth_3d` (default false, experimental) is for games that draw 3D below the
+DS frame rate. A game at 30 holds each image for two DS frames, so the second
+one is filled with an image halfway between the last two, built by pairing
+their polygons. 3D is shown one DS frame later for it, and the guest never sees
+the blended images. It is also a runtime setting, so it can be compared live;
+`show_fps` counts the blended images too. Pairs that are too different, such as
+a scene cut, show the real image instead.
 
 `startup_mode = "automatic"` sets the retail firmware's Automatic-mode flag
 in the runner's private in-memory firmware image. With a Slot-1 cartridge

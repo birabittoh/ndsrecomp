@@ -89,6 +89,13 @@ void SoftRenderer::SetupRenderThread(GPU& gpu)
 
 void SoftRenderer::EnableRenderThread()
 {
+    // Whatever starts the thread draws the latched frame, deferred or not.
+    Deferred = false;
+    if (BuffersStale)
+    {
+        FrameIdentical = false;
+        BuffersStale = false;
+    }
     if (Threaded && Sema_RenderStart)
     {
         RenderedScanlines.store(0, std::memory_order_release);
@@ -1751,12 +1758,52 @@ void SoftRenderer::RenderPolygons(const GPU& gpu, bool threaded, Polygon** polyg
 
 void SoftRenderer::VCount144(GPU& gpu)
 {
+    PastVCount144 = true;
+    // A deferred frame nobody asked for was never started: nothing to wait for.
+    if (Deferred) return;
     if (RenderThreadRunning.load(std::memory_order_relaxed) && !gpu.GPU3D.AbortFrame)
         Platform::Semaphore_Wait(Sema_RenderDone);
 }
 
 void SoftRenderer::RenderFrame(GPU& gpu)
 {
+    LatchFrame(gpu);
+    StartFrame(gpu);
+}
+
+void SoftRenderer::DeferFrame(GPU& gpu)
+{
+    LatchFrame(gpu);
+    Deferred = true;
+}
+
+bool SoftRenderer::RenderDeferredFrame(GPU& gpu)
+{
+    if (!Deferred) return false;
+    const bool late = PastVCount144;
+    StartFrame(gpu);
+    // VCount144 already went by without waiting: take the frame's done token
+    // here, so the next frame starts with none.
+    if (late && RenderThreadRunning.load(std::memory_order_relaxed))
+        Platform::Semaphore_Wait(Sema_RenderDone);
+    return true;
+}
+
+bool SoftRenderer::DropDeferredFrame() noexcept
+{
+    if (!Deferred) return false;
+    // The buffers hold an older frame, so the next one drawn cannot be
+    // skipped as identical.
+    Deferred = false;
+    BuffersStale = true;
+    return true;
+}
+
+void SoftRenderer::LatchFrame(GPU& gpu)
+{
+    DropDeferredFrame();
+    PastVCount144 = false;
+
     auto textureDirty = gpu.VRAMDirty_Texture.DeriveState(gpu.VRAMMap_Texture, gpu);
     auto texPalDirty = gpu.VRAMDirty_TexPal.DeriveState(gpu.VRAMMap_TexPal, gpu);
 
@@ -1764,6 +1811,16 @@ void SoftRenderer::RenderFrame(GPU& gpu)
     bool texPalChanged = gpu.MakeVRAMFlat_TexPalCoherent(texPalDirty);
 
     FrameIdentical = !(textureChanged || texPalChanged) && gpu.GPU3D.RenderFrameIdentical;
+}
+
+void SoftRenderer::StartFrame(GPU& gpu)
+{
+    Deferred = false;
+    if (BuffersStale)
+    {
+        FrameIdentical = false;
+        BuffersStale = false;
+    }
 
     if (RenderThreadRunning.load(std::memory_order_relaxed))
     {

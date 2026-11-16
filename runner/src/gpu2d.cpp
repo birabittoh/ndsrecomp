@@ -150,9 +150,27 @@ bool g_direct_frame_active = false;
 // stack with the 3D layer removed; see NdsGpu2dHdFrame in gpu2d.h.
 bool g_hd_emit_enabled = false;
 bool g_hd_frame_valid = false;
+int g_hd_screen = 0;
+// Per framebuffer: engine A's LCD (0 top, 1 bottom) and whether both LCDs
+// were blank, as the scanlines that drew that buffer latched them.
+std::array<uint8_t, 2> g_route_main_screen{};
+std::array<uint8_t, 2> g_route_both_blank{};
 std::vector<uint32_t> g_hd_top_pixels;
 std::vector<uint32_t> g_hd_below_pixels;
 NdsGpu2dHdFrame g_hd_frame{};
+
+// Fixed-size layers (see nds_gpu2d_set_fixed_size_layers in gpu2d.h).
+uint8_t g_fixed_mask = 0;
+// Native rect (x0, y0, x1, y1; exclusive) whose OBJs stay out of the layer.
+uint16_t g_fixed_obj_keep[4] = {0, 0, 0, 0};
+float g_fixed_scale = 1.0f;
+uint16_t g_fixed_anchor_x = 0;
+uint16_t g_fixed_anchor_y = 0;
+bool g_fixed_consumer = false;
+bool g_fixed_frame_valid = false;
+std::vector<uint32_t> g_fixed_base_pixels;
+std::vector<uint32_t> g_fixed_layer_pixels;
+NdsGpu2dFixedLayersFrame g_fixed_frame{};
 
 uint32_t hd_meta(const Pixel& p, uint8_t window_mask) {
     return static_cast<uint32_t>(p.target & 0x3Fu) |
@@ -178,6 +196,17 @@ uint64_t g_render_scanlines = 0;
 uint64_t g_direct_frames = 0;
 uint64_t g_hd_frames = 0;
 uint64_t g_hd_presented = 0;
+// Counts HD presents for the scheduler thread (never reset, unlike the
+// profile counter above), and the frames started since it last moved.
+std::atomic<uint64_t> g_hd_present_serial{0};
+uint64_t g_hd_present_serial_seen = 0;
+uint32_t g_frames_since_hd_present = ~0u;
+// Per back buffer: engine A lines of this frame went without their 3D line
+// because the presenter was expected to show the HD raster instead.
+std::array<bool, 2> g_frame_3d_skipped{};
+// The frame being latched has a line that reads the CPU 3D raster (see
+// nds_gpu2d_expects_cpu_3d).
+bool g_frame_reads_cpu_3d = false;
 uint64_t g_direct_overlay_ns = 0;
 uint64_t g_direct_class_frames[NDS_GPU2D_DIRECT_CLASS_COUNT] = {};
 uint64_t g_adaptive_fallback_frames[NDS_GPU2D_ADAPTIVE_FALLBACK_COUNT] = {};
@@ -1639,6 +1668,44 @@ uint64_t ns_since(std::chrono::steady_clock::time_point a,
         std::chrono::duration_cast<std::chrono::nanoseconds>(b - a).count());
 }
 
+// Whether the presenter is expected to show this line's 3D from the HD
+// raster, so the native composite (only its fallback then) can go without
+// the CPU 3D line. It mirrors what nds_gpu2d_adaptive_framebuffer() and the
+// host will decide after the frame, from what is known now; a frame that
+// stands HD down anyway shows a fallback without 3D once, after which the
+// present counter stops the skipping. Capture never goes through here.
+// Frames by the first reason a line of theirs read the CPU raster instead:
+// 1 HD emit off or skybox fill, 2 no recent HD present, 3 wide output,
+// 4 engine A not on the HD screen, 5 capture, 6 display mode, 7 3D scroll,
+// 8 title policy, 9 a BG that is not text. Logged by nds_gpu2d_start_frame.
+uint32_t g_cpu_3d_reason_frames[10] = {};
+int g_frame_cpu_3d_reason = 0;
+
+int hd_line_reject(const LineJob& job) {
+    const Unit& u = job.unit[0];
+    if (!g_hd_emit_enabled || g_adaptive_skybox_fill) return 1;
+    if (g_frames_since_hd_present > 2u) return 2;
+    if (nds_gpu3d_output_width() != 256u) return 3;
+    if (g_route_main_screen[job.buffer] != static_cast<uint8_t>(g_hd_screen))
+        return 4;
+    if (job.cap || g_frame_capture_active || u.capture_latch ||
+        (u.capture & 0x80000000u))
+        return 5;
+    if (((u.dispcnt >> 16) & 3u) != 1u) return 6;
+    if (nds_gpu3d_render_xpos() != 0u) return 7;
+    if (nds_title_patches_mph_adaptive_centered_native()) return 8;
+    for (int bg = 1; bg < 4; ++bg)
+        if ((u.dispcnt & (0x100u << bg)) && bg_kind(u, bg) != BgKind::Text)
+            return 9;
+    return 0;
+}
+
+bool hd_presents_3d_line(const LineJob& job) {
+    const int reject = hd_line_reject(job);
+    if (reject && !g_frame_cpu_3d_reason) g_frame_cpu_3d_reason = reject;
+    return reject == 0;
+}
+
 // Scheduler-thread latch. Everything a line render reads that a later guest
 // write could change is captured here, and the two pieces of renderer-owned
 // mutable state -- the BG2/BG3 affine accumulators and the DISPCAPCNT enable
@@ -1650,6 +1717,17 @@ void latch_line(int y, LineJob& job) {
     job.line3d = nullptr;
     job.direct_class = static_cast<uint8_t>(g_direct_frame_class);
     job.direct_extra_bg_mask = g_direct_extra_bg_mask;
+    {
+        // Overwritten every line, so the buffer ends up carrying the routing
+        // of its last scanline.
+        auto blank = [](int e) {
+            const uint32_t dispcnt = g_unit[e].dispcnt;
+            return !enabled(e) || (dispcnt & 0x80u) != 0u ||
+                   ((dispcnt >> 16) & 3u) == 0u;
+        };
+        g_route_main_screen[job.buffer] = engine_a_on_top ? 0u : 1u;
+        g_route_both_blank[job.buffer] = blank(0) && blank(1) ? 1u : 0u;
+    }
     for (int e = 0; e < 2; ++e) {
         job.unit[e] = g_unit[e];
         job.screen[e] = static_cast<uint32_t>(engine_a_on_top ? e : (e ^ 1));
@@ -1700,11 +1778,36 @@ void latch_line(int y, LineJob& job) {
     // scanline-semaphore tokens, so no other thread may call it.
     const bool engine_a_renders =
         job.engine_active[0] && !line_forceblank(job, 0);
-    if (engine_a_renders &&
+    if (y == 0) g_frame_3d_skipped[job.buffer] = false;
+    const bool capture_uses_3d = job.cap &&
+        ((job.unit[0].capture >> 29) & 3u) != 1u &&
+        ((job.unit[0].capture & (1u << 24)) || job.bg0_3d);
+    // The soft renderer has not drawn this frame yet (gpu3d.h). A capture
+    // draws it now; so does any line read below. A line without the 3D
+    // layer, or one the presenter shows from the HD raster, asks for
+    // nothing, and the frame stays undrawn.
+    bool wants_3d = true;
+    if (y == 0) {
+        g_frame_reads_cpu_3d = false;
+        ++g_cpu_3d_reason_frames[g_frame_cpu_3d_reason];
+        g_frame_cpu_3d_reason = 0;
+    }
+    if (engine_a_renders && (capture_uses_3d || job.bg0_3d)) {
+        const bool hd_line = !capture_uses_3d && hd_presents_3d_line(job);
+        if (!hd_line) g_frame_reads_cpu_3d = true;
+        if (nds_gpu3d_cpu_frame_deferred()) {
+            if (capture_uses_3d) {
+                nds_gpu3d_draw_deferred_frame(true);
+            } else if (hd_line) {
+                wants_3d = false;
+                g_frame_3d_skipped[job.buffer] = true;
+            }
+        }
+    } else if (engine_a_renders && nds_gpu3d_cpu_frame_deferred()) {
+        wants_3d = false;
+    }
+    if (engine_a_renders && wants_3d &&
         line_general_path(job.unit[0], 0, job.bg0_3d, job.cap)) {
-        const bool capture_uses_3d = job.cap &&
-            ((job.unit[0].capture >> 29) & 3u) != 1u &&
-            ((job.unit[0].capture & (1u << 24)) || job.bg0_3d);
         const uint32_t* const line3d = capture_uses_3d
             ? nds_gpu3d_capture_line(y) : nds_gpu3d_line(y);
         if (line3d) {
@@ -1864,6 +1967,12 @@ struct Pool {
     std::mutex m;
     std::condition_variable work_cv;
     std::condition_variable done_cv;
+    // Workers parked in work_cv.wait_for. Guarded by m: a worker increments
+    // it under the same lock it re-checks the predicate with, and submit
+    // publishes head under that lock, so a submit that reads 0 here is
+    // ordered before any later sleeper's predicate check (which then sees
+    // the new head). Lets submit skip the futex wake while workers are busy.
+    int sleepers = 0;
     std::vector<std::thread> threads;
     std::vector<std::unique_ptr<LineScratch>> scratch;
 };
@@ -1912,11 +2021,14 @@ void worker_main(Pool* pool, LineScratch* sc) {
             std::unique_lock<std::mutex> lock(pool->m);
             if (pool->stop.load(std::memory_order_acquire)) return;
             if (pool->claim.load(std::memory_order_acquire) >=
-                pool->head.load(std::memory_order_acquire))
+                pool->head.load(std::memory_order_acquire)) {
                 // Bounded so that no future publish/notify ordering mistake
                 // can wedge a worker asleep with work queued; the predicate is
                 // re-checked on every wakeup.
+                ++pool->sleepers;
                 pool->work_cv.wait_for(lock, std::chrono::milliseconds(2));
+                --pool->sleepers;
+            }
         }
         if (!have) continue;
         render_line_job(pool->jobs[index % kJobSlots], *sc);
@@ -2091,15 +2203,19 @@ void submit_line(int y) {
     // Publish under the mutex: a worker that has already evaluated its
     // predicate and is between that check and its wait would otherwise miss
     // the notification and sleep with work queued.
+    bool wake = false;
     {
         std::lock_guard<std::mutex> lock(pool->m);
         pool->head.store(head + 1, std::memory_order_release);
+        wake = pool->sleepers > 0;
     }
     nds_gpu2d_jobs_outstanding.store(1u, std::memory_order_relaxed);
     if (job.cap)
         nds_gpu2d_staged_captures.store(1u, std::memory_order_relaxed);
     ++g_threaded_lines;
-    pool->work_cv.notify_one();
+    // A futex wake per scanline cost ~3% of the emu thread in DQ9 while the
+    // workers were already running; only wake when one is actually parked.
+    if (wake) pool->work_cv.notify_one();
 }
 
 // Defined with the adaptive-compositor band pool further down (it needs
@@ -2118,6 +2234,8 @@ void nds_gpu2d_reset(){
     drain_pool(NDS_GPU2D_FENCE_FRAME);
     g_unit={};
     g_front = 0;
+    g_route_main_screen = {};
+    g_route_both_blank = {};
     g_direct_frame_active = false;
     g_direct_present_frame_active = false;
     g_frame_capture_active = false;
@@ -2297,6 +2415,7 @@ bool gpu2d_savestate_import(const NdsGpu2dSaveState& in,
     g_direct_object_write = 0;
     g_direct_force_cpu_frames = std::max(g_direct_force_cpu_frames, 1u);
     g_hd_frame_valid = false;
+    g_fixed_frame_valid = false;
     g_hd_frame = {};
     for (auto& frame : g_adaptive_frame) frame.fill(0u);
     for (auto& frame : g_wide_3d_frame) frame.fill(0u);
@@ -2408,6 +2527,25 @@ void nds_gpu2d_start_frame(){
     g_direct_present_frame_active = g_direct_frame_active;
     g_direct_present_frame = g_direct_current_frame;
     g_present_capture_active = g_frame_capture_active;
+    {
+        static uint32_t frames = 0;
+        if (g_hd_emit_enabled && ++frames % 1800u == 0u) {
+            const uint32_t* const r = g_cpu_3d_reason_frames;
+            std::fprintf(stderr,
+                "[gpu2d] frames reading CPU 3D, by reason: emit %u, no HD "
+                "present %u, wide %u, screen %u, capture %u, mode %u, "
+                "scroll %u, title %u, BG kind %u (none: %u)\n",
+                r[1], r[2], r[3], r[4], r[5], r[6], r[7], r[8], r[9], r[0]);
+            std::fill_n(g_cpu_3d_reason_frames, 10, 0u);
+        }
+        const uint64_t serial =
+            g_hd_present_serial.load(std::memory_order_relaxed);
+        if (serial != g_hd_present_serial_seen)
+            g_frames_since_hd_present = 0;
+        else if (g_frames_since_hd_present != ~0u)
+            ++g_frames_since_hd_present;
+        g_hd_present_serial_seen = serial;
+    }
     const bool force_cpu = g_direct_force_cpu_frames != 0u;
     if (force_cpu) --g_direct_force_cpu_frames;
     g_direct_frame_class =
@@ -2462,6 +2600,14 @@ const uint32_t* nds_gpu2d_framebuffer(int screen){
     drain_pool(NDS_GPU2D_FENCE_PRESENT);
     return g_fb[g_front][screen & 1].data();
 }
+int nds_gpu2d_presented_main_screen(){
+    drain_pool(NDS_GPU2D_FENCE_PRESENT);
+    return g_route_main_screen[g_front];
+}
+bool nds_gpu2d_presented_both_blank(){
+    drain_pool(NDS_GPU2D_FENCE_PRESENT);
+    return g_route_both_blank[g_front] != 0u;
+}
 void nds_gpu2d_set_adaptive_skybox_fill(bool enabled) {
     g_adaptive_skybox_fill = enabled;
 }
@@ -2487,6 +2633,8 @@ bool nds_gpu2d_direct_frame_active() {
 bool nds_gpu2d_direct_present_frame_active() {
     return g_direct_present_frame_active;
 }
+
+bool nds_gpu2d_expects_cpu_3d() { return g_frame_reads_cpu_3d; }
 
 bool nds_gpu2d_requires_3d_readback() {
     // Capture is tested LIVE, the same way direct_scene_class() does, not via
@@ -2576,8 +2724,61 @@ struct AdaptiveCtx {
     // Native-aspect HD returns the canonical scanline framebuffer, so only
     // the survivor layers are consumed; the adaptive RGB image is discarded.
     bool metadata_only = false;
+    // The frame's CPU 3D was never drawn (g_frame_3d_skipped): compose
+    // without the 3D layer instead of reading a raster that is not there.
+    bool no_3d = false;
     uint32_t front = 0;
+    // Fixed-size layers: BGs in this mask (bit n = BGn) are left out of the
+    // stack and resolved into `layer` (256 x 192, straight alpha) instead.
+    uint8_t fixed_mask = 0;
+    uint32_t* layer = nullptr;
+    uint16_t obj_keep[4] = {0, 0, 0, 0};
 };
+
+// One fixed-size-layer pixel: the masked BGs at this position resolved on
+// their own, as straight-alpha ARGB (0 = nothing). `first` and `second` are
+// the top two masked pixels (second may be invalid), `rest` the top of the
+// remaining stack at the same native position, which decides whether a
+// first-target BG blends with what lies under it. The caller guarantees
+// EVA + EVB = 16 whenever such a blend can happen.
+uint32_t fixed_layer_pixel(const Unit& u, const Pixel& first,
+                           const Pixel& second, const Pixel& rest,
+                           bool effects, uint32_t mbmode, uint32_t mb) {
+    if (!first.valid) return 0u;
+    uint32_t color = first.color;
+    uint32_t alpha = 255u;
+    const uint32_t mode = (u.bldcnt >> 6) & 3u;
+    if (first.alpha) {
+        // A semi-transparent or bitmap OBJ: it blends with a second target
+        // under it whatever the color effect (see compose()).
+        if (second.valid) {
+            color = compose(u, first, second, effects);
+        } else if (u.bldcnt & (static_cast<uint16_t>(rest.target) << 8)) {
+            const uint32_t eva = first.alpha == 0xFFu ? u.eva : first.alpha;
+            alpha = (std::min<uint32_t>(16u, eva) * 255u + 8u) / 16u;
+        } else {
+            color = compose(u, first, rest, effects);
+        }
+    } else if (effects && (u.bldcnt & first.target)) {
+        if (mode == 1u) {
+            if (second.valid) {
+                // Both inside the layer: blend there, opaque.
+                color = compose(u, first, second, true);
+            } else if (u.bldcnt & (static_cast<uint16_t>(rest.target) << 8)) {
+                // Over the rest of the stack: EVA/16 of alpha does it in
+                // the presenter, wherever the shrunk pixel lands.
+                alpha = (std::min<uint32_t>(16u, u.eva) * 255u + 8u) / 16u;
+            }
+        } else {
+            color = compose(u, first, second.valid ? second : rest, true);
+        }
+    }
+    if (mbmode == 1u)
+        color = brighten(color, mb, 0u);
+    else if (mbmode == 2u)
+        color = darken(color, mb, 15u);
+    return (alpha << 24) | (to_rgb32(color) & 0x00FFFFFFu);
+}
 
 void composite_adaptive_line(const AdaptiveCtx& c, int y,
                              AdaptiveScratch& sc) {
@@ -2596,6 +2797,9 @@ void composite_adaptive_line(const AdaptiveCtx& c, int y,
     const size_t hud_bg_count = c.hud_bg_count;
     const bool snapshot_matches = c.snapshot_matches;
     const bool emit_hd = c.emit_hd;
+    const uint8_t c_fixed_mask = c.fixed_mask;
+    uint32_t* const fixed_layer =
+        c.layer ? c.layer + static_cast<size_t>(y) * 256u : nullptr;
     // Named to match the single-threaded body they replace: the scratch is
     // per-renderer, everything else is shared and read-only.
     auto& obj = sc.obj;
@@ -2612,12 +2816,13 @@ void composite_adaptive_line(const AdaptiveCtx& c, int y,
     for (size_t i = 0; i < hud_bg_count; ++i)
         decode_bg_line(u, 0, hud_bgs[i], y, palette, *vram,
                        hud_bg_lines[i]);
-    const uint32_t* const line3d = c.metadata_only ? nullptr : snapshot_matches
+    const uint32_t* const line3d = (c.metadata_only || c.no_3d) ? nullptr
+        : snapshot_matches
         ? g_wide_3d_frame[c.front].data() +
               static_cast<size_t>(y) * output_width
         : nds_gpu3d_wide_line(y);
     const uint32_t* const attr3d =
-        !g_adaptive_skybox_fill ? nullptr
+        !g_adaptive_skybox_fill || !line3d ? nullptr
         : snapshot_matches
             ? g_wide_3d_attr_frame[c.front].data() +
                   static_cast<size_t>(y) * output_width
@@ -2732,6 +2937,9 @@ void composite_adaptive_line(const AdaptiveCtx& c, int y,
         const uint8_t window_mask = nds_gpu2d_window_mask(
             window_state, window_x, static_cast<uint8_t>(y),
             obj_window[x] != 0u);
+        // The masked BGs' own top two (fixed-size layers).
+        Pixel fixed_first{};
+        Pixel fixed_second{};
         const int bg_hud_x = g_adaptive_hud_gap_fill
             ? nds_gpu2d_adaptive_hud_x(x, output_width, g_adaptive_hud_anchor,
                                       g_adaptive_hud_center_width, true)
@@ -2748,12 +2956,40 @@ void composite_adaptive_line(const AdaptiveCtx& c, int y,
                     !(window_mask & (1u << hud_bgs[i])))
                     continue;
                 const BgLine& line = hud_bg_lines[i];
-                push(Pixel{
+                const Pixel pixel{
                     rgb6(static_cast<uint16_t>(c & 0x7FFFu)),
-                    line.target, 0, line.prio, line.order, true});
+                    line.target, 0, line.prio, line.order, true};
+                if (c_fixed_mask & (1u << hud_bgs[i])) {
+                    if (!fixed_first.valid || ahead(pixel, fixed_first)) {
+                        fixed_second = fixed_first;
+                        fixed_first = pixel;
+                    } else if (!fixed_second.valid ||
+                               ahead(pixel, fixed_second)) {
+                        fixed_second = pixel;
+                    }
+                    continue;
+                }
+                push(pixel);
             }
         }
-        if (obj[x].valid && (window_mask & 0x10u)) push(obj[x]);
+        if (obj[x].valid && (window_mask & 0x10u)) {
+            const int hx = hud_x, hy = y;
+            const bool keep = hx >= c.obj_keep[0] && hx < c.obj_keep[2] &&
+                              hy >= c.obj_keep[1] && hy < c.obj_keep[3];
+            if ((c_fixed_mask & 0x10u) && !keep) {
+                // Masked OBJs join the masked BGs (only over native
+                // columns; adaptive widths never split).
+                if (!fixed_first.valid || ahead(obj[x], fixed_first)) {
+                    fixed_second = fixed_first;
+                    fixed_first = obj[x];
+                } else if (!fixed_second.valid ||
+                           ahead(obj[x], fixed_second)) {
+                    fixed_second = obj[x];
+                }
+            } else {
+                push(obj[x]);
+            }
+        }
         if (emit_hd) {
             const size_t o = (static_cast<size_t>(y) * output_width + x)
                              * 2u;
@@ -2766,7 +3002,7 @@ void composite_adaptive_line(const AdaptiveCtx& c, int y,
         // even if enhanced presentation rejects this frame. Do not complete an
         // adaptive RGB image that neither success nor fallback will consume.
         if (c.metadata_only) continue;
-        const uint32_t c3 = composited_3d[x];
+        const uint32_t c3 = composited_3d ? composited_3d[x] : 0u;
         const uint8_t a3 =
             static_cast<uint8_t>((c3 >> 24) & 0x1Fu);
         if (a3 && (window_mask & 0x01u)) {
@@ -2780,6 +3016,20 @@ void composite_adaptive_line(const AdaptiveCtx& c, int y,
         else if (mbmode == 2u)
             color = darken(color, mb, 15u);
         dst[x] = to_rgb32(color);
+        if (fixed_layer && hud_x >= 0) {
+            // A skipped frame has no 3D pixel in the stack, yet the
+            // presenter shows the HD raster under the layer: stand in for
+            // it (coverage unknown, so taken as full) so a BG that blends
+            // over the 3D still gets its EVA as alpha.
+            Pixel rest = top;
+            if (c.no_3d && (window_mask & 0x01u)) {
+                const Pixel stand_in{0u, 0x01u, 0, prio3d, 1, true, 31};
+                if (ahead(stand_in, rest)) rest = stand_in;
+            }
+            fixed_layer[hud_x] = fixed_layer_pixel(
+                u, fixed_first, fixed_second, rest,
+                (window_mask & 0x20u) != 0u, mbmode, mb);
+        }
     }
 }
 
@@ -2953,16 +3203,22 @@ void composite_adaptive_frame(const AdaptiveCtx& ctx) {
 const uint32_t* nds_gpu2d_adaptive_framebuffer(int screen, uint16_t* width) {
     drain_pool(NDS_GPU2D_FENCE_PRESENT);
     const uint32_t* native = nds_gpu2d_framebuffer(screen);
-    const bool engine_a_on_top = (nds_powercontrol9() & 0x8000u) != 0;
+    // The routing the native buffer was drawn with, not the live POWCNT1: a
+    // VBlank write must not re-attribute an already drawn frame.
+    const bool engine_a_on_top = g_route_main_screen[g_front] == 0u;
     const int engine = engine_a_on_top ? screen : (screen ^ 1);
     // Cleared so every early return below (native width, unsupported scene)
     // leaves the presenter on the CPU composite rather than re-reading last
     // frame's surfaces. Guarded on engine A: this function is called once per
     // screen, and an unguarded reset here would let the engine-B call wipe
     // the flag the engine-A call just set, silently disabling HD entirely.
-    if (engine == 0) g_hd_frame_valid = false;
+    if (engine == 0) g_hd_frame_valid = g_fixed_frame_valid = false;
     const int output_width = nds_gpu3d_output_width();
-    if (output_width < 256 || (output_width == 256 && !g_hd_emit_enabled)) {
+    const bool fixed_wanted =
+        engine == 0 && screen == g_hd_screen &&
+        nds_gpu2d_fixed_layers_requested();
+    if (output_width < 256 ||
+        (output_width == 256 && !g_hd_emit_enabled && !fixed_wanted)) {
         if (width) *width = 256;
         return native;
     }
@@ -2981,6 +3237,16 @@ const uint32_t* nds_gpu2d_adaptive_framebuffer(int screen, uint16_t* width) {
     // (frontend_stats / profile) instead of by guessing.
     auto center_native = [&](NdsGpu2dAdaptiveFallback reason) {
         ++g_adaptive_fallback_frames[reason];
+        if (engine == 0 && g_frame_3d_skipped[g_front]) {
+            // Expected on the odd transition frame only; a run of these
+            // means hd_presents_3d_line() misses a stand-down reason.
+            static uint32_t logged = 0;
+            if (logged < 16u && ++logged)
+                std::fprintf(stderr,
+                    "[gpu2d] fallback frame without its 3D layer: the CPU "
+                    "draw was skipped and HD stood down (reason %d)\n",
+                    static_cast<int>(reason));
+        }
         for (int y = 0; y < 192; ++y)
             std::copy_n(native + y * 256, 256,
                         adaptive.data() + y * output_width + extra);
@@ -3062,12 +3328,13 @@ const uint32_t* nds_gpu2d_adaptive_framebuffer(int screen, uint16_t* width) {
     // presenter samples the raw hi-res surface and cannot see that repair, so
     // rather than silently dropping it, HD stands down for those frames and
     // the CPU composite is presented instead.
-    // screen == 0 as well as engine == 0: the direct presenter owns the top
-    // window only, so when POWCNT routes engine A to the bottom screen these
-    // surfaces would be applied to the wrong window. The direct path rejects
-    // that case as SCREEN_ROUTE for the same reason.
+    // screen == g_hd_screen as well as engine == 0: the surfaces belong to
+    // one presenter window (the top one unless the single-screen layout
+    // follows engine A to the bottom), so when engine A sits on the other
+    // LCD they would be applied to the wrong window. The direct OBJ path
+    // still owns the top window only and rejects that case as SCREEN_ROUTE.
     const bool emit_hd =
-        g_hd_emit_enabled && !g_adaptive_skybox_fill && screen == 0;
+        g_hd_emit_enabled && !g_adaptive_skybox_fill && screen == g_hd_screen;
     if (emit_hd) {
         const size_t needed =
             static_cast<size_t>(output_width) * 192u * 2u;
@@ -3076,6 +3343,27 @@ const uint32_t* nds_gpu2d_adaptive_framebuffer(int screen, uint16_t* width) {
             g_hd_below_pixels.resize(needed);
         }
     }
+    // Fixed-size layers: only the masked BGs that are on (and the OBJs when
+    // asked for), and only when their blend can be split exactly (see
+    // gpu2d.h). A semi-transparent OBJ blends with EVA/EVB in any mode.
+    uint8_t fixed_mask = 0;
+    if (fixed_wanted && output_width == 256) {
+        for (size_t i = 0; i < hud_bg_count; ++i)
+            fixed_mask |= static_cast<uint8_t>(
+                g_fixed_mask & (1u << hud_bgs[i]));
+        const bool exact = u.eva + u.evb == 16u;
+        // With BGs named, OBJs join only a frame that splits one of them;
+        // the OBJ bit alone splits the OBJs by themselves.
+        const bool obj_alone = (g_fixed_mask & 0x0Eu) == 0u;
+        if ((fixed_mask || obj_alone) && exact && (g_fixed_mask & 0x10u) &&
+            (u.dispcnt & 0x1000u))
+            fixed_mask |= 0x10u;
+        const bool alpha_mode = ((u.bldcnt >> 6) & 3u) == 1u;
+        if (fixed_mask && alpha_mode && (u.bldcnt & fixed_mask) && !exact)
+            fixed_mask = 0;
+    }
+    if (fixed_mask && g_fixed_layer_pixels.size() != 256u * 192u)
+        g_fixed_layer_pixels.resize(256u * 192u);
     AdaptiveCtx ctx{};
     ctx.u = &u;
     ctx.palette = palette;
@@ -3095,9 +3383,21 @@ const uint32_t* nds_gpu2d_adaptive_framebuffer(int screen, uint16_t* width) {
     ctx.hud_bg_count = hud_bg_count;
     ctx.snapshot_matches = snapshot_matches;
     ctx.emit_hd = emit_hd;
-    ctx.metadata_only = emit_hd && output_width == 256;
+    ctx.metadata_only = emit_hd && output_width == 256 && !fixed_mask;
+    ctx.no_3d = g_frame_3d_skipped[g_front];
     ctx.front = g_front;
+    ctx.fixed_mask = fixed_mask;
+    for (int i = 0; i < 4; ++i) ctx.obj_keep[i] = g_fixed_obj_keep[i];
+    ctx.layer = fixed_mask ? g_fixed_layer_pixels.data() : nullptr;
     composite_adaptive_frame(ctx);
+    if (fixed_mask) {
+        g_fixed_frame.base = adaptive.data();
+        g_fixed_frame.layer = g_fixed_layer_pixels.data();
+        g_fixed_frame.scale = g_fixed_scale;
+        g_fixed_frame.anchor_x = g_fixed_anchor_x;
+        g_fixed_frame.anchor_y = g_fixed_anchor_y;
+        g_fixed_frame_valid = true;
+    }
     if (emit_hd) {
         g_hd_frame.top_pixels = g_hd_top_pixels.data();
         g_hd_frame.below_pixels = g_hd_below_pixels.data();
@@ -3120,11 +3420,50 @@ const uint32_t* nds_gpu2d_adaptive_framebuffer(int screen, uint16_t* width) {
 
 void nds_gpu2d_invalidate_hd_frame() {
     g_hd_frame_valid = false;
+    g_fixed_frame_valid = false;
+}
+
+void nds_gpu2d_set_fixed_size_layers(uint8_t bg_mask, float scale,
+                                     uint16_t anchor_x, uint16_t anchor_y) {
+    g_fixed_mask = static_cast<uint8_t>(bg_mask & 0x1Eu);
+    g_fixed_scale = scale > 0.0f && scale < 1.0f ? scale : 1.0f;
+    g_fixed_anchor_x = std::min<uint16_t>(anchor_x, 256);
+    g_fixed_anchor_y = std::min<uint16_t>(anchor_y, 192);
+}
+
+void nds_gpu2d_set_fixed_layers_obj_keep(uint16_t x0, uint16_t y0,
+                                         uint16_t x1, uint16_t y1) {
+    g_fixed_obj_keep[0] = x0;
+    g_fixed_obj_keep[1] = y0;
+    g_fixed_obj_keep[2] = x1;
+    g_fixed_obj_keep[3] = y1;
+}
+
+void nds_gpu2d_set_fixed_layers_consumer(bool enabled) {
+    g_fixed_consumer = enabled;
+}
+
+bool nds_gpu2d_fixed_layers_requested() {
+    return g_fixed_consumer && g_fixed_mask != 0 && g_fixed_scale < 1.0f &&
+           !g_adaptive_hud_anchor && nds_gpu3d_output_width() == 256;
+}
+
+bool nds_gpu2d_fixed_layers_frame(NdsGpu2dFixedLayersFrame* out) {
+    if (!out || !g_fixed_frame_valid) return false;
+    *out = g_fixed_frame;
+    return true;
 }
 
 void nds_gpu2d_set_hd_emit(bool enabled) {
     g_hd_emit_enabled = enabled;
     if (!enabled) g_hd_frame_valid = false;
+}
+
+void nds_gpu2d_set_hd_screen(int screen) {
+    if (g_hd_screen == (screen & 1)) return;
+    g_hd_screen = screen & 1;
+    g_hd_frame_valid = false;
+    g_fixed_frame_valid = false;
 }
 
 bool nds_gpu2d_hd_frame_peek(NdsGpu2dHdFrame* out) {
@@ -3141,9 +3480,13 @@ bool nds_gpu2d_hd_frame(NdsGpu2dHdFrame* out) {
     // Counted on consumption, not emission: emitting surfaces nobody reads
     // looks identical to working HD from an emit-side counter.
     ++g_hd_presented;
+    g_hd_present_serial.fetch_add(1, std::memory_order_relaxed);
     return true;
 }
-void nds_gpu2d_note_owned_hd_presented() { ++g_hd_presented; }
+void nds_gpu2d_note_owned_hd_presented() {
+    ++g_hd_presented;
+    g_hd_present_serial.fetch_add(1, std::memory_order_relaxed);
+}
 void nds_gpu2d_profile(NdsGpu2dProfile* out) {
     drain_pool(NDS_GPU2D_FENCE_PRESENT);
     if (!out) return;

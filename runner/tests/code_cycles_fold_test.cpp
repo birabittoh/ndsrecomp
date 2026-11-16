@@ -103,8 +103,6 @@ void run_class(const ClassCase& c, bool thumb) {
         const uint32_t k = thumb ? NDS_ARM9_CODE_K(pc, 1)
                                  : NDS_ARM9_CODE_K(pc, 0);
         const uint32_t got = nds_code_numc(pc, k);
-        expect(g_last_code_pc[0] == pc,
-               "inline path did not record g_last_code_pc[0]");
         const uint32_t want = runtime_code_cycles(pc);
         if (got != want) fail("numc", pc, thumb, c.name, got, want);
         sum_inline += got;

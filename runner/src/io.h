@@ -8,6 +8,7 @@
 #pragma once
 
 #include <cstdint>
+#include <string>
 
 #include "cartridge_config.h"
 
@@ -21,6 +22,34 @@ void     nds_io_debug_history_reset();
 // fixed deterministic power-on datetime. Default false — the oracle gates
 // (G1/G3) and all parity work require the deterministic clock.
 extern bool g_nds_rtc_host;
+// The ARM9 clock as a power of two over the system (ARM7) clock: ARM9
+// timestamps are system cycles << this. 1 is the hardware (67 MHz); 2 and 3
+// overclock the ARM9 2x and 4x, which leaves devices, timers and the ARM7 on
+// the hardware timeline and lets the ARM9 retire more instructions per
+// frame. Only the scheduler writes it, between rounds, where it rescales the
+// ARM9 timestamp to match (scheduler.cpp).
+extern unsigned g_nds_arm9_clock_shift;
+// Asks for an ARM9 clock of `multiple` (1, 2 or 4) times the hardware's; any
+// other value is ignored. Takes effect at the next scheduler round. Any
+// thread.
+void nds_request_arm9_overclock(unsigned multiple);
+// The shift asked for last (1 when none was).
+unsigned nds_requested_arm9_clock_shift();
+// Divides the gamecard's transfer delays (ROMCTRL gaps and the per-word
+// clock) by `factor` for transfers started from now on; 1, the default, is
+// the hardware's. For a title that reads the card inside its frame loop and
+// has lifted its frame-rate cap. Any thread.
+void nds_request_card_speedup(unsigned factor);
+// Event windows: while the ARM7 sleeps with no wake pending and no DMA or
+// geometry stall, the scheduler lets the ARM9 run up to 256 system cycles
+// (not 64) before the next rendezvous, bounded by the next scheduled event
+// and timer overflow and ended by any ARM9 I/O the ARM7 could observe
+// (scheduler.cpp). It cuts the per-round host cost; what the guest can see
+// of it is that an ARM9 geometry interrupt may arrive up to 192 system
+// cycles later. Off by default. Any thread.
+void nds_request_event_windows(bool enabled);
+bool nds_event_windows_requested();
+unsigned nds_requested_card_speedup();
 void     nds_set_touch(uint16_t x, uint16_t y, bool down);
 void     nds_set_key_mask(uint32_t mask);
 // Debug-server throttle override (`turbo` command): frontend treats it like
@@ -345,3 +374,9 @@ void     nds_io_set_cartridge_save_path(const char* path);
 bool     nds_io_flush_cartridge_save();
 bool     nds_io_cartridge_save_snapshot(const uint8_t** data, uint32_t* size,
                                         bool* dirty);
+// The battery file's path ("" when persistence is off).
+const char* nds_io_cartridge_save_path();
+// Installs `data` as the cartridge save (it must be the backup's size) and
+// writes it to the battery file. The guest sees it after a reset.
+bool     nds_io_replace_cartridge_save(const uint8_t* data, uint32_t size,
+                                       std::string* error);

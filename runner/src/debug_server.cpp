@@ -1719,6 +1719,11 @@ std::string handle(const std::string& line) {
                std::to_string(gpu3d.vcount215_calls) +
                ",\"getline_ns\":" + std::to_string(gpu3d.getline_ns) +
                ",\"getline_calls\":" + std::to_string(gpu3d.getline_calls) +
+               ",\"cpu3d_drawn\":" + std::to_string(gpu3d.cpu3d_drawn) +
+               ",\"cpu3d_skipped\":" + std::to_string(gpu3d.cpu3d_skipped) +
+               ",\"cpu3d_on_demand\":" +
+               std::to_string(gpu3d.cpu3d_on_demand) +
+               ",\"cpu3d_capture\":" + std::to_string(gpu3d.cpu3d_capture) +
                ",\"vcount144_ns\":" + std::to_string(gpu3d.vcount144_ns) +
                ",\"vcount144_calls\":" +
                std::to_string(gpu3d.vcount144_calls) +
@@ -2119,10 +2124,7 @@ std::string handle(const std::string& line) {
         std::vector<uint32_t> pixels;
         unsigned width = 0, height = 0;
         const std::string surface = json_str(line, "surface", "game");
-        if (surface == "menu") {
-            if (!nds_frontend_read_runtime_menu(pixels, &width, &height))
-                return "{\"error\":\"no rendered runtime menu on this thread\"}";
-        } else {
+        {
             if (surface != "game") return "{\"error\":\"unknown presentation surface\"}";
 #if defined(NDS_HAVE_COMPUTE_RENDERER)
             if (!nds_compute_host_read_presented(pixels, width, height))

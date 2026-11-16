@@ -34,6 +34,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <unordered_map>
 #include <unordered_set>
 #include <vector>
 #if !defined(NDEBUG)
@@ -63,6 +64,20 @@ NdsDispatchStats g_nds_dispatch_stats[2] = {};
 // the stats JSON below can report it; the mechanism itself is further down.
 namespace { bool g_cycle_fast_limit_enabled = true; }
 unsigned long long g_nds_fast_limit_publishes = 0;
+namespace {
+enum : unsigned {
+    kFastLimitPublished, kFastLimitMode, kFastLimitCodePub, kFastLimitNoCap,
+    kFastLimitDeferred, kFastLimitStaticCode, kFastLimitBreak,
+    kFastLimitHalted, kFastLimitDma, kFastLimitIrq, kFastLimitReasons
+};
+unsigned long long g_fast_limit_reasons[2][kFastLimitReasons] = {};
+}  // namespace
+extern "C" void runtime_fast_limit_stats(unsigned long long out[2][10]) {
+    static_assert(kFastLimitReasons == 10);
+    for (int c = 0; c < 2; ++c)
+        for (unsigned r = 0; r < kFastLimitReasons; ++r)
+            out[c][r] = g_fast_limit_reasons[c][r];
+}
 
 std::string nds_dispatch_stats_json() {
     std::string out = "{";
@@ -86,6 +101,13 @@ std::string nds_dispatch_stats_json() {
             ",\"cache_hit_absent\":" + std::to_string(s.cache_hit_absent) +
             ",\"cache_slow_lookup\":" +
                 std::to_string(s.cache_slow_lookup) +
+            ",\"cache_slow_empty\":" + std::to_string(s.cache_slow_empty) +
+            ",\"cache_slow_collide\":" +
+                std::to_string(s.cache_slow_collide) +
+            ",\"cache_slow_epoch\":" + std::to_string(s.cache_slow_epoch) +
+            ",\"cache_slow_gen\":" + std::to_string(s.cache_slow_gen) +
+            ",\"cache_slow_gen_refresh\":" +
+                std::to_string(s.cache_slow_gen_refresh) +
             ",\"crs_push\":" + std::to_string(s.crs_push) +
             ",\"crs_hit\":" + std::to_string(s.crs_hit) +
             ",\"crs_miss\":" + std::to_string(s.crs_miss) +
@@ -269,22 +291,40 @@ void append_json_string(std::string& out, const char* text) {
 #endif
 
 constexpr uint32_t kDispatchCacheSize = 65536u;
+// Field order is a host-cache layout, not an ABI: everything the hit test
+// reads (key, epoch, flags, fn, serial, generations and the first three
+// generation pointers) sits in the first 64-byte line. The table is 16 MiB,
+// larger than a laptop L3, and the former order split the hit test across
+// both lines of the slot (pc at +0, occupied at +0x62): two misses per
+// dispatch. The second line holds what only the slow path and rare 4-page
+// candidates need.
 struct alignas(64) CachedStaticLookup {
     uint32_t pc = 0u;
-    uint32_t page_addr[4]{};
-    uint32_t generation[4]{};
-    const uint32_t* generation_ptr[4]{};
-    void (*fn)(void) = nullptr;
-    const NdsStaticValidation* validation = nullptr;
-    uint32_t live_bank_serial = 0u;
     uint32_t dispatch_epoch = 0u;
     uint8_t page_count = 0u;
     uint8_t thumb = 0u;
     uint8_t occupied = 0u;
+    uint32_t live_bank_serial = 0u;
+    void (*fn)(void) = nullptr;
+    uint32_t generation[4]{};
+    const uint32_t* generation_ptr[4]{};
+    uint32_t page_addr[4]{};
+    const NdsStaticValidation* validation = nullptr;
+    // The dispatch row selected when this slot was filled, and where its
+    // (pc, thumb) run starts in dispatch_index. Both are valid exactly while
+    // dispatch_epoch matches. Lets a generation-only miss re-run the exact
+    // selection without a fresh binary search (see lookup_static_cached_impl).
+    const DispatchEntry* entry = nullptr;
+    uint32_t index_pos = UINT32_MAX;
 };
 static_assert(sizeof(CachedStaticLookup) == 128u);
 std::array<std::array<CachedStaticLookup, kDispatchCacheSize>, 2>
     g_dispatch_cache{};
+
+inline uint32_t dispatch_cache_index(uint32_t pc, bool thumb) {
+    return ((pc >> 1u) ^ (pc >> 13u) ^ uint32_t{thumb}) &
+        (kDispatchCacheSize - 1u);
+}
 
 void clear_dispatch_cache_cpu(unsigned cpu) {
     CachedStaticLookup empty{};
@@ -442,40 +482,104 @@ bool cached_lookup_live(const CachedStaticLookup& cached) {
     return true;
 }
 
-bool cache_page_generation(CachedStaticLookup& slot, uint32_t page) {
+// The 64-byte blocks of 4 KiB page `page` that [addr, last] covers, as a
+// code_mask word (bit i = block i). The range must intersect the page.
+uint64_t range_page_blocks(uint32_t addr, uint32_t last, uint32_t page) {
+    const uint32_t lo = std::max(addr, page) - page;
+    const uint32_t hi = std::min(last, page | 0xFFFu) - page;
+    return (~0ull >> (63u - (hi >> 6u))) & (~0ull << (lo >> 6u));
+}
+
+// Main-RAM pages snapshot their CODE generation (bus_code_watch): it moves
+// only when a store touches a 64-byte block some snapshot watches, so a
+// data store elsewhere in the page no longer invalidates the snapshot. Exact
+// because the watched blocks cover every byte the validation reads (bytes
+// and provenance), and a store outside them can change neither: written[]
+// only goes 0 -> 1 between bus resets / savestate loads, which bump every
+// code generation (bus_init, runtime_note_code_write). Other pages keep the
+// plain page generation, bumped by every store.
+bool cache_page_generation(CachedStaticLookup& slot, uint32_t page,
+                           uint64_t blocks) {
     for (uint32_t i = 0; i < slot.page_count; ++i) {
-        if (slot.page_addr[i] == page) return true;
+        if (slot.page_addr[i] == page) {
+            if (slot.generation_ptr[i]) bus_code_watch(page, blocks);
+            return true;
+        }
     }
     if (slot.page_count >= 4u) return false;
     const uint32_t index = slot.page_count++;
     slot.page_addr[index] = page;
-    if (page - 0x02000000u < 0x01000000u && g_busf_main.gen) {
-        const uint32_t offset = page & g_busf_main.mask;
-        slot.generation_ptr[index] =
-            g_busf_main.gen + (offset >> 12u);
-        slot.generation[index] = *slot.generation_ptr[index];
+    if (uint32_t* cell = bus_code_watch(page, blocks)) {
+        slot.generation_ptr[index] = cell;
+        slot.generation[index] = *cell;
     } else {
+        bus_code_watch_page(page);
         slot.generation[index] = bus_exec_page_generation(page);
     }
     return true;
 }
 
+extern "C" uint32_t g_code_diag_watch_pc, g_code_diag_watch_addr,
+    g_code_diag_watch_size;
+
 bool cache_validation_pages(CachedStaticLookup& slot,
                             const NdsStaticValidation* validation) {
+    g_code_diag_watch_pc = slot.pc;
     return for_each_validation_range(
         validation, [&](const NdsStaticValidationRange& range) {
+            g_code_diag_watch_addr = range.addr;
+            g_code_diag_watch_size = range.size;
             if (!range.expected || range.size == 0u) return false;
             const uint64_t end = uint64_t{range.addr} + range.size;
             if (end > 0x1'0000'0000ull) return false;
+            const uint32_t last = static_cast<uint32_t>(end - 1u);
             const uint32_t first_page = range.addr & ~0xFFFu;
-            const uint32_t last_page =
-                static_cast<uint32_t>(end - 1u) & ~0xFFFu;
+            const uint32_t last_page = last & ~0xFFFu;
             for (uint32_t page = first_page;; page += 4096u) {
-                if (!cache_page_generation(slot, page)) return false;
+                if (!cache_page_generation(
+                        slot, page, range_page_blocks(range.addr, last, page)))
+                    return false;
                 if (page == last_page) break;
             }
             return true;
         });
+}
+
+// A cached hit's selection also depends on the other candidates of its
+// (pc, thumb) run: a newer variant that becomes live wins. A store to one of
+// their bytes on a page the slot snapshots must still invalidate the slot,
+// as the page-wide generation did. Watch those blocks too. (Candidate bytes
+// on other pages were never covered by the snapshot; that is unchanged.)
+void watch_candidate_run(const CpuCtx& c, uint32_t pc, bool thumb,
+                         const CachedStaticLookup& slot) {
+    const uint64_t wanted = (uint64_t{pc} << 1u) | uint64_t{thumb};
+    auto it = std::lower_bound(
+        c.dispatch_index.begin(), c.dispatch_index.end(), wanted,
+        [](const DispatchEntry* entry, uint64_t value) {
+            return nds_dispatch_entry_key(entry) < value;
+        });
+    for (; it != c.dispatch_index.end() &&
+           nds_dispatch_entry_key(*it) == wanted; ++it) {
+        for_each_validation_range(
+            (*it)->validation, [&](const NdsStaticValidationRange& range) {
+                if (range.size == 0u) return true;
+                const uint64_t end = uint64_t{range.addr} + range.size;
+                if (end > 0x1'0000'0000ull) return true;
+                const uint32_t last = static_cast<uint32_t>(end - 1u);
+                g_code_diag_watch_pc = pc | 0x80000000u;  // run candidate
+                g_code_diag_watch_addr = range.addr;
+                g_code_diag_watch_size = range.size;
+                for (uint32_t i = 0; i < slot.page_count; ++i) {
+                    const uint32_t page = slot.page_addr[i];
+                    if (!slot.generation_ptr[i] || last < page ||
+                        range.addr > (page | 0xFFFu))
+                        continue;
+                    bus_code_watch(page,
+                                   range_page_blocks(range.addr, last, page));
+                }
+                return true;
+            });
+    }
 }
 
 bool cache_rejected_candidate_chain(const CpuCtx& c, uint32_t pc, bool thumb,
@@ -495,12 +599,66 @@ bool cache_rejected_candidate_chain(const CpuCtx& c, uint32_t pc, bool thumb,
     return slot.page_count != 0u;
 }
 
+// ── Slow-lookup reason report (NDS_SLOW_LOOKUP_REPORT=1) ───────────────
+// Host-only diagnostic: classifies why a dispatch missed g_dispatch_cache and
+// whether the slow path could re-cache it, per guest PC, and prints the top
+// offenders at exit. Off unless the env var is set; one predicted branch.
+enum SlowReason : uint8_t { kSlowEmpty, kSlowCollide, kSlowEpoch, kSlowGen, kSlowReasonCount };
+struct SlowLookupDiag {
+    bool enabled = false;
+    struct Row { uint64_t n[kSlowReasonCount]{}; uint64_t uncached = 0; };
+    std::unordered_map<uint64_t, Row> rows;
+    std::unordered_map<uint32_t, uint64_t> gen_pages;
+    SlowLookupDiag() {
+        const char* v = std::getenv("NDS_SLOW_LOOKUP_REPORT");
+        enabled = v && *v && *v != '0';
+        if (enabled) std::atexit([] { report(); });
+    }
+    static void report();
+};
+// Heap-allocated and never destroyed: the atexit report registered from the
+// constructor would otherwise run after a static instance's destructor.
+SlowLookupDiag& g_slow_diag = *new SlowLookupDiag();
+void SlowLookupDiag::report() {
+    auto& d = g_slow_diag;
+    static const char* names[] = {"empty", "collide", "epoch", "gen"};
+    uint64_t tot[kSlowReasonCount]{}, unc = 0;
+    std::vector<std::pair<uint64_t, uint64_t>> order;
+    for (auto& [k, r] : d.rows) {
+        uint64_t sum = r.uncached;
+        for (int i = 0; i < kSlowReasonCount; ++i) { tot[i] += r.n[i]; sum += r.n[i]; }
+        unc += r.uncached;
+        order.push_back({sum, k});
+    }
+    std::sort(order.rbegin(), order.rend());
+    std::fprintf(stderr, "[slow-lookup] totals empty=%llu collide=%llu epoch=%llu gen=%llu uncached_results=%llu distinct_pcs=%zu\n",
+        (unsigned long long)tot[0], (unsigned long long)tot[1], (unsigned long long)tot[2],
+        (unsigned long long)tot[3], (unsigned long long)unc, d.rows.size());
+    for (size_t i = 0; i < order.size() && i < 40; ++i) {
+        const uint64_t k = order[i].second; const auto& r = d.rows[k];
+        std::fprintf(stderr, "[slow-lookup] cpu%u pc=%08X%s", unsigned(k >> 40), unsigned(k >> 1) & 0xFFFFFFFFu, (k & 1u) ? "T" : "A");
+        for (int j = 0; j < kSlowReasonCount; ++j) std::fprintf(stderr, " %s=%llu", names[j], (unsigned long long)r.n[j]);
+        std::fprintf(stderr, " uncached=%llu\n", (unsigned long long)r.uncached);
+    }
+    std::vector<std::pair<uint64_t, uint32_t>> pages;
+    for (auto& [pg, n] : d.gen_pages) pages.push_back({n, pg});
+    std::sort(pages.rbegin(), pages.rend());
+    for (size_t i = 0; i < pages.size() && i < 20; ++i)
+        std::fprintf(stderr, "[slow-lookup] gen-invalidating page %08X x%llu\n", pages[i].second, (unsigned long long)pages[i].first);
+}
+struct SlowLookupScope {
+    CachedStaticLookup* slot = nullptr; uint64_t key = 0;
+    ~SlowLookupScope() {
+        if (!slot) return;
+        if (!(slot->occupied && slot->pc == uint32_t(key >> 1) && slot->fn))
+            ++g_slow_diag.rows[key].uncached;
+    }
+};
+
 const CachedStaticLookup* lookup_static_cached_impl(const CpuCtx& c,
                                                     uint32_t pc, bool thumb) {
     auto& cache = g_dispatch_cache[g_nds_active];
-    CachedStaticLookup& slot =
-        cache[((pc >> 1u) ^ (pc >> 13u) ^ uint32_t{thumb}) &
-              (kDispatchCacheSize - 1u)];
+    CachedStaticLookup& slot = cache[dispatch_cache_index(pc, thumb)];
     if (slot.occupied && slot.dispatch_epoch == c.dispatch_epoch &&
         slot.pc == pc && slot.thumb == uint8_t{thumb} &&
         cached_lookup_live(slot)) {
@@ -513,7 +671,69 @@ const CachedStaticLookup* lookup_static_cached_impl(const CpuCtx& c,
         ++stats.cache_hit_absent;
         return nullptr;
     }
-    ++g_nds_dispatch_stats[g_nds_active].cache_slow_lookup;
+    {
+        NdsDispatchStats& stats = g_nds_dispatch_stats[g_nds_active];
+        ++stats.cache_slow_lookup;
+        if (!slot.occupied) ++stats.cache_slow_empty;
+        else if (slot.pc != pc || slot.thumb != uint8_t{thumb})
+            ++stats.cache_slow_collide;
+        else if (slot.dispatch_epoch != c.dispatch_epoch)
+            ++stats.cache_slow_epoch;
+        else ++stats.cache_slow_gen;
+    }
+#if !defined(NDS_MPH_SUBMIT_HLE) && !defined(NDS_MPH_MATH_HLE) && \
+    !defined(NDS_MKDS_HLE)
+    // Generation-only miss: same key, same epoch, a cached native hit, but a
+    // store somewhere in one of its 4 KiB pages bumped that page's
+    // generation. In DQ9 this is overlay code sharing a page with hot data
+    // (ov033 .text + its .bss + ov032's buffer tail at 0x022A2xxx), which
+    // made ~90 percent of all slow lookups.
+    //
+    // Re-run the SAME selection rule (nds_dispatch_lookup_run, the body of
+    // nds_dispatch_lookup_index) over the cached run position, i.e. every
+    // candidate is re-validated for provenance and live bytes exactly as
+    // before. If it picks the same row, the full slow path below would
+    // rebuild this slot field-for-field identically except for fresh
+    // generations: hit-path pages come from cache_validation_pages(hit->
+    // validation) in a fixed order, and the only other effect,
+    // live_overlay_note_lookup, is a no-op while live overlay is disabled.
+    // Title HLE builds layer extra resolution on top, so they keep the
+    // reference path. Any other outcome falls through to it unchanged.
+    if (slot.occupied && slot.dispatch_epoch == c.dispatch_epoch &&
+        slot.pc == pc && slot.thumb == uint8_t{thumb} && slot.fn &&
+        slot.entry && slot.index_pos != UINT32_MAX &&
+        !g_slow_diag.enabled && !live_overlay_enabled()) {
+        const NdsDispatchLookupResult again = nds_dispatch_lookup_run(
+            c.dispatch_index, slot.index_pos, pc, thumb,
+            dispatch_validation_live, nullptr);
+        if (again.selected == slot.entry) {
+            ++g_nds_dispatch_stats[g_nds_active].cache_slow_gen_refresh;
+            for (uint32_t i = 0; i < slot.page_count; ++i) {
+                slot.generation[i] = slot.generation_ptr[i]
+                    ? *slot.generation_ptr[i]
+                    : bus_exec_page_generation(slot.page_addr[i]);
+            }
+            return &slot;
+        }
+    }
+#endif
+    SlowLookupScope slow_scope;
+    if (g_slow_diag.enabled) [[unlikely]] {
+        SlowReason why = !slot.occupied ? kSlowEmpty
+            : (slot.pc != pc || slot.thumb != uint8_t{thumb}) ? kSlowCollide
+            : slot.dispatch_epoch != c.dispatch_epoch ? kSlowEpoch : kSlowGen;
+        const uint64_t key = (uint64_t{unsigned(g_nds_active)} << 40) |
+            (uint64_t{pc} << 1) | uint64_t{thumb};
+        ++g_slow_diag.rows[key].n[why];
+        if (why == kSlowGen) {
+            for (uint32_t i = 0; i < slot.page_count; ++i) {
+                const uint32_t live = slot.generation_ptr[i] ? *slot.generation_ptr[i]
+                    : bus_exec_page_generation(slot.page_addr[i]);
+                if (live != slot.generation[i]) ++g_slow_diag.gen_pages[slot.page_addr[i]];
+            }
+        }
+        slow_scope.slot = &slot; slow_scope.key = key;
+    }
 
     uint32_t candidate_count = 0u;
     const DispatchEntry* inactive_candidate = nullptr;
@@ -541,6 +761,13 @@ const CachedStaticLookup* lookup_static_cached_impl(const CpuCtx& c,
     slot.dispatch_epoch = c.dispatch_epoch;
     const DispatchEntry* const candidate = hit ? hit : inactive_candidate;
     slot.fn = hit ? hit->fn : nullptr;
+    if (hit && hit->validation) {
+        slot.entry = hit;
+        const std::size_t run =
+            nds_dispatch_index_run_start(c.dispatch_index, pc, thumb);
+        slot.index_pos = run < UINT32_MAX ? static_cast<uint32_t>(run)
+                                          : UINT32_MAX;
+    }
     slot.validation = candidate ? candidate->validation : nullptr;
     slot.live_bank_serial = hit
         ? live_overlay_candidate_serial(g_nds_active, hit)
@@ -608,7 +835,7 @@ const CachedStaticLookup* lookup_static_cached_impl(const CpuCtx& c,
         if (replacement.guard_size) {
             const uint32_t last = (replacement.guard_start + replacement.guard_size - 1) & ~0xFFFu;
             for (uint32_t page = replacement.guard_start & ~0xFFFu;; page += 4096u) {
-                if (!cache_page_generation(slot, page)) { slot = {}; return nullptr; }
+                if (!cache_page_generation(slot, page, ~0ull)) { slot = {}; return nullptr; }
                 if (page == last) break;
             }
         }
@@ -626,6 +853,7 @@ const CachedStaticLookup* lookup_static_cached_impl(const CpuCtx& c,
         }
     }
 #endif
+    if (hit && slot.page_count) watch_candidate_run(c, pc, thumb, slot);
     return slot.fn ? &slot : nullptr;
 }
 
@@ -650,22 +878,23 @@ bool arm_static_guard(const NdsStaticValidation* validation,
     guard = {};
     if (!validation) return true;
     guard.validation = validation;
-    auto add_page = [&](uint32_t page) {
+    auto add_page = [&](uint32_t page, uint64_t blocks) {
         for (uint32_t i = 0u; i < guard.page_count; ++i) {
-            if (guard.page_addr[i] == page) return true;
+            if (guard.page_addr[i] == page) {
+                if (guard.generation_ptr[i]) bus_code_watch(page, blocks);
+                return true;
+            }
         }
         if (guard.page_count >= 4u) return false;
         const uint32_t i = guard.page_count++;
         guard.page_addr[i] = page;
-        // Main RAM's generation storage is stable for a runtime instance.
-        // Keep the exact counter used by the dispatch cache so every nested
-        // static return does not resolve the same virtual page again.
-        if (page - 0x02000000u < 0x01000000u && g_busf_main.gen) {
-            const uint32_t offset = page & g_busf_main.mask;
-            guard.generation_ptr[i] =
-                g_busf_main.gen + (offset >> 12u);
-            guard.generation[i] = *guard.generation_ptr[i];
+        // Same snapshot rule as cache_page_generation: main RAM pages keep
+        // the exact code generation cell the dispatch cache uses.
+        if (uint32_t* cell = bus_code_watch(page, blocks)) {
+            guard.generation_ptr[i] = cell;
+            guard.generation[i] = *cell;
         } else {
+            bus_code_watch_page(page);
             guard.generation[i] = bus_exec_page_generation(page);
         }
         return true;
@@ -675,11 +904,12 @@ bool arm_static_guard(const NdsStaticValidation* validation,
             if (!range.expected || range.size == 0u) return false;
             const uint64_t end = uint64_t{range.addr} + range.size;
             if (end > 0x1'0000'0000ull) return false;
+            const uint32_t last = static_cast<uint32_t>(end - 1u);
             const uint32_t first_page = range.addr & ~0xFFFu;
-            const uint32_t last_page =
-                static_cast<uint32_t>(end - 1u) & ~0xFFFu;
+            const uint32_t last_page = last & ~0xFFFu;
             for (uint32_t page = first_page;; page += 4096u) {
-                if (!add_page(page)) return false;
+                if (!add_page(page, range_page_blocks(range.addr, last, page)))
+                    return false;
                 if (page == last_page) break;
             }
             return true;
@@ -1009,15 +1239,25 @@ extern "C" void runtime_request_yield_poll(void) { request_yield_poll(); }
 // instruction boundary, and the fast tick path does not look at it).
 extern "C" void runtime_clear_fast_limit(void) { g_nds_fast_limit = 0u; }
 
-static void publish_code_write(const uint32_t* first,uint32_t count) {
+// Dynarmic watches page-generation cells, not code-generation cells, and
+// sees every store (its main window publishes all of them, bus.cpp).
+static inline void publish_native_write(const uint32_t* page_cells,
+                                        uint32_t count) {
 #if defined(NDS_ARM9_DYNARMIC)
-    nds_arm9_native_note_write_pages(first,count);
+    nds_arm9_native_note_write_pages(page_cells,count);
+#else
+    (void)page_cells; (void)count;
 #endif
-    // beads-yjp.28: every guest RAM write funnels through here -- the slow bus
+}
+
+static void publish_code_write(const uint32_t* first,uint32_t count) {
+    // beads-yjp.28: every guest RAM write to a watched page of an untracked
+    // backing, and every write to a tracked backing (main RAM, ITCM, ARM7
+    // WRAM) that touches watched code, funnels through here -- the slow bus
     // path (bus.cpp note_ram_write) and the generated-bank inline fast path
-    // (runtime_arm.h nds_busf_note_write) alike -- so this single counter is
-    // what lets the coverage page cache stay trusted between writes instead of
-    // paying a generation lookup per interpreted instruction.
+    // (runtime_arm.h nds_busf_note_write) alike -- so this counter lets the
+    // coverage page cache trust an untracked page between writes. Tracked
+    // pages compare their page generation instead (coverage_manifest.h).
     ++g_coverage_write_epoch;
     if (g_static_guard && !g_static_guard->invalidated &&
         write_may_change_guard(*g_static_guard,first,count) &&
@@ -1029,10 +1269,42 @@ static void publish_code_write(const uint32_t* first,uint32_t count) {
     }
 }
 
+// ABI 7 store publisher (nds_busf_note_write, bus.cpp note_ram_write). A
+// window without code tracking publishes its page cells as before. On
+// tracked backings (main RAM, ITCM, ARM7 WRAM), only code generations whose
+// watched blocks the store overlaps move; a store that overlaps none changes
+// no byte any cached snapshot depends on and publishes nothing. Coverage
+// (coverage_note_exec) compares tracked page generations directly, so it
+// needs no epoch bump for those stores.
+extern "C" void runtime_note_code_store(const NdsBusFastWin* w, uint32_t off,
+                                        uint32_t width) {
+    if (!width) return;
+    const uint32_t first = off >> 12u;
+    const uint32_t pages = ((off + width - 1u) >> 12u) - first + 1u;
+    publish_native_write(w->gen + first, pages);
+    if (!w->code_gen) {
+        bus_code_diag_untracked(w);
+        publish_code_write(w->gen + first, pages);
+        return;
+    }
+    uint32_t count = 0u;
+    if (const uint32_t* cells = bus_code_store(w, off, width, &count))
+        publish_code_write(cells, count);
+}
+// Page-cell publisher kept for the non-main slow path and for shards built
+// against ABI <= 6, which call it on every store with page-generation
+// cells. Main-RAM cells bump their whole pages' code generations.
 extern "C" void runtime_note_code_write_pages(const uint32_t* first,uint32_t count) {
+    publish_native_write(first, count);
+    if (const uint32_t* cells = bus_code_store_pages(first, count)) {
+        publish_code_write(cells, count);
+        return;
+    }
     publish_code_write(first,count);
 }
 extern "C" void runtime_note_code_write(void) {
+    publish_native_write(nullptr, 0);
+    bus_code_store_all();
     publish_code_write(nullptr,0);
 }
 
@@ -1256,7 +1528,8 @@ extern "C" void nds_set_cycle_cap(unsigned long long cap) {
 }
 extern "C" void nds_reschedule_slice(unsigned long long system_deadline) {
     const unsigned long long cpu_deadline =
-        (g_nds_active == NDS_ARM9) ? (system_deadline << 1u) : system_deadline;
+        (g_nds_active == NDS_ARM9)
+            ? (system_deadline << g_nds_arm9_clock_shift) : system_deadline;
     if (g_cycle_cap == 0 || cpu_deadline < g_cycle_cap) {
         g_cycle_cap = cpu_deadline;
         // A device scheduled an EARLIER deadline than the published limit.
@@ -1424,18 +1697,48 @@ namespace {
 // Every disqualifying condition below yields zero — "always take the
 // faithful path". A too-small limit is only slow, never wrong.
 void publish_fast_limit() {
+    // Diagnostics: one counter per CPU and outcome (runtime_fast_limit_stats,
+    // perf log "fast_limit"). This is the slow path's own publisher, never
+    // the per-instruction path.
+    unsigned long long* const why =
+        g_fast_limit_reasons[g_nds_active == NDS_ARM7 ? 1 : 0];
+    unsigned reason = kFastLimitPublished;
     if (!g_cycle_fast_limit_enabled ||      // selector: NDS_CYCLE_FAST_LIMIT=0
         !g_cpu_fast_poll ||                 // faithful full-poll reference mode
         g_runtime_break_pc ||               // per-PC predicate, not cycle-based
-        g_nds_terminal ||
-        g_cycle_cap == 0u ||                // no slice bound to inherit
-        g_deferred_cycles != 0u ||          // tick must commit HALT debt
-        active_static_code_changed() ||     // guest rewrote executing code
-        g_nds_insn_stop ||                  // exact-index observer armed
-        nds_event_break_hit() ||            // debug event break already fired
-        nds_cpu_halted(g_nds_active) ||     // resumable hardware sleep
-        nds_dma_cpu_stalled(g_nds_active) ||  // DMA owns this CPU's bus slot
-        g_nds_irq_pending_cache[g_nds_active] != 0u) {  // IRQ due at next tick
+        g_insn_hook_armed ||                // per-insn payload (runtime_insn_enter)
+        g_nds_terminal) {
+        reason = kFastLimitMode;
+    } else if (g_nds_active == NDS_ARM9 &&  // stale code-fetch publication
+               g_arm9_code_pub_gen != g_cp15_timing_generation) {  // (numc_entered)
+        reason = kFastLimitCodePub;
+    } else if (g_cycle_cap == 0u) {         // no slice bound to inherit
+        reason = kFastLimitNoCap;
+    } else if (g_deferred_cycles != 0u) {   // tick must commit HALT debt
+        reason = kFastLimitDeferred;
+    } else if (active_static_code_changed()) {  // guest rewrote executing code
+        reason = kFastLimitStaticCode;
+    } else if (g_nds_insn_stop ||           // exact-index observer armed
+               nds_event_break_hit()) {     // debug event break already fired
+        reason = kFastLimitBreak;
+    } else if (nds_cpu_halted(g_nds_active)) {  // resumable hardware sleep
+        reason = kFastLimitHalted;
+    } else if (nds_dma_cpu_stalled(g_nds_active)) {  // DMA owns this CPU's bus slot
+        reason = kFastLimitDma;
+    } else if (g_nds_irq_pending_cache[g_nds_active] != 0u &&  // IRQ due at
+               !(g_cpu.cpsr & CPSR_I_BIT)) {                     // next tick
+        // With CPSR.I set a pending IRQ cannot be taken at any boundary until
+        // the guest clears I, and every path that can clear it drops the
+        // limit (note_cpsr_unmask: MSR, exception return, SPSR restore;
+        // Tier 3's own check; whole-CPSR restores), so the tick at the end
+        // of the unmasking instruction runs the faithful path and delivers
+        // at exactly the boundary it always did. Refusing here instead sent
+        // every instruction of an IRQ handler or critical section with an
+        // IRQ queued through the slow entry (~23k per DQ9 town frame).
+        reason = kFastLimitIrq;
+    }
+    ++why[reason];
+    if (reason != kFastLimitPublished) {
         g_nds_fast_limit = 0u;
         return;
     }
@@ -1774,6 +2077,9 @@ void runtime_dispatch_impl(uint32_t target_pc, NdsLinkSlot* linked) {
                            ? NDS_DISPATCH_CACHE_HIT_ABSENT
                            : NDS_DISPATCH_CACHE_SLOW);
             ++g_nds_dispatch_timing[g_nds_active].cache_events[cache_path];
+            if (cache_path == NDS_DISPATCH_CACHE_SLOW)
+                ++g_nds_dispatch_timing[g_nds_active]
+                      .class_slow[cost_region.cls()];
             cache_region.close_as(cache_path);
             // Refill the offered slot from the authoritative resolution.
             // Only when the slot's own target is the PC actually resolved
@@ -2254,6 +2560,15 @@ extern "C" void runtime_write_user_reg(uint32_t reg, uint32_t value) {
     else if (reg == 13u) g_cpu.banked_sp[ARM_BANK_USER] = value;
     else                 g_cpu.banked_lr[ARM_BANK_USER] = value;
 }
+// A CPSR write that clears I can make a queued IRQ deliverable at this
+// instruction's tick; publish_fast_limit may have published a limit while I
+// was set, so drop it (see the IRQ case there).
+static inline void note_cpsr_unmask(uint32_t oc, uint32_t nc) {
+    if (oc & ~nc & CPSR_I_BIT) g_nds_fast_limit = 0u;
+}
+extern "C" void runtime_note_cpsr_unmask(uint32_t old_cpsr, uint32_t new_cpsr) {
+    note_cpsr_unmask(old_cpsr, new_cpsr);
+}
 extern "C" uint32_t runtime_mrs_cpsr(void) { return g_cpu.cpsr; }
 extern "C" uint32_t runtime_mrs_spsr(void) { return g_cpu.banked_spsr[mode_to_bank(g_cpu.cpsr)]; }
 extern "C" void runtime_msr_cpsr(uint32_t value, uint32_t mask) {
@@ -2265,6 +2580,7 @@ extern "C" void runtime_msr_cpsr(uint32_t value, uint32_t mask) {
     unsigned ob = mode_to_bank(oc), nb = mode_to_bank(nc);
     g_cpu.cpsr = nc;
     if (ob != nb) { bank_out(ob, oc); bank_in(nb, nc); }
+    note_cpsr_unmask(oc, nc);
 }
 extern "C" void runtime_msr_spsr(uint32_t value, uint32_t mask) {
     unsigned bank = mode_to_bank(g_cpu.cpsr);
@@ -2280,6 +2596,7 @@ extern "C" void runtime_exception_return(uint32_t new_pc) {
     if (om == 0x10u || om == 0x1Fu) { g_cpu.R[15] = new_pc; return; }
     unsigned ob = mode_to_bank(oc); uint32_t spsr = g_cpu.banked_spsr[ob];
     bank_out(ob, oc); g_cpu.cpsr = spsr; bank_in(mode_to_bank(spsr), spsr);
+    note_cpsr_unmask(oc, spsr);
     g_cpu.R[15] = new_pc;
 }
 extern "C" void runtime_restore_cpsr_from_spsr(void) {
@@ -2287,6 +2604,7 @@ extern "C" void runtime_restore_cpsr_from_spsr(void) {
     if (om == 0x10u || om == 0x1Fu) return;
     unsigned ob = mode_to_bank(oc); uint32_t spsr = g_cpu.banked_spsr[ob];
     bank_out(ob, oc); g_cpu.cpsr = spsr; bank_in(mode_to_bank(spsr), spsr);
+    note_cpsr_unmask(oc, spsr);
 }
 
 // ── SWI / IRQ (per-CPU exception base) ──────────────────────────────────
@@ -2418,6 +2736,8 @@ bool runtime_savestate_import(const NdsRuntimeSaveState& in,
     g_nds_terminal = false;
     g_nds_halt_reason = nullptr;
     g_nds_unwinding = 0;
+    // A loaded state resumes no yield of this session's hooks.
+    g_hook_resume_pc[0] = g_hook_resume_pc[1] = 0xFFFFFFFFu;
     runtime_savestate_invalidate_host_caches();
     return true;
 }

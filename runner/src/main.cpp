@@ -6,6 +6,7 @@
 // halt. Reports where each core got — the execution-driven signal for the
 // next pieces (SPI/firmware boot for ARM7, IPC handshake between them).
 
+#include "rom_icon.h"
 #include <algorithm>
 #include <cstdint>
 #include <cstdio>
@@ -64,16 +65,24 @@
 #include "title_banks.h"
 #include "execution_model.h"
 #include "coverage_manifest.h"
+#include "tier3.h"
+#include "log_file.h"
+#include "player_launch.h"
 #include "title_patches.h"
+#if NDS_ONLINE
+#include "net/online_lobby.h"
+#endif
 #if defined(NDS_HAVE_COMPUTE_RENDERER)
 #include "melonds_compute/ComputeHost.h"
 #endif
 
 // Generated per-CPU dispatch tables (C linkage).
+#ifdef NDS_HAVE_RETAIL_BIOS_BANKS
 extern "C" const DispatchEntry g_dispatch_arm9_bios[];
 extern "C" const unsigned g_dispatch_arm9_bios_len;
 extern "C" const DispatchEntry g_dispatch_arm7_bios[];
 extern "C" const unsigned g_dispatch_arm7_bios_len;
+#endif
 extern "C" const DispatchEntry g_dispatch_freebios_arm9[];
 extern "C" const unsigned g_dispatch_freebios_arm9_len;
 extern "C" const DispatchEntry g_dispatch_freebios_arm7[];
@@ -151,10 +160,16 @@ extern "C" const unsigned g_dispatch_fw_arm7_pictochat_room_a_len;
 namespace {
 
 std::vector<uint8_t> read_file(const std::string& p) {
-    std::ifstream f(p, std::ios::binary);
+    // One bulk read: the per-char istreambuf_iterator path cost ~0.6 s on a
+    // 256 MiB cartridge at every launch.
+    std::ifstream f(p, std::ios::binary | std::ios::ate);
     if (!f) return {};
-    return std::vector<uint8_t>((std::istreambuf_iterator<char>(f)),
-                                std::istreambuf_iterator<char>());
+    const std::streamoff size = f.tellg();
+    if (size <= 0) return {};
+    std::vector<uint8_t> data(static_cast<size_t>(size));
+    f.seekg(0);
+    if (!f.read(reinterpret_cast<char*>(data.data()), size)) return {};
+    return data;
 }
 
 bool verify(const std::vector<uint8_t>& data, const char* want,
@@ -345,7 +360,52 @@ std::filesystem::path exe_dir_from_argv(const char* argv0) {
 
 }  // namespace
 
+// On Android the runner is a shared library and SDL's Java glue calls
+// SDL_main; SDL_main.h renames main to it there.
+#if defined(__ANDROID__) && defined(NDS_HAVE_SDL3)
+#include <SDL3/SDL_main.h>
+#endif
+
+#if defined(__ANDROID__)
+#include <android/log.h>
+#include <sys/system_properties.h>
+#include <unistd.h>
+
+namespace {
+// An app's stdout and stderr go nowhere on Android: send them, line by line,
+// to logcat under the "ndsrecomp" tag. Runs before nds_log_capture_begin(),
+// which then tees into this pipe as the console.
+void forward_stdio_to_logcat() {
+    static int fds[2];
+    if (pipe(fds) != 0) return;
+    dup2(fds[1], STDOUT_FILENO);
+    dup2(fds[1], STDERR_FILENO);
+    close(fds[1]);
+    setvbuf(stdout, nullptr, _IOLBF, 0);
+    std::thread([] {
+        std::string line;
+        char buffer[1024];
+        ssize_t got;
+        while ((got = read(fds[0], buffer, sizeof(buffer))) > 0) {
+            for (ssize_t i = 0; i < got; ++i) {
+                if (buffer[i] != '\n') {
+                    line.push_back(buffer[i]);
+                    continue;
+                }
+                __android_log_write(ANDROID_LOG_INFO, "ndsrecomp",
+                                    line.c_str());
+                line.clear();
+            }
+        }
+    }).detach();
+}
+}  // namespace
+#endif
+
 int main(int argc, char** argv) {
+#if defined(__ANDROID__)
+    forward_stdio_to_logcat();
+#endif
     // stderr is the runner's diagnostic stream and is read from files by
     // harnesses and field-bundle collectors. Under Windows UCRT a redirected
     // stderr becomes BLOCK buffered, so a force-killed process loses its tail
@@ -354,6 +414,9 @@ int main(int argc, char** argv) {
     // cost the session an hour of phantom debugging. Unbuffered is what the C
     // standard promises for stderr anyway; pay the syscall per line.
     setvbuf(stderr, nullptr, _IONBF, 0);
+    // A copy of stderr goes to logs/<app>_NNN.log (log_file.h), opened once
+    // the arguments and config say where; lines before that are held.
+    nds_log_capture_begin();
     // Calibrate the dispatch-cost tick source before anything can dispatch.
     // It is lazily self-calibrating as a fallback, but the lazy path would
     // spend its calibration spin inside whichever dispatch happened to be
@@ -400,10 +463,13 @@ int main(int argc, char** argv) {
     std::string config_path = "game.toml";
     std::string cli_screen_layout;
     std::string cli_fullscreen;
+    std::string cli_window_mode;
+    std::string cli_scaling;
     std::string cli_adaptive_screens;
     std::string cli_widescreen_width;
     std::string cli_supersampling;
     std::string cli_internal_resolution;
+    std::string cli_resolution_scale;
     std::string cli_texture_upscale;
     std::string cli_antialiasing;
     std::string cli_frame_interpolation;
@@ -427,13 +493,18 @@ int main(int argc, char** argv) {
     std::string cli_boot_mode;
     std::string cli_identity_mac;
     std::string cli_player_name;
+    std::string cli_language;
     bool cli_generated_firmware = false;
     bool cli_freebios = false;
+    bool use_embedded_dumps = false;
     std::string cli_instance_index;
     std::string cli_save_path;
     std::string cli_execution_model = "faithful";
     std::string cli_diagnostics;
     std::string cli_diagnostics_dir;
+    std::string cli_log_file;
+    std::string player_log_dir;
+    std::string player_data_dir;
     std::string cli_diagnostics_interval_ms;
     std::string cli_runtime_settings_path;
     // beads-yjp.28: where the Tier-3 coverage manifest lands. Empty means
@@ -452,6 +523,7 @@ int main(int argc, char** argv) {
     std::string cli_wfc_provider;
     std::string cli_local_wireless_enabled;
     std::string cli_local_wireless_base_port;
+    std::vector<std::pair<std::string, std::string>> cli_local_wireless_tuning;
     // Wiimmfi M8: capture/replay at the Ethernet backend boundary.
     std::string cli_net_capture_out;
     std::string cli_net_capture_in;
@@ -491,7 +563,27 @@ int main(int argc, char** argv) {
     NdsFrontendOptions frontend_options{};
     uint16_t port = 19842;
     int positional = 0;
-    for (int i = 1; i < argc; ++i) {
+    // No arguments on a title build: find everything and just play.
+    const bool player_mode = nds_player_requested(argc, argv);
+    if (player_mode) {
+        NdsPlayerLaunch launch;
+        if (!nds_player_prepare(argc, argv, &frontend_options, &launch))
+            return launch.exit_code;
+        interactive = true;
+        dir = launch.bios_dir;
+        rom_path = launch.rom;
+        cli_firmware_path = launch.firmware;
+        use_embedded_dumps = launch.embedded_dumps;
+        cli_save_path = launch.save;
+        cli_savestate_dir = launch.savestate_dir;
+        cli_diagnostics_dir = launch.log_dir;
+        player_log_dir = launch.log_dir;
+        player_data_dir = launch.data_dir;
+    }
+    const auto startup_failure = [&](const std::string& message) {
+        if (player_mode) nds_player_error(message);
+    };
+    for (int i = 1; i < argc && !player_mode; ++i) {
         std::string a = argv[i];
         if (a == "--serve") {
             serve = true;
@@ -518,6 +610,8 @@ int main(int argc, char** argv) {
             cli_diagnostics = argv[++i];
         } else if (a == "--diagnostics-dir" && i + 1 < argc) {
             cli_diagnostics_dir = argv[++i];
+        } else if (a == "--log-file" && i + 1 < argc) {
+            cli_log_file = argv[++i];
         } else if (a == "--diagnostics-interval-ms" && i + 1 < argc) {
             cli_diagnostics_interval_ms = argv[++i];
         } else if (a == "--runtime-settings-path" && i + 1 < argc) {
@@ -556,6 +650,10 @@ int main(int argc, char** argv) {
             if (pad) frontend_options.custom_gamepad_bindings = true;
         } else if (a == "--fullscreen" && i + 1 < argc) {
             cli_fullscreen = argv[++i];
+        } else if (a == "--window-mode" && i + 1 < argc) {
+            cli_window_mode = argv[++i];
+        } else if (a == "--scaling" && i + 1 < argc) {
+            cli_scaling = argv[++i];
         } else if (a == "--adaptive-widescreen" && i + 1 < argc) {
             cli_adaptive_screens = argv[++i];
         } else if (a == "--widescreen-width" && i + 1 < argc) {
@@ -564,6 +662,8 @@ int main(int argc, char** argv) {
             cli_supersampling = argv[++i];
         } else if (a == "--internal-resolution" && i + 1 < argc) {
             cli_internal_resolution = argv[++i];
+        } else if (a == "--resolution-scale" && i + 1 < argc) {
+            cli_resolution_scale = argv[++i];
         } else if (a == "--texture-upscale" && i + 1 < argc) {
             cli_texture_upscale = argv[++i];
         } else if (a == "--antialiasing" && i + 1 < argc) {
@@ -633,6 +733,8 @@ int main(int argc, char** argv) {
             cli_identity_mac = argv[++i];
         } else if (a == "--player-name" && i + 1 < argc) {
             cli_player_name = argv[++i];
+        } else if (a == "--language" && i + 1 < argc) {
+            cli_language = argv[++i];
         } else if (a == "--instance-index" && i + 1 < argc) {
             cli_instance_index = argv[++i];
         } else if (a == "--net-ring-dump") {
@@ -660,6 +762,8 @@ int main(int argc, char** argv) {
             cli_local_wireless_enabled = argv[++i];
         } else if (a == "--local-wireless-port" && i + 1 < argc) {
             cli_local_wireless_base_port = argv[++i];
+        } else if (nds_is_local_wireless_tuning_flag(a) && i + 1 < argc) {
+            cli_local_wireless_tuning.emplace_back(a, argv[++i]);
         } else if (a == "--net-capture-out" && i + 1 < argc) {
             cli_net_capture_out = argv[++i];
         } else if (a == "--net-capture-in" && i + 1 < argc) {
@@ -703,18 +807,20 @@ int main(int argc, char** argv) {
                 "[--save-path game.sav|--no-save] "
                 "[--execution-model faithful|performance] "
                 "[--diagnostics on|off] [--diagnostics-dir dir] "
-                "[--diagnostics-interval-ms ms] "
+                "[--diagnostics-interval-ms ms] [--log-file FILE] "
                 "[--runtime-settings-path FILE] "
                 "[--coverage-manifest out.json|--no-coverage-manifest] "
                 "[--firmware-path firmware.bin] "
                 "[--firmware-state-path mutable-firmware.bin] "
                 "[--config game.toml] "
-                "[--screen-layout stacked|separate] "
+                "[--screen-layout single|stacked|separate] "
                 "[--fullscreen off|borderless|exclusive] "
+                "[--window-mode letterbox|stretch|original] "
+                "[--scaling integer|bilinear|nearest] "
                 "[--adaptive-widescreen none|top|bottom|both] "
                 "[--widescreen-width even:256..448] "
                 "[--supersampling 1|2|3|4] "
-                "[--internal-resolution 1..12] "
+                "[--internal-resolution 1..16] [--resolution-scale PERCENT] "
                 "[--window-scale 1..8] "
                 "[--keyboard-bindings <12 comma-separated SDL scancodes>] "
                 "[--gamepad-bindings <12 comma-separated encoded controls>] "
@@ -743,6 +849,8 @@ int main(int argc, char** argv) {
                 "[--boot lle|direct] "
                 "[--generated-firmware] [--identity-mac AA:BB:CC:DD:EE:FF] "
                 "[--player-name NAME] "
+                "[--language preserve|japanese|english|french|german|"
+                "italian|spanish|chinese] "
                 "[--freebios] "
                 "[--instance-index 0..255] "
                 "[--discover-static-misses] [--rtc-host] "
@@ -753,6 +861,13 @@ int main(int argc, char** argv) {
                 "[--wfc on|off] "
                 "[--wfc-provider kaeru|wiimmfi|wiimmfi-direct|local|<ipv4>] "
                 "[--local-wireless on|off] [--local-wireless-port 1024..65520] "
+                "[--local-wireless-delay-ms MS] [--local-wireless-jitter-ms MS] "
+                "[--local-wireless-loss-pct PCT] "
+                "[--local-wireless-late-replies on|off] "
+                "[--local-wireless-reply-budget-us US] "
+                "[--local-wireless-stay-awake on|off] "
+                "[--local-wireless-link lan|loopback] "
+                "[--local-wireless-peer HOST[:PORT]]... "
                 "[--net-capture-out FILE] [--net-capture-in FILE] "
                 "[--net-capture-raw] [--net-capture-no-pcap] "
                 "[--net-capture-scenario NAME] "
@@ -785,7 +900,8 @@ int main(int argc, char** argv) {
         return 2;
     }
 
-    if (config_explicit || std::filesystem::exists(config_path)) {
+    if (!player_mode &&
+        (config_explicit || std::filesystem::exists(config_path))) {
         std::string config_error;
         if (!nds_load_frontend_config(config_path, &frontend_options,
                                       &config_error)) {
@@ -793,6 +909,18 @@ int main(int argc, char** argv) {
                          config_path.c_str(), config_error.c_str());
             return 2;
         }
+    }
+    {
+        // <executable's directory>/logs; a player's instance N from 1 on
+        // uses its logs/instance-N subdirectory (player_launch.h).
+        const auto exe_dir = exe_dir_from_argv(argv[0]);
+        const std::filesystem::path log_dir = player_log_dir.empty()
+            ? exe_dir / "logs"
+            : std::filesystem::path(player_log_dir);
+        const std::string log_app = frontend_options.app_name.empty()
+            ? std::filesystem::path(argv[0]).stem().string()
+            : frontend_options.app_name;
+        nds_log_file_open(cli_log_file, log_dir, log_app);
     }
     NdsFullscreenOverrideError fullscreen_error =
         NdsFullscreenOverrideError::None;
@@ -819,7 +947,22 @@ int main(int argc, char** argv) {
                                      &frontend_options.screen_layout)) {
             std::fprintf(stderr,
                          "invalid NDS_SCREEN_LAYOUT "
-                         "(expected stacked or separate)\n");
+                         "(expected single, stacked, or separate)\n");
+            return 2;
+        }
+    }
+    if (const char* value = std::getenv("NDS_WINDOW_MODE")) {
+        if (!nds_parse_window_mode(value, &frontend_options.window_mode)) {
+            std::fprintf(stderr,
+                         "invalid NDS_WINDOW_MODE "
+                         "(expected letterbox, stretch, or original)\n");
+            return 2;
+        }
+    }
+    if (const char* value = std::getenv("NDS_SCALING")) {
+        if (!nds_parse_scaling_filter(value, &frontend_options.scaling)) {
+            std::fprintf(stderr,
+                         "invalid NDS_SCALING (expected integer, bilinear, or nearest)\n");
             return 2;
         }
     }
@@ -865,13 +1008,34 @@ int main(int argc, char** argv) {
             return 2;
         }
     }
-    if (const char* value = std::getenv("NDS_INTERNAL_RESOLUTION")) {
-        if (!nds_parse_internal_resolution(
-                value, &frontend_options.internal_resolution)) {
+    {
+        const char* internal = std::getenv("NDS_INTERNAL_RESOLUTION");
+        const char* scale = std::getenv("NDS_RESOLUTION_SCALE");
+        if (internal && *internal && scale && *scale) {
             std::fprintf(stderr,
-                         "invalid NDS_INTERNAL_RESOLUTION "
-                         "(expected 1..12)\n");
+                         "NDS_INTERNAL_RESOLUTION and NDS_RESOLUTION_SCALE "
+                         "are exclusive\n");
             return 2;
+        }
+        if (internal && *internal) {
+            if (!nds_parse_internal_resolution(
+                    internal, &frontend_options.internal_resolution)) {
+                std::fprintf(stderr,
+                             "invalid NDS_INTERNAL_RESOLUTION "
+                             "(expected 1..16)\n");
+                return 2;
+            }
+            frontend_options.resolution_scale = 0;
+        }
+        if (scale && *scale) {
+            if (!nds_parse_resolution_scale(
+                    scale, &frontend_options.resolution_scale)) {
+                std::fprintf(stderr,
+                             "invalid NDS_RESOLUTION_SCALE "
+                             "(expected 10..1000)\n");
+                return 2;
+            }
+            frontend_options.internal_resolution = 1;
         }
     }
     if (const char* value = std::getenv("NDS_ANTIALIASING")) {
@@ -937,6 +1101,25 @@ int main(int argc, char** argv) {
         }
         frontend_options.freebios = enabled;
     }
+    if (const char* value = std::getenv("NDS_LANGUAGE")) {
+        if (!nds_parse_firmware_language(
+                value, &frontend_options.firmware_language)) {
+            std::fprintf(stderr,
+                         "invalid NDS_LANGUAGE (expected preserve, japanese, "
+                         "english, french, german, italian, spanish, or "
+                         "chinese)\n");
+            return 2;
+        }
+    }
+    if (!cli_language.empty() &&
+        !nds_parse_firmware_language(cli_language,
+                                     &frontend_options.firmware_language)) {
+        std::fprintf(stderr,
+                     "invalid --language (expected preserve, japanese, "
+                     "english, french, german, italian, spanish, or "
+                     "chinese)\n");
+        return 2;
+    }
     if (const char* value = std::getenv("NDS_PLAYER_NAME")) {
         frontend_options.player_name = value;
     }
@@ -959,7 +1142,21 @@ int main(int argc, char** argv) {
                                  &frontend_options.screen_layout)) {
         std::fprintf(stderr,
                      "invalid --screen-layout "
-                     "(expected stacked or separate)\n");
+                     "(expected single, stacked, or separate)\n");
+        return 2;
+    }
+    if (!cli_window_mode.empty() &&
+        !nds_parse_window_mode(cli_window_mode,
+                               &frontend_options.window_mode)) {
+        std::fprintf(stderr,
+                     "invalid --window-mode "
+                     "(expected letterbox, stretch, or original)\n");
+        return 2;
+    }
+    if (!cli_scaling.empty() &&
+        !nds_parse_scaling_filter(cli_scaling, &frontend_options.scaling)) {
+        std::fprintf(stderr,
+                     "invalid --scaling (expected integer, bilinear, or nearest)\n");
         return 2;
     }
     if (!cli_adaptive_screens.empty() &&
@@ -995,13 +1192,31 @@ int main(int argc, char** argv) {
                      "(expected 1, 2, or 4)\n");
         return 2;
     }
-    if (!cli_internal_resolution.empty() &&
-        !nds_parse_internal_resolution(
-            cli_internal_resolution,
-            &frontend_options.internal_resolution)) {
+    if (!cli_internal_resolution.empty() && !cli_resolution_scale.empty()) {
         std::fprintf(stderr,
-                     "invalid --internal-resolution (expected 1..12)\n");
+                     "--internal-resolution and --resolution-scale are "
+                     "exclusive\n");
         return 2;
+    }
+    if (!cli_internal_resolution.empty()) {
+        if (!nds_parse_internal_resolution(
+                cli_internal_resolution,
+                &frontend_options.internal_resolution)) {
+            std::fprintf(stderr,
+                         "invalid --internal-resolution (expected 1..16)\n");
+            return 2;
+        }
+        frontend_options.resolution_scale = 0;
+    }
+    if (!cli_resolution_scale.empty()) {
+        if (!nds_parse_resolution_scale(
+                cli_resolution_scale,
+                &frontend_options.resolution_scale)) {
+            std::fprintf(stderr,
+                         "invalid --resolution-scale (expected 10..1000)\n");
+            return 2;
+        }
+        frontend_options.internal_resolution = 1;
     }
     if (!cli_antialiasing.empty() &&
         !nds_parse_antialiasing(cli_antialiasing,
@@ -1237,6 +1452,15 @@ int main(int argc, char** argv) {
                      "invalid --local-wireless-port (expected 1024..65520)\n");
         return 2;
     }
+    for (const auto& [flag, value] : cli_local_wireless_tuning) {
+        std::string tuning_error;
+        if (!nds_parse_local_wireless_tuning(
+                flag, value, &frontend_options.local_wireless,
+                &tuning_error)) {
+            std::fprintf(stderr, "%s\n", tuning_error.c_str());
+            return 2;
+        }
+    }
     if (frontend_options.local_wireless.enabled &&
         frontend_options.instance_index > 15u) {
         std::fprintf(stderr,
@@ -1275,7 +1499,10 @@ int main(int argc, char** argv) {
     if (cli_net_capture_no_pcap) frontend_options.network.capture_no_pcap = true;
     if (!cli_net_capture_scenario.empty())
         frontend_options.network.capture_scenario = cli_net_capture_scenario;
-    bool diagnostics_enabled = true;
+    // Opt-in: the performance log, the ~36 MB host-profile bundle and the
+    // dispatch-miss log are developer artifacts, not something a stock launch
+    // should leave in logs/. Pass `--diagnostics on` to get them.
+    bool diagnostics_enabled = false;
     if (!cli_diagnostics.empty() &&
         !nds_parse_on_off(cli_diagnostics, &diagnostics_enabled)) {
         std::fprintf(stderr, "invalid --diagnostics (expected on or off)\n");
@@ -1297,7 +1524,11 @@ int main(int argc, char** argv) {
     nds_diagnostics_configure(diagnostics_enabled,
                               cli_diagnostics_dir.c_str(),
                               diagnostics_interval_ms);
-    if (!diagnostics_enabled) coverage_manifest_disabled = true;
+    // The coverage manifest is a player-facing feature, so it stays on by
+    // default; only an explicit `--diagnostics off` turns it off with them.
+    if ((!cli_diagnostics.empty() && !diagnostics_enabled) ||
+        !tier3_interpreter_present())
+        coverage_manifest_disabled = true;
     nds_diagnostics_enable_profile_environment();
 
     // Always-on host CPU sampler (host_profile.h). Started HERE -- before the
@@ -1340,6 +1571,42 @@ int main(int argc, char** argv) {
         frontend_options.instance_index;
     resolved_network.local_wireless_base_port =
         frontend_options.local_wireless.base_port;
+    resolved_network.local_wireless_delay_ms =
+        frontend_options.local_wireless.delay_ms;
+    resolved_network.local_wireless_jitter_ms =
+        frontend_options.local_wireless.jitter_ms;
+    resolved_network.local_wireless_loss_pct =
+        frontend_options.local_wireless.loss_pct;
+    resolved_network.local_wireless_late_replies =
+        frontend_options.local_wireless.late_replies;
+    resolved_network.local_wireless_reply_budget_us =
+        frontend_options.local_wireless.reply_budget_us;
+    resolved_network.local_wireless_stay_awake =
+        frontend_options.local_wireless.stay_awake;
+    resolved_network.local_wireless_lan = frontend_options.local_wireless.lan;
+    resolved_network.local_wireless_peers =
+        frontend_options.local_wireless.peers;
+    {
+        // An app gets no environment on Android: there the switches are
+        // also read from debug.ndsrecomp.local_mp_{stats,trace}, which
+        // `adb shell setprop` sets without root.
+        const auto switch_on = [](const char* env, const char* prop) {
+            const char* value = std::getenv(env);
+            if (value && value[0]) return std::strcmp(value, "0") != 0;
+#if defined(__ANDROID__)
+            char buf[PROP_VALUE_MAX] = "";
+            if (__system_property_get(prop, buf) > 0)
+                return std::strcmp(buf, "0") != 0;
+#else
+            (void)prop;
+#endif
+            return false;
+        };
+        resolved_network.local_wireless_stats_log = switch_on(
+            "NDS_LOCAL_MP_STATS", "debug.ndsrecomp.local_mp_stats");
+        resolved_network.local_wireless_trace = switch_on(
+            "NDS_LOCAL_MP_TRACE", "debug.ndsrecomp.local_mp_trace");
+    }
 
     // Resolve the user-facing backend name to the bridge enum. Replay is
     // always available; pcap is available only in builds that opt into the
@@ -1620,6 +1887,17 @@ int main(int argc, char** argv) {
 
     if (cli_generated_firmware) frontend_options.generated_firmware = true;
     if (cli_freebios) frontend_options.freebios = true;
+#ifndef NDS_HAVE_RETAIL_BIOS_BANKS
+    if (!frontend_options.freebios) {
+        // Built with NDS_RETAIL_BIOS_BANKS=OFF: there is no compiled code for
+        // the retail BIOS, so its dumps could not run.
+        std::fprintf(stderr,
+            "refusing to start: this build has no retail BIOS banks; "
+            "use --freebios (system.freebios = true)\n");
+        startup_failure("This build only runs on FreeBIOS: set freebios = true.");
+        return 1;
+    }
+#endif
     if (frontend_options.freebios &&
         frontend_options.boot_mode != NdsBootMode::Direct) {
         // A reimplemented BIOS cannot boot the firmware menu (melonDS
@@ -1665,11 +1943,18 @@ int main(int argc, char** argv) {
             "arm7 %zu bytes SHA-1 %s\n",
             a9.size(), gba::sha1(a9.data(), a9.size()).hex().c_str(),
             a7.size(), gba::sha1(a7.data(), a7.size()).hex().c_str());
+    } else if (use_embedded_dumps) {
+        // fw is filled from the same source below.
     } else {
         a9 = read_file(dir + "/biosnds9.rom");
         a7 = read_file(dir + "/biosnds7.rom");
     }
     std::vector<uint8_t> fw;
+    if (use_embedded_dumps && !frontend_options.freebios) {
+        std::vector<uint8_t> embedded_fw;
+        nds_player_embedded_dumps(&a9, &a7, &embedded_fw);
+        if (!frontend_options.generated_firmware) fw = std::move(embedded_fw);
+    }
     if (frontend_options.generated_firmware) {
         std::array<uint8_t, 6> identity_mac{};
         if (!cli_identity_mac.empty()) {
@@ -1693,11 +1978,13 @@ int main(int argc, char** argv) {
             "[firmware] GENERATED image (opt-in, no dump), %zu bytes, "
             "SHA-1 %s\n", fw.size(),
             gba::sha1(fw.data(), fw.size()).hex().c_str());
-    } else {
+    } else if (!use_embedded_dumps) {
         fw = read_file(cli_firmware_path.empty() ? (dir + "/firmware.bin")
                                                  : cli_firmware_path);
     }
     auto rom = rom_path.empty() ? std::vector<uint8_t>{} : read_file(rom_path);
+    nds_rom_banner_icon_rgba(rom.data(), rom.size(), 8,
+                             &frontend_options.window_icon_rgba);
     std::string rom_sha1;
     bool sm64ds_wide_policy = false;
     bool mph_mouse_aim_policy = false;
@@ -1721,6 +2008,7 @@ int main(int argc, char** argv) {
         std::fprintf(stderr,
             "refusing to start: --firmware-path %s has %zu bytes, expected 262144\n",
             cli_firmware_path.c_str(), fw.size());
+        startup_failure(cli_firmware_path + " is not a 256 KiB firmware dump.");
         return 1;
     } else {
         std::fprintf(stderr,
@@ -1728,7 +2016,12 @@ int main(int argc, char** argv) {
             cli_firmware_path.c_str(),
             gba::sha1(fw.data(), fw.size()).hex().c_str());
     }
-    if (!ok) { std::fprintf(stderr, "refusing to start: dump verification failed\n"); return 1; }
+    if (!ok) {
+        std::fprintf(stderr, "refusing to start: dump verification failed\n");
+        startup_failure("The BIOS or firmware dumps in " + dir +
+                        " failed verification.");
+        return 1;
+    }
     if (!cli_firmware_state_path.empty()) {
         std::string state_error;
         const NdsFirmwareStateLoadResult state_result =
@@ -1748,6 +2041,7 @@ int main(int argc, char** argv) {
     if (!rom_path.empty()) {
         if (rom.size() < 0x200u) {
             std::fprintf(stderr, "refusing to start: cartridge image is missing or truncated\n");
+            startup_failure(rom_path + " is missing or truncated.");
             return 1;
         }
         rom_sha1 = gba::sha1(rom.data(), rom.size()).hex();
@@ -1760,6 +2054,8 @@ int main(int argc, char** argv) {
                          "%s, got %s\n",
                          frontend_options.expected_rom_sha1.c_str(),
                          rom_sha1.c_str());
+            startup_failure(rom_path + " is not the ROM this build runs. "
+                            "Clear rom in settings.toml to pick another.");
             return 1;
         }
     }
@@ -1788,6 +2084,40 @@ int main(int argc, char** argv) {
     nds_diagnostics_set_identity(rom_sha1.c_str(), rom_name.c_str(),
                                  execution_build_id.c_str());
     debug_set_savestate_identity(execution_build_id, rom_sha1);
+    {
+        const NdsOnlineOptions& online = frontend_options.local_wireless.online;
+#if NDS_ONLINE
+        if (interactive && !rom.empty() &&
+            frontend_options.local_wireless.enabled) {
+            NdsOnlineConfig config;
+            if (!online.lobby_url.empty()) config.lobby_url = online.lobby_url;
+            config.game_name = online.game_name;
+            if (config.game_name.empty())
+                config.game_name = std::string(
+                    reinterpret_cast<const char*>(rom.data()) + 0x0C, 4);
+            // Only the same ROM with the same MP wire format may meet.
+            config.game_version = "nif3-" + rom_sha1.substr(0, 12);
+            config.lobby_name = online.lobby_name;
+            // The player's data folder; next to the exe for scripted runs.
+            config.secret_path =
+                ((player_data_dir.empty()
+                      ? exe_dir_from_argv(argv[0])
+                      : std::filesystem::path(player_data_dir)) /
+                 "netplay_secret")
+                    .string();
+            config.enabled = online.enabled;
+            config.sign_in = online.sign_in;
+            config.join = online.join;
+            nds_online_start(config);
+            std::atexit(nds_online_stop);
+        }
+#else
+        if (online.enabled)
+            std::fprintf(stderr,
+                         "[online] Netplay needs a build with NDS_ONLINE=ON; "
+                         "local wireless stays on the LAN\n");
+#endif
+    }
     nds_arm9_native_prepare_initialize(rom_sha1);
 #if defined(NDS_MPH_SUBMIT_HLE)
     if (mph_submit::initialize(rom_sha1.c_str()))
@@ -2091,6 +2421,31 @@ int main(int argc, char** argv) {
             "copies (in-memory only; the dump on disk is untouched)\n",
             frontend_options.player_name.c_str());
     }
+    if (!nds_apply_firmware_language(fw, frontend_options.firmware_language)) {
+        std::fprintf(stderr,
+            "refusing to start: cannot apply firmware language (malformed "
+            "firmware user-settings layout)\n");
+        return 1;
+    }
+    if (frontend_options.firmware_language != NdsFirmwareLanguage::Preserve) {
+        std::fprintf(stderr,
+            "[firmware] language: %s written to both user-settings copies "
+            "(in-memory only; the dump on disk is untouched)\n",
+            nds_firmware_language_name(frontend_options.firmware_language));
+    }
+    // The guest only connects to an AP named in a configured slot; a dump
+    // set up under melonDS names "melonAP", which this runner's AP is not.
+    bool wifi_slot_changed = false;
+    if (!nds_apply_wifi_ap_slot(fw, &wifi_slot_changed)) {
+        std::fprintf(stderr,
+            "refusing to start: malformed firmware Wi-Fi connection slots\n");
+        return 1;
+    }
+    if (wifi_slot_changed) {
+        std::fprintf(stderr,
+            "[firmware] Wi-Fi connection slot pointed at the runner's "
+            "\"ndsrecomp\" access point (in-memory only)\n");
+    }
     if (!nds_apply_instance_mac(fw, frontend_options.instance_index)) {
         std::fprintf(stderr,
             "refusing to start: cannot apply per-instance guest MAC "
@@ -2145,10 +2500,12 @@ int main(int argc, char** argv) {
             nds_register_dispatch(NDS_ARM7, g_dispatch_freebios_arm7,
                                   g_dispatch_freebios_arm7_len, 0x00000000u);
         } else {
+#ifdef NDS_HAVE_RETAIL_BIOS_BANKS
             nds_register_dispatch(NDS_ARM9, g_dispatch_arm9_bios,
                                   g_dispatch_arm9_bios_len, 0xFFFF0000u);
             nds_register_dispatch(NDS_ARM7, g_dispatch_arm7_bios,
                                   g_dispatch_arm7_bios_len, 0x00000000u);
+#endif
         }
 #ifndef NDS_BOOTSTRAP_FIRMWARE
         nds_register_dispatch(NDS_ARM9, g_dispatch_fw_arm9_early,
@@ -2383,6 +2740,7 @@ int main(int argc, char** argv) {
         // via debug_pump(). Execution stays frontend-owned (run_to_* are
         // rejected); queries, rings, and touch/keys injection are live.
         debug_set_reset_fn(boot);
+        nds_frontend_set_reset(boot);
         debug_pump_start(port);
         std::fprintf(stderr, "[run] interactive SDL mode from reset\n");
         const int rc = nds_run_interactive_frontend(frontend_options);

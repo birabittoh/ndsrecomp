@@ -7,6 +7,7 @@
 #include <chrono>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <ctime>
 #include <filesystem>
 #include <string>
@@ -27,6 +28,8 @@
 #include "scheduler.h"
 #include "tier3.h"
 #include "wifi_net.h"
+
+extern "C" void runtime_fast_limit_stats(unsigned long long out[2][10]);
 
 namespace {
 
@@ -384,7 +387,10 @@ void write_dispatch_delta(const NdsDispatchStats& now,
         "\"literal_branch\":%llu,\"literal_call\":%llu,"
         "\"literal_fallthrough\":%llu,\"exception_dispatch\":%llu,"
         "\"cache_hit\":%llu,\"cache_hit_absent\":%llu,"
-        "\"cache_slow_lookup\":%llu,\"crs_push\":%llu,"
+        "\"cache_slow_lookup\":%llu,\"cache_slow_empty\":%llu,"
+        "\"cache_slow_collide\":%llu,\"cache_slow_epoch\":%llu,"
+        "\"cache_slow_gen\":%llu,\"cache_slow_gen_refresh\":%llu,"
+        "\"crs_push\":%llu,"
         "\"crs_hit\":%llu,\"crs_miss\":%llu,\"crs_scan_iters\":%llu}",
         (unsigned long long)sub_u64(now.resume_dispatch, before.resume_dispatch),
         (unsigned long long)sub_u64(now.dispatch_total, before.dispatch_total),
@@ -403,6 +409,15 @@ void write_dispatch_delta(const NdsDispatchStats& now,
                                     before.cache_hit_absent),
         (unsigned long long)sub_u64(now.cache_slow_lookup,
                                     before.cache_slow_lookup),
+        (unsigned long long)sub_u64(now.cache_slow_empty,
+                                    before.cache_slow_empty),
+        (unsigned long long)sub_u64(now.cache_slow_collide,
+                                    before.cache_slow_collide),
+        (unsigned long long)sub_u64(now.cache_slow_epoch,
+                                    before.cache_slow_epoch),
+        (unsigned long long)sub_u64(now.cache_slow_gen, before.cache_slow_gen),
+        (unsigned long long)sub_u64(now.cache_slow_gen_refresh,
+                                    before.cache_slow_gen_refresh),
         (unsigned long long)sub_u64(now.crs_push, before.crs_push),
         (unsigned long long)sub_u64(now.crs_hit, before.crs_hit),
         (unsigned long long)sub_u64(now.crs_miss, before.crs_miss),
@@ -426,7 +441,8 @@ void write_timing_delta(const NdsDispatchTiming& now,
     for (int i = 0; i < NDS_DISPATCH_CLASS_COUNT; ++i) {
         if (i) std::fputc(',', g_perf);
         std::fprintf(g_perf,
-                     "\"%s\":{\"ns\":%llu,\"samples\":%llu,\"events\":%llu}",
+                     "\"%s\":{\"ns\":%llu,\"samples\":%llu,\"events\":%llu,"
+                     "\"slow\":%llu}",
                      nds_dispatch_class_name(
                          static_cast<NdsDispatchClass>(i)),
                      (unsigned long long)sub_u64(now.class_ns[i],
@@ -434,7 +450,9 @@ void write_timing_delta(const NdsDispatchTiming& now,
                      (unsigned long long)sub_u64(now.class_samples[i],
                                                  before.class_samples[i]),
                      (unsigned long long)sub_u64(now.class_events[i],
-                                                 before.class_events[i]));
+                                                 before.class_events[i]),
+                     (unsigned long long)sub_u64(now.class_slow[i],
+                                                 before.class_slow[i]));
     }
     // Nested inside the class regions above -- a breakdown of where the
     // dispatch prologue spends its time, NOT an addend to class ns.
@@ -796,6 +814,11 @@ void nds_diagnostics_maybe_write_performance_sample(
         "\"governor\":{\"stage\":%u,\"over_frames\":%u,"
         "\"under_frames\":%u,\"held\":%s,\"apply_failed\":%s,"
         "\"transitions\":%llu,\"compute_readback_ms\":%.3f},"
+        "\"gx\":{\"vblanks\":%llu,\"swaps\":%llu,\"new_images\":%llu,"
+        "\"swap_polygons\":%llu,\"lcd_flips\":%llu,"
+        "\"fifo_words\":%llu,\"fifo_writes\":%llu,\"fifo_executed\":%llu,"
+        "\"interp_images\":%llu,\"interp_units\":%llu,"
+        "\"interp_blended_units\":%llu,\"interp_skipped\":%llu},"
         "\"cycles\":{\"arm9\":%llu,\"arm7\":%llu},"
         "\"tier3_delta\":{\"arm9\":{\"entries\":%llu,"
         "\"instructions\":%llu,\"clean_ram_rejects\":%llu},"
@@ -833,6 +856,29 @@ void nds_diagnostics_maybe_write_performance_sample(
                                   g_prev_gpu3d.compute_readback_ns)) /
                           1000000.0 / static_cast<double>(frame_delta)
                     : 0.0,
+        (unsigned long long)sub_u64(gpu3d.gx_vblanks,
+                                    g_prev_gpu3d.gx_vblanks),
+        (unsigned long long)sub_u64(gpu3d.gx_swaps, g_prev_gpu3d.gx_swaps),
+        (unsigned long long)sub_u64(gpu3d.gx_new_images,
+                                    g_prev_gpu3d.gx_new_images),
+        (unsigned long long)sub_u64(gpu3d.gx_swap_polygons,
+                                    g_prev_gpu3d.gx_swap_polygons),
+        (unsigned long long)sub_u64(gpu3d.gx_lcd_flips,
+                                    g_prev_gpu3d.gx_lcd_flips),
+        (unsigned long long)sub_u64(gpu3d.gx_fifo_words,
+                                    g_prev_gpu3d.gx_fifo_words),
+        (unsigned long long)sub_u64(gpu3d.gx_fifo_writes,
+                                    g_prev_gpu3d.gx_fifo_writes),
+        (unsigned long long)sub_u64(gpu3d.gx_fifo_executed,
+                                    g_prev_gpu3d.gx_fifo_executed),
+        (unsigned long long)sub_u64(gpu3d.gx_interp_images,
+                                    g_prev_gpu3d.gx_interp_images),
+        (unsigned long long)sub_u64(gpu3d.gx_interp_units,
+                                    g_prev_gpu3d.gx_interp_units),
+        (unsigned long long)sub_u64(gpu3d.gx_interp_blended_units,
+                                    g_prev_gpu3d.gx_interp_blended_units),
+        (unsigned long long)sub_u64(gpu3d.gx_interp_skipped,
+                                    g_prev_gpu3d.gx_interp_skipped),
         (unsigned long long)sched_state.cycles[0],
         (unsigned long long)sched_state.cycles[1],
         (unsigned long long)sub_u64(tier3.entries[0],
@@ -983,6 +1029,30 @@ void nds_diagnostics_maybe_write_performance_sample(
     // carried the dispatches. Both, always: reading either alone is how the
     // first cut of this block spent a field session reporting the idle loop as
     // "the hottest code in the game".
+    {
+        // Why the per-instruction fast limit was or was not published, per
+        // CPU (runtime_arm.cpp publish_fast_limit). Each refusal sends the
+        // next instruction through runtime_insn_enter_slow again.
+        static const char* const kReasons[10] = {
+            "published", "mode", "code_pub", "no_cap", "deferred",
+            "static_code", "break", "halted", "dma", "irq"};
+        static unsigned long long prev[2][10] = {};
+        unsigned long long now[2][10];
+        runtime_fast_limit_stats(now);
+        std::fprintf(g_perf, ",\"fast_limit_delta\":{");
+        for (int c = 0; c < 2; ++c) {
+            std::fprintf(g_perf, "%s\"%s\":{", c ? "," : "", c ? "arm7" : "arm9");
+            for (int r = 0; r < 10; ++r)
+                std::fprintf(g_perf, "%s\"%s\":%llu", r ? "," : "", kReasons[r],
+                             now[c][r] - prev[c][r]);
+            std::fprintf(g_perf, "}");
+        }
+        std::fprintf(g_perf, "}");
+        std::memcpy(prev, now, sizeof prev);
+        // Cumulative GX command cache statistics ({} when not built in).
+        std::fprintf(g_perf, ",\"gx_command_cache\":%s",
+                     nds_gpu3d_command_batch_json());
+    }
     std::fprintf(g_perf, ",\"pc_hot_delta\":");
     write_pc_delta(NDS_PC_HOT_PARK);
     std::fprintf(g_perf, ",\"pc_exec_delta\":");

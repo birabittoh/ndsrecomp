@@ -59,6 +59,55 @@ The native readback and guest capture paths are unchanged. An actual-GL
 test runs both production output shaders on an asymmetric color fixture and
 checks their decoded RGB6 agreement.
 
+## 0025-gpu3d-command-observer-and-replay.patch
+
+2026-11-07: `GPU3D.{cpp,h}` gain two host-only hooks for smooth_3d
+(`runner/src/gpu3d_gxstream.h`). `ExecObserver` sees each geometry command
+with all its parameters as it executes, so the runner can record one command
+stream per 3D image. `ExecuteReplayCommand` runs one whole command on a
+private GPU3D instance without the FIFO, so no IRQ, DMA or stall reaches the
+NDS; `ExecuteCommand` now reads the FIFO and hands the entry to the shared
+`ExecuteEntry`. Neither hook is hardware state or enters the serializer, and
+with no observer set the engine behaves exactly as before.
+
+## 0026-wifi-inhibit-power-down-hook.patch
+
+2026-11-09: `Wifi.cpp`'s `UpdatePowerStatus` asks the runner hook
+`nds_wifi_inhibit_power_down()` before powering the radio down and, on true,
+stays on as `W_PowerDownCtrl` bit 0 would. Opt-in via
+`--local-wireless-stay-awake on` while the local MP transport is open: over
+a link with latency the auth/assoc handshake no longer fits in one
+post-beacon wake window. Off by default; behaviour is otherwise unchanged.
+
+## 0027-wifi-mp-ack-without-frame.patch
+
+2026-11-09: `Wifi.cpp`/`Wifi.h`: right after `MP_RecvReplies` the MP host
+asks the runner hook `nds_wifi_local_mp_take_ack_only()` for clients whose
+reply is still in flight. They count as answered (no fail bit, so no WM
+retransmission on either side) but no reply frame is received for them.
+Only `--local-wireless-late-replies on` returns a non-zero mask: there the
+runner delivers each client's replies FIFO, one per cmd, so every reply
+reaches the guest exactly once. Behaviour is otherwise unchanged.
+
+## 0028-wifi-local-mp-client-trace.patch
+
+2026-11-09: `Wifi.cpp`/`Wifi.h`: with `NDS_LOCAL_MP_TRACE=1` and the local
+MP transport open (runner hook `nds_wifi_local_mp_trace_enabled()`), the MP
+client logs each host frame it syncs to (timestamp vs its own clock,
+NextSync), each reply it sends and how the reply slots move, duplicate cmds
+dropped from RX, and how long it waited for host frames. Diagnostics only;
+behaviour is unchanged.
+
+## 0029-wifi-rx-channel-hook.patch
+
+2026-11-11: `Wifi.cpp`'s `CheckRX` tells the runner hook
+`nds_wifi_local_mp_note_rx_channel()` the channel it is listening on before
+each regular `MP_RecvPacket`. With Netplay on and no lobby joined, the
+runner replays the open lobbies' host beacons into the radio
+(HANDOFF_ONLINE_LOBBY.md, "DQ9's in-game host list"); it hands one over
+only on the channel the guest is on, since `CheckRX` drops a frame from any
+other channel. The hook only records a number; behaviour is unchanged.
+
 ## 0001-wifi-ap-identity.patch
 
 `src/WifiAP.cpp`: changes the hardcoded AP identity from melonDS's default
@@ -518,3 +567,15 @@ viewport, output-width and guest-wide-mode keys qualify hits. Zero-W behavior
 is retained. Reset and load discard derived entries. The bridge enables this
 only in the MPH submission HLE build; focused tests compare it with caching
 disabled. FIFO/device timing and polygon processing are unchanged.
+
+## 0030-gpu3d-register-fifo-entries.patch
+
+2026-11-12: `GPU3D.{cpp,h}` build each `CmdFIFOEntry` as one 64-bit value
+(`MakeCmdFIFOEntry`) and pass it by value, so a command word no longer goes
+through two 4-byte stores read back as one 8-byte load (a store-forwarding
+stall per entry). `CmdFIFOWrite` and `CmdFIFORead` are forced inline into
+their callers in `GPU3D.cpp`; the full-FIFO stall branch moves out of line
+into `CmdFIFOStall` with the same body. Three host-only counters
+(`HostGXFIFOWords`, `HostFIFOWrites`, `HostFIFOExecuted`) feed the runner's
+perf log; they are not hardware state and do not enter the serializer.
+FIFO, PIPE, stall, IRQ, DMA and command semantics are unchanged.

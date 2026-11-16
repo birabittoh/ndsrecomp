@@ -1,10 +1,13 @@
 #pragma once
 
 #include <cstdint>
+#include <functional>
 #include <string>
+#include <utility>
 #include <vector>
 
 #include "cartridge_config.h"
+#include "frontend_window_size.h"
 #include "perf_governor.h"
 #include "../../launcher/nds_input_bindings.h"
 
@@ -14,6 +17,10 @@
 enum class NdsScreenLayout : uint8_t {
     Stacked,
     Separate,
+    // One window showing only the DS main screen: whichever LCD engine A is
+    // routed to (POWCNT1 bit 15), debounced. A hotkey shows the other LCD and
+    // holding the virtual stylus peeks at the bottom one.
+    Single,
 };
 
 enum class NdsFullscreenMode : uint8_t {
@@ -29,6 +36,21 @@ enum class NdsStartupMode : uint8_t {
     Preserve,
     Manual,
     Automatic,
+};
+
+// Firmware user-settings language (user settings +0x64 bits 0-2). Preserve
+// leaves the dump's (or generated image's) language alone; every other value
+// is the firmware's own encoding and overrides the runner's private in-memory
+// copy, which games read to pick their text language.
+enum class NdsFirmwareLanguage : uint8_t {
+    Japanese = 0,
+    English = 1,
+    French = 2,
+    German = 3,
+    Italian = 4,
+    Spanish = 5,
+    Chinese = 6,
+    Preserve = 0xFF,
 };
 
 // Which boot path establishes the pre-game machine state. Lle executes the
@@ -139,9 +161,45 @@ struct NdsNetworkOptions {
                                      // header, e.g. "dhcp"
 };
 
+// Netplay (net/online_lobby.h): local wireless with the members of an
+// online lobby. [online] in game.toml, --netplay* flags. Builds without
+// NDS_ONLINE ignore it.
+struct NdsOnlineOptions {
+    bool enabled = false;
+    std::string lobby_url;   // empty = the public lobby server
+    std::string game_name;   // lobby list filter; empty = the ROM game code
+    std::string lobby_name;  // empty = "<host's name>'s lobby"
+    bool sign_in = false;    // --netplay-sign-in on: sign in at startup
+    std::string join;        // --netplay-join ID|first
+};
+
 struct NdsLocalWirelessOptions {
     bool enabled = false;
     uint16_t base_port = 26710;
+    // Latency lab (HANDOFF_ONLINE_LOBBY.md Phase 0): every received datagram
+    // is held for delay_ms (+ up to jitter_ms) before the guest sees it, and
+    // loss_pct of them are dropped. Applied on receive, so running both
+    // instances with the same delay gives a round trip of 2 x delay_ms.
+    uint32_t delay_ms = 0;
+    uint32_t jitter_ms = 0;
+    uint32_t loss_pct = 0;
+    // Host side: wait only reply_budget_us for MP replies instead of 25 ms,
+    // and accept a reply that arrives late as the reply to a later MP cmd.
+    bool late_replies = false;
+    uint32_t reply_budget_us = 2000;
+    // Keep the guest radio powered while the transport is open: a DS host
+    // sleeps between beacons and a station after its post-beacon window,
+    // and the auth/assoc handshake only fits inside one wake window when
+    // replies take microseconds. With real latency, frames wait for the
+    // next wake-up and the join times out.
+    bool stay_awake = false;
+    // Link: lan (default) finds runners on the local network by broadcast
+    // and other instances on this machine; loopback only the latter.
+    bool lan = true;
+    // Runners to contact directly (host or host:port, port defaulting to
+    // base_port), for networks that drop broadcast. Lan link only.
+    std::vector<std::string> peers;
+    NdsOnlineOptions online;
 };
 
 struct NdsMphPrimeControlBindings {
@@ -190,18 +248,56 @@ struct NdsVirtualStylusOptions {
     uint16_t pad_sensitivity = 100; // 10%..400%
 };
 
+// [paths] from the player's settings.toml. Empty means "use the default".
+// Relative paths are relative to the data directory.
+struct NdsSettingsPaths {
+    std::string rom;
+    std::string bios;
+    std::string save;
+};
+
 struct NdsFrontendOptions {
     // Optional exact cartridge identity from [game]. When present, every
     // title-owned setting in this config is rejected for any other ROM.
     std::string expected_rom_sha1;
+    // Display name from [game].name (runtime settings menu title).
+    std::string game_name;
+    // Window icon, 256x256 RGBA8 (empty = the platform default). Taken from
+    // the cartridge banner by main.cpp; see rom_icon.h.
+    std::vector<uint8_t> window_icon_rgba;
+    // [game].app_name: the per-title data directory's name (player_launch.h).
+    std::string app_name;
+    // [title]: values for the title's own settings (title_settings.h), in
+    // file order; a later file's entry for the same key wins. Applied by the
+    // frontend, which knows which keys the title registered.
+    std::vector<std::pair<std::string, int>> title_settings;
+    NdsSettingsPaths paths{};
+    // [display] discrete_gpu: on hybrid-graphics laptops, run on the discrete
+    // GPU. Consumed by the player launch only.
+    bool discrete_gpu = true;
     NdsScreenLayout screen_layout = NdsScreenLayout::Stacked;
     NdsFullscreenMode fullscreen = NdsFullscreenMode::Off;
+    // Host presentation geometry ([display] window_mode / scaling). The
+    // defaults reproduce the historical SDL path: an aspect-correct,
+    // pixel-perfect integer fit. Both are live-adjustable from the runtime
+    // menu and never touch guest-visible bytes.
+    NdsWindowMode window_mode = NdsWindowMode::Letterbox;
+    NdsScalingFilter scaling = NdsScalingFilter::Integer;
     // Zero preserves the standalone runner's historical 2x sizing. Title
     // launchers can request 1..8x with display-DPI-aware desktop fitting.
     uint8_t window_scale = 0;
+    // [display] window_width / window_height: the last windowed size, in
+    // logical (SDL window) units, written back when a resize settles and
+    // restored at launch. Zero means none saved. Only the one-window layouts
+    // use it.
+    int window_width = 0;
+    int window_height = 0;
     NdsButtonBindings keyboard_bindings = kNdsDefaultKeys;
     NdsButtonBindings gamepad_bindings = kNdsDefaultPad;
     bool custom_gamepad_bindings = false;
+    // Face buttons by position (kNdsPositionalPad) rather than by label.
+    // Live-adjustable from the runtime menu; custom bindings take priority.
+    bool gamepad_positional = false;
     NdsStartupMode startup_mode = NdsStartupMode::Preserve;
     NdsBootMode boot_mode = NdsBootMode::Lle;
     // Opt-in synthesized firmware image (no firmware dump). Forces direct
@@ -232,6 +328,11 @@ struct NdsFrontendOptions {
     // "ndsrecomp". Sources, lowest to highest precedence: game.toml
     // [system] player_name, NDS_PLAYER_NAME, --player-name.
     std::string player_name;
+    // Firmware language (user settings +0x64 bits 0-2), applied to the
+    // in-memory image alongside player_name. Preserve (the default) is a
+    // no-op. Sources, lowest to highest precedence: game.toml [system]
+    // language, NDS_LANGUAGE, --language.
+    NdsFirmwareLanguage firmware_language = NdsFirmwareLanguage::Preserve;
     uint8_t adaptive_screens = NDS_ADAPTIVE_NONE;
     // Title-owned capability mask. A requested screen must be present here;
     // unsupported adaptive output fails closed instead of stretching pixels.
@@ -269,13 +370,27 @@ struct NdsFrontendOptions {
     // paths retain the reconstruction filter.
     uint8_t supersampling = 1;  // 1x..4x presentation reconstruction
     uint8_t antialiasing = 0;   // 0/2/4/8 samples per output pixel
-    // Internal-resolution (HD) 3D scaling, 1x..4x. This is pre-composition:
+    // Internal-resolution (HD) 3D scaling, 1x..16x. This is pre-composition:
     // it raises the 3D engine's sample
     // density. It still alters no guest-visible bytes, because every
     // faithful consumer reads the native surface the same render pass
     // point-samples out of the scaled raster. Requires the accelerated
     // renderer; ignored by the software floor.
     uint8_t internal_resolution = 1;
+    // Automatic 3D scale, as a percentage of the presented rect's own pixel
+    // density: 100 renders 3D at the screen's resolution, less is coarser,
+    // more supersamples. 0 = off (internal_resolution is used as is). The
+    // last source (TOML < env < CLI) that names either option wins: setting
+    // internal_resolution clears this and pins the multiplier.
+    uint16_t resolution_scale = 0;
+    // Single-screen layout: the other LCD beside the main one, as a percent
+    // of its size, kNdsMinSecondScreenSize..kNdsMaxSecondScreenSize.
+    uint8_t second_screen_size = 30;
+    // On-screen frame rate, in the top-left of the shown screen.
+    bool show_fps = false;
+    // Blends 3D images for games drawing below the DS frame rate, at the cost
+    // of showing 3D one DS frame later. See gpu3d_interp.h.
+    bool smooth_3d = false;
     // Texture upscaling factor, 1 (off), 2, or 4. Filters each decoded DS
     // texture once on a cache miss; independent of internal_resolution, but
     // only worth enabling alongside it.
@@ -294,11 +409,16 @@ struct NdsFrontendOptions {
     // stylus.
     bool tab_turbo = false;
     uint16_t relative_mouse_sensitivity = 100;  // 10%..400%
+    uint8_t audio_volume = 100;  // 0..100, host output only
+    bool audio_muted = false;
     bool relative_mouse_invert_y = false;
     // Active-high frontend pressed-bit mask (same layout as key_bit()).
     uint16_t relative_mouse_fire_mask = 0;
     bool mph_prime_controls = false;
     NdsVirtualStylusOptions virtual_stylus{};
+    // Single-screen layout: key that toggles the shown LCD between the main
+    // screen and the other one ([controls] screen_toggle).
+    std::string screen_toggle_binding = "Grave";
     // Default-off compatibility switch for titles that want relative mouse
     // capture to persist across separate top/bottom presentation windows.
     bool mph_prime_unified_window_focus = false;
@@ -326,6 +446,9 @@ struct NdsFrontendOptions {
     // Optional launcher-owned settings file. Runtime-only menu changes update
     // the existing key/value file when the launcher passes this path.
     std::string runtime_settings_path;
+    // The player's settings.toml. When set, every runtime menu change is
+    // written back to it (nds_update_settings_file).
+    std::string settings_path;
 };
 
 // Parse [display] settings from a game TOML. Missing [display] is valid.
@@ -338,10 +461,44 @@ bool nds_load_frontend_config(const std::string& path,
 bool nds_load_runtime_quality_setting(NdsFrontendOptions* options);
 bool nds_save_runtime_settings(const NdsFrontendOptions& options,
                                 bool mouse_changed, bool quality_changed);
+// Same, from TOML text already in memory (the title config embedded in the
+// executable).
+bool nds_load_frontend_config_text(const std::string& text,
+                                   NdsFrontendOptions* options,
+                                   std::string* error);
+// Layer the player's settings.toml over `options`. Title-owned sections
+// ([game], [cartridge]) are ignored here; [paths] is only read here.
+bool nds_load_settings_file(const std::string& path,
+                            NdsFrontendOptions* options,
+                            std::string* error);
+// One key of a settings file. `value` is TOML source text (quote strings with
+// nds_toml_string); `remove` deletes the key instead.
+struct NdsSettingUpdate {
+    NdsSettingUpdate(std::string section_name, std::string key_name,
+                     std::string toml_value, bool remove_key = false)
+        : section(std::move(section_name)), key(std::move(key_name)),
+          value(std::move(toml_value)), remove(remove_key) {}
+    std::string section;
+    std::string key;
+    std::string value;
+    bool remove;
+};
+// Edit keys in place, keeping comments, ordering and every other line. Keys
+// not in the file are added to their section, created if needed. The file is
+// replaced atomically.
+bool nds_update_settings_file(const std::string& path,
+                              const std::vector<NdsSettingUpdate>& updates,
+                              std::string* error);
+std::string nds_toml_string(const std::string& value);
 bool nds_parse_screen_layout(const std::string& value,
                              NdsScreenLayout* out);
 bool nds_parse_fullscreen_mode(const std::string& value,
                                NdsFullscreenMode* out);
+// letterbox | stretch | original (aliases: fit, 1:1, native).
+bool nds_parse_window_mode(const std::string& value, NdsWindowMode* out);
+// integer | bilinear (aliases: pixel-perfect, linear).
+bool nds_parse_scaling_filter(const std::string& value,
+                              NdsScalingFilter* out);
 enum class NdsFullscreenOverrideError : uint8_t {
     None,
     Environment,
@@ -355,6 +512,10 @@ bool nds_apply_fullscreen_overrides(
 bool nds_parse_startup_mode(const std::string& value,
                             NdsStartupMode* out);
 bool nds_parse_boot_mode(const std::string& value, NdsBootMode* out);
+// preserve, or a language name / ISO 639-1 code: japanese|ja, english|en,
+// french|fr, german|de, italian|it, spanish|es, chinese|zh.
+bool nds_parse_firmware_language(const std::string& value,
+                                 NdsFirmwareLanguage* out);
 // 0..255 (fits the byte-wise MAC perturbation in main.cpp's
 // apply_instance_mac(), which wraps mod-256 exactly like melonDS's own u8
 // arithmetic -- see that function's comment for why a wider range would
@@ -365,6 +526,15 @@ bool nds_parse_widescreen_width(const std::string& value, uint16_t* out);
 bool nds_parse_supersampling(const std::string& value, uint8_t* out);
 bool nds_parse_antialiasing(const std::string& value, uint8_t* out);
 bool nds_parse_internal_resolution(const std::string& value, uint8_t* out);
+// 10..1000 (percent).
+bool nds_parse_resolution_scale(const std::string& value, uint16_t* out);
+// The second screen's size range, in percent: the inset is always shown in
+// the single layout, from a tenth of the main screen up to its full size.
+inline constexpr uint8_t kNdsMinSecondScreenSize = 10;
+inline constexpr uint8_t kNdsMaxSecondScreenSize = 100;
+// kNdsMinSecondScreenSize..kNdsMaxSecondScreenSize (percent).
+bool nds_parse_second_screen_size(const std::string& value, uint8_t* out);
+bool nds_parse_gamepad_layout(const std::string& value, bool* positional);
 bool nds_parse_texture_upscale(const std::string& value, uint8_t* out);
 bool nds_parse_frame_interpolation(const std::string& value,
                                    NdsFrameInterpolation* out);
@@ -387,23 +557,37 @@ bool nds_parse_ipv4(const std::string& value, uint32_t* out);
 bool nds_parse_network_backend(const std::string& value, std::string* out);
 bool nds_parse_local_wireless_base_port(const std::string& value,
                                         uint16_t* out);
+// The latency-lab flags shared by the dev CLI and player mode:
+// --local-wireless-delay-ms 0..2000, --local-wireless-jitter-ms 0..2000,
+// --local-wireless-loss-pct 0..100, --local-wireless-late-replies on|off,
+// --local-wireless-reply-budget-us 0..25000,
+// --local-wireless-stay-awake on|off. True if `flag` is one of them.
+bool nds_is_local_wireless_tuning_flag(const std::string& flag);
+// Parses one of those flags into `out`. On failure *error names the range.
+bool nds_parse_local_wireless_tuning(const std::string& flag,
+                                     const std::string& value,
+                                     NdsLocalWirelessOptions* out,
+                                     std::string* error);
 const char* nds_screen_layout_name(NdsScreenLayout value);
 const char* nds_fullscreen_mode_name(NdsFullscreenMode value);
+const char* nds_window_mode_name(NdsWindowMode value);
+const char* nds_scaling_filter_name(NdsScalingFilter value);
 const char* nds_startup_mode_name(NdsStartupMode value);
 const char* nds_boot_mode_name(NdsBootMode value);
+const char* nds_firmware_language_name(NdsFirmwareLanguage value);
 const char* nds_adaptive_screens_name(uint8_t value);
 const char* nds_frame_interpolation_name(NdsFrameInterpolation value);
 
 int nds_run_interactive_frontend(const NdsFrontendOptions& options);
 
+// The console's power-on reset (the runner's boot), which the frontend runs
+// between frames, e.g. after a title menu imported a save (title_save.h).
+void nds_frontend_set_reset(std::function<void()> reset);
+
 // Request the interactive frontend's normal SDL quit path. Debug-driven
 // scenario harnesses use this instead of TerminateProcess so runtime teardown
 // (including compiler profile-data flushing) completes normally.
 bool nds_frontend_request_exit();
-// Read the last rendered menu composite at a frontend-thread debug safe point.
-// No window capture or extra per-frame copy; unavailable when the menu is shut.
-bool nds_frontend_read_runtime_menu(std::vector<uint32_t>& pixels,
-                                    unsigned* width, unsigned* height);
 
 // Live frontend counters for the play-mode debug surface (`frontend_stats`).
 // Cumulative since frontend start; a client samples twice and derives fps /

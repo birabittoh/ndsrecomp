@@ -1,6 +1,7 @@
 // GPL-3.0-or-later; see ComputeHost.h and THIRD_PARTY_ATTRIBUTION.md.
 #include "ComputeHost.h"
 
+#include <algorithm>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -36,6 +37,25 @@ GLuint g_hd_top_texture[2] = {};
 GLuint g_hd_below_texture[2] = {};
 int g_texture_width = 0;
 unsigned g_present_buffer = 0;
+NdsWindowMode g_window_mode = NdsWindowMode::Letterbox;
+NdsScalingFilter g_scaling = NdsScalingFilter::Integer;
+// The rect the last frame was drawn into; the readback observer reads it.
+NdsPresentRect g_last_rect{};
+// Bilinear: compose offscreen at the frame's own density, then resample.
+GLuint g_blit_program = 0;
+GLuint g_compose_fbo = 0;
+GLuint g_compose_texture = 0;
+int g_compose_width = 0;
+int g_compose_height = 0;
+GLuint g_overlay_texture = 0;
+int g_overlay_texture_width = 0;
+const uint32_t* g_overlay_pixels = nullptr;
+unsigned g_overlay_width = 0;
+GLuint g_inset_texture = 0;
+int g_inset_texture_width = 0;
+const uint32_t* g_inset_pixels = nullptr;
+unsigned g_inset_width = 0;
+int g_inset_percent = 0;
 
 // GL identity, captured once the context is current. Fixed buffers rather
 // than std::string: this is read from the diagnostics sampler, and the
@@ -119,41 +139,9 @@ void sdl_get_drawable_size(SDL_Window* window, int* width, int* height)
 #endif
 }
 
-struct PresentViewport {
-    int x = 0;
-    int y = 0;
-    int width = 0;
-    int height = 0;
-};
-
-PresentViewport fit_present_viewport(int drawable_width, int drawable_height,
-                                     int content_width, int content_height)
-{
-    PresentViewport viewport{};
-    if (drawable_width <= 0 || drawable_height <= 0 ||
-        content_width <= 0 || content_height <= 0) {
-        return viewport;
-    }
-
-    viewport.width = drawable_width;
-    viewport.height = static_cast<int>(
-        static_cast<long long>(drawable_width) * content_height /
-        content_width);
-    if (viewport.height > drawable_height) {
-        viewport.height = drawable_height;
-        viewport.width = static_cast<int>(
-            static_cast<long long>(drawable_height) * content_width /
-            content_height);
-    }
-    if (viewport.width < 1) viewport.width = 1;
-    if (viewport.height < 1) viewport.height = 1;
-    viewport.x = (drawable_width - viewport.width) / 2;
-    viewport.y = (drawable_height - viewport.height) / 2;
-    return viewport;
-}
-
 using nds_compute_present::kPresentVertex;
 using nds_compute_present::kPresentFragment;
+using nds_compute_present::kBlitFragment;
 
 GLuint compile_shader(GLenum type, const char* source)
 {
@@ -170,29 +158,43 @@ GLuint compile_shader(GLenum type, const char* source)
     return 0;
 }
 
-bool start_presenter()
+GLuint link_program(const char* vertex_source, const char* fragment_source)
 {
-    GLuint vertex = compile_shader(GL_VERTEX_SHADER, kPresentVertex);
-    GLuint fragment = compile_shader(GL_FRAGMENT_SHADER, kPresentFragment);
+    GLuint vertex = compile_shader(GL_VERTEX_SHADER, vertex_source);
+    GLuint fragment = compile_shader(GL_FRAGMENT_SHADER, fragment_source);
     if (!vertex || !fragment) {
         if (vertex) glDeleteShader(vertex);
         if (fragment) glDeleteShader(fragment);
-        return false;
+        return 0;
     }
-    g_present_program = glCreateProgram();
-    glAttachShader(g_present_program, vertex);
-    glAttachShader(g_present_program, fragment);
-    glLinkProgram(g_present_program);
+    GLuint program = glCreateProgram();
+    glAttachShader(program, vertex);
+    glAttachShader(program, fragment);
+    glLinkProgram(program);
     glDeleteShader(vertex);
     glDeleteShader(fragment);
     GLint ok = GL_FALSE;
-    glGetProgramiv(g_present_program, GL_LINK_STATUS, &ok);
+    glGetProgramiv(program, GL_LINK_STATUS, &ok);
     if (ok != GL_TRUE) {
         char log[2048] = {};
-        glGetProgramInfoLog(g_present_program, sizeof(log), nullptr, log);
+        glGetProgramInfoLog(program, sizeof(log), nullptr, log);
         std::fprintf(stderr, "[gpu3d] direct-present link failed: %s\n", log);
-        return false;
+        glDeleteProgram(program);
+        return 0;
     }
+    return program;
+}
+
+bool start_presenter()
+{
+    g_present_program = link_program(kPresentVertex, kPresentFragment);
+    if (!g_present_program) return false;
+    g_blit_program = link_program(kPresentVertex, kBlitFragment);
+    if (!g_blit_program) return false;
+    glGenFramebuffers(1, &g_compose_fbo);
+    glGenTextures(1, &g_compose_texture);
+    glGenTextures(1, &g_overlay_texture);
+    glGenTextures(1, &g_inset_texture);
     glGenVertexArrays(1, &g_present_vao);
     glGenTextures(2, g_fallback_texture);
     glGenTextures(2, g_object_texture);
@@ -204,6 +206,20 @@ bool start_presenter()
 
 void stop_presenter()
 {
+    if (g_compose_fbo) glDeleteFramebuffers(1, &g_compose_fbo);
+    if (g_compose_texture) glDeleteTextures(1, &g_compose_texture);
+    if (g_blit_program) glDeleteProgram(g_blit_program);
+    if (g_overlay_texture) glDeleteTextures(1, &g_overlay_texture);
+    g_overlay_texture = 0;
+    g_overlay_texture_width = 0;
+    if (g_inset_texture) glDeleteTextures(1, &g_inset_texture);
+    g_inset_texture = 0;
+    g_inset_texture_width = 0;
+    g_compose_fbo = 0;
+    g_compose_texture = 0;
+    g_blit_program = 0;
+    g_compose_width = g_compose_height = 0;
+    g_last_rect = {};
     glDeleteTextures(2, g_hd_below_texture);
     glDeleteTextures(2, g_hd_top_texture);
     glDeleteTextures(2, g_object_texture);
@@ -244,6 +260,35 @@ void configure_layer_texture(GLuint texture, int width)
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
     glTexImage2D(GL_TEXTURE_2D, 0, GL_RG32UI, width, 192, 0,
                  GL_RG_INTEGER, GL_UNSIGNED_INT, nullptr);
+}
+
+// (Re)size the offscreen compose target. RGBA8 holds the composed colour
+// exactly as the default framebuffer would.
+bool ensure_compose_target(int width, int height)
+{
+    if (g_compose_width == width && g_compose_height == height) return true;
+    glBindTexture(GL_TEXTURE_2D, g_compose_texture);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, width, height, 0, GL_RGBA,
+                 GL_UNSIGNED_BYTE, nullptr);
+    glBindFramebuffer(GL_FRAMEBUFFER, g_compose_fbo);
+    glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0,
+                           GL_TEXTURE_2D, g_compose_texture, 0);
+    const bool complete = glCheckFramebufferStatus(GL_FRAMEBUFFER) ==
+                          GL_FRAMEBUFFER_COMPLETE;
+    glBindFramebuffer(GL_FRAMEBUFFER, 0);
+    if (!complete) {
+        std::fprintf(stderr,
+                     "[gpu3d] bilinear compose target %dx%d incomplete\n",
+                     width, height);
+        g_compose_width = g_compose_height = 0;
+        return false;
+    }
+    g_compose_width = width;
+    g_compose_height = height;
+    return true;
 }
 
 void release_host_objects()
@@ -355,6 +400,26 @@ bool nds_compute_host_has_visible_context()
     return g_active && g_visible;
 }
 
+bool nds_compute_host_composes_3d()
+{
+    return true;
+}
+
+bool nds_compute_host_presents_direct()
+{
+    return true;
+}
+
+void nds_compute_host_set_raster_request(unsigned, unsigned)
+{
+    // The GL renderers take their whole-multiple scale from gpu3d.
+}
+
+void nds_compute_host_set_cache_directory(const char*)
+{
+    // The GL program binary cache has its own location (OpenGLSupport).
+}
+
 bool nds_compute_host_read_presented(std::vector<uint32_t>& pixels,
                                       unsigned& width, unsigned& height)
 {
@@ -363,8 +428,15 @@ bool nds_compute_host_read_presented(std::vector<uint32_t>& pixels,
         !sdl_make_current(g_window, g_context)) return false;
     int dw = 0, dh = 0;
     sdl_get_drawable_size(g_window, &dw, &dh);
-    const auto v = fit_present_viewport(dw, dh, g_texture_width, 192);
-    if (dw <= 0 || dh <= 0 || uint64_t(v.width) * v.height > 16000000u)
+    // The rect the last frame went into, clipped to the drawable (Original
+    // can exceed a small window).
+    struct { int x, y, width, height; } v{};
+    v.x = std::max(g_last_rect.x, 0);
+    v.y = std::max(g_last_rect.y, 0);
+    v.width = std::min(g_last_rect.x + g_last_rect.w, dw) - v.x;
+    v.height = std::min(g_last_rect.y + g_last_rect.h, dh) - v.y;
+    if (dw <= 0 || dh <= 0 || v.width <= 0 || v.height <= 0 ||
+        uint64_t(v.width) * v.height > 16000000u)
         return false;
     GLint old_fbo, old_pack, old_alignment, old_length, old_rows, old_pixels;
     glGetIntegerv(GL_READ_FRAMEBUFFER_BINDING, &old_fbo);
@@ -402,6 +474,39 @@ bool nds_compute_host_read_presented(std::vector<uint32_t>& pixels,
     width = static_cast<unsigned>(v.width);
     height = static_cast<unsigned>(v.height);
     return true;
+}
+
+void nds_compute_host_set_overlay(const uint32_t* argb, unsigned width)
+{
+    g_overlay_pixels = width > 0 && width <= 448 ? argb : nullptr;
+    g_overlay_width = g_overlay_pixels ? width : 0;
+}
+
+// The GL presenter has no layer pass; the frontend keeps the full composite.
+bool nds_compute_host_supports_layer()
+{
+    return false;
+}
+
+void nds_compute_host_set_layer(const uint32_t*, const uint32_t*, unsigned,
+                                float, float, float, float)
+{
+}
+
+void nds_compute_host_set_inset(const uint32_t* argb, unsigned width,
+                                int percent)
+{
+    const bool shown = argb && percent > 0 && width > 0 && width <= 448;
+    g_inset_pixels = shown ? argb : nullptr;
+    g_inset_width = shown ? width : 0;
+    g_inset_percent = shown ? percent : 0;
+}
+
+void nds_compute_host_set_present_mode(NdsWindowMode mode,
+                                       NdsScalingFilter scaling)
+{
+    g_window_mode = mode;
+    g_scaling = scaling;
 }
 
 bool nds_compute_host_present_top(const unsigned int* fallback_pixels,
@@ -485,11 +590,46 @@ bool nds_compute_host_present_top(const unsigned int* fallback_pixels,
     int drawable_width = 0;
     int drawable_height = 0;
     sdl_get_drawable_size(g_window, &drawable_width, &drawable_height);
-    const PresentViewport viewport =
-        fit_present_viewport(drawable_width, drawable_height, width, 192);
+    const NdsSingleLayout layout = nds_single_layout(
+        g_window_mode, g_scaling, drawable_width, drawable_height, width,
+        192, g_inset_percent, nds_stack_vertically_flag().load());
+    const NdsPresentRect rect = layout.main;
+    g_last_rect = rect;
+    // GL's viewport origin is bottom-left.
+    const int viewport_y = drawable_height - rect.y - rect.h;
+    // Integer scaling composes straight into the rect while the 3D raster
+    // is no denser than it: nearest at a whole factor is exact. A denser
+    // raster (resolution_scale above 100%) composes offscreen and is box
+    // resolved. Bilinear composes offscreen at the frame's own sample
+    // density (the 3D raster's when it is denser than native, so HD detail
+    // survives) and resamples that linearly. When the offscreen image would
+    // be exactly the rect's size the resample is the identity, so skip it.
+    const int density = (hd_active || direct_frame) ? int(scale) : 1;
+    const int compose_width = width * density;
+    const int compose_height = 192 * density;
+    const bool supersampled =
+        compose_width > rect.w || compose_height > rect.h;
+    // Nearest composes straight into its exact rect too (point sampling is
+    // what it asks for), box resolving only a raster at least twice as dense,
+    // i.e. resolution_scale supersampling rather than the round-up remainder.
+    const bool box_resolve =
+        (g_scaling == NdsScalingFilter::Integer && supersampled) ||
+        (g_scaling == NdsScalingFilter::Nearest &&
+         compose_width >= 2 * rect.w && compose_height >= 2 * rect.h);
+    const bool offscreen =
+        (box_resolve || (g_scaling == NdsScalingFilter::Bilinear &&
+                         (compose_width != rect.w ||
+                          compose_height != rect.h))) &&
+        ensure_compose_target(compose_width, compose_height);
     glClearColor(0.f, 0.f, 0.f, 1.f);
+    glBindFramebuffer(GL_FRAMEBUFFER, 0);
     glClear(GL_COLOR_BUFFER_BIT);
-    glViewport(viewport.x, viewport.y, viewport.width, viewport.height);
+    if (offscreen) {
+        glBindFramebuffer(GL_FRAMEBUFFER, g_compose_fbo);
+        glViewport(0, 0, compose_width, compose_height);
+    } else {
+        glViewport(rect.x, viewport_y, rect.w, rect.h);
+    }
     glUseProgram(g_present_program);
     glActiveTexture(GL_TEXTURE1);
     glBindTexture(GL_TEXTURE_2D, g_object_texture[buffer]);
@@ -541,6 +681,88 @@ bool nds_compute_host_present_top(const unsigned int* fallback_pixels,
     }
     glBindVertexArray(g_present_vao);
     glDrawArrays(GL_TRIANGLES, 0, 3);
+    if (offscreen) {
+        glBindFramebuffer(GL_FRAMEBUFFER, 0);
+        glViewport(rect.x, viewport_y, rect.w, rect.h);
+        glActiveTexture(GL_TEXTURE7);
+        glBindTexture(GL_TEXTURE_2D, g_compose_texture);
+        // Shrinking (a dense HD raster into a smaller rect) goes through the
+        // mip chain so it averages instead of skipping samples; integer
+        // scaling box-resolves the base level instead.
+        const bool mipmapped = supersampled && !box_resolve;
+        if (mipmapped) glGenerateMipmap(GL_TEXTURE_2D);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER,
+                        mipmapped ? GL_LINEAR_MIPMAP_LINEAR : GL_LINEAR);
+        glUseProgram(g_blit_program);
+        glUniform1ui(0, 0u);
+        glUniform1ui(1, box_resolve ? 1u : 0u);
+        glUniform2i(2, rect.w, rect.h);
+        glDrawArrays(GL_TRIANGLES, 0, 3);
+    }
+    if (g_inset_pixels && layout.inset.w > 0 && layout.inset.h > 0) {
+        const NdsPresentRect& inset = layout.inset;
+        glBindFramebuffer(GL_FRAMEBUFFER, 0);
+        glViewport(inset.x, drawable_height - inset.y - inset.h, inset.w,
+                   inset.h);
+        glActiveTexture(GL_TEXTURE7);
+        glBindTexture(GL_TEXTURE_2D, g_inset_texture);
+        const int inset_width = static_cast<int>(g_inset_width);
+        if (g_inset_texture_width != inset_width) {
+            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S,
+                            GL_CLAMP_TO_EDGE);
+            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T,
+                            GL_CLAMP_TO_EDGE);
+            glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, inset_width, 192, 0,
+                         GL_BGRA, GL_UNSIGNED_BYTE, nullptr);
+            g_inset_texture_width = inset_width;
+        }
+        glPixelStorei(GL_UNPACK_ALIGNMENT, 4);
+        glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, inset_width, 192, GL_BGRA,
+                        GL_UNSIGNED_BYTE, g_inset_pixels);
+        // Point sampling a shrunk inset drops whole rows of text.
+        const GLint filter = g_scaling == NdsScalingFilter::Bilinear ||
+                                     inset.w < inset_width
+            ? GL_LINEAR : GL_NEAREST;
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, filter);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, filter);
+        glUseProgram(g_blit_program);
+        glUniform1ui(0, 1u);
+        glUniform1ui(1, 0u);
+        // The source's alpha byte is not meaningful: keep the window opaque.
+        glColorMask(GL_TRUE, GL_TRUE, GL_TRUE, GL_FALSE);
+        glDrawArrays(GL_TRIANGLES, 0, 3);
+        glColorMask(GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE);
+    }
+    if (g_overlay_pixels) {
+        glBindFramebuffer(GL_FRAMEBUFFER, 0);
+        glViewport(rect.x, viewport_y, rect.w, rect.h);
+        glActiveTexture(GL_TEXTURE7);
+        glBindTexture(GL_TEXTURE_2D, g_overlay_texture);
+        const int overlay_width = static_cast<int>(g_overlay_width);
+        if (g_overlay_texture_width != overlay_width) {
+            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S,
+                            GL_CLAMP_TO_EDGE);
+            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T,
+                            GL_CLAMP_TO_EDGE);
+            glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, overlay_width, 192, 0,
+                         GL_BGRA, GL_UNSIGNED_BYTE, nullptr);
+            g_overlay_texture_width = overlay_width;
+        }
+        glPixelStorei(GL_UNPACK_ALIGNMENT, 4);
+        glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, overlay_width, 192, GL_BGRA,
+                        GL_UNSIGNED_BYTE, g_overlay_pixels);
+        const GLint filter = g_scaling == NdsScalingFilter::Bilinear
+            ? GL_LINEAR : GL_NEAREST;
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, filter);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, filter);
+        glEnable(GL_BLEND);
+        glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+        glUseProgram(g_blit_program);
+        glUniform1ui(0, 1u);
+        glUniform1ui(1, 0u);
+        glDrawArrays(GL_TRIANGLES, 0, 3);
+        glDisable(GL_BLEND);
+    }
     ticks->draw += SDL_GetPerformanceCounter() - start;
 
     // Keep the qualified per-frame GL checks. A window-system swap failure

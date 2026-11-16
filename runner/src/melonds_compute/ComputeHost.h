@@ -4,6 +4,7 @@
 #include <cstdint>
 #include <vector>
 #include "../gpu2d.h"
+#include "../frontend_window_size.h"
 
 struct SDL_Window;
 struct NdsGpu2dDirectFrame;
@@ -29,14 +30,60 @@ struct NdsComputePresentationFrame {
     bool has_direct{}, has_hd{};
 };
 
+// Two implementations sit behind this API, selected at build time:
+// ComputeHost.cpp (OpenGL 4.3: COMPUTE and OPENGL) and src/plume/PlumeHost.cpp
+// (Plume: Vulkan, or D3D12 on Windows). The frontend drives either unchanged.
 bool nds_compute_host_start(SDL_Window* presentation_window = nullptr);
 bool nds_compute_host_make_current();
 bool nds_compute_host_has_visible_context();
+// Whether this host's presenter composes the 3D layer itself, from the
+// renderer's GPU surfaces (the OBJ-only direct path and the HD path). When it
+// does not, the 2D compositor must keep the 3D layer in the CPU frame, and HD
+// layer surfaces would only be emitted to be ignored.
+bool nds_compute_host_composes_3d();
+// Whether the OBJ-only direct path (no CPU composite at all) can be used: it
+// needs the native 3D surface on the GPU. The GL host has one; the Plume host
+// keeps native 3D on the CPU (soft renderer) and composes only HD frames.
+bool nds_compute_host_presents_direct();
+// What the 3D raster is sized by, from [display]: `percent` of the presented
+// rect (resolution_scale; 0 = off) or else `fixed_scale` x native
+// (internal_resolution). Only the Plume host uses it, and takes the rect's
+// exact size rather than a whole multiple; the GL renderers' integer scale
+// comes from nds_gpu3d_set_internal_scale as before.
+void nds_compute_host_set_raster_request(unsigned percent, unsigned fixed_scale);
+// Where the host may keep files between runs (a pipeline cache). Before
+// nds_compute_host_start.
+void nds_compute_host_set_cache_directory(const char* directory);
 // Observer only: the actual last swapped top-window image, in top-down
 // 0xFFRRGGBB order. Does not re-render or advance emulation. Never used by
 // ordinary presentation, capture hardware or performance measurements.
 bool nds_compute_host_read_presented(std::vector<uint32_t>& pixels,
                                       unsigned& width, unsigned& height);
+// Presentation geometry for the visible GL window, from [display]
+// window_mode / scaling. Takes effect on the next present.
+void nds_compute_host_set_present_mode(NdsWindowMode mode,
+                                       NdsScalingFilter scaling);
+// Optional host overlay (virtual stylus cursor, notices) for the next
+// present: `width` x 192 ARGB, alpha 0 transparent, drawn over the image in
+// the same rect. The pointer is read during that present only; pass nullptr
+// to clear.
+void nds_compute_host_set_overlay(const uint32_t* argb, unsigned width);
+// Optional second LCD for the next present, in the nds_single_layout() inset:
+// `width` x 192 ARGB at `percent` of the main screen, which moves left to make
+// room. The pointer is read during that present only; pass nullptr to clear.
+void nds_compute_host_set_inset(const uint32_t* argb, unsigned width,
+                                int percent);
+// Optional layer image for the next present: `layer` is `width` x 192
+// straight-alpha ARGB, drawn over the image into the sub-rectangle
+// (x, y, w, h) of the image rect, given as fractions of it. `base` replaces
+// the fallback image for that present (the image without the layer); the
+// HD surfaces, if used, must lack it too. Pointers are read during that
+// present only; pass nullptr to clear. Hosts that return false from
+// nds_compute_host_supports_layer() ignore it.
+bool nds_compute_host_supports_layer();
+void nds_compute_host_set_layer(const uint32_t* layer, const uint32_t* base,
+                                unsigned width, float x, float y, float w,
+                                float h);
 bool nds_compute_host_present_top(const unsigned int* fallback_pixels,
                                   unsigned short fallback_width,
                                   const NdsGpu2dDirectFrame* direct_frame,

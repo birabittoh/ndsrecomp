@@ -1,36 +1,6 @@
 cmake_minimum_required(VERSION 3.20)
 project(nds_runner VERSION 0.6.12 LANGUAGES C CXX)
 
-# Resolve the shared menu dependency before bank discovery or optional backends.
-# An explicit cache value wins; otherwise accept the environment or a checkout
-# beside/inside this repository. Never depend on a developer's drive layout.
-set(NDS_RECOMP_UI_ROOT_DEFAULT "")
-if(DEFINED ENV{RECOMP_UI_ROOT})
-    set(NDS_RECOMP_UI_ROOT_DEFAULT "$ENV{RECOMP_UI_ROOT}")
-else()
-    foreach(_ui_root IN ITEMS
-            "${CMAKE_CURRENT_LIST_DIR}/../recomp-ui"
-            "${CMAKE_CURRENT_LIST_DIR}/../../recomp-ui"
-            "${CMAKE_CURRENT_LIST_DIR}/../../../recomp-ui")
-        if(EXISTS "${_ui_root}/src/recomp_runtime_ui.h" AND
-           EXISTS "${_ui_root}/src/common/recomp_runtime_ui.c")
-            set(NDS_RECOMP_UI_ROOT_DEFAULT "${_ui_root}")
-            break()
-        endif()
-    endforeach()
-endif()
-set(NDS_RECOMP_UI_ROOT "${NDS_RECOMP_UI_ROOT_DEFAULT}" CACHE PATH
-    "Path to the shared recomp-ui checkout for the runner in-game menu")
-if(NOT EXISTS "${NDS_RECOMP_UI_ROOT}/src/recomp_runtime_ui.h" OR
-   NOT EXISTS "${NDS_RECOMP_UI_ROOT}/src/common/recomp_runtime_ui.c")
-    message(FATAL_ERROR
-        "The runner requires a recomp-ui checkout (headers and common runtime).\n"
-        "Clone https://github.com/RetroPortingToolKit/recomp-ui.git beside ndsrecomp,\n"
-        "or configure with -DNDS_RECOMP_UI_ROOT=/path/to/recomp-ui.\n"
-        "RECOMP_UI_ROOT may also be supplied as an environment variable.\n"
-        "Current NDS_RECOMP_UI_ROOT: '${NDS_RECOMP_UI_ROOT}'")
-endif()
-
 include("${CMAKE_CURRENT_LIST_DIR}/../cmake/NdsCompilerCache.cmake")
 include("${CMAKE_CURRENT_LIST_DIR}/../cmake/NdsJobPools.cmake")
 include("${CMAKE_CURRENT_LIST_DIR}/../cmake/NdsTomlPlusPlus.cmake")
@@ -61,12 +31,23 @@ arm_recomp_core_include_dirs(NDS_ARM_RECOMP_INCLUDE_DIRS armv4t)
 option(NDS_BOOTSTRAP_FIRMWARE
     "Build with BIOS banks only so guest-produced firmware RAM can be captured"
     OFF)
+# The retail BIOS banks are recompiled from the user's biosnds{7,9}.rom. A
+# title that only runs on FreeBIOS (system.freebios with --boot direct) can
+# leave them out, and then needs no dump to build or to run.
+option(NDS_RETAIL_BIOS_BANKS
+    "Link the retail BIOS banks (generated/arm{9,7}_bios.c, from the user's dumps)"
+    ON)
+if(NOT NDS_RETAIL_BIOS_BANKS AND NOT NDS_BOOTSTRAP_FIRMWARE)
+    message(FATAL_ERROR
+        "NDS_RETAIL_BIOS_BANKS=OFF requires NDS_BOOTSTRAP_FIRMWARE=ON: "
+        "the firmware banks run on the retail BIOS")
+endif()
 option(NDS_ENABLE_COMPUTE_RENDERER
     "Build the selected melonDS accelerated renderer (OpenGL 4.3 context)"
     ON)
-set(NDS_ACCELERATED_RENDERER "COMPUTE" CACHE STRING
-    "Developer build selection: COMPUTE or OPENGL native rasterization")
-set_property(CACHE NDS_ACCELERATED_RENDERER PROPERTY STRINGS COMPUTE OPENGL)
+set(NDS_ACCELERATED_RENDERER "PLUME" CACHE STRING
+    "Accelerated renderer: PLUME (Vulkan, D3D12 on Windows, MoltenVK on Apple; default), or the GL backends COMPUTE or OPENGL")
+set_property(CACHE NDS_ACCELERATED_RENDERER PROPERTY STRINGS COMPUTE OPENGL PLUME)
 option(NDS_BUILD_NATIVE_GL_TESTS "Build focused SDL3/native-GL context checks" OFF)
 option(NDS_LEAN_DIAGNOSTICS "Experiment: diagnostic sampling is explicitly armed" OFF)
 option(NDS_CAPTURE_VIEW_REUSE "Experiment: reuse unchanged immutable capture texture views" OFF)
@@ -86,6 +67,9 @@ option(NDS_NATIVE_CONTROL
     "Experiment: native pure status/multiply and stateless ARM9 cache operations" OFF)
 option(NDS_TIER3_CANONICAL_STATE
     "Share canonical registers/banks with faithful execution" ON)
+option(NDS_INTERPRETER
+    "Link the Tier-3 interpreter; OFF makes code with no live bank a fatal error"
+    ON)
 set(NDS_MKDS_PERFORMANCE_BANK_DIR "" CACHE PATH
     "Generated mkds_perf_arm9 and mkds_perf_arm9_itcm banks")
 set(NDS_ARM9_DYNARMIC_ROOT "" CACHE PATH "Optional pinned Dynarmic source for experimental ARM9 native execution")
@@ -123,8 +107,8 @@ if(NDS_ARM9_DYNARMIC_ROOT)
         message(STATUS "Optional ARM9 native host unavailable; retaining portable faithful execution")
     endif()
 endif()
-if(NOT NDS_ACCELERATED_RENDERER MATCHES "^(COMPUTE|OPENGL)$")
-    message(FATAL_ERROR "NDS_ACCELERATED_RENDERER must be COMPUTE or OPENGL")
+if(NOT NDS_ACCELERATED_RENDERER MATCHES "^(COMPUTE|OPENGL|PLUME)$")
+    message(FATAL_ERROR "NDS_ACCELERATED_RENDERER must be COMPUTE, OPENGL or PLUME")
 endif()
 set(NDS_SDL_BACKEND "SDL3" CACHE STRING
     "Host presentation backend: SDL3, SDL2, or NONE")
@@ -199,6 +183,18 @@ if(NDS_ENABLE_COMPUTE_RENDERER AND NDS_ACCELERATED_RENDERER STREQUAL "OPENGL")
     endif()
     string(APPEND NDS_BUILD_VARIANT "native-gl-v1")
 endif()
+# A GL host (COMPUTE or OPENGL): glad, OpenGLSupport and the GL tests. PLUME
+# shares the frontend-facing host API but none of the GL sources.
+set(NDS_GL_HOST OFF)
+if(NDS_ENABLE_COMPUTE_RENDERER AND NOT NDS_ACCELERATED_RENDERER STREQUAL "PLUME")
+    set(NDS_GL_HOST ON)
+endif()
+if(NDS_ENABLE_COMPUTE_RENDERER AND NDS_ACCELERATED_RENDERER STREQUAL "PLUME")
+    if(NDS_BUILD_VARIANT)
+        string(APPEND NDS_BUILD_VARIANT "-")
+    endif()
+    string(APPEND NDS_BUILD_VARIANT "plume-v1")
+endif()
 if(NDS_MKDS_IMPLEMENTATION STREQUAL "HLE")
     if(NDS_BUILD_VARIANT)
         string(APPEND NDS_BUILD_VARIANT "-")
@@ -216,6 +212,12 @@ if(NDS_MKDS_CARD_PIO_IMPLEMENTATION STREQUAL "HLE")
 endif()
 if(NDS_TIER3_CANONICAL_STATE)
     string(APPEND NDS_BUILD_VARIANT "-canonical-tier3-v1")
+endif()
+if(NDS_INTERPRETER)
+    set(NDS_TIER3_SOURCE src/tier3.cpp)
+else()
+    set(NDS_TIER3_SOURCE src/tier3_absent.cpp)
+    string(APPEND NDS_BUILD_VARIANT "-no-interpreter-v1")
 endif()
 foreach(_experiment NDS_CAPTURE_VIEW_REUSE NDS_LEAN_DIAGNOSTICS)
     if(${_experiment})
@@ -296,6 +298,13 @@ else()
     file(GLOB FW_BANK_DISPATCH CONFIGURE_DEPENDS "${GEN}/fw_*_dispatch.c")
 endif()
 list(SORT FW_BANK_BODIES)
+if(NDS_RETAIL_BIOS_BANKS)
+    set(RETAIL_BIOS_ARM9_SOURCES ${GEN}/arm9_bios.c ${GEN}/arm9_bios_dispatch.c)
+    set(RETAIL_BIOS_ARM7_SOURCES ${GEN}/arm7_bios.c ${GEN}/arm7_bios_dispatch.c)
+else()
+    set(RETAIL_BIOS_ARM9_SOURCES)
+    set(RETAIL_BIOS_ARM7_SOURCES)
+endif()
 list(SORT FW_BANK_DISPATCH)
 set(SM64DS_BANK_SOURCES)
 if(NDS_SM64DS_BANK_DIR)
@@ -418,10 +427,8 @@ if(NDS_PREBUILT_BANK_ARCHIVE)
     message(STATUS "Reusing bank archive ${_bank_archive_sha256}; release inventory checks remain required")
 else()
 add_library(nds_banks STATIC
-    ${GEN}/arm9_bios.c
-    ${GEN}/arm9_bios_dispatch.c
-    ${GEN}/arm7_bios.c
-    ${GEN}/arm7_bios_dispatch.c
+    ${RETAIL_BIOS_ARM9_SOURCES}
+    ${RETAIL_BIOS_ARM7_SOURCES}
     ${GEN}/freebios_arm9.c
     ${GEN}/freebios_arm9_dispatch.c
     ${GEN}/freebios_arm7.c
@@ -439,8 +446,8 @@ target_include_directories(nds_banks PRIVATE
     ${TITLE_GROUP_DIRS})
 endif()
 set_source_files_properties(
-    ${GEN}/arm9_bios.c ${GEN}/arm9_bios_dispatch.c
-    ${GEN}/arm7_bios.c ${GEN}/arm7_bios_dispatch.c
+    ${RETAIL_BIOS_ARM9_SOURCES}
+    ${RETAIL_BIOS_ARM7_SOURCES}
     ${GEN}/freebios_arm9.c ${GEN}/freebios_arm9_dispatch.c
     ${GEN}/freebios_arm7.c ${GEN}/freebios_arm7_dispatch.c
     ${FW_BANK_BODIES}
@@ -448,24 +455,42 @@ set_source_files_properties(
     ${SM64DS_BANK_SOURCES}
     ${TITLE_BANK_SOURCES}
     PROPERTIES COMPILE_OPTIONS "-Wno-unused-variable;-Wno-unused-but-set-variable")
+# Generated bodies touch a dozen runtime globals per guest instruction
+# (g_cpu, g_runtime_cycles, g_nds_fast_limit, g_insn_count, ...). Clang's
+# PIE default reaches each through a GOT entry, which the linker relaxes to
+# a separate `lea` before every access. The banks are linked into the
+# runner itself, which defines all of them, so address them RIP-relative
+# directly: -6% bank text and one instruction less per access. GCC already
+# does this for PIE (copy relocations); ELF only, COFF has no GOT here.
+set(NDS_GAME_BANK_COMPILE_OPTIONS "-w;-O2;-g0")
+if(CMAKE_C_COMPILER_ID MATCHES "Clang" AND NOT WIN32 AND NOT APPLE)
+    list(APPEND NDS_GAME_BANK_COMPILE_OPTIONS "-fdirect-access-external-data")
+endif()
+# A shared runner (Android) builds the banks -fPIC, where clang ignores the
+# flag above; declaring the runtime hidden gets the same direct access
+# (src/bank_hidden_visibility.h).
+if(ANDROID)
+    list(APPEND NDS_GAME_BANK_COMPILE_OPTIONS
+        "-include;${CMAKE_CURRENT_SOURCE_DIR}/src/bank_hidden_visibility.h")
+endif()
 if(SM64DS_BANK_SOURCES AND NOT MSVC)
     # Game banks are on the hot path (the ARM7 runtime-RAM bank carries the
     # sound engine); boot correctness is gate-proven (G1/G2/G3), so compile
     # them optimized. -g0 keeps the large generated TUs cheap to link.
     set_source_files_properties(${SM64DS_BANK_SOURCES}
-        PROPERTIES COMPILE_OPTIONS "-w;-O2;-g0")
+        PROPERTIES COMPILE_OPTIONS "${NDS_GAME_BANK_COMPILE_OPTIONS}")
 endif()
 if(TITLE_BANK_SOURCES AND NOT MSVC)
     set_source_files_properties(${TITLE_BANK_SOURCES}
-        PROPERTIES COMPILE_OPTIONS "-w;-O2;-g0")
+        PROPERTIES COMPILE_OPTIONS "${NDS_GAME_BANK_COMPILE_OPTIONS}")
 endif()
 
 # Every immutable bank is CPU-specific even though both use one runtime ABI.
 # Tell the C compiler which core owns each source so it can fold the emitted
 # timing selection without changing generated C or the two-CPU scheduler.
-set(ARM9_BANK_SOURCES ${GEN}/arm9_bios.c ${GEN}/arm9_bios_dispatch.c
+set(ARM9_BANK_SOURCES ${RETAIL_BIOS_ARM9_SOURCES}
     ${GEN}/freebios_arm9.c ${GEN}/freebios_arm9_dispatch.c)
-set(ARM7_BANK_SOURCES ${GEN}/arm7_bios.c ${GEN}/arm7_bios_dispatch.c
+set(ARM7_BANK_SOURCES ${RETAIL_BIOS_ARM7_SOURCES}
     ${GEN}/freebios_arm7.c ${GEN}/freebios_arm7_dispatch.c)
 set(SM64DS_ARM9_BANK_SOURCES)
 set(SM64DS_HLE_PROFILE_SOURCES)
@@ -697,14 +722,22 @@ if(NOT MSVC)
     target_compile_options(slirp PRIVATE -w)
 endif()
 
-
 # The runner: runtime ABI + DS bus + CP15 + driver.
 # The portable ARMv4T/v5TE core (decoders + IR + the Tier-3 interpreter).
 add_library(nds_armv4t STATIC ${NDS_ARM_RECOMP_SOURCES})
 target_include_directories(nds_armv4t PUBLIC
     ${NDS_ARM_RECOMP_INCLUDE_DIRS})
 
-add_executable(nds_runner
+# On Android the runner is libnds_runner.so, which SDL's Java glue loads and
+# enters through SDL_main (src/main.cpp); the APK packages it.
+if(ANDROID)
+    set(NDS_RUNNER_TARGET_KIND add_library)
+    set(NDS_RUNNER_TARGET_TYPE SHARED)
+else()
+    set(NDS_RUNNER_TARGET_KIND add_executable)
+    set(NDS_RUNNER_TARGET_TYPE "")
+endif()
+cmake_language(CALL ${NDS_RUNNER_TARGET_KIND} nds_runner ${NDS_RUNNER_TARGET_TYPE}
     src/arm9_native.cpp
     src/runtime_arm.cpp
     src/execution_region.cpp
@@ -736,12 +769,21 @@ add_executable(nds_runner
     src/net/net_sanitize.cpp
     src/net/net_replay.cpp
     src/net/wfc_provider.cpp
+    src/net/mp_wire.cpp
+    src/net/mp_reliable.cpp
+    src/net/mp_link.cpp
+    src/net/mp_beacon.cpp
     src/spu.cpp
     src/vram.cpp
     src/gpu2d.cpp
     src/gpu3d.cpp
+    src/gpu3d_interp.cpp
+    src/gpu3d_gxstream.cpp
     src/title_patches.cpp
-    src/tier3.cpp
+    src/title_settings.cpp
+    src/title_menu.cpp
+    src/title_save.cpp
+    ${NDS_TIER3_SOURCE}
     src/coverage_manifest.cpp
     src/diagnostics.cpp
     src/dispatch_timing.cpp
@@ -757,9 +799,11 @@ add_executable(nds_runner
     src/scheduler.cpp
     src/debug_server.cpp
     src/frontend_config.cpp
+    src/player_launch.cpp
+    src/log_file.cpp
     src/relative_mouse_touch.cpp
-    "${NDS_RECOMP_UI_ROOT}/src/common/recomp_runtime_ui.c"
     src/frontend.cpp
+    src/rom_icon.cpp
     src/cpu_render_handoff.cpp
     src/main.cpp
     src/runtime_exports.def
@@ -816,6 +860,102 @@ if(NDS_MKDS_IMPLEMENTATION STREQUAL "HLE")
 endif()
 message(STATUS "MKDS implementation: ${NDS_MKDS_IMPLEMENTATION}")
 message(STATUS "MKDS card PIO implementation: ${NDS_MKDS_CARD_PIO_IMPLEMENTATION}")
+# The .exe's own icon (Explorer, taskbar before the window opens, Alt-Tab) on
+# Windows: the cartridge banner icon of NDS_EXE_ICON_ROM, converted at build
+# time. The window icon is applied at run time from the loaded ROM instead
+# (src/rom_icon.cpp), on every platform.
+set(NDS_EXE_ICON_ROM "" CACHE FILEPATH
+    "ROM whose banner icon becomes the Windows .exe icon (empty = none)")
+if(WIN32 AND NDS_EXE_ICON_ROM AND EXISTS "${NDS_EXE_ICON_ROM}")
+    find_package(Python3 REQUIRED COMPONENTS Interpreter)
+    enable_language(RC)
+    set(_nds_ico "${CMAKE_CURRENT_BINARY_DIR}/nds_icon.ico")
+    set(_nds_rc "${CMAKE_CURRENT_BINARY_DIR}/nds_icon.rc")
+    add_custom_command(
+        OUTPUT "${_nds_ico}" "${_nds_rc}"
+        COMMAND "${Python3_EXECUTABLE}" -I
+                "${CMAKE_CURRENT_LIST_DIR}/../tools/gen_nds_icon.py"
+                "${NDS_EXE_ICON_ROM}" "${_nds_ico}" "${_nds_rc}"
+        DEPENDS "${NDS_EXE_ICON_ROM}"
+                "${CMAKE_CURRENT_LIST_DIR}/../tools/gen_nds_icon.py"
+        COMMENT "Converting the cartridge banner icon to an .exe icon")
+    target_sources(nds_runner PRIVATE "${_nds_rc}")
+    set_source_files_properties("${_nds_rc}" PROPERTIES OBJECT_DEPENDS "${_nds_ico}")
+endif()
+
+# Title-owned handlers for hooks baked into title banks by
+# `nds_recompile --hooks` (docs/midasm-hooks.md). A bank generated with hooks
+# references its handlers by name, so leaving them out fails at link time
+# rather than at run time. Sources compile only into nds_runner, never into
+# the bank archive, so editing a handler does not rebuild any bank.
+set(NDS_TITLE_HOOK_SOURCES "" CACHE STRING
+    "Semicolon list of C/C++ sources defining title hook handlers")
+if(NDS_TITLE_HOOK_SOURCES)
+    foreach(_hook_source IN LISTS NDS_TITLE_HOOK_SOURCES)
+        if(NOT IS_ABSOLUTE "${_hook_source}" OR NOT EXISTS "${_hook_source}")
+            message(FATAL_ERROR
+                "NDS_TITLE_HOOK_SOURCES entry '${_hook_source}' must be an "
+                "existing absolute path")
+        endif()
+    endforeach()
+    target_sources(nds_runner PRIVATE ${NDS_TITLE_HOOK_SOURCES})
+    list(LENGTH NDS_TITLE_HOOK_SOURCES _hook_source_count)
+    message(STATUS "Title hook sources: ${_hook_source_count}")
+endif()
+
+# Online lobbies for local wireless (HANDOFF_ONLINE_LOBBY.md in DQ9Recomp):
+# ICE through a TURN relay (libjuice) and Discord sign-in for the lobby
+# server (recomp-net's auth.h). recomp-net is a sibling checkout (or
+# RECOMP_NET_ROOT); only its account module and the libjuice it builds are
+# used.
+option(NDS_ONLINE "Online lobbies for local wireless (needs recomp-net)" OFF)
+if(NDS_ONLINE)
+    if(DEFINED ENV{RECOMP_NET_ROOT})
+        set(NDS_RECOMP_NET_ROOT_DEFAULT "$ENV{RECOMP_NET_ROOT}")
+    else()
+        set(NDS_RECOMP_NET_ROOT_DEFAULT "${CMAKE_CURRENT_LIST_DIR}/../../../recomp-net")
+    endif()
+    set(NDS_RECOMP_NET_ROOT "${NDS_RECOMP_NET_ROOT_DEFAULT}" CACHE PATH
+        "Path to the recomp-net checkout (NDS_ONLINE)")
+    if(NOT EXISTS "${NDS_RECOMP_NET_ROOT}/include/recomp_net/auth.h")
+        message(FATAL_ERROR "NDS_ONLINE needs recomp-net at NDS_RECOMP_NET_ROOT "
+            "(${NDS_RECOMP_NET_ROOT}); clone "
+            "https://github.com/RetroPortingToolKit/recomp-net there")
+    endif()
+    # libjuice first, the release recomp-net pins, so that its TURN server
+    # stays in: ice_link_test relays through it on 127.0.0.1. recomp-net's
+    # own FetchContent of it (NO_SERVER forced on) then finds it populated.
+    include(FetchContent)
+    if(POLICY CMP0135)
+        cmake_policy(SET CMP0135 NEW)
+    endif()
+    set(BUILD_SHARED_LIBS OFF CACHE BOOL "" FORCE)
+    set(NO_TESTS ON CACHE BOOL "" FORCE)
+    set(NO_SERVER OFF CACHE BOOL "" FORCE)
+    set(USE_NETTLE OFF CACHE BOOL "" FORCE)
+    FetchContent_Declare(
+        libjuice
+        URL https://github.com/paullouisageneau/libjuice/archive/refs/tags/v1.7.2.tar.gz
+        URL_HASH SHA256=75159867c4a5a689a6559e11aa0d30c9eba12ce73a4ae3d898b521467e1f635d)
+    FetchContent_MakeAvailable(libjuice)
+    set(RNET_ENABLE_ICE ON CACHE BOOL "" FORCE)
+    set(RNET_BUILD_EXAMPLES OFF CACHE BOOL "" FORCE)
+    set(RNET_BUILD_TESTS OFF CACHE BOOL "" FORCE)
+    set(RNET_BUILD_MODULE OFF CACHE BOOL "" FORCE)
+    add_subdirectory("${NDS_RECOMP_NET_ROOT}" "${CMAKE_BINARY_DIR}/recomp-net"
+                     EXCLUDE_FROM_ALL)
+    target_sources(nds_runner PRIVATE
+        src/net/ice_link.cpp
+        src/net/lobby_json.cpp
+        src/net/lobby_ws.cpp
+        src/net/online_lobby.cpp
+        src/netplay_menu.cpp)
+    target_link_libraries(nds_runner PRIVATE recomp_net Libjuice::Libjuice)
+    target_include_directories(nds_runner PRIVATE
+        "${NDS_RECOMP_NET_ROOT}/include")
+    target_compile_definitions(nds_runner PRIVATE NDS_ONLINE=1)
+    message(STATUS "Online lobbies: on (recomp-net ${NDS_RECOMP_NET_ROOT})")
+endif()
 ndsrecomp_limit_link(nds_runner)
 if(NDS_CORE_IPO)
     # Do not enable global IPO: imported banks, the native SDK and slirp keep
@@ -944,7 +1084,10 @@ if(NDS_PROFILE_HLE_HEAT)
     set_property(SOURCE src/main.cpp src/runtime_arm.cpp APPEND PROPERTY
         COMPILE_DEFINITIONS NDS_PROFILE_HLE_HEAT=1)
 endif()
-if(NDS_ENABLE_COMPUTE_RENDERER)
+if(NDS_ENABLE_COMPUTE_RENDERER AND NDS_ACCELERATED_RENDERER STREQUAL "PLUME")
+    include("${CMAKE_CURRENT_SOURCE_DIR}/cmake/NdsPlume.cmake")
+    nds_add_plume_renderer(nds_runner)
+elseif(NDS_ENABLE_COMPUTE_RENDERER)
     if(NDS_ACCELERATED_RENDERER STREQUAL "OPENGL")
         target_sources(nds_runner PRIVATE vendor/melonds/GPU3D_OpenGL.cpp
             src/melonds_compute/CaptureReference.cpp
@@ -980,6 +1123,48 @@ if(NDS_ENABLE_PCAP_BACKEND)
     target_sources(nds_runner PRIVATE vendor/melonds/net/Net_PCap.cpp)
     target_compile_definitions(nds_runner PRIVATE NDS_ENABLE_PCAP_BACKEND=1)
 endif()
+# A title's game.toml, embedded so the executable runs with no arguments and
+# from any directory (player_launch.h). Unset, a no-argument run stays a plain
+# batch run.
+set(NDS_TITLE_CONFIG "" CACHE FILEPATH
+    "game.toml to embed for the no-argument player launch")
+set(_nds_title_config_bytes "")
+if(NDS_TITLE_CONFIG)
+    set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS
+        "${NDS_TITLE_CONFIG}")
+    file(READ "${NDS_TITLE_CONFIG}" _nds_title_config_hex HEX)
+    string(REGEX REPLACE "(..)" "0x\\1," _nds_title_config_bytes
+        "${_nds_title_config_hex}")
+endif()
+file(CONFIGURE OUTPUT "${CMAKE_CURRENT_BINARY_DIR}/generated/nds_title_config.inc"
+    CONTENT "${_nds_title_config_bytes}0x00\n" @ONLY)
+# Optional: bake the BIOS and firmware dumps into the executable so a title
+# build only has to ask for the game. Point NDS_EMBED_DUMPS_DIR at a folder
+# holding biosnds7.rom, biosnds9.rom and firmware.bin; the runtime still
+# verifies their SHA-1 before booting.
+set(NDS_EMBED_DUMPS_DIR "" CACHE PATH
+    "Folder with biosnds7.rom, biosnds9.rom, firmware.bin to embed")
+set(_nds_have_embedded 0)
+if(NDS_EMBED_DUMPS_DIR AND EXISTS "${NDS_EMBED_DUMPS_DIR}/biosnds7.rom"
+   AND EXISTS "${NDS_EMBED_DUMPS_DIR}/biosnds9.rom"
+   AND EXISTS "${NDS_EMBED_DUMPS_DIR}/firmware.bin")
+    set(_nds_have_embedded 1)
+    foreach(_dump biosnds7.rom biosnds9.rom firmware.bin)
+        set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS
+            "${NDS_EMBED_DUMPS_DIR}/${_dump}")
+        file(READ "${NDS_EMBED_DUMPS_DIR}/${_dump}" _hex HEX)
+        string(REGEX REPLACE "(..)" "0x\\1," _bytes "${_hex}")
+        file(CONFIGURE OUTPUT
+            "${CMAKE_CURRENT_BINARY_DIR}/generated/embedded_${_dump}.inc"
+            CONTENT "${_bytes}\n" @ONLY)
+    endforeach()
+    message(STATUS "Embedding BIOS and firmware dumps from ${NDS_EMBED_DUMPS_DIR}")
+    set_property(SOURCE src/player_launch.cpp APPEND PROPERTY COMPILE_DEFINITIONS
+        "NDS_EMBEDDED_DUMPS=1")
+endif()
+set_property(SOURCE src/player_launch.cpp APPEND PROPERTY COMPILE_DEFINITIONS
+    "NDS_SOURCE_BIOS_DIR=\"${CMAKE_CURRENT_SOURCE_DIR}/../bios\"")
+
 # beads-yjp.28: stamped into the coverage manifest so an ingested playthrough
 # can be tied to the build whose static coverage it was measured against.
 # beads-yjp.44: re-read at BUILD time, not configure time. The old
@@ -1025,9 +1210,7 @@ target_include_directories(nds_runner PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/../recompiler/armv4t   # runtime_arm.h
     ${NDS_ARM_RECOMP_INCLUDE_DIRS}                     # shared ARM core headers
     ${CMAKE_CURRENT_SOURCE_DIR}/../recompiler/support   # sha1.h
-    ${CMAKE_CURRENT_SOURCE_DIR}/../vendor/freebios      # embedded FreeBIOS (BSD-2-Clause)
-    "${NDS_RECOMP_UI_ROOT}/src"
-    "${NDS_RECOMP_UI_ROOT}/src/common")
+    ${CMAKE_CURRENT_SOURCE_DIR}/../vendor/freebios)     # embedded FreeBIOS (BSD-2-Clause)
 ndsrecomp_link_tomlpp(nds_runner)
 if(NOT MSVC)
     # Unmodified upstream melonDS sources carry their own warning posture;
@@ -1047,7 +1230,7 @@ if(NOT MSVC)
         set_source_files_properties(vendor/melonds/net/Net_PCap.cpp
             PROPERTIES COMPILE_OPTIONS "-w")
     endif()
-    if(NDS_ENABLE_COMPUTE_RENDERER)
+    if(NDS_GL_HOST)
         set_source_files_properties(
             vendor/melonds/GPU3D_Compute.cpp
             vendor/melonds/GPU3D_Texcache.cpp
@@ -1058,7 +1241,7 @@ if(NOT MSVC)
             PROPERTIES COMPILE_OPTIONS "-w")
     endif()
 endif()
-if(NDS_ENABLE_COMPUTE_RENDERER)
+if(NDS_GL_HOST)
     if(MSVC)
         set_source_files_properties(vendor/melonds/OpenGLSupport.cpp
             PROPERTIES COMPILE_OPTIONS
@@ -1134,6 +1317,9 @@ elseif(EXISTS "${GEN}/fw_arm9_calibration_save_dispatch.c")
     # only when the complete extended set has been generated locally.
     target_compile_definitions(nds_runner PRIVATE NDS_HAVE_FW_EXTENDED_BANKS=1)
 endif()
+if(NDS_RETAIL_BIOS_BANKS)
+    target_compile_definitions(nds_runner PRIVATE NDS_HAVE_RETAIL_BIOS_BANKS=1)
+endif()
 if(SM64DS_BANK_SOURCES)
     target_compile_definitions(nds_runner PRIVATE NDS_HAVE_SM64DS_BANKS=1)
     if(EXISTS "${NDS_SM64DS_BANK_DIR}/sm64ds_arm7_ram_dispatch.c")
@@ -1182,11 +1368,103 @@ if(CMAKE_DL_LIBS)
     target_link_libraries(nds_runner PRIVATE ${CMAKE_DL_LIBS})
 endif()
 if(WIN32)
-    target_link_libraries(nds_runner PRIVATE ws2_32)
-    if(NDS_ENABLE_PCAP_BACKEND)
-        target_link_libraries(nds_runner PRIVATE iphlpapi)
+    # iphlpapi: the local wireless LAN link lists the network interfaces
+    # (net/mp_link.cpp), and the pcap backend uses it too.
+    target_link_libraries(nds_runner PRIVATE ws2_32 iphlpapi)
+endif()
+
+# Self-update (src/update/self_update.h, offered to titles through
+# src/title_update.h): checks NDS_UPDATE_REPO's latest GitHub release for an
+# asset named NDS_UPDATE_ASSET_FORMAT ("{tag}" and "{platform}" filled in)
+# plus the platform's extension, and compares its tag with
+# NDS_RELEASE_VERSION. That version is an explicit override, else the
+# release tag CI passes in NDS_VERSION_NAME (the Android Gradle build reads
+# it too), else the newest v* tag reachable in the title repo (the one
+# holding NDS_TITLE_BANK_DIR), else empty, which leaves the updater off; a
+# leading "v" is dropped. Unlike NDS_GAME_VERSION (a diagnostics string that
+# can be a hash or "-dirty"), it is always a plain X.Y.Z or empty.
+# Recomputed on every configure, so a new tag reaches an old build dir.
+set(NDS_UPDATE_REPO "" CACHE STRING
+    "GitHub repo (owner/name) the self-updater checks; empty turns it off")
+set(NDS_UPDATE_ASSET_FORMAT "" CACHE STRING
+    "Release asset name without its extension, with {tag} and {platform}")
+set(NDS_RELEASE_VERSION_OVERRIDE "" CACHE STRING
+    "Version embedded for the self-updater (vX.Y.Z or X.Y.Z); empty to derive it")
+set(NDS_RELEASE_VERSION "${NDS_RELEASE_VERSION_OVERRIDE}")
+if(NDS_RELEASE_VERSION STREQUAL "")
+    set(NDS_RELEASE_VERSION "$ENV{NDS_VERSION_NAME}")
+endif()
+if(NDS_RELEASE_VERSION STREQUAL "")
+    if(NDS_TITLE_BANK_DIR AND EXISTS "${NDS_TITLE_BANK_DIR}")
+        set(_nds_release_git_dir "${NDS_TITLE_BANK_DIR}")
+    else()
+        set(_nds_release_git_dir "${CMAKE_CURRENT_SOURCE_DIR}")
+    endif()
+    find_package(Git QUIET)
+    if(GIT_FOUND)
+        execute_process(
+            COMMAND "${GIT_EXECUTABLE}" describe --tags --abbrev=0 --match "v*"
+            WORKING_DIRECTORY "${_nds_release_git_dir}"
+            OUTPUT_VARIABLE NDS_RELEASE_VERSION
+            OUTPUT_STRIP_TRAILING_WHITESPACE
+            ERROR_QUIET)
     endif()
 endif()
+string(REGEX REPLACE "^[vV]" "" NDS_RELEASE_VERSION "${NDS_RELEASE_VERSION}")
+message(STATUS "nds_runner: release version '${NDS_RELEASE_VERSION}', "
+               "updates from '${NDS_UPDATE_REPO}'")
+
+target_sources(nds_runner PRIVATE
+    src/title_update.cpp
+    src/update/self_update.cpp
+    src/update/archive.cpp
+    vendor/miniz/miniz.c)
+if(WIN32)
+    target_sources(nds_runner PRIVATE
+        src/update/http_win.cpp
+        src/update/self_update_win.cpp)
+    target_link_libraries(nds_runner PRIVATE winhttp)
+elseif(ANDROID)
+    # Bionic has no libcurl: HTTP goes through HttpURLConnection over JNI,
+    # and the update is handed to the package installer the same way.
+    target_sources(nds_runner PRIVATE
+        src/update/http_android.cpp
+        src/update/self_update_android.cpp)
+    # liblog: stdout/stderr forwarded to logcat (src/main.cpp); libandroid:
+    # ANativeWindow, which Plume's Vulkan backend sizes its swapchain from.
+    target_link_libraries(nds_runner PRIVATE log android)
+    # Bind the library's calls to its own functions at link time. Without it
+    # every call from the generated banks into the runtime (bus_read_u32,
+    # runtime_dispatch, ...) goes through a PLT stub: ~4 percent of the
+    # emulation thread on a Cortex-A720.
+    target_link_options(nds_runner PRIVATE -Wl,-Bsymbolic-functions)
+else()
+    find_package(CURL REQUIRED)
+    target_link_libraries(nds_runner PRIVATE CURL::libcurl)
+    target_sources(nds_runner PRIVATE src/update/http_curl.cpp)
+    if(APPLE)
+        target_sources(nds_runner PRIVATE src/update/self_update_mac.cpp)
+    else()
+        target_sources(nds_runner PRIVATE src/update/self_update_posix.cpp)
+    endif()
+endif()
+# Vendored single-file libraries (THIRD_PARTY_ATTRIBUTION.md): miniz for the
+# .zip / .tar.gz payloads, picosha2 for the asset digest, nlohmann/json for
+# the release response. toml++ (ndsrecomp_link_tomlpp above) merges shipped
+# TOML files.
+target_include_directories(nds_runner SYSTEM PRIVATE
+    vendor/miniz
+    vendor/picosha2
+    vendor)
+if(NOT MSVC)
+    set_source_files_properties(vendor/miniz/miniz.c
+        PROPERTIES COMPILE_OPTIONS "-w")
+endif()
+# Only the files that read them, so a new version or repo does not rebuild
+# the whole runner.
+set_source_files_properties(src/title_update.cpp src/update/self_update.cpp
+    PROPERTIES COMPILE_DEFINITIONS
+    "NDS_RELEASE_VERSION=\"${NDS_RELEASE_VERSION}\";NDS_UPDATE_REPO=\"${NDS_UPDATE_REPO}\";NDS_UPDATE_ASSET_FORMAT=\"${NDS_UPDATE_ASSET_FORMAT}\"")
 
 # The dual-CPU boot nests deeply enough to exhaust the 8 MB main-thread stack
 # macOS gives a process by default, faulting in ___chkstk_darwin before the
@@ -1220,16 +1498,95 @@ add_test(NAME cpu_render_handoff_test COMMAND cpu_render_handoff_test)
 
   add_executable(frontend_config_test
       tests/frontend_config_test.cpp
-      src/frontend_config.cpp)
+      src/frontend_config.cpp
+      src/perf_governor.cpp)
 target_include_directories(frontend_config_test PRIVATE src)
 ndsrecomp_link_tomlpp(frontend_config_test)
   add_test(NAME frontend_config_test COMMAND frontend_config_test)
+
+  add_executable(frontend_window_size_test
+      tests/frontend_window_size_test.cpp)
+  target_include_directories(frontend_window_size_test PRIVATE src)
+  add_test(NAME frontend_window_size_test COMMAND frontend_window_size_test)
+
+  add_executable(frontend_screen_route_test
+      tests/frontend_screen_route_test.cpp)
+  target_include_directories(frontend_screen_route_test PRIVATE src)
+  add_test(NAME frontend_screen_route_test COMMAND frontend_screen_route_test)
 
   add_executable(wfc_provider_test
       tests/wfc_provider_test.cpp
       src/net/wfc_provider.cpp)
   target_include_directories(wfc_provider_test PRIVATE src)
   add_test(NAME wfc_provider_test COMMAND wfc_provider_test)
+
+  add_executable(mp_reliable_test
+      tests/mp_reliable_test.cpp
+      src/net/mp_wire.cpp
+      src/net/mp_reliable.cpp)
+  target_include_directories(mp_reliable_test PRIVATE src)
+  add_test(NAME mp_reliable_test COMMAND mp_reliable_test)
+
+  add_executable(mp_beacon_test
+      tests/mp_beacon_test.cpp
+      src/net/mp_beacon.cpp)
+  target_include_directories(mp_beacon_test PRIVATE src)
+  add_test(NAME mp_beacon_test COMMAND mp_beacon_test)
+
+  add_executable(mp_link_test
+      tests/mp_link_test.cpp
+      src/net/mp_wire.cpp
+      src/net/mp_reliable.cpp
+      src/net/mp_link.cpp)
+  target_include_directories(mp_link_test PRIVATE src)
+  if(WIN32)
+    target_link_libraries(mp_link_test PRIVATE ws2_32 iphlpapi)
+  endif()
+  add_test(NAME mp_link_test COMMAND mp_link_test)
+
+  if(NDS_ONLINE)
+    add_executable(ice_link_test
+        tests/ice_link_test.cpp
+        src/net/mp_wire.cpp
+        src/net/ice_link.cpp)
+    target_include_directories(ice_link_test PRIVATE src)
+    target_link_libraries(ice_link_test PRIVATE Libjuice::Libjuice
+                          Threads::Threads)
+    if(WIN32)
+      target_link_libraries(ice_link_test PRIVATE ws2_32)
+    endif()
+    add_test(NAME ice_link_test COMMAND ice_link_test)
+
+    add_executable(lobby_json_test
+        tests/lobby_json_test.cpp
+        src/net/lobby_json.cpp
+        src/net/lobby_ws.cpp)
+    target_include_directories(lobby_json_test PRIVATE src
+                               "${NDS_RECOMP_NET_ROOT}/include")
+    target_link_libraries(lobby_json_test PRIVATE recomp_net)
+    if(WIN32)
+      target_link_libraries(lobby_json_test PRIVATE ws2_32)
+    endif()
+    add_test(NAME lobby_json_test COMMAND lobby_json_test)
+
+    # Two-process run against a lobby server; see the test's header. Not a
+    # ctest, since it needs that server.
+    add_executable(online_lobby_test
+        tests/online_lobby_test.cpp
+        src/net/online_lobby.cpp
+        src/net/ice_link.cpp
+        src/net/lobby_json.cpp
+        src/net/lobby_ws.cpp
+        src/net/mp_beacon.cpp
+        src/net/mp_wire.cpp)
+    target_include_directories(online_lobby_test PRIVATE src
+                               "${NDS_RECOMP_NET_ROOT}/include")
+    target_link_libraries(online_lobby_test PRIVATE recomp_net
+                          Libjuice::Libjuice Threads::Threads)
+    if(WIN32)
+      target_link_libraries(online_lobby_test PRIVATE ws2_32)
+    endif()
+  endif()
 
   add_executable(net_ring_test
       tests/net_ring_test.cpp
@@ -1278,7 +1635,20 @@ ndsrecomp_link_tomlpp(frontend_config_test)
   target_include_directories(gx_command_batch_test PRIVATE vendor/melonds)
   add_test(NAME gx_command_batch_test COMMAND gx_command_batch_test)
 
-  if(NDS_BUILD_NATIVE_GL_TESTS AND NDS_ENABLE_COMPUTE_RENDERER AND NDS_SDL_BACKEND STREQUAL "SDL3")
+  add_executable(gpu3d_gxstream_test tests/gpu3d_gxstream_test.cpp
+      src/gpu3d_gxstream.cpp
+      vendor/melonds/GPU3D.cpp vendor/melonds/GPU3D_Soft.cpp vendor/melonds/Savestate.cpp)
+  target_include_directories(gpu3d_gxstream_test PRIVATE src vendor/melonds)
+  add_test(NAME gpu3d_gxstream_test COMMAND gpu3d_gxstream_test)
+
+  # Offline smooth_3d diagnosis of an NDS_GX_CMD_TRACE (not a test).
+  add_executable(gx_interp_diag tests/gx_interp_diag.cpp
+      src/gpu3d_gxstream.cpp
+      vendor/melonds/GPU3D.cpp vendor/melonds/GPU3D_Soft.cpp vendor/melonds/Savestate.cpp)
+  target_include_directories(gx_interp_diag PRIVATE src vendor/melonds
+      ${CMAKE_CURRENT_SOURCE_DIR}/../recompiler/armv4t ${NDS_ARM_RECOMP_INCLUDE_DIRS})
+
+  if(NDS_BUILD_NATIVE_GL_TESTS AND NDS_GL_HOST AND NDS_SDL_BACKEND STREQUAL "SDL3")
     add_executable(native_gl_test tests/native_gl_test.cpp
         src/melonds_compute/CaptureReference.cpp src/melonds_compute/GPU_OpenGL.cpp
         src/melonds_compute/PlatformCompute.cpp vendor/melonds/GPU3D.cpp
@@ -1476,6 +1846,8 @@ ndsrecomp_link_tomlpp(frontend_config_test)
       src/vram.cpp
       src/gpu2d.cpp
       src/gpu3d.cpp
+      src/gpu3d_interp.cpp
+      src/gpu3d_gxstream.cpp
       src/dispatch_timing.cpp
       src/emu_profile.cpp
       # The worker threads in these units register themselves with the
@@ -1643,7 +2015,7 @@ ndsrecomp_link_tomlpp(frontend_config_test)
       ${NDS_ARM_RECOMP_INCLUDE_DIRS})
   add_test(NAME gpu2d_window_test COMMAND gpu2d_window_test)
 
-  if(NDS_BUILD_NATIVE_GL_TESTS AND NDS_ENABLE_COMPUTE_RENDERER AND NDS_SDL_BACKEND STREQUAL "SDL3")
+  if(NDS_BUILD_NATIVE_GL_TESTS AND NDS_GL_HOST AND NDS_SDL_BACKEND STREQUAL "SDL3")
     add_executable(gpu2d_direct_gl_test tests/gpu2d_direct_gl_test.cpp
         src/emu_profile.cpp src/dispatch_timing.cpp src/host_profile.cpp
         src/host_prof_ring.cpp src/host_unwind_x64.cpp vendor/melonds/glad/glad.c)
@@ -1762,6 +2134,10 @@ ndsrecomp_link_tomlpp(frontend_config_test)
         NAME coverage_generation_identity_test
         COMMAND "${Python3_EXECUTABLE}"
                 "${CMAKE_CURRENT_SOURCE_DIR}/../tools/test_coverage_generation_identity.py")
+    add_test(
+        NAME fw_extract_test
+        COMMAND "${Python3_EXECUTABLE}"
+                "${CMAKE_CURRENT_SOURCE_DIR}/../tools/test_fw_extract.py")
     add_test(
         NAME live_compile_owner_test
         COMMAND "${Python3_EXECUTABLE}"

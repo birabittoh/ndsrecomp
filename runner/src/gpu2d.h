@@ -73,6 +73,13 @@ void nds_gpu2d_finish_frame();
 // StartScanline order.
 void nds_gpu2d_vblank();
 const uint32_t* nds_gpu2d_framebuffer(int screen);
+// Engine A's routing for the frame nds_gpu2d_framebuffer() exposes, as the
+// scanlines latched it (POWCNT1 bit 15 of the last line), never the live
+// register: 0 when engine A ("main") drew the top LCD, 1 for the bottom.
+int nds_gpu2d_presented_main_screen();
+// True when neither LCD showed an image in that frame (each engine powered
+// off, force-blanked, or in display mode 0) -- a fade or transition frame.
+bool nds_gpu2d_presented_both_blank();
 // Host-only adaptive presentation surface. Returns the native framebuffer
 // with width=256 when no enhanced surface is active for this physical LCD.
 const uint32_t* nds_gpu2d_adaptive_framebuffer(int screen, uint16_t* width);
@@ -149,6 +156,10 @@ struct NdsGpu2dHdFrame {
 // Enabled only while internal resolution > 1. Emission costs an extra pair of
 // stores per pixel in the adaptive loop, so it stays off at 1x.
 void nds_gpu2d_set_hd_emit(bool enabled);
+// The physical LCD whose window consumes the HD surfaces (default 0, the
+// top). Surfaces are emitted only when engine A is routed to this LCD, so a
+// presenter never applies them to the wrong window.
+void nds_gpu2d_set_hd_screen(int screen);
 // Valid only after nds_gpu2d_adaptive_framebuffer() has run for this frame,
 // which is where the surfaces are filled.
 bool nds_gpu2d_hd_frame(NdsGpu2dHdFrame* out);
@@ -165,6 +176,56 @@ void nds_gpu2d_note_owned_hd_presented();
 // 3D against a stale 2D stack and stale blend registers.
 void nds_gpu2d_invalidate_hd_frame();
 
+// Fixed-size 2D layers (presentation only, never guest-visible).
+//
+// A title names engine A text BGs (bg_mask bit n = BGn, n = 1..3) that hold
+// its windows, and with bit 4 (the BLDCNT OBJ bit) all of engine A's OBJs
+// too (cursors, icons drawn over the windows); OBJs go into the layer only
+// on frames that also split a BG (or, with bit 4 alone, by themselves), and
+// only when EVA + EVB = 16 (their semi-transparency blends in any mode). On a presenter that can draw a layer image, engine A's LCD
+// (the HD screen, nds_gpu2d_set_hd_screen) is then presented split: those
+// BGs alone into a straight-alpha image, shown at `scale` of the game rect
+// about the native point
+// (anchor_x, anchor_y), and the rest of the stack without them (the CPU
+// image and the HD surfaces alike). The guest framebuffer, display capture
+// and nds_gpu2d_framebuffer() keep the full composite.
+//
+// The split is exact for alpha blending only when EVA + EVB = 16 (then
+// EVA*A + EVB*B is A at alpha EVA/16 over B); a frame whose masked BGs
+// would need another blend is presented unsplit. A masked BG is drawn over
+// every unmasked layer, so an unmasked layer above it (an OBJ left out of
+// the mask) would be hidden where they overlap. Native aspect only (output width 256), and
+// not combined with the adaptive HUD anchor.
+//
+// bg_mask 0 or scale >= 1 turns it off. Title thread; latched by the
+// adaptive compositor when it runs for the frame.
+void nds_gpu2d_set_fixed_size_layers(uint8_t bg_mask, float scale,
+                                     uint16_t anchor_x, uint16_t anchor_y);
+// OBJs whose pixels lie in this native rect (x1, y1 exclusive) stay in the
+// base image at full size instead of joining the layer (a HUD icon). An empty
+// rect (the default) keeps nothing out. Title thread.
+void nds_gpu2d_set_fixed_layers_obj_keep(uint16_t x0, uint16_t y0,
+                                         uint16_t x1, uint16_t y1);
+// Frontend: whether this frame's presenter will draw the layer image
+// (nds_compute_host_supports_layer() on the path that presents engine A's
+// LCD). Without a consumer nothing is split.
+void nds_gpu2d_set_fixed_layers_consumer(bool enabled);
+// True when the next adaptive composite of the HD screen would split, so the
+// frontend has to run nds_gpu2d_adaptive_framebuffer() even at 1x.
+bool nds_gpu2d_fixed_layers_requested();
+struct NdsGpu2dFixedLayersFrame {
+    const uint32_t* base;   // 256 x 192, 0xFFRRGGBB: the stack without them
+    const uint32_t* layer;  // 256 x 192, straight alpha ARGB: them alone
+    float scale;
+    uint16_t anchor_x;      // native pixels
+    uint16_t anchor_y;
+};
+// Valid only after nds_gpu2d_adaptive_framebuffer() has run for this
+// frame; cleared by nds_gpu2d_invalidate_hd_frame(). When valid, the HD
+// surfaces of the same frame lack the masked BGs too, so a presenter that
+// uses either must draw the layer.
+bool nds_gpu2d_fixed_layers_frame(NdsGpu2dFixedLayersFrame* out);
+
 void nds_gpu2d_set_direct_present(bool enabled);
 void nds_gpu2d_set_direct_windows(bool enabled);
 bool nds_gpu2d_direct_frame_active();
@@ -174,6 +235,11 @@ bool nds_gpu2d_direct_frame_active();
 bool nds_gpu2d_direct_present_frame_active();
 bool nds_gpu2d_direct_frame(NdsGpu2dDirectFrame* out);
 bool nds_gpu2d_requires_3d_readback();
+// Whether the frame whose lines were latched last read the CPU 3D raster
+// (capture, or 3D the presenter does not show from the HD raster). Asked at
+// VCount215: the next frame most likely does too, and is then drawn there,
+// with VBlank as a head start, instead of on demand at its first line.
+bool nds_gpu2d_expects_cpu_3d();
 void nds_gpu2d_force_cpu_frames(uint32_t frames);
 
 enum NdsGpu2dDirectClass : uint8_t {

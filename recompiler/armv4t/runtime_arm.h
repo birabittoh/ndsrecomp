@@ -117,7 +117,12 @@ typedef struct NdsDispatchEntry {
 // runner needs, so the version is bumped rather than silently mixing linked
 // and unlinked shards. Bumping invalidates every previously cached shard by
 // design.
-#define NDS_LIVE_BANK_ABI_VERSION 6u
+//
+// ABI 7 adds NdsBusFastWin::code_mask/code_gen and runtime_note_code_store:
+// inline stores publish only when they touch cached code. An older shard
+// would still publish every store through runtime_note_code_write_pages,
+// which stays exported and conservative, but its window layout differs.
+#define NDS_LIVE_BANK_ABI_VERSION 7u
 #define NDS_LIVE_BANK_FLAG_DEPENDENCY_CLOSURE 0x00000001u
 
 typedef struct NdsBusFastWin NdsBusFastWin;
@@ -204,8 +209,8 @@ int arm_cond_passes(unsigned cond);
 //     slow path would (same mirror math, same bounds; unaligned edge
 //     cases that resolve() rejects fall back to the slow path);
 //   * writes preserve Tier-3 provenance byte-for-byte: written[] bytes,
-//     per-4KiB-page generation bump (0 skipped), and the static-guard
-//     invalidation via runtime_note_code_write();
+//     per-4KiB-page generation bump (0 skipped), and the code-tracker
+//     publication via runtime_note_code_store() for masked blocks;
 //   * windows are refreshed by bus_fast_refresh() whenever the mapping
 //     inputs change (WRAMCNT, CP15 TCM config, bus_init).
 
@@ -224,6 +229,11 @@ void runtime_note_code_write(void);
 // Aliased virtual addresses share these cells. The addressless entry above
 // remains conservative for backing replacement and older compiled banks.
 void runtime_note_code_write_pages(const uint32_t* first, uint32_t count);
+// ABI 7 store publisher: the store [off, off + width) in window w touched a
+// 64-byte block marked in w->code_mask. Called after the page generation
+// bumps, before the written[] marks.
+void runtime_note_code_store(const NdsBusFastWin* w, uint32_t off,
+                             uint32_t width);
 void runtime_note_live_write(uint32_t addr, uint32_t width,
                              uint32_t old_value, uint32_t new_value);
 // Optional native RAM stores may publish directly only within this qualified
@@ -244,6 +254,16 @@ typedef struct NdsBusFastWin {
     uint8_t*  written;  // per-byte write-provenance flags (parallel)
     uint32_t* gen;      // per-4KiB-page provenance generations (parallel)
     uint32_t  mask;     // mirror mask: off = addr & mask (window-relative)
+    // Exact code-write tracking (ABI 7). Per 4 KiB page, bit i of
+    // code_mask is set while some cached snapshot (dispatch slot, link
+    // guard, static guard) depends on bytes in 64-byte block i of that
+    // page. A store publishes (runtime_note_code_store) only when it
+    // touches a set bit; the handler then bumps code_gen[page], which is
+    // the generation those snapshots compare. Windows without code
+    // tracking point code_mask at an all-ones table (every store
+    // publishes, as before) and code_gen is NULL.
+    const uint64_t* code_mask;
+    uint32_t* code_gen;
 } NdsBusFastWin;
 
 extern NdsBusFastWin g_busf_main;        // 0x02000000..0x02FFFFFF, both CPUs
@@ -290,21 +310,30 @@ static inline const NdsBusFastWin* nds_busf_classify(uint32_t addr,
 
 // Write-side Tier-3 provenance, identical to the slow path's
 // note_ram_write: bump every touched page's generation (skipping 0),
-// invalidate the static guard, mark the written bytes.
+// publish to the code trackers when the store touches a block some cached
+// snapshot depends on, mark the written bytes. width <= 4, so the store
+// covers at most the two blocks holding its first and last byte.
 static inline void nds_busf_note_write(const NdsBusFastWin* w, uint32_t off,
                                        uint32_t width) {
+    const uint32_t end = off + width - 1u;
     const uint32_t first = off >> 12u;
-    const uint32_t last = (off + width - 1u) >> 12u;
-    uint32_t page;
-    for (page = first; page <= last; ++page) {
-        const uint32_t g = w->gen[page] + 1u;
-        w->gen[page] = g ? g : 1u;
-    }
-    runtime_note_code_write_pages(w->gen + first, last - first + 1u);
+    const uint32_t last = end >> 12u;
+    uint32_t* const gen = w->gen;
+    const uint64_t* const code_mask = w->code_mask;
+    // Loaded before the publication call: it never reallocates backings.
+    uint8_t* const written = w->written;
     {
-        uint32_t i;
-        for (i = 0; i < width; ++i) w->written[off + i] = 1u;
+        const uint32_t g = gen[first] + 1u;
+        gen[first] = g ? g : 1u;
     }
+    if (last != first) {
+        const uint32_t g = gen[last] + 1u;
+        gen[last] = g ? g : 1u;
+    }
+    if (((code_mask[first] >> ((off >> 6u) & 63u)) |
+         (code_mask[last] >> ((end >> 6u) & 63u))) & 1u)
+        runtime_note_code_store(w, off, width);
+    memset(written + off, 1, width);
 }
 
 static inline uint32_t bus_read_u32(uint32_t addr) {
@@ -589,10 +618,23 @@ NDS_HOT_INLINE uint32_t nds_code_numc(uint32_t pc, uint32_t k) {
     if (g_nds_active != NDS_ARM9) return runtime_code_cycles(pc);
     if (g_arm9_code_pub_gen != g_cp15_timing_generation)
         return runtime_code_cycles(pc);
-    g_last_code_pc[0] = pc;
+    // No g_last_code_pc[0] store: only the ARM7 slot is ever read
+    // (arm7_cycle_combine). runtime_code_cycles still records both.
     if (k == 0u) return 0u;                       // Thumb odd halfword
     if (pc < g_arm9_itcm_code_limit) return 1u;   // live ITCM mapping
     return (k >> g_arm9_code_class_shift) & 0xFFu;
+}
+// nds_code_numc() for an instruction entered below g_nds_fast_limit
+// (codegen version 4, the LC_ path). The runtime publishes a nonzero limit
+// on the ARM9 only while g_arm9_code_pub_gen == g_cp15_timing_generation,
+// and zeroes it wherever that can stop holding (a CP15 timing-generation
+// bump, a dropped publication), so below the limit the generation check
+// above is known to pass and is skipped. Same result as nds_code_numc().
+NDS_HOT_INLINE uint32_t nds_code_numc_entered(uint32_t pc, uint32_t k) {
+    if (g_nds_active != NDS_ARM9) return runtime_code_cycles(pc);
+    if (k == 0u) return 0u;                       // Thumb odd halfword
+    const uint32_t region = (k >> g_arm9_code_class_shift) & 0xFFu;
+    return pc < g_arm9_itcm_code_limit ? 1u : region;
 }
 
 // ── Inline condition evaluation (beads-yjp.70 phase 2A) ─────────────────
@@ -683,6 +725,75 @@ void arm_set_nzcv_add(uint32_t a, uint32_t b, uint32_t result);
 void arm_set_nzcv_adc(uint32_t a, uint32_t b, uint32_t c_in, uint32_t result);
 void arm_set_nzcv_sub(uint32_t a, uint32_t b, uint32_t result);
 void arm_set_nzcv_sbc(uint32_t a, uint32_t b, uint32_t c_in, uint32_t result);
+
+// Generated banks (built with NDS_STATIC_CPU) take these inline: each is a
+// few ALU ops on CPSR, and the cross-TU call was the cost (arm_set_nzcv_sub
+// alone ran at ~1% of the DQ9 emulation thread, 900+ sites a shard). The
+// bodies are runner/src/runtime_arm.cpp's, verbatim; the exported symbols
+// stay for everything else.
+#ifdef NDS_STATIC_CPU
+NDS_MACHINERY_INLINE void arm_set_nz_i(uint32_t r) {
+    uint32_t c = g_cpu.cpsr & ~(CPSR_N_BIT | CPSR_Z_BIT);
+    if (r & 0x80000000u) c |= CPSR_N_BIT;
+    if (r == 0) c |= CPSR_Z_BIT;
+    g_cpu.cpsr = c;
+}
+NDS_MACHINERY_INLINE void arm_set_nzc_logic_i(uint32_t r, uint32_t sh) {
+    uint32_t c = g_cpu.cpsr & ~(CPSR_N_BIT | CPSR_Z_BIT | CPSR_C_BIT);
+    if (r & 0x80000000u) c |= CPSR_N_BIT;
+    if (r == 0) c |= CPSR_Z_BIT;
+    if (sh) c |= CPSR_C_BIT;
+    g_cpu.cpsr = c;
+}
+NDS_MACHINERY_INLINE void arm_set_nzcv_add_i(uint32_t a, uint32_t b,
+                                             uint32_t r) {
+    uint32_t c = g_cpu.cpsr &
+                 ~(CPSR_N_BIT | CPSR_Z_BIT | CPSR_C_BIT | CPSR_V_BIT);
+    if (r & 0x80000000u) c |= CPSR_N_BIT;
+    if (r == 0) c |= CPSR_Z_BIT;
+    if (r < a) c |= CPSR_C_BIT;
+    if ((~(a ^ b) & (a ^ r)) & 0x80000000u) c |= CPSR_V_BIT;
+    g_cpu.cpsr = c;
+}
+NDS_MACHINERY_INLINE void arm_set_nzcv_adc_i(uint32_t a, uint32_t b,
+                                             uint32_t ci, uint32_t r) {
+    uint32_t c = g_cpu.cpsr &
+                 ~(CPSR_N_BIT | CPSR_Z_BIT | CPSR_C_BIT | CPSR_V_BIT);
+    uint64_t w = (uint64_t)a + b + ci;
+    if (r & 0x80000000u) c |= CPSR_N_BIT;
+    if (r == 0) c |= CPSR_Z_BIT;
+    if (w >> 32) c |= CPSR_C_BIT;
+    if ((~(a ^ b) & (a ^ r)) & 0x80000000u) c |= CPSR_V_BIT;
+    g_cpu.cpsr = c;
+}
+NDS_MACHINERY_INLINE void arm_set_nzcv_sub_i(uint32_t a, uint32_t b,
+                                             uint32_t r) {
+    uint32_t c = g_cpu.cpsr &
+                 ~(CPSR_N_BIT | CPSR_Z_BIT | CPSR_C_BIT | CPSR_V_BIT);
+    if (r & 0x80000000u) c |= CPSR_N_BIT;
+    if (r == 0) c |= CPSR_Z_BIT;
+    if (a >= b) c |= CPSR_C_BIT;
+    if (((a ^ b) & (a ^ r)) & 0x80000000u) c |= CPSR_V_BIT;
+    g_cpu.cpsr = c;
+}
+NDS_MACHINERY_INLINE void arm_set_nzcv_sbc_i(uint32_t a, uint32_t b,
+                                             uint32_t ci, uint32_t r) {
+    uint32_t c = g_cpu.cpsr &
+                 ~(CPSR_N_BIT | CPSR_Z_BIT | CPSR_C_BIT | CPSR_V_BIT);
+    uint64_t w = (uint64_t)a + (~b & 0xFFFFFFFFu) + ci;
+    if (r & 0x80000000u) c |= CPSR_N_BIT;
+    if (r == 0) c |= CPSR_Z_BIT;
+    if (w >> 32) c |= CPSR_C_BIT;
+    if (((a ^ b) & (a ^ r)) & 0x80000000u) c |= CPSR_V_BIT;
+    g_cpu.cpsr = c;
+}
+#define arm_set_nz arm_set_nz_i
+#define arm_set_nzc_logic arm_set_nzc_logic_i
+#define arm_set_nzcv_add arm_set_nzcv_add_i
+#define arm_set_nzcv_adc arm_set_nzcv_adc_i
+#define arm_set_nzcv_sub arm_set_nzcv_sub_i
+#define arm_set_nzcv_sbc arm_set_nzcv_sbc_i
+#endif
 
 // ── Dispatch ───────────────────────────────────────────────────────
 // `target_pc` is a guest PC. Low bit indicates THUMB on BX/BLX. The
@@ -953,6 +1064,43 @@ NDS_MACHINERY_INLINE bool runtime_unwinding(void) {
 }
 #endif
 
+// ── Folded per-instruction entry (codegen version 4) ──────────────────
+// The emitted prologue used to be
+//
+//     if (runtime_should_yield()) return;
+//     ++g_insn_count[g_nds_active];
+//     if (g_insn_hook_armed) runtime_insn_slow();
+//
+// The runtime keeps g_nds_fast_limit at zero while g_insn_hook_armed is set
+// (publish_fast_limit, nds_insn_hook_recompute), so below the limit the
+// hook cannot be armed and the whole sequence is the counter bump. At or
+// over the limit runtime_insn_enter_slow() runs the three steps above in
+// that order and returns what the yield check returned.
+bool runtime_insn_enter_slow(void);
+NDS_MACHINERY_INLINE bool runtime_insn_due(void) {
+    return __builtin_expect(g_runtime_cycles >= g_nds_fast_limit, 0);
+}
+NDS_MACHINERY_INLINE bool runtime_insn_enter(void) {
+    if (runtime_insn_due()) return runtime_insn_enter_slow();
+    ++g_insn_count[g_nds_active];
+    return false;
+}
+// runtime_tick() that reports which path it took: true when the cycles fit
+// under the limit (g_runtime_cycles is now strictly below g_nds_fast_limit),
+// false after the faithful runtime_tick_slow(). A fall-through site uses a
+// true result to enter the next instruction past its entry check: with the
+// clock below the limit that check is provably the counter bump alone, and
+// R15 already holds the next pc.
+NDS_MACHINERY_INLINE bool runtime_tick_fast(uint32_t cycles) {
+    const unsigned long long next = g_runtime_cycles + cycles;
+    if (__builtin_expect(next < g_nds_fast_limit, 1)) {
+        g_runtime_cycles = next;
+        return true;
+    }
+    runtime_tick_slow(cycles);
+    return false;
+}
+
 // Cooperative slice-yield signal, checked ONLY at backward branches (loop
 // tops, which are dispatch entries). Lets the scheduler preempt a guest
 // spin to run the other core, with a clean re-dispatch on resume. Returns
@@ -970,6 +1118,14 @@ extern unsigned long long g_runtime_cycles;
 // current runtime_dispatch the moment the guest PC equals this value.
 // Set via the TCP set_break_pc command; 0 = disabled. (MC-HP-002.)
 extern uint32_t g_runtime_break_pc;
+// Title "before" hooks (recompiler emit_hook_site): the PC whose hook has
+// already run when its instruction yielded right after it, per CPU, or
+// 0xFFFFFFFF. A handler's MMIO access can end the slice (the performance
+// fence), so without this the resume at that PC would run the handler again.
+// The resume clears it and skips the handler once, taking a bool handler's
+// result from g_hook_resume_result.
+extern uint32_t g_hook_resume_pc[2];
+extern unsigned char g_hook_resume_result[2];
 
 // ── BIOS / SWI ─────────────────────────────────────────────────────
 // SWI emits a call here. The runtime sets up the exception frame

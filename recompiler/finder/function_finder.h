@@ -101,7 +101,32 @@ struct FinderStats {
     // live in LR at an UNRESOLVED indirect PC-write — the return-pad idiom
     // (adr lr,X; ldr pc,[handler]). Seeded as a dispatch entry.
     std::size_t landing_pads_discovered = 0;
+    // Walks that started with register constants carried in from a
+    // direct-branch predecessor (see branch_target_regs_).
+    std::size_t carried_state_walks = 0;
+    // Code-pointer arrays: an indirect call/jump through a register that
+    // was loaded from a static in-image address. The words from that
+    // address on are walked while each is a decode-valid code pointer
+    // (C++ static-init tables, callback/ops tables).
+    std::size_t ptr_arrays = 0;
+    std::size_t ptr_array_targets = 0;
+    // Pointer-origin entry candidates (stored pointers, pointer arrays)
+    // that decoded cleanly but failed the function-entry shape gate.
+    std::size_t entry_gate_rejects = 0;
+    // ARM `add{cond} pc,pc,rX,lsl #2` branch-ladder switches.
+    std::size_t branch_ladders = 0;
+    std::size_t branch_ladder_slots = 0;
+    std::size_t branch_ladders_rejected = 0;
     std::size_t undefined_instr_count = 0;
+    // Static scan (set_static_scan): fixed-point rounds of whole-image
+    // PointerHarvest + prologue GapFill run after the CFG worklist drains.
+    std::size_t static_scan_rounds = 0;
+    std::size_t ptr_harvest_seeds = 0;     // aligned data word -> entry
+    std::size_t ptr_harvest_rejects = 0;   // in-image pointer, failed validation
+    std::size_t gap_fill_seeds = 0;        // prologue in uncovered bytes
+    std::size_t gap_fill_rejects = 0;
+    std::size_t extern_candidate_seeds = 0;
+    std::size_t extern_candidate_rejects = 0;
     // Automatic jump-table detection (MC-HP-000).
     std::size_t auto_jump_tables = 0;          // tables emitted
     std::size_t auto_jump_table_targets = 0;   // entry targets seeded
@@ -165,6 +190,18 @@ public:
         authoritative_seeds_ = authoritative;
     }
 
+    // Whole-image static scan. After the seeded CFG walk drains, harvest
+    // candidate entries from (a) every aligned in-image word outside
+    // discovered code whose value is a decode-valid code pointer (bit0 =
+    // mode) and (b) function prologues inside uncovered bytes, then walk
+    // them and repeat until nothing new is found. Every candidate must
+    // pass validate_candidate(); see HANDOFF_STATIC_SCANNER.md §4.4/§4.5.
+    void set_static_scan(bool on) { static_scan_ = on; }
+    // A candidate entry that must pass validate_candidate() before it is
+    // walked (static scan only): cross-image call targets, where several
+    // overlays share one load base and the target may not be code in this one.
+    void add_candidate(const FunctionSeed& seed) { pending_candidates_.push_back(seed); }
+
     // Register a byte range as data — the finder will hard-error
     // if control flow ever enters it. Caller supplies `note` for
     // the diagnostic; `origin_kind` is "data_range" for explicit
@@ -208,6 +245,14 @@ public:
         return unreachable_targets_;
     }
 
+    // Direct control-flow targets (B/BL/BLX imm, resolved constants) that
+    // lie outside the readable image: calls from an overlay into the main
+    // image or into another overlay. Keyed visit_key-style ((addr<<1)|mode);
+    // value = first site PC. Exported so the owning image can seed them.
+    const std::unordered_map<uint64_t, uint32_t>& external_targets() const {
+        return external_targets_;
+    }
+
     // Non-empty when the recompile must abort. See
     // docs/TOML_SCHEMA.md "[[data_range]]" — control flow into
     // a data_range is a hard error.
@@ -219,6 +264,8 @@ public:
     // guest address; translated to rom buffer offset internally).
     // Returns 0 if out of bounds.
     uint32_t read_u32_public(uint32_t addr) const;
+    // Readable in the image or a declared/proven code_copy runtime span.
+    bool readable(uint32_t addr, uint32_t len) const { return can_read_at(addr, len); }
 
 private:
     const uint8_t* rom_;
@@ -234,6 +281,13 @@ private:
     // confirmation can fire from several overlapping walks). Keeps the
     // emitted / overlap / rejected tallies counting distinct tables.
     std::unordered_set<uint32_t> jt_seen_bases_;
+    // Every address an AL `add/sub Rd,pc,#imm` in the image computes, built
+    // lazily on the first unbounded base-relative table walk. A table walk
+    // with no CMP bound stops at the next such address: hand-written code
+    // lays its offset tables back to back, and the words of the next table
+    // also read as plausible offsets from the previous base.
+    std::unordered_set<uint32_t> pc_rel_bases_;
+    bool pc_rel_bases_ready_ = false;
     // CMP-bound carried across an inverted switch guard. For the
     // `CMP Ri,#N; B{ls,cc} <dispatch>; B <default>` idiom the indexed
     // dispatch lives at the BRANCH TARGET, which the finder walks as its
@@ -242,11 +296,57 @@ private:
     // re-seeded into reg_bound[reg] when that seed is walked.
     struct SeedBound { uint8_t reg; uint32_t max_index; };
     std::unordered_map<uint32_t, SeedBound> branch_target_bounds_;
+    // Register constants carried across a direct same-mode B/Bcc edge.
+    // The linear walk ends a block at every unconditional branch and
+    // walks each branch target as its own seed, so without this the
+    // tracker starts empty at every block (crt0's `ldr r1,=NitroMain;
+    // tst; bne L1; b L2; L1: sub sp; L2: bx r1` lost the whole game).
+    // Keyed by visit_key(target, mode); a second predecessor that
+    // deposits before the target is walked meets by intersection
+    // (only registers both paths agree on survive). Values come from a
+    // real predecessor path, so a carried value is a real runtime value
+    // on that path; registers made uncertain by a call or a conditional
+    // write are never deposited.
+    // `load_*` is a second, weaker lane: "if this register was loaded on
+    // this path, it was loaded from this static address". It survives a
+    // conditional load (crt0's sinit loop is `ldrne r0,[r4]; cmpne r0,#0;
+    // bne call`) and is consumed only by the code-pointer-array harvest,
+    // whose entries are decode-validated individually.
+    struct CarriedRegs {
+        uint16_t mask = 0;
+        uint32_t value[16] = {};
+        uint16_t load_mask = 0;
+        uint32_t load_addr[16] = {};
+    };
+    std::unordered_map<uint64_t, CarriedRegs> branch_target_regs_;
+    // Base addresses already walked as code-pointer arrays.
+    std::unordered_set<uint32_t> ptr_array_seen_;
+    // Branch-ladder sites already decided (overlapping walks reach the
+    // same site; account it once).
+    std::unordered_set<uint32_t> ladder_seen_sites_;
     // (addr<<1)|mode keys already promoted as stored-code-pointer seeds,
     // so the same pointer stored from many walks is seeded once.
     std::unordered_set<uint64_t> stored_ptr_seen_;
     FinderStats stats_{};
     bool authoritative_seeds_ = false;
+    bool static_scan_ = false;
+    std::vector<FunctionSeed> pending_candidates_;
+    std::size_t deferred_thumb_ = 0;
+
+    // Static-scan helpers. A ScanRegion is a runtime address span whose
+    // bytes are executable in place: the image minus every code_copy
+    // source span (those bytes run only at their runtime alias), plus
+    // every code_copy runtime span.
+    struct ScanRegion {
+        uint32_t start;
+        uint32_t size;
+        std::vector<uint8_t> cover;  // per byte: bit0 ARM body, bit1 THUMB body
+    };
+    std::vector<ScanRegion> build_scan_regions() const;
+    std::vector<FunctionSeed> static_scan_candidates();
+    bool validate_candidate(uint32_t addr, CpuMode mode,
+                            const std::vector<ScanRegion>& regions,
+                            bool strict = false) const;
 
     std::vector<DataRange>           data_ranges_;
     std::vector<CodeCopyRange>       code_copies_;
@@ -255,6 +355,7 @@ private:
     std::unordered_map<uint32_t, std::string> exclude_reasons_;
 
     std::vector<UnreachableTarget> unreachable_targets_;
+    std::unordered_map<uint64_t, uint32_t> external_targets_;
 
     // Mode-switching seeds discovered DURING a walk (e.g. BX Rm
     // where the constant tracker resolved Rm to a THUMB target

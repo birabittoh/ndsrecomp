@@ -37,6 +37,14 @@ bool nds_normalize_touch_calibration(std::vector<uint8_t>& fw);
 // Firmware "start automatically / manually" user setting.
 bool nds_apply_startup_mode(std::vector<uint8_t>& fw, NdsStartupMode mode);
 
+// Firmware language (user settings +0x64 bits 0-2) in both copies, resealing
+// each CRC. Preserve is a byte-exact no-op. A dump carrying iQue/DSi-style
+// extended settings (+0x74 == 1) also gets its extended language (+0x75) and
+// supported-language mask (+0x76) updated, since the console prefers that
+// field, and its own CRC (+0xFE over +0x74..+0xFD) resealed.
+bool nds_apply_firmware_language(std::vector<uint8_t>& fw,
+                                 NdsFirmwareLanguage language);
+
 // Per-instance guest MAC perturbation (Wiimmfi multi-instance identity).
 // Instance 0 is a deliberate total no-op: LLE-faithful, the guest reads the
 // real dump's MAC over SPI unperturbed.
@@ -70,3 +78,22 @@ bool nds_apply_player_name(std::vector<uint8_t>& fw, const std::string& name);
 // provenance reporting; nothing in the boot path depends on it.
 bool nds_read_player_name(const std::vector<uint8_t>& fw, unsigned copy,
                           std::string* out);
+
+// ---- Wi-Fi connection slots vs the runner's virtual access point ---------
+//
+// The guest connects only to an AP whose SSID matches a configured
+// connection slot (three 0x100-byte slots at user-settings - 0x400; SSID at
+// +0x40, status at +0xE7, CRC16 start 0 over 0xFE bytes at +0xFE). The
+// runner's AP calls itself "ndsrecomp" (vendor/melonds/patches/
+// 0001-wifi-ap-identity.patch), so a dump whose slots were set up under
+// melonDS ("melonAP") or a real router never finds it: error 51099.
+//
+// Rewrites every configured "melonAP" slot's SSID to the runner's AP,
+// keeping the rest of the slot (WFC user ID, DNS, ...). If afterwards no
+// configured slot names the runner's AP, the first unconfigured slot is set
+// up for it (DHCP, no encryption). Slots set up for other networks stay as
+// they are. In-memory only, like every patch here. *changed (optional)
+// reports whether any byte moved. Returns false only for a malformed
+// layout; a dump with three slots all configured for other networks is left
+// untouched and still returns true.
+bool nds_apply_wifi_ap_slot(std::vector<uint8_t>& fw, bool* changed);

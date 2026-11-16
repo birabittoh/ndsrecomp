@@ -385,11 +385,17 @@ void coverage_capture_exec_page(int cpu, uint32_t base, uint32_t pc) {
     const int index = cpu & 1;
     CoverageExecCache& cache = g_coverage_exec_cache[index];
     const uint32_t generation = bus_exec_page_generation(base);
+    const uint32_t* const generation_ptr = bus_main_page_generation_cell(base);
+    // A non-main page is trusted until the write epoch moves, so its stores
+    // must publish.
+    if (!generation_ptr) bus_code_watch_page(base);
 
     // Same page, same generation: the write that invalidated our epoch landed
     // somewhere else. Re-trust the cache without touching the contents.
     if (cache.valid && cache.base == base && cache.generation == generation) {
         cache.epoch = g_coverage_write_epoch;
+        cache.generation_ptr = generation_ptr;
+        cache.mapping_generation = g_busf_mapping_generation;
         ++g_page_stats.revisits;
         return;
     }
@@ -397,6 +403,8 @@ void coverage_capture_exec_page(int cpu, uint32_t base, uint32_t pc) {
     cache.base = base;
     cache.generation = generation;
     cache.epoch = g_coverage_write_epoch;
+    cache.generation_ptr = generation_ptr;
+    cache.mapping_generation = g_busf_mapping_generation;
     cache.valid = true;
 
     // Only RAM-resident code is interesting. Immutable ROM-derived addresses

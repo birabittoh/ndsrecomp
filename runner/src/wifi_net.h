@@ -127,12 +127,28 @@ struct NdsWifiNetworkConfig {
     uint32_t wfc_clear_crt_errno_addr = 0;
 
     // Local wireless / Download Play / NiFi transport. Disabled by default;
-    // when enabled, each runner process binds localhost UDP port
-    // local_wireless_base_port + instance_index and fans MP frames out to
-    // the other local instance slots.
+    // when enabled, each runner process binds UDP port
+    // local_wireless_base_port + instance_index (on all interfaces with the
+    // lan link, on 127.0.0.1 with loopback), finds the other runners in
+    // range and sends them its radio frames reliably (net/mp_reliable.h).
     bool local_wireless_enabled = false;
     uint32_t local_wireless_instance = 0;
     uint16_t local_wireless_base_port = 26710;
+    // Latency lab, see NdsLocalWirelessOptions (frontend.h).
+    uint32_t local_wireless_delay_ms = 0;
+    uint32_t local_wireless_jitter_ms = 0;
+    uint32_t local_wireless_loss_pct = 0;
+    bool local_wireless_late_replies = false;
+    uint32_t local_wireless_reply_budget_us = 2000;
+    bool local_wireless_stay_awake = false;
+    // Link, see NdsLocalWirelessOptions (frontend.h).
+    bool local_wireless_lan = true;
+    std::vector<std::string> local_wireless_peers;
+    // NDS_LOCAL_MP_STATS=1: one "[local_mp] stats" line per second on
+    // stderr while the transport is open.
+    bool local_wireless_stats_log = false;
+    // NDS_LOCAL_MP_TRACE=1: log the auth/assoc handshake frames.
+    bool local_wireless_trace = false;
 };
 
 // Wiimmfi M8: query surface for a --network-backend replay run's outcome.
@@ -202,6 +218,34 @@ struct NdsLocalMpStats {
     uint64_t recv_host_timeouts = 0;    // client: hit the 25 ms deadline
     uint64_t recv_host_wait_us = 0;     // client: total wall-clock inside calls
     uint64_t stale_reply_drops = 0;  // replies older than the freshness window
+    uint64_t late_replies = 0;       // late-reply mode: stale but accepted
+    uint64_t late_ack_only = 0;      // late-reply mode: answered, frame in flight
+    uint64_t late_trimmed = 0;       // late-reply mode: backlogged empty replies shed
+    uint64_t late_gap_waits = 0;     // late-reply mode: waited for a reply behind a lost datagram
+    uint64_t injected_drops = 0;     // latency lab: --local-wireless-loss-pct
+    uint64_t bytes_sent = 0;         // per logical frame, header included
+    uint64_t bytes_received = 0;
+    // Reliable delivery (net/mp_reliable.h): datagrams sent again, received
+    // again, received after a gap; gaps given up on and sent frames dropped
+    // unacknowledged (both lose data); frames waiting behind a gap now.
+    uint64_t rel_retransmits = 0;
+    uint64_t rel_duplicates = 0;
+    uint64_t rel_reordered = 0;
+    uint64_t rel_gap_skips = 0;
+    uint64_t rel_give_ups = 0;
+    uint64_t rel_held = 0;
+    // Of rel_retransmits, the ones a selective ack triggered; frames that
+    // first arrived as a bundled copy (a lost datagram that cost no round
+    // trip); bytes of bundled copies sent; copies per datagram now.
+    uint64_t rel_fast_retransmits = 0;
+    uint64_t rel_recovered = 0;
+    uint64_t rel_redundant_bytes = 0;
+    uint64_t rel_redundancy = 0;
+    uint64_t peers = 0;              // other runners in range now
+    // Index = frame type: 0 packet/beacon, 1 MP cmd, 2 reply, 3 ack.
+    // sent_by_type counts logical frames (one per send, not per target).
+    uint64_t sent_by_type[4] = {};
+    uint64_t received_by_type[4] = {};
     // Wall-clock latency histograms, bucket edges 1/2/4/8/16/32 ms (last
     // bucket = >=32 ms). reply_latency: host side, MP-cmd datagram sent ->
     // reply datagram received. turnaround: client side, MP-cmd datagram
@@ -256,6 +300,74 @@ void nds_wifi_on_client_state_changed(uint32_t status);
 // what proves that the peer session has ended without requiring radio power
 // to be cycled.
 void nds_wifi_on_local_mp_disconnected();
+
+// Called by the vendored Wifi model whenever the guest radio is about to
+// power down (auto-sleep after the post-beacon window, or a requested
+// sleep). True keeps it powered, exactly as W_PowerDownCtrl bit 0 would:
+// NdsWifiNetworkConfig::local_wireless_stay_awake while the local MP
+// transport is open.
+bool nds_wifi_inhibit_power_down();
+
+// True while the guest's radio is powered on (the vendored Wifi model's
+// MP_Begin..MP_End). Any thread.
+bool nds_wifi_local_mp_radio_on();
+
+// Called by the vendored Wifi model right after MP_RecvReplies: clients to
+// treat as having answered the cmd although no reply frame is handed to the
+// guest (late-reply mode; their reply is still in flight). Read-and-clear.
+uint16_t nds_wifi_local_mp_take_ack_only();
+
+// What a title reads out of the game info its own MP host beacons carry
+// (net/mp_beacon.h), for the online lobby (HANDOFF_ONLINE_LOBBY.md Phase 1b).
+struct NdsNetplayHostInfo {
+    bool accepting = false;   // the game takes new players
+    int free_slots = 0;       // player slots still free
+    char host_name[64] = "";  // UTF-8, the hosting player's name
+};
+
+// Returns false when the beacon is not this title's (other GGID, malformed).
+// Called on the emulation thread with the transport's lock held: keep it a
+// pure function of its arguments.
+using NdsNetplayHostDecoder = bool (*)(uint32_t ggid, uint8_t attribute,
+                                       const uint8_t* user, size_t user_len,
+                                       NdsNetplayHostInfo* out);
+
+// Titles register their decoder from a static initializer. Without one, the
+// runner only logs the raw beacons.
+void nds_netplay_set_host_decoder(NdsNetplayHostDecoder decoder);
+
+// False while this instance is not beaconing as an MP host or the title's
+// decoder did not accept its beacon.
+bool nds_netplay_host_info(NdsNetplayHostInfo* out);
+
+// Once per presented frame (frontend thread): ends the "host beacon"
+// state when this instance stopped beaconing, and flushes rate-limited
+// stderr lines.
+void nds_wifi_frame_tick();
+
+// NDS_LOCAL_MP_TRACE=1 with the transport open: the vendored Wifi model
+// logs MP client timing (diagnostics only).
+bool nds_wifi_local_mp_trace_enabled();
+
+// Lobby beacons (HANDOFF_ONLINE_LOBBY.md, "DQ9's in-game host list"): with
+// Netplay on and no lobby joined, the open lobbies' hosts are put in radio
+// range as beacons only, so the game lists them in its own join menu.
+//
+// The last beacon this instance transmitted as an MP host (transport frame
+// of type 0: melonDS TX header + 802.11 frame). False when it is not
+// beaconing. Any thread.
+bool nds_wifi_local_mp_own_beacon(std::vector<uint8_t>* out);
+// Beacons to replay into this guest's radio, each a frame as above. They
+// are only handed over while the Netplay link is the transport's link and
+// no peer is in range; an empty list stops it. Any thread.
+void nds_wifi_local_mp_set_replay_beacons(
+    std::vector<std::vector<uint8_t>> frames);
+// The game sent an authentication or association request to the BSSID of a
+// replayed beacon: `bssid` is that host. Read-and-clear. Any thread.
+bool nds_wifi_local_mp_take_join_request(uint8_t bssid[6]);
+// Called by the vendored Wifi model before each regular receive: the
+// channel the guest radio listens on.
+void nds_wifi_local_mp_note_rx_channel(int channel);
 
 // Transaction-boundary query installed into the core savestate layer when
 // the bridge attaches. A configured/idle backend does not block. Association,

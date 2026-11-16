@@ -61,7 +61,7 @@ uint32_t nds_gpu3d_compute_output_texture();
 // nds_gpu3d_use_compute_renderer(): the scale is a baked shader constant and
 // sizes every framebuffer allocation. The runtime setter rebuilds the active
 // accelerated renderer for the governor path. Both return false for an
-// out-of-range scale (valid range 1..12).
+// out-of-range scale (valid range 1..16).
 bool nds_gpu3d_set_internal_scale(uint8_t scale);
 bool nds_gpu3d_set_runtime_internal_scale(uint8_t scale);
 uint8_t nds_gpu3d_internal_scale();
@@ -93,8 +93,41 @@ struct NdsGpu3dProfile {
     // critical path, so the governor has to be able to read it in every build.
     uint64_t compute_readback_ns;
     uint64_t compute_readback_calls;
+    // ALWAYS-ON: how often the game really finishes a 3D image, which the
+    // frame rate does not show. A swap is a SWAP_BUFFERS that took effect at
+    // VBlank; a new image is a swap whose vertices differ from the last one.
+    // LCD flips count POWCNT1 bit 15 changes between VBlanks: a game drawing
+    // 3D on both screens alternates them, halving each screen's rate.
+    uint64_t gx_vblanks;
+    uint64_t gx_swaps;
+    uint64_t gx_new_images;
+    uint64_t gx_swap_polygons;
+    uint64_t gx_lcd_flips;
+    // ALWAYS-ON: packed GXFIFO words, FIFO entries written and executed
+    // (melonDS GPU3D host counters), the geometry engine's per-entry load.
+    uint64_t gx_fifo_words;
+    uint64_t gx_fifo_writes;
+    uint64_t gx_fifo_executed;
+    // Motion smoothing (gpu3d_interp.h): blended images, their polygons, and
+    // how many of those had a partner in the previous image.
+    uint64_t gx_interp_images;
+    uint64_t gx_interp_units;
+    uint64_t gx_interp_blended_units;
+    uint64_t gx_interp_skipped;
+    // ALWAYS-ON, Plume HD only (nds_gpu3d_cpu_frame_deferred): 3D frames the
+    // soft renderer never drew, drew late because a line was read, and (of
+    // those) drew for a display capture. Frames drawn at VCount215 as usual
+    // are cpu3d_drawn.
+    uint64_t cpu3d_drawn;
+    uint64_t cpu3d_skipped;
+    uint64_t cpu3d_on_demand;
+    uint64_t cpu3d_capture;
 };
 void nds_gpu3d_profile(NdsGpu3dProfile* out);
+// Motion smoothing for games drawing 3D below the DS frame rate.
+void nds_gpu3d_set_interpolation(bool enabled);
+// The mark key: with NDS_GX_CMD_TRACE, notes the moment in the command trace.
+void nds_gpu3d_mark_interp();
 // Host-only immutable capture-copy counters; unavailable paths return zeros.
 bool nds_gpu3d_capture_copy_counts(uint64_t* texture, uint64_t* palette);
 void nds_gpu3d_debug_history_reset();
@@ -119,13 +152,19 @@ void nds_gpu3d_set_power(uint16_t powcnt1);
 // Geometry engine clock. Called once per scheduler round after the ARM9
 // phase and its timer catch-up, mirroring melonDS NDS::RunSystem
 // (ARM9.Execute / DMA / GXFIFO-stall advance, then RunTimers(0), then
-// GPU.GPU3D.Run()). arm9_cycles is the ARM9 timestamp in its 2x domain.
+// GPU.GPU3D.Run()). arm9_cycles is the ARM9 timestamp, in ARM9 cycles.
 void nds_gpu3d_run(unsigned long long arm9_cycles);
+// The ARM9 timestamp's shift over system cycles (io.h
+// g_nds_arm9_clock_shift), for the geometry engine's own clock.
+void nds_gpu3d_set_arm9_clock_shift(unsigned shift);
 
 // While the GXFIFO stall owns the ARM9, the CPU timestamp advances by the
 // engine's pending cycle debt instead of executing (melonDS CPUStop_GXStall
 // branch). Returns GPU3D::CyclesToRunFor() in system cycles.
 int32_t nds_gpu3d_cycles_to_run();
+// GXSTAT bit 0 (a box, position or vector test is in flight) as of the
+// engine's last Run(); unlike a GXSTAT read it does not run the engine.
+bool nds_gpu3d_test_busy();
 
 // GXFIFO DMA (ARM9 start mode 7): enabling the channel or exhausting a
 // 112-unit iteration re-arms through the engine's FIFO-level check rather
@@ -151,6 +190,16 @@ void nds_gpu3d_start_frame();
 const uint32_t* nds_gpu3d_line(int line);
 // Guest VRAM capture uses the portable raster in native-GL builds.
 const uint32_t* nds_gpu3d_capture_line(int line);
+
+// With the Plume raster drawn for HD presentation, the soft renderer latches
+// its frame at VCount215 without drawing it. The frame is drawn when one of
+// the line calls here is made before the next VBlank (exactly the frame an
+// undeferred draw gives), and dropped at that VBlank otherwise. The 2D
+// compositor asks for no line on frames whose 3D only the presenter shows;
+// `for_capture` only labels the draw in the counters. Always false in the
+// other builds.
+bool nds_gpu3d_cpu_frame_deferred();
+void nds_gpu3d_draw_deferred_frame(bool for_capture);
 
 // Opt-in host-only widened raster surface. The native line API above always
 // returns the centered 256-pixel hardware viewport for the faithful 2D

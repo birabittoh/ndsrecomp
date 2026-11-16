@@ -208,6 +208,7 @@ void cp15_reset() {
     g_cp15.high_vectors = true;
     g_cp15.control = (1u << 13);
     if (++g_cp15_timing_generation == 0u) g_cp15_timing_generation = 1u;
+    runtime_clear_fast_limit();   // publication now stale: nds_code_numc_entered
     g_class_inputs_valid = false;
     cp15_class_sync();
     bus_fast_refresh();
@@ -278,9 +279,14 @@ extern "C" void runtime_coproc_write(uint32_t cp_num, uint32_t op1,
         nds_cpu_enter_halt(0);
         return;
     }
-    if (crn == 1u || crn == 2u || crn == 6u || crn == 9u)
+    if (crn == 1u || crn == 2u || crn == 6u || crn == 9u) {
         if (++g_cp15_timing_generation == 0u)
             g_cp15_timing_generation = 1u;
+        // The ARM9 code-fetch publication is stale until the next latch or
+        // slow numC: code below the fast limit must not run on it
+        // (nds_code_numc_entered).
+        runtime_clear_fast_limit();
+    }
     switch (crn) {
         case 1:  // control register (c1,c0,0)
             if (crm == 0 && op2 == 0) {
