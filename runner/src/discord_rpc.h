@@ -1,7 +1,11 @@
-// discord_rpc.h -- Discord Rich Presence over the local Discord client's IPC
-// (a named pipe on Windows, a Unix socket on Linux and macOS), with no
-// third-party code. Android has no Discord client to talk to, so the calls
-// do nothing there (kNdsDiscordRpcSupported is false).
+// discord_rpc.h -- Discord Rich Presence.
+//
+// On desktop it talks to the Discord app's IPC (a named pipe on Windows, a
+// Unix socket on Linux and macOS) with no third-party code. On Android it
+// needs Discord's Social SDK (discord_rpc_social_sdk.cpp, built with
+// NDS_DISCORD_SOCIAL_SDK, CMake NDS_DISCORD_SOCIAL_SDK_AAR), which reaches
+// the installed Discord app; without it the calls do nothing
+// (kNdsDiscordRpcSupported is false).
 //
 // A background thread connects, keeps looking for Discord while it is not
 // running and sends the activity whenever it changes. It logs once when it
@@ -15,16 +19,24 @@
 
 #include <string>
 
-#if defined(__ANDROID__) || !(defined(_WIN32) || defined(__linux__) || \
-                              defined(__APPLE__))
-inline constexpr bool kNdsDiscordRpcSupported = false;
-#else
+#ifndef NDS_DISCORD_SOCIAL_SDK
+#define NDS_DISCORD_SOCIAL_SDK 0
+#endif
+
+#if defined(__ANDROID__)
+inline constexpr bool kNdsDiscordRpcSupported = NDS_DISCORD_SOCIAL_SDK != 0;
+#elif defined(_WIN32) || defined(__linux__) || defined(__APPLE__)
 inline constexpr bool kNdsDiscordRpcSupported = true;
+#else
+inline constexpr bool kNdsDiscordRpcSupported = false;
 #endif
 
 namespace nds::discord {
 
 struct Activity {
+    // The game's name. Desktop Discord takes it from the application; the
+    // Social SDK shows "Game" unless it is set.
+    std::string name;
     std::string details;      // first line, e.g. "In battle"
     std::string state;        // second line; empty leaves it out
     std::string large_image;  // asset key or https URL

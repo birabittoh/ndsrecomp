@@ -1437,6 +1437,37 @@ string(REGEX REPLACE "^[vV]" "" NDS_RELEASE_VERSION "${NDS_RELEASE_VERSION}")
 message(STATUS "nds_runner: release version '${NDS_RELEASE_VERSION}', "
                "updates from '${NDS_UPDATE_REPO}'")
 
+# Discord Rich Presence on Android (src/discord_rpc.h): the desktop builds
+# talk to the Discord app's IPC themselves, Android needs Discord's Social
+# SDK. Point NDS_DISCORD_SOCIAL_SDK_AAR at its discord_partner_sdk.aar
+# (DiscordSocialSdk-<version>.zip, lib/release/), the same file the Gradle
+# build packages (it brings the .so and the Java side into the APK). Empty:
+# no Discord activity on Android.
+set(NDS_DISCORD_SOCIAL_SDK_AAR "" CACHE FILEPATH
+    "Discord Social SDK discord_partner_sdk.aar (Android Rich Presence)")
+target_sources(nds_runner PRIVATE src/discord_rpc_social_sdk.cpp)
+if(ANDROID AND NDS_DISCORD_SOCIAL_SDK_AAR)
+    if(NOT EXISTS "${NDS_DISCORD_SOCIAL_SDK_AAR}")
+        message(FATAL_ERROR
+            "NDS_DISCORD_SOCIAL_SDK_AAR not found: ${NDS_DISCORD_SOCIAL_SDK_AAR}")
+    endif()
+    set(_discord_dir "${CMAKE_BINARY_DIR}/discord_social_sdk")
+    file(ARCHIVE_EXTRACT INPUT "${NDS_DISCORD_SOCIAL_SDK_AAR}"
+         DESTINATION "${_discord_dir}"
+         PATTERNS "prefab/modules/discord_partner_sdk/include/*"
+                  "jni/${ANDROID_ABI}/*")
+    add_library(discord_partner_sdk SHARED IMPORTED)
+    set_target_properties(discord_partner_sdk PROPERTIES
+        IMPORTED_LOCATION
+            "${_discord_dir}/jni/${ANDROID_ABI}/libdiscord_partner_sdk.so"
+        INTERFACE_INCLUDE_DIRECTORIES
+            "${_discord_dir}/prefab/modules/discord_partner_sdk/include")
+    target_link_libraries(nds_runner PRIVATE discord_partner_sdk)
+    target_compile_definitions(nds_runner PRIVATE NDS_DISCORD_SOCIAL_SDK=1)
+    message(STATUS "nds_runner: Discord Social SDK from "
+                   "${NDS_DISCORD_SOCIAL_SDK_AAR}")
+endif()
+
 target_sources(nds_runner PRIVATE
     src/title_update.cpp
     src/update/self_update.cpp

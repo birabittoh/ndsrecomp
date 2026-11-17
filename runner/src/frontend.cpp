@@ -4687,6 +4687,9 @@ int nds_run_interactive_frontend(const NdsFrontendOptions& initial_options) {
                 discord_now >= discord_next) {
                 discord_next = discord_now + frequency;
                 nds::discord::Activity activity;
+                activity.name = options.app_name.empty()
+                                    ? nds_game_display_name(options)
+                                    : options.app_name;
                 NdsTitlePresence presence;
                 if (nds_title_presence(&presence)) {
                     activity.details = presence.details;

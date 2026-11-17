@@ -442,7 +442,8 @@ void Stop() {
 
 }  // namespace nds::discord
 
-#else
+#elif !NDS_DISCORD_SOCIAL_SDK
+// (With the Social SDK, discord_rpc_social_sdk.cpp implements these.)
 
 namespace nds::discord {
 void Start(const std::string&, const Activity&) {}
