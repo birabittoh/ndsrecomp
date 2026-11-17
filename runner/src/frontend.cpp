@@ -1142,7 +1142,8 @@ uint32_t audio_queue_count(const NdsAudioDevice& device, AudioQueue& queue) {
 
 uint32_t drain_audio(const NdsAudioDevice& device, AudioQueue& queue,
                      bool throttle, uint32_t pace_floor, bool& queue_error,
-                     const std::vector<int16_t>* owned_pcm = nullptr) {
+                     const std::vector<int16_t>* owned_pcm = nullptr,
+                     uint32_t drop_above = 0) {
     if (!device) return 0;
     std::array<int16_t, 2048> samples{};
     size_t pcm_offset=0;
@@ -1155,6 +1156,12 @@ uint32_t drain_audio(const NdsAudioDevice& device, AudioQueue& queue,
             std::copy_n(owned_pcm->data()+pcm_offset,frames*2u,samples.data());
             pcm_offset+=frames*2u;
         }
+        // Fast-forward: the guest makes audio faster than real time, so keep
+        // the queue short by dropping whole blocks; what plays stays at the
+        // normal pitch.
+        if (drop_above &&
+            audio_queue_count(device, queue) + frames > drop_above)
+            continue;
         bool pushed = false;
         while (!pushed) {
 #if defined(NDS_HAVE_SDL3)
@@ -4255,6 +4262,7 @@ int nds_run_interactive_frontend(const NdsFrontendOptions& initial_options) {
     uint64_t audio_presentation_epoch = nds_spu_presentation_epoch();
     bool turbo_pressed = false;
     bool turbo_active = false;
+    bool turbo_audio = false;  // turbo_active with fast_forward_volume > 0
     bool focus_release_pending = false;
     bool presentation_window_focused[2] = {
         (SDL_GetWindowFlags(presentation.windows[0]) &
@@ -5601,10 +5609,18 @@ int nds_run_interactive_frontend(const NdsFrontendOptions& initial_options) {
         const bool turbo_want = turbo_pressed || nds_debug_turbo();
         if (turbo_want != turbo_active) {
             turbo_active = turbo_want;
+            turbo_audio = turbo_active && options.audio_fast_forward_volume > 0;
             if (audio) {
                 pause_audio(audio, true);
                 clear_audio_queue(audio, audio_queue);
                 audio_queue.started.store(false, std::memory_order_relaxed);
+                apply_audio_output_level(
+                    audio, audio_queue,
+                    turbo_audio ? static_cast<uint8_t>(
+                                      options.audio_volume *
+                                      options.audio_fast_forward_volume / 100u)
+                                : options.audio_volume,
+                    options.audio_muted);
             }
             audio_started = false;
             audio_start_threshold = kAudioQueueFrames;
@@ -6079,8 +6095,17 @@ int nds_run_interactive_frontend(const NdsFrontendOptions& initial_options) {
             audio_pace_floor = audio_steady_floor;
         uint32_t queued = audio_queue_count(audio, audio_queue);
         const uint32_t latency_queue_before_drain = queued;
-        if (turbo_active) {
+        if (turbo_active && !turbo_audio) {
             if (!cpu_handoff) discard_spu_output();
+        } else if (turbo_active) {
+            queued = drain_audio(
+                audio, audio_queue, false, 0, audio_queue_error
+#if defined(NDS_HAVE_COMPUTE_RENDERER)
+                ,cpu_handoff ? &presented->pcm : nullptr
+#else
+                ,nullptr
+#endif
+                ,kAudioQueueFrames * 2u);
         } else {
             queued = drain_audio(
                 audio, audio_queue, audio_started, audio_pace_floor,
@@ -6094,7 +6119,7 @@ int nds_run_interactive_frontend(const NdsFrontendOptions& initial_options) {
             SDL_GetPerformanceCounter() - phase2;
         phase_drain_ticks += frame_drain_ticks;
         audio_max_queue = std::max(audio_max_queue, queued);
-        if (audio && !audio_started && !turbo_active &&
+        if (audio && !audio_started && (!turbo_active || turbo_audio) &&
             queued >= audio_start_threshold) {
             // Opening paused and prebuffering avoids the guaranteed startup
             // underrun produced by unpausing an empty SDL queue.

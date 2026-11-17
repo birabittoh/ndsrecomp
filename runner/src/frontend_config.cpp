@@ -981,6 +981,14 @@ static bool apply_frontend_config(toml::table& root,
         }
         if (const auto value = (*audio)["mute"].value<bool>())
             options->audio_muted = *value;
+        if (const auto value =
+                (*audio)["fast_forward_volume"].value<int64_t>()) {
+            if (*value < 0 || *value > 100) {
+                if (error) *error = "audio.fast_forward_volume must be 0..100";
+                return false;
+            }
+            options->audio_fast_forward_volume = static_cast<uint8_t>(*value);
+        }
     }
 
     if (const toml::table* display = root["display"].as_table()) {

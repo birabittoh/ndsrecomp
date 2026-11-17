@@ -183,6 +183,9 @@ bool write_default_settings(const fs::path& path,
         << "volume = " << static_cast<unsigned>(options.audio_volume)
         << "   # 0..100\n"
         << "mute = " << (options.audio_muted ? "true" : "false") << "\n"
+        << "fast_forward_volume = "
+        << static_cast<unsigned>(options.audio_fast_forward_volume)
+        << "   # percent of volume while fast-forwarding, 0 mutes\n"
         << "\n[controls]\n"
         << "# positional: the pad's right button is DS A, as on a DS.\n"
         << "# labels: pad A is DS A.\n"
