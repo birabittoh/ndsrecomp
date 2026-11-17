@@ -374,6 +374,12 @@ void     nds_io_set_cartridge_save_path(const char* path);
 bool     nds_io_flush_cartridge_save();
 bool     nds_io_cartridge_save_snapshot(const uint8_t** data, uint32_t* size,
                                         bool* dirty);
+// Overwrites `size` bytes of the cartridge save at `offset`, as a guest
+// write would (marks it dirty; the next transaction end flushes it). For
+// title hooks that keep data in bytes the game never touches; false when out
+// of range. Emulation thread only.
+bool     nds_io_cartridge_save_patch(uint32_t offset, const uint8_t* data,
+                                     uint32_t size);
 // The battery file's path ("" when persistence is off).
 const char* nds_io_cartridge_save_path();
 // Installs `data` as the cartridge save (it must be the backup's size) and

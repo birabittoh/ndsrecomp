@@ -2110,6 +2110,17 @@ bool nds_io_replace_cartridge_save(const uint8_t* data, uint32_t size,
     return true;
 }
 
+bool nds_io_cartridge_save_patch(uint32_t offset, const uint8_t* data,
+                                 uint32_t size) {
+    const size_t total = g_cart_backup.sram.size();
+    if (!data || offset > total || size > total - offset) return false;
+    uint8_t* dst = g_cart_backup.sram.data() + offset;
+    if (std::equal(data, data + size, dst)) return true;
+    std::copy(data, data + size, dst);
+    g_cart_backup.dirty = true;
+    return true;
+}
+
 bool nds_io_cartridge_save_snapshot(const uint8_t** data, uint32_t* size,
                                     bool* dirty) {
     if (!data || !size || !dirty || g_cart_backup.sram.empty())
