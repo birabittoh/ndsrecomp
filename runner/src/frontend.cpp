@@ -44,6 +44,7 @@
 #include "title_menu.h"
 #include "title_save.h"
 #include "title_settings.h"
+#include "rom_title.h"
 #include "title_update.h"
 #include "update/self_update.h"
 #include "wifi_net.h"
@@ -2804,8 +2805,7 @@ bool create_presentation(const NdsFrontendOptions& options,
     const uint64_t top_window_flags =
         SDL_WINDOW_RESIZABLE | SDL_WINDOW_ALLOW_HIGHDPI |
         (presentation.gl_top ? accelerated_window_flag() : 0u);
-    const std::string single_title =
-        options.game_name.empty() ? "ndsrecomp" : options.game_name;
+    const std::string single_title = nds_game_display_name(options);
     presentation.windows[0] = create_window(
         presentation.separate ? "ndsrecomp - Top Screen"
         : presentation.single ? single_title.c_str()
@@ -6260,8 +6260,7 @@ int nds_run_interactive_frontend(const NdsFrontendOptions& initial_options) {
             const std::string top_title = !savestate_notice.empty()
                 ? "ndsrecomp - " + savestate_notice
                 : presentation.single
-                ? (options.game_name.empty() ? std::string("ndsrecomp")
-                                             : options.game_name) +
+                ? nds_game_display_name(options) +
                       " - " + fps_text + governor_text
                 : presentation.separate
                 ? "ndsrecomp - Top Screen - " + fps_text + governor_text

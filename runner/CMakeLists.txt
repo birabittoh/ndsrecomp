@@ -804,6 +804,7 @@ cmake_language(CALL ${NDS_RUNNER_TARGET_KIND} nds_runner ${NDS_RUNNER_TARGET_TYP
     src/relative_mouse_touch.cpp
     src/frontend.cpp
     src/rom_icon.cpp
+    src/rom_title.cpp
     src/cpu_render_handoff.cpp
     src/main.cpp
     src/runtime_exports.def
@@ -881,6 +882,26 @@ if(WIN32 AND NDS_EXE_ICON_ROM AND EXISTS "${NDS_EXE_ICON_ROM}")
         COMMENT "Converting the cartridge banner icon to an .exe icon")
     target_sources(nds_runner PRIVATE "${_nds_rc}")
     set_source_files_properties("${_nds_rc}" PROPERTIES OBJECT_DEPENDS "${_nds_ico}")
+endif()
+
+# The game's name in every banner language, from the same ROM, for the window
+# title and the player's dialogs (src/rom_title.cpp). Without a ROM they fall
+# back to [game].name.
+if(NDS_EXE_ICON_ROM AND EXISTS "${NDS_EXE_ICON_ROM}")
+    find_package(Python3 REQUIRED COMPONENTS Interpreter)
+    set(_nds_titles "${CMAKE_CURRENT_BINARY_DIR}/nds_rom_titles.generated.h")
+    add_custom_command(
+        OUTPUT "${_nds_titles}"
+        COMMAND "${Python3_EXECUTABLE}" -I
+                "${CMAKE_CURRENT_LIST_DIR}/../tools/gen_nds_title.py"
+                "${NDS_EXE_ICON_ROM}" "${_nds_titles}"
+        DEPENDS "${NDS_EXE_ICON_ROM}"
+                "${CMAKE_CURRENT_LIST_DIR}/../tools/gen_nds_title.py"
+        COMMENT "Reading the game's names from the cartridge banner")
+    set_source_files_properties(src/rom_title.cpp
+        PROPERTIES COMPILE_DEFINITIONS
+        "NDS_ROM_TITLES_HEADER=\"${_nds_titles}\""
+        OBJECT_DEPENDS "${_nds_titles}")
 endif()
 
 # Title-owned handlers for hooks baked into title banks by

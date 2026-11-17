@@ -146,6 +146,14 @@ void nds_title_set_event_windows(bool enabled);
 // not guest time: the CPU still waits as long as the engine takes.
 void nds_title_wait_gx_test();
 
+// The language the title shows the game in, as a firmware language code
+// (0 Japanese .. 5 Spanish), for what the frontend shows of its own, such as
+// the window title (the game's name from the ROM banner in that language).
+// -1, the default, follows the firmware language option. Host state; any
+// thread.
+void nds_title_set_language(int code);
+int nds_title_language();
+
 // Registers a query the frontend calls once per presented frame: true while
 // the game is in a mode that wants both screens stacked vertically at the
 // same size (a title screen, say), whatever the screen_layout option says.

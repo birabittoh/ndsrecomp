@@ -115,7 +115,17 @@ int nds_title_zoom_value() {
 
 namespace {
 std::atomic<NdsTitleStackedLayoutQuery> g_stacked_layout_query{nullptr};
+std::atomic<int> g_title_language{-1};
 }  // namespace
+
+void nds_title_set_language(int code) {
+    g_title_language.store(code >= 0 && code < 8 ? code : -1,
+                           std::memory_order_relaxed);
+}
+
+int nds_title_language() {
+    return g_title_language.load(std::memory_order_relaxed);
+}
 
 void nds_title_set_stacked_layout_query(NdsTitleStackedLayoutQuery query) {
     g_stacked_layout_query.store(query, std::memory_order_relaxed);

@@ -18,6 +18,7 @@
 #endif
 
 #include "sha1.h"
+#include "rom_title.h"
 
 namespace fs = std::filesystem;
 
@@ -140,7 +141,7 @@ bool write_default_settings(const fs::path& path,
         language ? language
                  : nds_firmware_language_name(options.firmware_language);
     std::ofstream out(path);
-    out << "# " << options.game_name << " settings.\n"
+    out << "# " << nds_game_display_name(options) << " settings.\n"
         << "# Edit this file with the game closed. The in-game menu (Esc)\n"
         << "# updates the values it covers and keeps everything else,\n"
         << "# comments included.\n"
@@ -369,7 +370,7 @@ bool resolve_rom(const fs::path& root, const fs::path& settings,
     std::string candidate = argument ? argument : "";
     for (;;) {
         if (candidate.empty()) {
-            switch (pick_file("Select your " + options.game_name + " ROM",
+            switch (pick_file("Select your " + nds_game_display_name(options) + " ROM",
                               &candidate)) {
                 case DialogResult::Picked:
                     break;
@@ -429,7 +430,7 @@ bool resolve_rom(const fs::path& root, const fs::path& settings,
         nds_player_error((imported ? std::string("The selected file")
                                    : path.filename().string()) +
                          " is not the ROM this build runs: " +
-                         options.game_name + ", SHA-1 " +
+                         nds_game_display_name(options) + ", SHA-1 " +
                          options.expected_rom_sha1 + ".");
         if (argument) return false;
         candidate.clear();
