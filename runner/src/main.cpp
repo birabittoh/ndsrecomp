@@ -570,6 +570,9 @@ int main(int argc, char** argv) {
         if (!nds_player_prepare(argc, argv, &frontend_options, &launch))
             return launch.exit_code;
         interactive = true;
+        // Playing, not a parity run: the guest clock follows the host's, or
+        // the game dates everything (quests, saves) 2024-01-01.
+        g_nds_rtc_host = true;
         dir = launch.bios_dir;
         rom_path = launch.rom;
         cli_firmware_path = launch.firmware;
@@ -1498,6 +1501,32 @@ int main(int argc, char** argv) {
     // Opt-in: the performance log, the ~36 MB host-profile bundle and the
     // dispatch-miss log are developer artifacts, not something a stock launch
     // should leave in logs/. Pass `--diagnostics on` to get them.
+#if defined(__ANDROID__)
+    {
+        // An app gets no command line or environment on Android: read the
+        // same switches from properties `adb shell setprop` sets without
+        // root. debug.ndsrecomp.diagnostics is --diagnostics (on|off);
+        // debug.ndsrecomp.env is space-separated NAME=VALUE pairs for the
+        // profilers' environment switches (an existing variable wins).
+        char buf[PROP_VALUE_MAX] = "";
+        if (cli_diagnostics.empty() &&
+            __system_property_get("debug.ndsrecomp.diagnostics", buf) > 0)
+            cli_diagnostics = buf;
+        buf[0] = '\0';
+        if (__system_property_get("debug.ndsrecomp.env", buf) > 0) {
+            char* save = nullptr;
+            for (char* pair = strtok_r(buf, " ", &save); pair;
+                 pair = strtok_r(nullptr, " ", &save)) {
+                char* eq = std::strchr(pair, '=');
+                if (!eq || eq == pair) continue;
+                *eq = '\0';
+                setenv(pair, eq + 1, 0);
+                std::fprintf(stderr, "[diagnostics] env %s=%s\n", pair,
+                             std::getenv(pair));
+            }
+        }
+    }
+#endif
     bool diagnostics_enabled = false;
     if (!cli_diagnostics.empty() &&
         !nds_parse_on_off(cli_diagnostics, &diagnostics_enabled)) {
