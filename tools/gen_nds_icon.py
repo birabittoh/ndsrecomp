@@ -1,15 +1,19 @@
 #!/usr/bin/env python3
 """Writes the cartridge banner icon of a .nds as a Windows .ico and its .rc.
 
-usage: gen_nds_icon.py <rom.nds> <out.ico> <out.rc>
+usage: gen_nds_icon.py <rom.nds or unpacked folder> <out.ico> <out.rc>
 
 Same decoding as runner/src/rom_icon.cpp. The .ico holds PNG entries at
 32 (native) and 64/128/256 (nearest-neighbour), which Explorer, the taskbar
 and Alt-Tab pick from. Needs no third-party packages.
 """
+import os
 import struct
 import sys
 import zlib
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from nds_folder import banner_image  # noqa: E402
 
 
 def banner_icon(rom):
@@ -51,12 +55,7 @@ def png(px, scale):
 
 def main():
     rom_path, ico_path, rc_path = sys.argv[1:4]
-    with open(rom_path, "rb") as f:
-        rom = f.read(0x100000)  # the banner sits near the start of the ROM
-        if struct.unpack_from("<I", rom, 0x68)[0] + 0x240 > len(rom):
-            f.seek(0)
-            rom = f.read()
-    px = banner_icon(rom)
+    px = banner_icon(banner_image(rom_path))
     images = [(32 * s, png(px, s)) for s in (1, 2, 4, 8)]
     out = bytearray(struct.pack("<HHH", 0, 1, len(images)))
     offset = 6 + 16 * len(images)

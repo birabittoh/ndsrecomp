@@ -256,10 +256,19 @@ struct NdsSettingsPaths {
     std::string save;
 };
 
+// [[game.releases]]: a known release of the title. Its id names the folder
+// the player's ROM is unpacked to (<data>/assets/<id>).
+struct NdsRelease {
+    std::string id;
+    std::string name;
+    std::string sha1;
+};
+
 struct NdsFrontendOptions {
     // Optional exact cartridge identity from [game]. When present, every
     // title-owned setting in this config is rejected for any other ROM.
     std::string expected_rom_sha1;
+    std::vector<NdsRelease> releases;
     // Display name from [game].name (runtime settings menu title).
     std::string game_name;
     // Window icon, 256x256 RGBA8 (empty = the platform default). Taken from

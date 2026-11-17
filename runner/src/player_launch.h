@@ -12,6 +12,7 @@
 // directory, and everything the player owns lives in one data directory:
 //
 //   settings.toml   editable; the runtime menu writes changes back to it
+//   assets/<id>/    the ROM, unpacked, one folder per release (rom_folder.h)
 //   saves/          cartridge battery save
 //   savestates/     savestate slots
 //   bios/           optional home for the BIOS and firmware dumps

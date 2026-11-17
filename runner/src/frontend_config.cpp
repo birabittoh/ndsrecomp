@@ -914,6 +914,25 @@ static bool apply_frontend_config(toml::table& root,
             }
             options->expected_rom_sha1 = *value;
         }
+        if (const toml::array* releases = (*game)["releases"].as_array()) {
+            options->releases.clear();
+            for (const toml::node& node : *releases) {
+                const toml::table* release = node.as_table();
+                const auto id = release ? (*release)["id"].value<std::string>()
+                                        : std::nullopt;
+                const auto sha1 = release
+                    ? (*release)["sha1"].value<std::string>() : std::nullopt;
+                if (!id || id->empty() || !sha1 || sha1->size() != 40u ||
+                    id->find_first_of("/\\:.") != std::string::npos) {
+                    if (error)
+                        *error = "every game.releases entry needs an id (a "
+                                 "folder name) and a 40-digit sha1";
+                    return false;
+                }
+                options->releases.push_back(
+                    {*id, (*release)["name"].value_or(*id), *sha1});
+            }
+        }
     }
 
     if (const toml::table* system = root["system"].as_table()) {

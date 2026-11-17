@@ -802,6 +802,7 @@ cmake_language(CALL ${NDS_RUNNER_TARGET_KIND} nds_runner ${NDS_RUNNER_TARGET_TYP
     src/debug_server.cpp
     src/frontend_config.cpp
     src/player_launch.cpp
+    src/rom_folder.cpp
     src/log_file.cpp
     src/relative_mouse_touch.cpp
     src/frontend.cpp
@@ -868,7 +869,14 @@ message(STATUS "MKDS card PIO implementation: ${NDS_MKDS_CARD_PIO_IMPLEMENTATION
 # time. The window icon is applied at run time from the loaded ROM instead
 # (src/rom_icon.cpp), on every platform.
 set(NDS_EXE_ICON_ROM "" CACHE FILEPATH
-    "ROM whose banner icon becomes the Windows .exe icon (empty = none)")
+    "ROM (.nds or unpacked folder) whose banner icon becomes the Windows .exe icon (empty = none)")
+# What the banner is read from: the file, or an unpacked folder's banner.bin.
+if(IS_DIRECTORY "${NDS_EXE_ICON_ROM}")
+    set(_nds_banner_source "${NDS_EXE_ICON_ROM}/banner.bin"
+        "${NDS_EXE_ICON_ROM}/header.bin")
+else()
+    set(_nds_banner_source "${NDS_EXE_ICON_ROM}")
+endif()
 if(WIN32 AND NDS_EXE_ICON_ROM AND EXISTS "${NDS_EXE_ICON_ROM}")
     find_package(Python3 REQUIRED COMPONENTS Interpreter)
     enable_language(RC)
@@ -879,8 +887,9 @@ if(WIN32 AND NDS_EXE_ICON_ROM AND EXISTS "${NDS_EXE_ICON_ROM}")
         COMMAND "${Python3_EXECUTABLE}" -I
                 "${CMAKE_CURRENT_LIST_DIR}/../tools/gen_nds_icon.py"
                 "${NDS_EXE_ICON_ROM}" "${_nds_ico}" "${_nds_rc}"
-        DEPENDS "${NDS_EXE_ICON_ROM}"
+        DEPENDS ${_nds_banner_source}
                 "${CMAKE_CURRENT_LIST_DIR}/../tools/gen_nds_icon.py"
+                "${CMAKE_CURRENT_LIST_DIR}/../tools/nds_folder.py"
         COMMENT "Converting the cartridge banner icon to an .exe icon")
     target_sources(nds_runner PRIVATE "${_nds_rc}")
     set_source_files_properties("${_nds_rc}" PROPERTIES OBJECT_DEPENDS "${_nds_ico}")
@@ -897,8 +906,9 @@ if(NDS_EXE_ICON_ROM AND EXISTS "${NDS_EXE_ICON_ROM}")
         COMMAND "${Python3_EXECUTABLE}" -I
                 "${CMAKE_CURRENT_LIST_DIR}/../tools/gen_nds_title.py"
                 "${NDS_EXE_ICON_ROM}" "${_nds_titles}"
-        DEPENDS "${NDS_EXE_ICON_ROM}"
+        DEPENDS ${_nds_banner_source}
                 "${CMAKE_CURRENT_LIST_DIR}/../tools/gen_nds_title.py"
+                "${CMAKE_CURRENT_LIST_DIR}/../tools/nds_folder.py"
         COMMENT "Reading the game's names from the cartridge banner")
     set_source_files_properties(src/rom_title.cpp
         PROPERTIES COMPILE_DEFINITIONS
@@ -1553,6 +1563,15 @@ add_executable(cpu_render_handoff_test tests/cpu_render_handoff_test.cpp src/cpu
 target_include_directories(cpu_render_handoff_test PRIVATE src)
 target_link_libraries(cpu_render_handoff_test PRIVATE Threads::Threads)
 add_test(NAME cpu_render_handoff_test COMMAND cpu_render_handoff_test)
+
+  add_executable(rom_folder_test
+      tests/rom_folder_test.cpp
+      src/rom_folder.cpp
+      ${CMAKE_CURRENT_SOURCE_DIR}/../recompiler/support/sha1.cpp)
+target_include_directories(rom_folder_test PRIVATE src
+    ${CMAKE_CURRENT_SOURCE_DIR}/../recompiler/support)
+ndsrecomp_link_tomlpp(rom_folder_test)
+  add_test(NAME rom_folder_test COMMAND rom_folder_test)
 
   add_executable(frontend_config_test
       tests/frontend_config_test.cpp

@@ -18,6 +18,7 @@
 #endif
 
 #include "sha1.h"
+#include "rom_folder.h"
 #include "rom_title.h"
 
 namespace fs = std::filesystem;
@@ -148,7 +149,7 @@ bool write_default_settings(const fs::path& path,
         << "\n[paths]\n"
         << "# Empty means the default. Relative paths start from this "
            "folder.\n"
-        << "rom = \"\"    # asked for on first launch, copied into this folder\n"
+        << "rom = \"\"    # asked for on first launch, unpacked into assets/\n"
         << "bios = \"\"   # folder with biosnds7.rom, biosnds9.rom, "
            "firmware.bin\n"
         << "save = \"\"   # default: saves/" << options.app_name << ".sav\n"
@@ -309,13 +310,68 @@ bool import_uri(const std::string& uri, const fs::path& dest) {
 }
 #endif
 
-bool rom_matches(const fs::path& path, const std::string& expected_sha1) {
-    if (expected_sha1.empty()) return true;
+bool read_bytes(const fs::path& path, std::vector<uint8_t>* bytes) {
     std::ifstream in(path, std::ios::binary);
     if (!in) return false;
-    std::vector<uint8_t> bytes((std::istreambuf_iterator<char>(in)),
-                               std::istreambuf_iterator<char>());
-    return gba::sha1(bytes.data(), bytes.size()).hex() == expected_sha1;
+    bytes->assign(std::istreambuf_iterator<char>(in),
+                  std::istreambuf_iterator<char>());
+    return true;
+}
+
+// An unpacked ROM folder made from the image this build runs.
+bool folder_matches(const fs::path& dir, const std::string& expected_sha1) {
+    if (!nds_rom_folder_is(dir)) return false;
+    NdsRomFolderInfo info;
+    std::string error;
+    if (!nds_rom_folder_info(dir, &info, &error)) {
+        std::fprintf(stderr, "[player] %s\n", error.c_str());
+        return false;
+    }
+    return expected_sha1.empty() || info.sha1 == expected_sha1;
+}
+
+// The library folder for an image: its [[game.releases]] id, else its game
+// code. An existing folder holding another image is left alone.
+fs::path release_dir(const fs::path& library, const NdsFrontendOptions& options,
+                     const std::vector<uint8_t>& rom, const std::string& sha1) {
+    std::string id;
+    for (const NdsRelease& release : options.releases)
+        if (release.sha1 == sha1) id = release.id;
+    if (id.empty()) {
+        for (size_t i = 0x0C; i < 0x10 && i < rom.size(); ++i) {
+            const unsigned char c = rom[i];
+            id.push_back(std::isalnum(c) ? static_cast<char>(std::tolower(c))
+                                         : '_');
+        }
+        if (rom.size() > 0x1E && rom[0x1E])
+            id += "-rev" + std::to_string(rom[0x1E]);
+    }
+    fs::path dir = library / id;
+    for (int n = 2; fs::exists(dir) && !folder_matches(dir, sha1); ++n)
+        dir = library / (id + "-" + std::to_string(n));
+    return dir;
+}
+
+enum class Install { Done, NotThisGame, Failed };
+
+// Unpacks `rom` into the library, or finds it already there.
+Install install_rom(const fs::path& library, const NdsFrontendOptions& options,
+                    const std::vector<uint8_t>& rom, fs::path* dir) {
+    const std::string sha1 = gba::sha1(rom.data(), rom.size()).hex();
+    const std::string& expected = options.expected_rom_sha1;
+    if (!expected.empty() && sha1 != expected) return Install::NotThisGame;
+    *dir = release_dir(library, options, rom, sha1);
+    if (folder_matches(*dir, sha1)) return Install::Done;
+    std::error_code ec;
+    fs::create_directories(library, ec);
+    std::fprintf(stderr, "[player] unpacking the ROM to %s\n",
+                 dir->string().c_str());
+    std::string error;
+    if (!nds_rom_folder_unpack(rom, *dir, &error)) {
+        nds_player_error("Cannot unpack the ROM: " + error);
+        return Install::Failed;
+    }
+    return Install::Done;
 }
 
 // Which dumps the folder has to hold. system.freebios replaces the two BIOS
@@ -360,15 +416,54 @@ bool remember(const fs::path& settings, const char* key,
     return false;
 }
 
+// The ROM is kept unpacked, one folder per release, in <data>/assets
+// (rom_folder.h); paths.rom names the folder in use. A picked .nds is
+// unpacked there and can then be moved or deleted. A folder can also be
+// picked or given on the command line, and is then used where it is.
 // False: the player cancelled (*cancelled), or an error was already shown.
 bool resolve_rom(const fs::path& root, const fs::path& settings,
                  const NdsFrontendOptions& options, const char* argument,
                  fs::path* rom, bool* cancelled) {
+    const fs::path library = root / "assets";
+    const std::string& expected = options.expected_rom_sha1;
+    const fs::path old_copy = root / (options.app_name + ".nds");
     if (!argument && !options.paths.rom.empty()) {
-        *rom = resolve_stored(root, options.paths.rom);
-        if (fs::is_regular_file(*rom)) return true;
+        const fs::path stored = resolve_stored(root, options.paths.rom);
+        if (folder_matches(stored, expected)) {
+            *rom = stored;
+            return true;
+        }
+        std::vector<uint8_t> bytes;
+        if (fs::is_regular_file(stored) && read_bytes(stored, &bytes)) {
+            // A .nds from before ROMs were unpacked.
+            const Install install = install_rom(library, options, bytes, rom);
+            if (install == Install::Failed) return false;
+            if (install == Install::Done) {
+                remember(settings, "rom", to_stored(root, *rom));
+                std::error_code ec;
+                if (fs::equivalent(stored, old_copy, ec)) {
+                    fs::remove(old_copy, ec);
+                    std::fprintf(stderr, "[player] removed %s\n",
+                                 old_copy.string().c_str());
+                }
+                return true;
+            }
+        }
         std::fprintf(stderr, "[player] remembered ROM %s is gone\n",
-                     rom->string().c_str());
+                     stored.string().c_str());
+    }
+    if (!argument && !expected.empty()) {
+        // A folder unpacked earlier, or next to the executable (a build).
+        for (const fs::path& dir : {library, executable_dir() / "assets"}) {
+            std::error_code ec;
+            for (const fs::directory_entry& entry :
+                 fs::directory_iterator(dir, ec)) {
+                if (!folder_matches(entry.path(), expected)) continue;
+                *rom = entry.path();
+                remember(settings, "rom", to_stored(root, *rom));
+                return true;
+            }
+        }
     }
     std::string candidate = argument ? argument : "";
     for (;;) {
@@ -389,9 +484,9 @@ bool resolve_rom(const fs::path& root, const fs::path& settings,
         }
         bool imported = false;
 #if defined(__ANDROID__) && defined(NDS_HAVE_SDL3)
-        // Straight to the copy the code below would make.
+        // A file the code below can read, unpacked and then removed.
         if (candidate.rfind("content://", 0) == 0) {
-            const fs::path copy = root / (options.app_name + ".nds");
+            const fs::path copy = root / (options.app_name + ".import.nds");
             if (!import_uri(candidate, copy)) {
                 nds_player_error("The selected file could not be read.");
                 candidate.clear();
@@ -402,39 +497,37 @@ bool resolve_rom(const fs::path& root, const fs::path& settings,
         }
 #endif
         const fs::path path = fs::absolute(candidate);
-        if (rom_matches(path, options.expected_rom_sha1)) {
-            // Keep our own copy in the data folder and run from it, so the
-            // original can be moved or deleted.
-            const fs::path copy = root / (options.app_name + ".nds");
-            std::error_code ec;
-            if (fs::equivalent(path, copy, ec)) {
-                *rom = copy;
-            } else {
-                ec.clear();
-                fs::create_directories(root, ec);
-                ec.clear();
-                if (fs::copy_file(path, copy,
-                                  fs::copy_options::overwrite_existing, ec)) {
-                    *rom = copy;
-                } else {
-                    std::fprintf(stderr,
-                                 "[player] could not copy the ROM to %s: %s\n",
-                                 copy.string().c_str(), ec.message().c_str());
-                    *rom = path;
-                }
+        if (fs::is_directory(path)) {
+            if (folder_matches(path, expected)) {
+                *rom = path;
+                remember(settings, "rom", to_stored(root, *rom));
+                return true;
             }
-            remember(settings, "rom", to_stored(root, *rom));
-            return true;
+            nds_player_error(path.string() +
+                             " is not the unpacked ROM this build runs.");
+            if (argument) return false;
+            candidate.clear();
+            continue;
         }
+        std::vector<uint8_t> bytes;
+        const bool read = read_bytes(path, &bytes);
         if (imported) {
             std::error_code ec;
             fs::remove(path, ec);
+        }
+        if (read) {
+            const Install install = install_rom(library, options, bytes, rom);
+            if (install == Install::Failed) return false;
+            if (install == Install::Done) {
+                remember(settings, "rom", to_stored(root, *rom));
+                return true;
+            }
         }
         nds_player_error((imported ? std::string("The selected file")
                                    : path.filename().string()) +
                          " is not the ROM this build runs: " +
                          nds_game_display_name(options) + ", SHA-1 " +
-                         options.expected_rom_sha1 + ".");
+                         expected + ".");
         if (argument) return false;
         candidate.clear();
     }
@@ -547,7 +640,8 @@ bool nds_player_embedded_dumps(std::vector<uint8_t>* arm9_bios,
 
 namespace {
 
-// Player-mode command line: an optional .nds path and an optional
+// Player-mode command line: an optional .nds path (or unpacked ROM
+// folder) and an optional
 // `--instance N`, in any order. `instance` stays -1 without the flag.
 struct PlayerArgs {
     const char* rom = nullptr;
@@ -577,7 +671,8 @@ bool parse_player_args(int argc, char** argv, PlayerArgs* out) {
             out->instance = static_cast<int>(value);
         } else if (nds_is_local_wireless_tuning_flag(arg) && i + 1 < argc) {
             out->local_wireless_tuning.emplace_back(arg, argv[++i]);
-        } else if (arg[0] != '-' && !out->rom && is_nds_path(argv[i])) {
+        } else if (arg[0] != '-' && !out->rom &&
+                   (is_nds_path(argv[i]) || nds_rom_folder_is(argv[i]))) {
             out->rom = argv[i];
         } else {
             return false;

@@ -68,6 +68,7 @@
 #include "tier3.h"
 #include "log_file.h"
 #include "player_launch.h"
+#include "rom_folder.h"
 #include "title_patches.h"
 #if NDS_ONLINE
 #include "net/online_lobby.h"
@@ -2007,7 +2008,22 @@ int main(int argc, char** argv) {
         fw = read_file(cli_firmware_path.empty() ? (dir + "/firmware.bin")
                                                  : cli_firmware_path);
     }
-    auto rom = rom_path.empty() ? std::vector<uint8_t>{} : read_file(rom_path);
+    std::vector<uint8_t> rom;
+    if (!rom_path.empty() && nds_rom_folder_is(rom_path)) {
+        // An unpacked ROM (rom_folder.h): packed back into the image here,
+        // so everything below sees a cartridge as before.
+        std::string folder_error;
+        if (!nds_rom_folder_pack(rom_path, &rom, &folder_error)) {
+            std::fprintf(stderr, "refusing to start: %s\n",
+                         folder_error.c_str());
+            startup_failure("The game files in " + rom_path +
+                            " cannot be read: " + folder_error);
+            return 1;
+        }
+        std::fprintf(stderr, "[load] packed %s\n", rom_path.c_str());
+    } else if (!rom_path.empty()) {
+        rom = read_file(rom_path);
+    }
     nds_rom_banner_icon_rgba(rom.data(), rom.size(), 8,
                              &frontend_options.window_icon_rgba);
     std::string rom_sha1;
