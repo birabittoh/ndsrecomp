@@ -764,7 +764,7 @@ struct LocalMpTuning {
     // send, socket arrival, release to the guest, and guest pickup.
     bool trace = false;
     bool stay_awake = false;
-    // Link (HANDOFF_ONLINE_LOBBY.md Phase 1): loopback reaches instances
+    // Link: loopback reaches instances
     // on this machine only, lan also finds runners on the local network.
     bool lan = false;
     std::vector<mpnet::PeerAddr> peers;
@@ -883,7 +883,7 @@ public:
         // Netplay on: the lobby's members come into range next to the
         // runners on the local network, and internet latency needs a radio
         // that stays awake and, while a lobby member is in range, late
-        // replies (HANDOFF_ONLINE_LOBBY.md Phase 0; LateReplies()).
+        // replies (LateReplies()).
         online_epoch_ = nds_online_link_epoch();
         if (std::shared_ptr<mpnet::IceLink> online = nds_online_link()) {
             link_ = std::make_unique<DualLink>(
@@ -2126,7 +2126,7 @@ private:
     }
 
     // NDS_LOCAL_MP_STATS=1: one line per second of per-second deltas, only
-    // while traffic flows, for the Phase 0 table in HANDOFF_ONLINE_LOBBY.md.
+    // while traffic flows.
     void MaybeLogStats() {
         if (!tuning_.stats_log || !LinkOpen()) return;
         const auto now = std::chrono::steady_clock::now();
@@ -2212,10 +2212,9 @@ private:
         stats_log_last_ = now;
     }
 
-    // What this instance advertises as an MP host (Phase 1b of
-    // HANDOFF_ONLINE_LOBBY.md): one line when it starts beaconing, when
-    // the game info changes (at most every kBeaconLogInterval) and when
-    // the beacons stop.
+    // What this instance advertises as an MP host: one line when it starts
+    // beaconing, when the game info changes (at most every
+    // kBeaconLogInterval) and when the beacons stop.
     void ObserveBeacon(const uint8_t* data, size_t len) {
         mpnet::GameInfo info;
         if (!mpnet::ParseBeaconGameInfo(data, len, &info)) return;

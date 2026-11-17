@@ -176,7 +176,7 @@ struct NdsOnlineOptions {
 struct NdsLocalWirelessOptions {
     bool enabled = false;
     uint16_t base_port = 26710;
-    // Latency lab (HANDOFF_ONLINE_LOBBY.md Phase 0): every received datagram
+    // Latency lab: every received datagram
     // is held for delay_ms (+ up to jitter_ms) before the guest sees it, and
     // loss_pct of them are dropped. Applied on receive, so running both
     // instances with the same delay gives a round trip of 2 x delay_ms.

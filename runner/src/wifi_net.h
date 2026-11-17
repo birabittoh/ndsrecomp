@@ -318,7 +318,7 @@ bool nds_wifi_local_mp_radio_on();
 uint16_t nds_wifi_local_mp_take_ack_only();
 
 // What a title reads out of the game info its own MP host beacons carry
-// (net/mp_beacon.h), for the online lobby (HANDOFF_ONLINE_LOBBY.md Phase 1b).
+// (net/mp_beacon.h), for the online lobby.
 struct NdsNetplayHostInfo {
     bool accepting = false;   // the game takes new players
     int free_slots = 0;       // player slots still free
@@ -349,7 +349,7 @@ void nds_wifi_frame_tick();
 // logs MP client timing (diagnostics only).
 bool nds_wifi_local_mp_trace_enabled();
 
-// Lobby beacons (HANDOFF_ONLINE_LOBBY.md, "DQ9's in-game host list"): with
+// Lobby beacons, for a game's own host list: with
 // Netplay on and no lobby joined, the open lobbies' hosts are put in radio
 // range as beacons only, so the game lists them in its own join menu.
 //

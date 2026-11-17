@@ -85,8 +85,8 @@ behaviour is unchanged.
 2026-11-11: `Wifi.cpp`'s `CheckRX` tells the runner hook
 `nds_wifi_local_mp_note_rx_channel()` the channel it is listening on before
 each regular `MP_RecvPacket`. With Netplay on and no lobby joined, the
-runner replays the open lobbies' host beacons into the radio
-(HANDOFF_ONLINE_LOBBY.md, "DQ9's in-game host list"); it hands one over
+runner replays the open lobbies' host beacons into the radio, so the
+game lists them in its own host list; it hands one over
 only on the channel the guest is on, since `CheckRX` drops a frame from any
 other channel. The hook only records a number; behaviour is unchanged.
 

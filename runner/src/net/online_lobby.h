@@ -1,5 +1,5 @@
 // online_lobby.h -- Netplay: local wireless with the players of an online
-// lobby (HANDOFF_ONLINE_LOBBY.md in DQ9Recomp, "The goal").
+// lobby.
 //
 // With Netplay on, the members of the lobby this runner sits in come into
 // radio range next to the runners found by LAN discovery (wifi_net.cpp's
@@ -17,7 +17,7 @@
 // Privacy: datagrams go through the TURN relay only (net/ice_link.h).
 // This client sends no endpoint of its own and no match_caps. The lobby
 // server still learns, and in its current version publishes, the
-// connection's address (host_endpoint / guest_endpoint), see the handoff.
+// connection's address (host_endpoint / guest_endpoint).
 //
 // Every function here is safe to call from any thread.
 

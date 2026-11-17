@@ -926,7 +926,7 @@ if(NDS_TITLE_HOOK_SOURCES)
     message(STATUS "Title hook sources: ${_hook_source_count}")
 endif()
 
-# Online lobbies for local wireless (HANDOFF_ONLINE_LOBBY.md in DQ9Recomp):
+# Online lobbies for local wireless:
 # ICE through a TURN relay (libjuice) and Discord sign-in for the lobby
 # server (recomp-net's auth.h). recomp-net is a sibling checkout (or
 # RECOMP_NET_ROOT); only its account module and the libjuice it builds are

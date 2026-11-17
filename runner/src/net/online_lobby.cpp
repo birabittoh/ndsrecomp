@@ -43,7 +43,7 @@ constexpr auto kConnectBackoffMax = std::chrono::seconds(60);
 constexpr auto kHostGoneWithRadioOn = std::chrono::seconds(30);
 constexpr int kConnectTimeoutMs = 8000;
 
-// Lobby beacons (HANDOFF_ONLINE_LOBBY.md, "DQ9's in-game host list"): a
+// Lobby beacons, for a game's own host list: a
 // runner that is in no lobby asks each open lobby's host for its current
 // beacon with the server's probe_signal (open to a client that has not
 // joined) and replays it into its own radio, so the game lists the lobby

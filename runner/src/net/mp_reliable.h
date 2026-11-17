@@ -1,5 +1,5 @@
 // mp_reliable.h -- reliable, ordered delivery for the local wireless
-// transport (HANDOFF_ONLINE_LOBBY.md Phase 1 step 5).
+// transport.
 //
 // Late-reply mode answers every MP exchange locally and lets the data
 // follow with the link's latency, so nobody retransmits at the radio level

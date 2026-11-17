@@ -195,7 +195,7 @@ public:
     // discovered code whose value is a decode-valid code pointer (bit0 =
     // mode) and (b) function prologues inside uncovered bytes, then walk
     // them and repeat until nothing new is found. Every candidate must
-    // pass validate_candidate(); see HANDOFF_STATIC_SCANNER.md §4.4/§4.5.
+    // pass validate_candidate().
     void set_static_scan(bool on) { static_scan_ = on; }
     // A candidate entry that must pass validate_candidate() before it is
     // walked (static scan only): cross-image call targets, where several

@@ -1,6 +1,6 @@
 // ice_link.h -- local wireless over the internet: ICE through a TURN relay.
 //
-// A lobby is a radio room (HANDOFF_ONLINE_LOBBY.md §2.1): while this runner
+// A lobby is a radio room: while this runner
 // sits in an online lobby, the transport's datagrams go to the other lobby
 // members instead of the LAN. The lobby's host is the hub. It holds one ICE
 // agent per guest and forwards what one guest sends to the others; a guest
