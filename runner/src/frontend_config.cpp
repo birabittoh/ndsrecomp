@@ -1387,6 +1387,15 @@ static bool apply_frontend_config(toml::table& root,
             }
         }
     }
+    if (const toml::table* discord = root["discord"].as_table()) {
+        if (const auto value =
+                (*discord)["application_id"].value<std::string>())
+            options->discord_application_id = *value;
+        if (const auto value = (*discord)["large_image"].value<std::string>())
+            options->discord_large_image = *value;
+        if (const auto value = (*discord)["activity"].value<bool>())
+            options->discord_activity = *value;
+    }
     if (const toml::table* online = root["online"].as_table()) {
         NdsOnlineOptions& o = options->local_wireless.online;
         if (const auto value = (*online)["enabled"].value<bool>())

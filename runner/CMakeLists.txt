@@ -782,6 +782,8 @@ cmake_language(CALL ${NDS_RUNNER_TARGET_KIND} nds_runner ${NDS_RUNNER_TARGET_TYP
     src/title_patches.cpp
     src/title_settings.cpp
     src/title_menu.cpp
+    src/title_presence.cpp
+    src/discord_rpc.cpp
     src/title_save.cpp
     ${NDS_TIER3_SOURCE}
     src/coverage_manifest.cpp

@@ -46,6 +46,8 @@
 #include "title_settings.h"
 #include "rom_title.h"
 #include "title_update.h"
+#include "discord_rpc.h"
+#include "title_presence.h"
 #include "update/self_update.h"
 #include "wifi_net.h"
 #if defined(NDS_HAVE_COMPUTE_RENDERER)
@@ -1345,6 +1347,7 @@ constexpr const char* kRuntimeFullscreenKey = "display.fullscreen";
 constexpr const char* kRuntimeSmooth3dKey = "display.smooth_3d";
 constexpr const char* kRuntimeVolumeKey = "audio.volume";
 constexpr const char* kRuntimeMuteKey = "audio.mute";
+constexpr const char* kRuntimeDiscordKey = "discord.activity";
 // Rows for the title's own settings (title_settings.h): "title.<key>".
 constexpr const char* kRuntimeTitlePrefix = "title.";
 
@@ -1472,6 +1475,10 @@ int runtime_menu_get_value(RuntimeMenuState* state, const NdsMenuItem* item,
         *value_out = state->options->audio_muted ? 1 : 0;
         return 1;
     }
+    if (std::strcmp(item->key, kRuntimeDiscordKey) == 0) {
+        *value_out = state->options->discord_activity ? 1 : 0;
+        return 1;
+    }
     return 0;
 }
 
@@ -1542,6 +1549,11 @@ int runtime_menu_set_value(RuntimeMenuState* state, const NdsMenuItem* item,
     if (std::strcmp(item->key, kRuntimeSmooth3dKey) == 0) {
         if (value < 0 || value > 1) return 0;
         state->options->smooth_3d = value != 0;
+        return 1;
+    }
+    if (std::strcmp(item->key, kRuntimeDiscordKey) == 0) {
+        if (value < 0 || value > 1) return 0;
+        state->options->discord_activity = value != 0;
         return 1;
     }
     if (std::strcmp(item->key, kRuntimeVolumeKey) == 0 ||
@@ -1628,6 +1640,7 @@ void runtime_menu_save(const RuntimeMenuState* state) {
         {"display", "smooth_3d", options.smooth_3d ? "true" : "false"},
         {"audio", "volume", std::to_string(options.audio_volume)},
         {"audio", "mute", options.audio_muted ? "true" : "false"},
+        {"discord", "activity", options.discord_activity ? "true" : "false"},
         {"controls", "gamepad_layout",
          quoted(options.gamepad_positional ? "positional" : "labels")},
     };
@@ -3887,6 +3900,13 @@ int nds_run_interactive_frontend(const NdsFrontendOptions& initial_options) {
     // Then the title's own settings, then Netplay when the lobby thread runs.
     std::vector<NdsMenuItem> runtime_menu_list(
         std::begin(runtime_menu_items), std::end(runtime_menu_items));
+    // Discord Rich Presence, where the build talks to Discord and the game
+    // names a Discord application.
+    if (kNdsDiscordRpcSupported && !options.discord_application_id.empty())
+        runtime_menu_list.push_back(
+            {kRuntimeDiscordKey, "Discord", "Discord activity",
+             "Shows what you are doing in the game on your Discord profile.",
+             NdsMenuItemType::Bool, 0, 1, 1, nullptr, 0, nullptr});
     // A title that decides smoothing itself (title_settings.h) shows its own
     // setting for it instead.
     if (nds_title_smooth_3d_owned())
@@ -4655,6 +4675,29 @@ int nds_run_interactive_frontend(const NdsFrontendOptions& initial_options) {
                 g_frontend_reset();
                 blend_cache.valid = false;
                 publish_keys();
+            }
+        }
+        {
+            // Discord Rich Presence: the title's activity, about once a
+            // second (the client sends only changes).
+            static uint64_t discord_next = 0;
+            const uint64_t discord_now = SDL_GetPerformanceCounter();
+            if (kNdsDiscordRpcSupported &&
+                !options.discord_application_id.empty() &&
+                discord_now >= discord_next) {
+                discord_next = discord_now + frequency;
+                nds::discord::Activity activity;
+                NdsTitlePresence presence;
+                if (nds_title_presence(&presence)) {
+                    activity.details = presence.details;
+                    activity.state = presence.state;
+                }
+                activity.large_image = options.discord_large_image;
+                if (!activity.large_image.empty())
+                    activity.large_text = nds_game_display_name(options);
+                nds::discord::SetEnabled(options.discord_activity);
+                nds::discord::Start(options.discord_application_id, activity);
+                nds::discord::SetActivity(activity);
             }
         }
         {
@@ -6341,6 +6384,7 @@ int nds_run_interactive_frontend(const NdsFrontendOptions& initial_options) {
     if (window_resize_save_at && !presentation.separate)
         persist_window_size(options, presentation.windows[0]);
     destroy_presentation(presentation);
+    nds::discord::Stop();
     SDL_Quit();
     std::fprintf(stderr, "[sdl] closed after %llu presented frames\n",
                  static_cast<unsigned long long>(shown_frames));

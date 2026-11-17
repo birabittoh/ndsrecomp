@@ -389,6 +389,13 @@ struct NdsFrontendOptions {
     // Blends 3D images for games drawing below the DS frame rate, at the cost
     // of showing 3D one DS frame later. See gpu3d_interp.h.
     bool smooth_3d = false;
+    // [discord]: Rich Presence (discord_rpc.h). application_id (game.toml)
+    // names the Discord application, empty = off; activity is the player's
+    // switch; large_image an asset key (or https URL) to show with it, empty
+    // = the application's own icon.
+    std::string discord_application_id;
+    std::string discord_large_image;
+    bool discord_activity = true;
     // Texture upscaling factor, 1 (off), 2, or 4. Filters each decoded DS
     // texture once on a cache miss; independent of internal_resolution, but
     // only worth enabling alongside it.
