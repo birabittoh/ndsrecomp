@@ -340,6 +340,26 @@ void nds_netplay_set_host_decoder(NdsNetplayHostDecoder decoder);
 // decoder did not accept its beacon.
 bool nds_netplay_host_info(NdsNetplayHostInfo* out);
 
+// A title's own data for the other machines of its wireless session, e.g.
+// the host's settings that every player must share. While the radio has a
+// BSSID (an MP host or a client joined to one), the transport asks the
+// source for a message about once a second and whenever a new peer turns
+// up, and sends it to every peer, unreliably. Receivers keep the latest
+// message from a sender with the same BSSID: the same session, on the LAN
+// or in an online lobby.
+//
+// The source fills at most `capacity` (256) bytes and returns how many, 0
+// for nothing to send. Called on the emulation thread with the transport
+// busy: keep it short, reads of guest RAM only.
+using NdsNetplayTitleMessageSource = size_t (*)(uint8_t* out, size_t capacity);
+
+// Titles register their source from a static initializer.
+void nds_netplay_set_title_message_source(NdsNetplayTitleMessageSource source);
+
+// The latest message from this session's other machines. False when none
+// arrived in the last five seconds or the radio is off.
+bool nds_netplay_title_message(std::vector<uint8_t>* out);
+
 // Once per presented frame (frontend thread): ends the "host beacon"
 // state when this instance stopped beaconing, and flushes rate-limited
 // stderr lines.

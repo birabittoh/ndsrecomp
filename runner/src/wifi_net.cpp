@@ -849,6 +849,11 @@ private:
 
 // Set once from a title's static initializer (nds_netplay_set_host_decoder).
 std::atomic<NdsNetplayHostDecoder> g_netplay_host_decoder{nullptr};
+std::atomic<NdsNetplayTitleMessageSource> g_netplay_title_source{nullptr};
+
+// The BSSID the radio model is set to (an MP host's own MAC, a client's
+// host's), all zero when none. Defined after g_bridge.
+bool CurrentBssid(uint8_t out[6]);
 
 // Between the radio model's MP_Begin and MP_End (Wifi power on / off).
 std::atomic<bool> g_local_mp_radio_on{false};
@@ -952,6 +957,8 @@ public:
         link_.reset();
         online_link_ = false;
         held_.clear();
+        std::lock_guard<std::mutex> lock(title_mutex_);
+        title_rx_.clear();
     }
 
     // ---- lobby beacons (see wifi_net.h) ------------------------------------
@@ -1354,6 +1361,10 @@ private:
     static constexpr size_t kMaxPeers = 15;
     static constexpr std::chrono::milliseconds kHelloInterval{1000};
     static constexpr std::chrono::milliseconds kPeerTimeout{5000};
+    // Datagram type of a title message (SendTitleMessage), next to the
+    // radio's 0-3; never handed to the radio model.
+    static constexpr uint32_t kTypeTitle = 4;
+    static constexpr size_t kTitleMessageMax = 256;
     // Longest a join request holds the guest (AwaitJoinAnswer): well
     // above a LAN or internet round trip, short enough that a host that
     // never answers costs one hitch.
@@ -1794,7 +1805,62 @@ private:
         const auto send = PeerSender();
         for (const auto& [node, peer] : peers_)
             rel_.SendControl(node, mpnet::kFlagHello, now, send);
+        SendTitleMessage(now);
     }
+
+    // The title's message for its session (nds_netplay_title_message), to
+    // every peer: BSSID, then the title's bytes. Unreliable and repeated
+    // with every hello, so a loss costs one interval and a new peer gets it
+    // within one. Nothing while the radio has no BSSID or the title has
+    // nothing to say.
+    void SendTitleMessage(std::chrono::steady_clock::time_point now) {
+        const NdsNetplayTitleMessageSource source =
+            g_netplay_title_source.load(std::memory_order_acquire);
+        if (!source || peers_.empty()) return;
+        uint8_t bssid[6];
+        if (!CurrentBssid(bssid)) return;
+        uint8_t body[kTitleMessageMax];
+        const size_t len = source(body, sizeof(body));
+        if (len == 0 || len > sizeof(body)) return;
+        LocalMpFrame frame;
+        frame.type = kTypeTitle;
+        frame.payload.assign(bssid, bssid + 6);
+        frame.payload.insert(frame.payload.end(), body, body + len);
+        rel_.Send(&frame, false, now, PeerSender());
+    }
+
+    // A message of another runner's title: kept when it comes from this
+    // radio's session (same BSSID).
+    void ReceiveTitleMessage(const LocalMpFrame& frame) {
+        const std::vector<uint8_t>& p = frame.payload;
+        uint8_t bssid[6];
+        if (p.size() <= 6 || !CurrentBssid(bssid) ||
+            std::memcmp(p.data(), bssid, 6) != 0)
+            return;
+        std::lock_guard<std::mutex> lock(title_mutex_);
+        const bool changed =
+            title_rx_.size() != p.size() - 6 ||
+            std::memcmp(title_rx_.data(), p.data() + 6, p.size() - 6) != 0;
+        title_rx_.assign(p.begin() + 6, p.end());
+        title_rx_at_ = std::chrono::steady_clock::now();
+        if (changed)
+            std::fprintf(stderr,
+                "[netplay] inst=%u title message from %08x (%zu bytes)\n",
+                static_cast<unsigned>(instance_),
+                static_cast<unsigned>(frame.node), title_rx_.size());
+    }
+
+public:
+    bool TitleMessage(std::vector<uint8_t>* out) {
+        std::lock_guard<std::mutex> lock(title_mutex_);
+        if (title_rx_.empty() ||
+            std::chrono::steady_clock::now() - title_rx_at_ > kPeerTimeout)
+            return false;
+        if (out) *out = title_rx_;
+        return true;
+    }
+
+private:
 
     int SendGeneric(uint32_t type, uint8_t* data, int len,
                     uint64_t timestamp) {
@@ -1926,6 +1992,7 @@ private:
                      static_cast<unsigned>(frame.node),
                      mpnet::FormatPeerAddress(frame.from).c_str());
         rel_.SendControl(frame.node, mpnet::kFlagHello, now, PeerSender());
+        SendTitleMessage(now);
         // Held join requests are for the lobby host, not a LAN runner.
         if (IsOnlineAddr(frame.from)) FlushHeld(now);
         return true;
@@ -2022,6 +2089,10 @@ private:
         // success alone only proves that the local stack accepted a
         // datagram, not that a peer is listening.
         g_savestate_network_guard.NoteLocalMpPeer();
+        if ((frame.type & 0xFFFFu) == kTypeTitle) {
+            ReceiveTitleMessage(frame);
+            return;
+        }
         stats_frames_received_.fetch_add(1, std::memory_order_relaxed);
         stats_bytes_received_.fetch_add(mpnet::kHeaderBytes + frame.payload.size(),
                                         std::memory_order_relaxed);
@@ -2394,6 +2465,9 @@ private:
     std::atomic<uint64_t> stats_injected_drops_{0};
     std::atomic<uint64_t> stats_bytes_sent_{0};
     std::atomic<uint64_t> stats_bytes_received_{0};
+    std::mutex title_mutex_;
+    std::vector<uint8_t> title_rx_;
+    std::chrono::steady_clock::time_point title_rx_at_;
     std::atomic<uint64_t> stats_sent_by_type_[4] = {};
     std::atomic<uint64_t> stats_received_by_type_[4] = {};
     std::atomic<uint64_t> stats_reply_latency_[7] = {};
@@ -2695,6 +2769,14 @@ struct WifiBridgeState {
 };
 
 std::unique_ptr<WifiBridgeState> g_bridge;
+
+bool CurrentBssid(uint8_t out[6]) {
+    if (!g_bridge || !g_bridge->wifi) return false;
+    std::memcpy(out, g_bridge->wifi->GetBSSID(), 6);
+    for (int i = 0; i < 6; ++i)
+        if (out[i] != 0) return true;
+    return false;
+}
 
 void LearnGuestMacFromTx(WifiBridgeState* state, const uint8_t* data,
                          int len) {
@@ -3435,6 +3517,14 @@ void nds_netplay_set_host_decoder(NdsNetplayHostDecoder decoder) {
 
 bool nds_netplay_host_info(NdsNetplayHostInfo* out) {
     return g_bridge && g_bridge->local_mp.HostInfo(out);
+}
+
+void nds_netplay_set_title_message_source(NdsNetplayTitleMessageSource source) {
+    g_netplay_title_source.store(source, std::memory_order_release);
+}
+
+bool nds_netplay_title_message(std::vector<uint8_t>* out) {
+    return g_bridge && g_bridge->local_mp.TitleMessage(out);
 }
 
 void nds_wifi_frame_tick() {
