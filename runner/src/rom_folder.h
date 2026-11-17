@@ -16,6 +16,11 @@ struct NdsRomFolderInfo {
     uint32_t revision = 0;
     // The image the folder was unpacked from.
     std::string sha1;
+    // Optional: the SHA-1 of the image whose code this folder carries, when
+    // it is not the image it was unpacked from (a release converted to
+    // another's code). The runner keys everything that names a cartridge on
+    // it instead of the packed image's hash. Empty when absent.
+    std::string identity;
 };
 
 // `dir` holds a rom.toml.

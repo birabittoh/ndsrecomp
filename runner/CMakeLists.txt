@@ -693,6 +693,30 @@ else()
 endif()
 file(APPEND "${TITLE_BANK_REGISTRY}" "}\n")
 
+# The same tables, by bank name, for code that reads their validation copies
+# (release_recipe.cpp rebuilds a release's code from them).
+file(APPEND "${TITLE_BANK_REGISTRY}"
+    "\nvoid nds_visit_configured_title_banks(const char* rom_sha1,\n"
+    "        NdsTitleBankVisitor visit, void* context) {\n"
+    "    if (!rom_sha1 || !visit) return;\n")
+if(TITLE_BANK_DISPATCH)
+    math(EXPR _title_last "${TITLE_GROUP_COUNT} - 1")
+    foreach(_gi RANGE 0 ${_title_last})
+        file(APPEND "${TITLE_BANK_REGISTRY}"
+            "    if (std::strcmp(rom_sha1, "
+            "\"${TITLE_GROUP_${_gi}_SHA1}\") == 0) {\n")
+        foreach(src IN LISTS TITLE_GROUP_${_gi}_DISPATCH)
+            get_filename_component(dispatch_stem "${src}" NAME_WE)
+            string(REGEX REPLACE "_dispatch$" "" bank "${dispatch_stem}")
+            file(APPEND "${TITLE_BANK_REGISTRY}"
+                "        visit(\"${bank}\", g_dispatch_${bank}, "
+                "g_dispatch_${bank}_len, context);\n")
+        endforeach()
+        file(APPEND "${TITLE_BANK_REGISTRY}" "    }\n")
+    endforeach()
+endif()
+file(APPEND "${TITLE_BANK_REGISTRY}" "}\n")
+
 # SHA-1 helper (reused from the recompiler support lib).
 add_library(nds_support STATIC
     ${CMAKE_CURRENT_SOURCE_DIR}/../recompiler/support/sha1.cpp)
@@ -803,6 +827,7 @@ cmake_language(CALL ${NDS_RUNNER_TARGET_KIND} nds_runner ${NDS_RUNNER_TARGET_TYP
     src/frontend_config.cpp
     src/player_launch.cpp
     src/rom_folder.cpp
+    src/release_recipe.cpp
     src/log_file.cpp
     src/relative_mouse_touch.cpp
     src/frontend.cpp
@@ -1175,6 +1200,34 @@ if(NDS_TITLE_CONFIG)
 endif()
 file(CONFIGURE OUTPUT "${CMAKE_CURRENT_BINARY_DIR}/generated/nds_title_config.inc"
     CONTENT "${_nds_title_config_bytes}0x00\n" @ONLY)
+# Release recipes (tools/release_recipe.py): each rebuilds the title's code
+# from another release's ROM, so a player with that release can play
+# (release_recipe.h). Embedded for the player launch; a picked ROM that one
+# applies to is converted when it is unpacked.
+set(NDS_RELEASE_RECIPES "" CACHE STRING
+    "Semicolon list of release recipe files to embed")
+set(_nds_recipes_inc "")
+set(_nds_recipes_list "")
+set(_nds_recipe_index 0)
+foreach(_recipe IN LISTS NDS_RELEASE_RECIPES)
+    if(NOT EXISTS "${_recipe}")
+        message(FATAL_ERROR "NDS_RELEASE_RECIPES: ${_recipe} does not exist")
+    endif()
+    set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS "${_recipe}")
+    file(READ "${_recipe}" _hex HEX)
+    string(REGEX REPLACE "(..)" "0x\\1," _bytes "${_hex}")
+    string(APPEND _nds_recipes_inc
+        "static const unsigned char kRecipe${_nds_recipe_index}[] = {${_bytes}};\n")
+    string(APPEND _nds_recipes_list
+        "    {kRecipe${_nds_recipe_index}, sizeof kRecipe${_nds_recipe_index}},\n")
+    math(EXPR _nds_recipe_index "${_nds_recipe_index} + 1")
+endforeach()
+if(_nds_recipe_index GREATER 0)
+    message(STATUS "Embedding ${_nds_recipe_index} release recipe(s)")
+endif()
+file(CONFIGURE OUTPUT "${CMAKE_CURRENT_BINARY_DIR}/generated/nds_release_recipes.inc"
+    CONTENT "${_nds_recipes_inc}struct NdsBuiltinRecipe {\n    const unsigned char* data;\n    unsigned long size;\n};\n// The last entry is empty.\nstatic const NdsBuiltinRecipe kReleaseRecipes[] = {\n${_nds_recipes_list}    {nullptr, 0},\n};\n" @ONLY)
+
 # Optional: bake the BIOS and firmware dumps into the executable so a title
 # build only has to ask for the game. Point NDS_EMBED_DUMPS_DIR at a folder
 # holding biosnds7.rom, biosnds9.rom and firmware.bin; the runtime still

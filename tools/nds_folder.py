@@ -17,6 +17,9 @@ rom.toml:
     [rom]
     game_code = "YDQP"   revision = 0
     sha1 = "..."         size = 0x10000000   fill = 0xFF
+    identity = "..."     # optional: the SHA-1 of the image whose code the
+                         # folder carries, if not its own (a converted
+                         # release); the runner runs it as that image
     [regions]            # fixed parts, path = offset
     "arm9.bin" = 0x4000
     [extra]              # same, for the extra/ files

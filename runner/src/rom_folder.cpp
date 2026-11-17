@@ -172,6 +172,7 @@ bool nds_rom_folder_info(const fs::path& dir, NdsRomFolderInfo* info,
     info->revision =
         static_cast<uint32_t>(root["rom"]["revision"].value_or(int64_t{0}));
     info->sha1 = root["rom"]["sha1"].value_or(std::string());
+    info->identity = root["rom"]["identity"].value_or(std::string());
     return true;
 }
 

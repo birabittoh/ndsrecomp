@@ -19,6 +19,7 @@
 
 #include "sha1.h"
 #include "rom_folder.h"
+#include "release_recipe.h"
 #include "rom_title.h"
 
 namespace fs = std::filesystem;
@@ -28,6 +29,20 @@ namespace {
 const unsigned char kTitleConfig[] = {
 #include "nds_title_config.inc"
 };
+
+#include "nds_release_recipes.inc"
+
+// The built-in recipe that rebuilds the expected image's code from `sha1`.
+const NdsBuiltinRecipe* recipe_for(const std::string& sha1,
+                                   const std::string& expected) {
+    for (const NdsBuiltinRecipe* r = kReleaseRecipes; r->data; ++r) {
+        NdsReleaseRecipeInfo info;
+        if (nds_release_recipe_info(r->data, r->size, &info, nullptr) &&
+            info.applies_to == sha1 && info.runs_as == expected)
+            return r;
+    }
+    return nullptr;
+}
 
 #if defined(NDS_EMBEDDED_DUMPS)
 const unsigned char kEmbeddedBios7[] = {
@@ -318,7 +333,8 @@ bool read_bytes(const fs::path& path, std::vector<uint8_t>* bytes) {
     return true;
 }
 
-// An unpacked ROM folder made from the image this build runs.
+// An unpacked ROM folder made from the image this build runs, or converted
+// to run as it (rom.toml identity).
 bool folder_matches(const fs::path& dir, const std::string& expected_sha1) {
     if (!nds_rom_folder_is(dir)) return false;
     NdsRomFolderInfo info;
@@ -327,7 +343,8 @@ bool folder_matches(const fs::path& dir, const std::string& expected_sha1) {
         std::fprintf(stderr, "[player] %s\n", error.c_str());
         return false;
     }
-    return expected_sha1.empty() || info.sha1 == expected_sha1;
+    return expected_sha1.empty() || info.sha1 == expected_sha1 ||
+           info.identity == expected_sha1;
 }
 
 // The library folder for an image: its [[game.releases]] id, else its game
@@ -354,21 +371,72 @@ fs::path release_dir(const fs::path& library, const NdsFrontendOptions& options,
 
 enum class Install { Done, NotThisGame, Failed };
 
-// Unpacks `rom` into the library, or finds it already there.
+// A folder unpacked from `sha1` and, if `identity` is set, converted to run
+// as it.
+bool folder_is(const fs::path& dir, const std::string& sha1,
+               const std::string& identity) {
+    if (!nds_rom_folder_is(dir)) return false;
+    NdsRomFolderInfo info;
+    return nds_rom_folder_info(dir, &info, nullptr) && info.sha1 == sha1 &&
+           info.identity == identity;
+}
+
+// Unpacks `rom` into the library, or finds it already there. Another release
+// with a built-in recipe is unpacked and its code rebuilt (release_recipe.h).
 Install install_rom(const fs::path& library, const NdsFrontendOptions& options,
                     const std::vector<uint8_t>& rom, fs::path* dir) {
     const std::string sha1 = gba::sha1(rom.data(), rom.size()).hex();
     const std::string& expected = options.expected_rom_sha1;
-    if (!expected.empty() && sha1 != expected) return Install::NotThisGame;
+    const NdsBuiltinRecipe* recipe =
+        expected.empty() || sha1 == expected ? nullptr
+                                             : recipe_for(sha1, expected);
+    if (!expected.empty() && sha1 != expected && !recipe)
+        return Install::NotThisGame;
     *dir = release_dir(library, options, rom, sha1);
-    if (folder_matches(*dir, sha1)) return Install::Done;
+    if (recipe ? folder_is(*dir, sha1, expected) : folder_matches(*dir, sha1))
+        return Install::Done;
     std::error_code ec;
     fs::create_directories(library, ec);
-    std::fprintf(stderr, "[player] unpacking the ROM to %s\n",
-                 dir->string().c_str());
     std::string error;
-    if (!nds_rom_folder_unpack(rom, *dir, &error)) {
-        nds_player_error("Cannot unpack the ROM: " + error);
+    if (!recipe) {
+        std::fprintf(stderr, "[player] unpacking the ROM to %s\n",
+                     dir->string().c_str());
+        if (!nds_rom_folder_unpack(rom, *dir, &error)) {
+            nds_player_error("Cannot unpack the ROM: " + error);
+            return Install::Failed;
+        }
+        return Install::Done;
+    }
+    // A plain unpack of this image already in place is converted as it is.
+    const bool unpacked = folder_is(*dir, sha1, "");
+    fs::path source = *dir;
+    if (!unpacked) {
+        source += ".unpacked";
+        fs::remove_all(source, ec);
+        std::fprintf(stderr, "[player] unpacking the ROM to %s\n",
+                     source.string().c_str());
+        if (!nds_rom_folder_unpack(rom, source, &error)) {
+            nds_player_error("Cannot unpack the ROM: " + error);
+            return Install::Failed;
+        }
+    }
+    fs::path converted = *dir;
+    converted += ".converted";
+    fs::remove_all(converted, ec);
+    std::fprintf(stderr, "[player] rebuilding the code of %s to run as %s\n",
+                 source.string().c_str(), expected.c_str());
+    if (!nds_release_convert_folder(source, converted, recipe->data,
+                                    recipe->size, &error)) {
+        fs::remove_all(converted, ec);
+        if (!unpacked) fs::remove_all(source, ec);
+        nds_player_error("Cannot convert the ROM: " + error);
+        return Install::Failed;
+    }
+    fs::remove_all(source, ec);
+    fs::remove_all(*dir, ec);
+    fs::rename(converted, *dir, ec);
+    if (ec) {
+        nds_player_error("Cannot create " + dir->string() + ": " + ec.message());
         return Install::Failed;
     }
     return Install::Done;

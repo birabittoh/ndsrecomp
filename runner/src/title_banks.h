@@ -6,3 +6,15 @@
 // NDS_TITLE_BANK_DIR, so the shared runtime does not name individual games or
 // assume a fixed number of overlay/runtime bank generations.
 bool nds_register_configured_title_banks(const char* rom_sha1);
+
+struct NdsDispatchEntry;
+
+// Calls `visit` with every dispatch table configured for rom_sha1 and its
+// bank name (the dispatch source's name without _dispatch, e.g.
+// "dq9_arm9_ov031"). Registers nothing.
+using NdsTitleBankVisitor = void (*)(const char* bank,
+                                     const NdsDispatchEntry* table,
+                                     unsigned length, void* context);
+void nds_visit_configured_title_banks(const char* rom_sha1,
+                                      NdsTitleBankVisitor visit,
+                                      void* context);

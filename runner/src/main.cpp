@@ -69,6 +69,7 @@
 #include "log_file.h"
 #include "player_launch.h"
 #include "rom_folder.h"
+#include "release_recipe.h"
 #include "title_patches.h"
 #if NDS_ONLINE
 #include "net/online_lobby.h"
@@ -415,6 +416,22 @@ int main(int argc, char** argv) {
     // cost the session an hour of phantom debugging. Unbuffered is what the C
     // standard promises for stderr anyway; pay the syscall per line.
     setvbuf(stderr, nullptr, _IONBF, 0);
+    // Developer entry: rebuild a release's code with a recipe file
+    // (release_recipe.h) and exit. The player flow does the same with the
+    // recipes built in.
+    if (argc == 5 && std::strcmp(argv[1], "--convert-release") == 0) {
+        std::vector<uint8_t> recipe = read_file(argv[4]);
+        std::string error;
+        if (recipe.empty() ||
+            !nds_release_convert_folder(argv[2], argv[3], recipe.data(),
+                                        recipe.size(), &error)) {
+            std::fprintf(stderr, "convert: %s\n",
+                         recipe.empty() ? "cannot read the recipe" : error.c_str());
+            return 1;
+        }
+        std::fprintf(stderr, "convert: wrote %s\n", argv[3]);
+        return 0;
+    }
     // A copy of stderr goes to logs/<app>_NNN.log (log_file.h), opened once
     // the arguments and config say where; lines before that are held.
     nds_log_capture_begin();
@@ -2009,10 +2026,15 @@ int main(int argc, char** argv) {
                                                  : cli_firmware_path);
     }
     std::vector<uint8_t> rom;
+    // A folder converted to another release's code names that release here.
+    std::string rom_identity;
     if (!rom_path.empty() && nds_rom_folder_is(rom_path)) {
         // An unpacked ROM (rom_folder.h): packed back into the image here,
         // so everything below sees a cartridge as before.
         std::string folder_error;
+        NdsRomFolderInfo folder_info;
+        if (nds_rom_folder_info(rom_path, &folder_info, &folder_error))
+            rom_identity = folder_info.identity;
         if (!nds_rom_folder_pack(rom_path, &rom, &folder_error)) {
             std::fprintf(stderr, "refusing to start: %s\n",
                          folder_error.c_str());
@@ -2088,6 +2110,11 @@ int main(int argc, char** argv) {
         rom_sha1 = gba::sha1(rom.data(), rom.size()).hex();
         std::fprintf(stderr, "[load] cartridge: %zu bytes, SHA-1 %s\n",
                      rom.size(), rom_sha1.c_str());
+        if (!rom_identity.empty() && rom_identity != rom_sha1) {
+            std::fprintf(stderr, "[load] runs as SHA-1 %s (rom.toml identity)\n",
+                         rom_identity.c_str());
+            rom_sha1 = rom_identity;
+        }
         if (!frontend_options.expected_rom_sha1.empty() &&
             rom_sha1 != frontend_options.expected_rom_sha1) {
             std::fprintf(stderr,
