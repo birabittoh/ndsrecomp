@@ -130,6 +130,7 @@ const char* StateName(NdsOnlineState s) {
     case NdsOnlineState::NeedSignIn: return "need sign-in";
     case NdsOnlineState::SigningIn: return "signing in";
     case NdsOnlineState::Connecting: return "connecting";
+    case NdsOnlineState::Unreachable: return "unreachable";
     case NdsOnlineState::Idle: return "idle";
     case NdsOnlineState::Hosting: return "hosting";
     case NdsOnlineState::Joining: return "joining";
@@ -405,7 +406,7 @@ private:
                     std::max<Clock::duration>(kConnectBackoffMin,
                                               connect_backoff_ * 2));
                 next_connect_ = Clock::now() + connect_backoff_;
-                Publish(NdsOnlineState::Error,
+                Publish(NdsOnlineState::Unreachable,
                         "Lobby server unreachable (" + error + "), retrying");
                 return;
             }
@@ -485,6 +486,8 @@ private:
         connect_backoff_ =
             std::max<Clock::duration>(kConnectBackoffMin, connect_backoff_);
         next_connect_ = Clock::now() + connect_backoff_;
+        Publish(NdsOnlineState::Unreachable,
+                "Lobby connection lost (" + why + "), retrying");
     }
 
     // ---- server messages --------------------------------------------------

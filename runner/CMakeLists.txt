@@ -973,6 +973,10 @@ if(NDS_ONLINE)
         src/net/lobby_ws.cpp
         src/net/online_lobby.cpp
         src/netplay_menu.cpp)
+    if(ANDROID)
+        # recomp-net's browser launcher needs xdg-open: use SDL's instead.
+        target_sources(nds_runner PRIVATE src/net/open_url_android.cpp)
+    endif()
     target_link_libraries(nds_runner PRIVATE recomp_net Libjuice::Libjuice)
     target_include_directories(nds_runner PRIVATE
         "${NDS_RECOMP_NET_ROOT}/include")

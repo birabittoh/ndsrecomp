@@ -23,6 +23,9 @@ using Text = std::array<char, 96>;
 
 struct MenuState {
     Text account_label{};
+    // The Netplay row's description: the lobby server's state as a key the
+    // game's pages turn into text ("Server status: ...").
+    Text server_status{};
     NdsOnlineStatus status;
     // The setting, kept as loaded so saving [online] does not clear it.
     std::string lobby_name;
@@ -60,6 +63,19 @@ void refresh_label(MenuState& m) {
         label = "Sign in with Discord";
     std::snprintf(m.account_label.data(), m.account_label.size(), "%s",
                   label.c_str());
+
+    // Off never contacts the lobby server, so its state is not known then.
+    const char* server = "online";
+    switch (m.status.state) {
+    case NdsOnlineState::Off: server = "unknown"; break;
+    case NdsOnlineState::Connecting: server = "connecting"; break;
+    case NdsOnlineState::Unreachable: server = "unreachable"; break;
+    case NdsOnlineState::NeedSignIn:
+    case NdsOnlineState::SigningIn: server = "sign_in"; break;
+    case NdsOnlineState::Error: server = "error"; break;
+    default: break;
+    }
+    std::snprintf(m.server_status.data(), m.server_status.size(), "%s", server);
 }
 
 }  // namespace
@@ -75,7 +91,7 @@ void nds_netplay_menu_append_items(std::vector<NdsMenuItem>* items) {
     enabled.key = kEnabledKey;
     enabled.section = kSection;
     enabled.label = "Netplay";
-    enabled.description = "Online lobbies and the local network. Off: the local network only.";
+    enabled.description = m.server_status.data();
     enabled.type = NdsMenuItemType::Bool;
     enabled.maximum = 1;
     enabled.step = 1;
@@ -118,6 +134,9 @@ int nds_netplay_menu_run_action(const NdsMenuItem* item) {
     } else {
         m.confirm_until = {};
         nds_online_sign_out();
+        // Signed out, there is no online netplay to choose: back to local.
+        nds_online_set_enabled(false);
+        m.dirty = true;
     }
     refresh_label(m);
     return 0;
@@ -125,6 +144,8 @@ int nds_netplay_menu_run_action(const NdsMenuItem* item) {
 
 int nds_netplay_menu_is_enabled(const NdsMenuItem* item) {
     const MenuState& m = state();
+    // Always there: the lobby server is not contacted while Off, so only the
+    // row's description (the server status) says whether Online will work.
     if (is(item, kEnabledKey)) return 1;
     // Only a server that wants Discord sign-in has a use for the row; one that
     // does not offer it (a private server) leaves it disabled.
@@ -132,7 +153,9 @@ int nds_netplay_menu_is_enabled(const NdsMenuItem* item) {
         return m.status.state != NdsOnlineState::Off &&
                        (m.status.state == NdsOnlineState::NeedSignIn ||
                         m.status.state == NdsOnlineState::SigningIn ||
-                        !m.status.account.empty())
+                        (!m.status.account.empty() &&
+                         m.status.state != NdsOnlineState::Connecting &&
+                         m.status.state != NdsOnlineState::Unreachable))
                    ? 1 : 0;
     return 0;
 }

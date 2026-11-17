@@ -54,6 +54,7 @@ enum class NdsOnlineState : uint8_t {
     NeedSignIn,
     SigningIn,
     Connecting,
+    Unreachable,  // no connection to the lobby server (it retries)
     Idle,
     Hosting,
     Joining,
