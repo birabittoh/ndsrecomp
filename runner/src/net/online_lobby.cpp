@@ -35,7 +35,11 @@ using mpnet::Json;
 using mpnet::JsonOp;
 
 constexpr auto kListInterval = std::chrono::seconds(3);
-constexpr auto kPingInterval = std::chrono::seconds(20);
+constexpr auto kPingInterval = std::chrono::seconds(10);
+// The server answers every ping. Silence this long means the socket is
+// dead (a network change leaves TCP sending into nothing without an
+// error): reconnect instead of signalling into it.
+constexpr auto kServerSilence = std::chrono::seconds(25);
 constexpr auto kConnectBackoffMin = std::chrono::seconds(5);
 constexpr auto kConnectBackoffMax = std::chrono::seconds(60);
 // Beacons stop while the host's game is paused, not only when it stops
@@ -418,6 +422,7 @@ private:
             turn_ok_ = false;
             turn_error_.clear();
             last_ping_ = Clock::now();
+            last_heard_ = last_ping_;
             last_list_ = {};
         }
 
@@ -427,8 +432,13 @@ private:
             OnConnectionLost(error);
             return;
         }
+        if (!messages.empty()) last_heard_ = now;
         for (const std::string& text : messages) Handle(Json::Parse(text));
         if (!ws_.IsOpen()) return;
+        if (now - last_heard_ >= kServerSilence) {
+            OnConnectionLost("the server went silent");
+            return;
+        }
         if (!welcomed_) {
             Publish(NdsOnlineState::Connecting,
                     "Connecting to the lobby server");
@@ -684,6 +694,10 @@ private:
         const std::string from = msg.Str("from_player_id", "");
         const Member* m = MemberById(from);
         if (!m) return;
+        // A guest offers as soon as it is seated, and its offer can come
+        // in the same poll as the lobby_update that seats it: give the
+        // link the new seat first, or the hub drops the offer.
+        if (!SyncLink()) return;
         mpnet::IceSignal s;
         s.seat = m->slot;
         s.type = type;
@@ -967,14 +981,16 @@ private:
         return nullptr;
     }
 
-    void LinkLogic(Clock::time_point now) {
-        if (!link_ref_) return;
+    // Brings the link's room and peer seats in line with room_. False
+    // while there is no room to link yet.
+    bool SyncLink() {
+        if (!link_ref_) return false;
         if (room_.lobby_id.empty() || !turn_ok_) {
             if (link_ref_->InRoom()) link_ref_->ClearRoom();
-            return;
+            return false;
         }
         const Member* hub = MemberById(room_.host_player_id);
-        if (!hub || room_.local_slot < 0) return;
+        if (!hub || room_.local_slot < 0) return false;
         if (!link_ref_->InRoom() || room_.linked_slot != room_.local_slot ||
             room_.linked_hub != hub->slot) {
             link_ref_->SetRoom(room_.local_slot, hub->slot, turn_);
@@ -995,6 +1011,11 @@ private:
             linked_seats_ = seats;
             peers_set_ = true;
         }
+        return true;
+    }
+
+    void LinkLogic(Clock::time_point now) {
+        if (!SyncLink()) return;
         link_ref_->Poll(now);
         for (const mpnet::IceSignal& s : link_ref_->TakeSignals()) {
             const Member* to = MemberBySlot(s.seat);
@@ -1123,6 +1144,7 @@ private:
     Clock::time_point next_connect_{};
     Clock::duration connect_backoff_{};
     Clock::time_point last_ping_{};
+    Clock::time_point last_heard_{};
     Clock::time_point last_list_{};
     Clock::time_point host_seen_{};
     Room room_;

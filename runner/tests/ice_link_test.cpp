@@ -125,6 +125,62 @@ void Drain(IceLink& link) {
     }
 }
 
+juice_server_t* StartTurn(mpnet::TurnConfig* turn) {
+    static juice_server_credentials_t cred;
+    std::memset(&cred, 0, sizeof(cred));
+    cred.username = "test";
+    cred.password = "secret";
+    cred.allocations_quota = 8;
+    juice_server_config_t server_config;
+    std::memset(&server_config, 0, sizeof(server_config));
+    server_config.credentials = &cred;
+    server_config.credentials_count = 1;
+    server_config.max_allocations = 16;
+    server_config.bind_address = "127.0.0.2";
+    server_config.external_address = "127.0.0.2";
+    server_config.port = 0;
+    server_config.realm = "test";
+    juice_server_t* server = juice_server_create(&server_config);
+    if (!server) return nullptr;
+    turn->host = "127.0.0.2";
+    turn->port = juice_server_get_port(server);
+    turn->user = "test";
+    turn->pass = "secret";
+    return server;
+}
+
+// The guest's first offer reaches a hub that has not seated it yet (the
+// offer and the lobby_update that seats the guest in one server poll).
+// The hub drops it; the guest must offer again quickly, well inside the
+// game's join window, not after the full connect timeout.
+bool TestLostFirstOffer() {
+    mpnet::TurnConfig turn;
+    juice_server_t* server = StartTurn(&turn);
+    if (!require(server != nullptr, "TURN server starts")) return false;
+    IceLink hub, a;
+    std::vector<IceLink*> links = {&hub, &a};
+    hub.SetRoom(0, 0, turn);
+    a.SetRoom(1, 0, turn);
+    for (IceLink* l : links) l->Open();
+    hub.SetPeers({});
+    a.SetPeers({0});
+    Relay(links);  // the offer: dropped, seat 1 is not a peer yet
+    hub.SetPeers({1});
+
+    const auto start = Clock::now();
+    const auto deadline = start + std::chrono::seconds(8);
+    while (Clock::now() < deadline && !(AllRelay(hub, 1) && AllRelay(a, 1))) {
+        Relay(links);
+        for (IceLink* l : links) l->Poll(Clock::now());
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    }
+    const bool ok = require(AllRelay(hub, 1) && AllRelay(a, 1),
+                            "guest re-offers after a lost offer and links");
+    for (IceLink* l : links) l->ClearRoom();
+    juice_server_destroy(server);
+    return ok;
+}
+
 bool TestHubAndGuests() {
     bool ok = true;
     juice_server_credentials_t cred;
@@ -250,6 +306,7 @@ int main() {
     bool ok = true;
     ok &= TestFilter();
     ok &= TestHubAndGuests();
+    ok &= TestLostFirstOffer();
     std::printf("%s\n", ok ? "ice_link_test: ok" : "ice_link_test: FAILED");
     return ok ? 0 : 1;
 }

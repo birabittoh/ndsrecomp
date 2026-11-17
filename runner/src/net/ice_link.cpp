@@ -8,6 +8,7 @@
 #include <atomic>
 #include <cstdio>
 #include <cstring>
+#include <mutex>
 #include <random>
 #include <sstream>
 
@@ -18,8 +19,13 @@ using Clock = std::chrono::steady_clock;
 
 constexpr uint32_t kSeatNet = 0xC0000200u;  // 192.0.2.0
 constexpr uint16_t kSeatPort = 1;
-// A guest gives an agent this long to connect, then offers again.
-constexpr auto kConnectTimeout = std::chrono::seconds(30);
+// The hub answers an offer the moment it reads it. A guest with no answer
+// after this long takes the offer as lost and makes the next one; the
+// game gives up a join well before a long timeout would retry.
+constexpr auto kAnswerTimeout = std::chrono::seconds(3);
+// An answered agent gets this long to connect, then the guest offers
+// again. Relay pairs connect in well under 5 s.
+constexpr auto kConnectTimeout = std::chrono::seconds(10);
 // ... and waits this long after a failure before the next offer.
 constexpr auto kRetryDelay = std::chrono::seconds(3);
 // The transport drains far faster than this; it only bounds a stall.
@@ -38,9 +44,27 @@ std::string CandidateType(const char* line) {
     return std::string(typ, end);
 }
 
+// libjuice warns once per datagram when the network goes away: print a
+// repeated warning once a second, with how many were held back.
 void JuiceLog(juice_log_level_t level, const char* message) {
-    if (level >= JUICE_LOG_LEVEL_WARN)
-        std::fprintf(stderr, "[online] juice: %s\n", message);
+    if (level < JUICE_LOG_LEVEL_WARN) return;
+    static std::mutex mutex;
+    static std::string last;
+    static Clock::time_point last_at{};
+    static int held = 0;
+    std::lock_guard<std::mutex> lock(mutex);
+    const auto now = Clock::now();
+    if (message == last && now - last_at < std::chrono::seconds(1)) {
+        ++held;
+        return;
+    }
+    if (held > 0)
+        std::fprintf(stderr, "[online] juice: (%d more like the last)\n",
+                     held);
+    held = 0;
+    last = message;
+    last_at = now;
+    std::fprintf(stderr, "[online] juice: %s\n", message);
 }
 
 }  // namespace
@@ -94,6 +118,7 @@ struct IceLink::Peer {
     int state = JUICE_STATE_DISCONNECTED;
     bool relay = false;
     bool relay_checked = false;
+    bool answered = false;  // an offerer has the hub's answer
     Clock::time_point started{};
     Clock::time_point failed_at{};
 
@@ -351,12 +376,17 @@ void IceLink::PushSignal(const IceSignal& signal) {
         peer = it->second;
     }
     switch (signal.type) {
-    case kIceSignalSdp:  // the hub's answer to our offer
+    case kIceSignalSdp: {  // the hub's answer to our offer
         if (juice_set_remote_description(
-                peer->agent, FilterRelayOnly(signal.text).c_str()) != 0)
+                peer->agent, FilterRelayOnly(signal.text).c_str()) != 0) {
             std::fprintf(stderr, "[online] link: bad answer from seat %d\n",
                          signal.seat);
+            break;
+        }
+        std::lock_guard<std::mutex> lock(mutex_);
+        peer->answered = true;
         break;
+    }
     case kIceSignalCandidate:
         if (IsRelayCandidate(signal.text))
             juice_add_remote_candidate(peer->agent, signal.text.c_str());
@@ -391,14 +421,20 @@ void IceLink::Poll(Clock::time_point now) {
             if (Connected(p.state) && !p.relay_checked)
                 unchecked.push_back(it->second);
             const bool failed = p.state == JUICE_STATE_FAILED;
+            const bool unanswered = !is_hub && p.offerer && !p.answered &&
+                                    now - p.started > kAnswerTimeout;
             const bool stale = !is_hub && !Connected(p.state) &&
-                               now - p.started > kConnectTimeout;
+                               (unanswered ||
+                                now - p.started > kConnectTimeout);
             // The hub drops a failed agent and waits for the next offer;
             // a guest makes that offer once the retry delay has passed.
             if ((failed && (is_hub || now - p.failed_at > kRetryDelay)) ||
                 stale) {
                 std::fprintf(stderr, "[online] link: seat %d %s (gen %d)\n",
-                             it->first, failed ? "failed" : "timed out",
+                             it->first,
+                             failed       ? "failed"
+                             : unanswered ? "never answered"
+                                          : "timed out",
                              p.gen);
                 doomed.push_back(std::move(it->second));
                 it = peers_.erase(it);
