@@ -2354,8 +2354,15 @@ int presented_screen_points(const FrontendPresentation& presentation) {
         window_present_rect(presentation, 0, drawable_w, drawable_h);
     double density = 1.0;
 #if defined(NDS_HAVE_SDL3)
+#if defined(__ANDROID__)
+    // Android windows are sized in pixels (pixel density 1): the screen's
+    // density is only in the display scale.
+    const float window_density =
+        SDL_GetWindowDisplayScale(presentation.windows[0]);
+#else
     const float window_density =
         SDL_GetWindowPixelDensity(presentation.windows[0]);
+#endif
     if (window_density > 0) density = window_density;
 #endif
     return static_cast<int>(std::lround(
