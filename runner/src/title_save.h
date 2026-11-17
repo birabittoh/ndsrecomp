@@ -38,3 +38,11 @@ struct NdsTitleSaveRequest {
 // nds_title_save_finish().
 bool nds_title_save_take_request(NdsTitleSaveRequest* request);
 void nds_title_save_finish();
+
+// A console reset asked for by a title hook (e.g. a "turn the power off"
+// screen that should go back to the title): the frontend runs the
+// power-on reset on its next frame, as after an import. For the title
+// thread; a request made while one is pending is merged into it.
+void nds_title_request_reset();
+// For the frontend: whether a reset was asked for since the last call.
+bool nds_title_take_reset_request();

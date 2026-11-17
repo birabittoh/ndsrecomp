@@ -4647,6 +4647,9 @@ int nds_run_interactive_frontend(const NdsFrontendOptions& initial_options) {
                 savestate_notice_until =
                     SDL_GetPerformanceCounter() + frequency * 4u;
             }
+            // A title hook's reset request (nds_title_request_reset) takes
+            // the same path as an imported save.
+            if (nds_title_take_reset_request()) reset_console = true;
             if (reset_console && g_frontend_reset) {
                 finish_pending_save(true);
                 g_frontend_reset();

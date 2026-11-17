@@ -1,5 +1,6 @@
 #include "title_save.h"
 
+#include <atomic>
 #include <cstdio>
 #include <mutex>
 
@@ -55,4 +56,17 @@ void nds_title_save_finish() {
     State& s = state();
     std::lock_guard<std::mutex> lock(s.mutex);
     s.busy = false;
+}
+
+namespace {
+std::atomic<bool> g_reset_requested{false};
+}  // namespace
+
+void nds_title_request_reset() {
+    if (!g_reset_requested.exchange(true))
+        std::fprintf(stderr, "[title] console reset requested\n");
+}
+
+bool nds_title_take_reset_request() {
+    return g_reset_requested.exchange(false);
 }
