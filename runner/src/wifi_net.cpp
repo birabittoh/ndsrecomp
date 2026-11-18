@@ -23,6 +23,7 @@
 #include "savestate.h"
 #if NDS_ONLINE
 #include "net/ice_link.h"
+#include "net/netplay_chat.h"
 #include "net/online_lobby.h"
 #endif
 
@@ -952,6 +953,7 @@ public:
         delayed_.clear();
         last_release_ = {};
         peers_.clear();
+        nds_netplay_chat_set_lan_peers(0);
         rel_.Reset(0);
         if (link_) link_->Close();
         link_.reset();
@@ -1365,6 +1367,9 @@ private:
     // radio's 0-3; never handed to the radio model.
     static constexpr uint32_t kTypeTitle = 4;
     static constexpr size_t kTitleMessageMax = 256;
+    // Datagram type of a chat line (net/netplay_chat.h); never handed to
+    // the radio model either. Payload: BSSID, name length (u8), name, text.
+    static constexpr uint32_t kTypeChat = 5;
     // Longest a join request holds the guest (AwaitJoinAnswer): well
     // above a LAN or internet round trip, short enough that a host that
     // never answers costs one hitch.
@@ -1939,6 +1944,50 @@ private:
             Process(std::move(frame), now);
         }
         Service(now);
+        SendChat(now);
+    }
+
+    // Chat lines for this session's LAN peers (net/netplay_chat.h). They
+    // go on the reliable stream to every peer, since a frame left out for
+    // one peer would be a gap in its stream; lobby members drop them
+    // (ReceiveChat) and get the line from the lobby server instead.
+    void SendChat(std::chrono::steady_clock::time_point now) {
+        uint8_t bssid[6];
+        int lan = 0;
+        if (CurrentBssid(bssid))
+            for (const auto& [node, peer] : peers_)
+                if (!IsOnlineAddr(peer.addr)) ++lan;
+        nds_netplay_chat_set_lan_peers(lan);
+        if (lan == 0) return;
+        std::string from, text;
+        while (nds_netplay_chat_take_lan(&from, &text)) {
+            if (from.size() > kNdsChatNameMax) from.resize(kNdsChatNameMax);
+            if (text.size() > kNdsChatTextMax) text.resize(kNdsChatTextMax);
+            LocalMpFrame frame;
+            frame.type = kTypeChat;
+            frame.payload.assign(bssid, bssid + 6);
+            frame.payload.push_back(static_cast<uint8_t>(from.size()));
+            frame.payload.insert(frame.payload.end(), from.begin(), from.end());
+            frame.payload.insert(frame.payload.end(), text.begin(), text.end());
+            rel_.Send(&frame, true, now, PeerSender());
+        }
+    }
+
+    // A LAN peer's chat line, kept when it comes from this radio's session.
+    void ReceiveChat(const LocalMpFrame& frame) {
+        if (IsOnlineAddr(frame.from)) return;
+        const std::vector<uint8_t>& p = frame.payload;
+        uint8_t bssid[6];
+        if (p.size() < 7 || !CurrentBssid(bssid) ||
+            std::memcmp(p.data(), bssid, 6) != 0)
+            return;
+        const size_t name_len = p[6];
+        if (name_len > kNdsChatNameMax || p.size() < 7 + name_len) return;
+        NdsChatLine line;
+        line.source = NdsChatSource::Lan;
+        line.from.assign(p.begin() + 7, p.begin() + 7 + name_len);
+        line.text.assign(p.begin() + 7 + name_len, p.end());
+        nds_netplay_chat_push(std::move(line));
     }
 
     // A datagram through the latency lab: the peer table, then the
@@ -2091,6 +2140,10 @@ private:
         g_savestate_network_guard.NoteLocalMpPeer();
         if ((frame.type & 0xFFFFu) == kTypeTitle) {
             ReceiveTitleMessage(frame);
+            return;
+        }
+        if ((frame.type & 0xFFFFu) == kTypeChat) {
+            ReceiveChat(frame);
             return;
         }
         stats_frames_received_.fetch_add(1, std::memory_order_relaxed);

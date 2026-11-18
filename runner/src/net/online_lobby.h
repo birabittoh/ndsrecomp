@@ -8,6 +8,7 @@
 // the title's beacon decoder) a lobby opens with one seat per free player
 // slot, and it closes when hosting ends. Joining a lobby only puts the two
 // consoles in range; the player then joins in the game's own menus.
+// The room's chat goes through the server too (net/netplay_chat.h).
 //
 // One thread owns the lobby server connection (WebSocket, JSON ops) and
 // the ICE link's signalling. The lobby server requires Discord sign-in

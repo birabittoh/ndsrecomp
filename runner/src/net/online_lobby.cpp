@@ -6,6 +6,7 @@
 #include "net/lobby_json.h"
 #include "net/lobby_ws.h"
 #include "net/mp_beacon.h"
+#include "net/netplay_chat.h"
 #include "wifi_net.h"
 
 #include "recomp_net/auth.h"
@@ -154,6 +155,9 @@ std::string ErrorText(const std::string& code) {
     if (code == "login_required") return "the server wants you signed in again";
     if (code == "already_in_lobby") return "already in a lobby";
     if (code == "lobby_limit") return "the server has no room for more lobbies";
+    if (code == "login_required_chat")
+        return "sign in with Discord to chat";
+    if (code == "not_in_lobby") return "not in a lobby";
     return "server error: " + code;
 }
 
@@ -452,6 +456,8 @@ private:
         }
         if (leave && !room_.lobby_id.empty()) LeaveRoom("left");
         if (!join.empty()) RequestJoin(join);
+        SendChat();
+        if (!ws_.IsOpen()) return;
         if ((browsing_now_ || BeaconScanActive()) &&
             now - last_list_ >= kListInterval) {
             Send(JsonOp("list").Str("game_name", config_.game_name)
@@ -536,10 +542,39 @@ private:
             OnSignal(msg);
         } else if (op == "probe_signal") {
             OnProbeSignal(msg);
+        } else if (op == "chat") {
+            OnChat(msg);
         } else if (op == "error") {
             OnError(msg.Str("code", ""));
         }
-        // hello_ok, pong, left, chat, server_chat: nothing.
+        // hello_ok, pong, left, server_chat: nothing.
+    }
+
+    // A line of this room's chat (net/netplay_chat.h), ours included.
+    void OnChat(const Json& msg) {
+        const std::string lobby = msg.Str("lobby_id", "");
+        if (room_.lobby_id.empty() ||
+            (!lobby.empty() && lobby != room_.lobby_id))
+            return;
+        NdsChatLine line;
+        line.source = msg.Bool("system", false) ? NdsChatSource::System
+                                                : NdsChatSource::Online;
+        line.self = !player_id_.empty() &&
+                    msg.Str("from_player_id", "") == player_id_;
+        line.from = msg.Str("from", "");
+        line.text = msg.Str("text", "");
+        line.mid = msg.Str("mid", "");
+        nds_netplay_chat_push(std::move(line));
+    }
+
+    // Lines queued by nds_netplay_chat_send, while in a room.
+    void SendChat() {
+        std::string text;
+        while (nds_netplay_chat_take_online(&text)) {
+            if (room_.lobby_id.empty()) continue;
+            if (!Send(JsonOp("chat").Str("text", text).Text())) return;
+            last_chat_sent_ = Clock::now();
+        }
     }
 
     // Test aid: NDS_ONLINE_TURN=host:port:user:pass replaces the server's
@@ -718,6 +753,18 @@ private:
             return;
         }
         std::fprintf(stderr, "[online] server error: %s\n", code.c_str());
+        // A refused chat line: said where the line would have shown.
+        // not_in_lobby answers other ops too, so only just after a line.
+        const bool chat_refused =
+            code == "login_required_chat" ||
+            (code == "not_in_lobby" &&
+             Clock::now() - last_chat_sent_ < std::chrono::seconds(5));
+        if (chat_refused) {
+            NdsChatLine line;
+            line.text = ErrorText(code);
+            nds_netplay_chat_push(std::move(line));
+            if (code == "login_required_chat") return;
+        }
         if (code == "login_required") {
             // Wait for a session this server has not refused yet.
             const char* session = rnet_account_session();
@@ -826,6 +873,7 @@ private:
     }
 
     void ClearRoom() {
+        nds_netplay_chat_set_online_room(false);
         room_ = Room{};
         create_pending_ = false;
         join_pending_ = false;
@@ -1033,6 +1081,8 @@ private:
     // ---- status ---------------------------------------------------------------
 
     void PublishRoom() {
+        nds_netplay_chat_set_online_room(welcomed_ && ws_.IsOpen() &&
+                                         !room_.lobby_id.empty());
         int linked = 0;
         if (link_ref_)
             for (const auto& p : link_ref_->Status())
@@ -1132,6 +1182,7 @@ private:
     std::shared_ptr<mpnet::IceLink> link_ref_;
     std::string lobby_name_now_;
     bool browsing_now_ = false;
+    Clock::time_point last_chat_sent_{};
     std::string auto_join_;
     mpnet::WsClient ws_;
     bool welcomed_ = false;

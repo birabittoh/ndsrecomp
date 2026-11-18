@@ -797,6 +797,7 @@ cmake_language(CALL ${NDS_RUNNER_TARGET_KIND} nds_runner ${NDS_RUNNER_TARGET_TYP
     src/net/mp_reliable.cpp
     src/net/mp_link.cpp
     src/net/mp_beacon.cpp
+    src/net/netplay_chat.cpp
     src/spu.cpp
     src/vram.cpp
     src/gpu2d.cpp
@@ -1664,6 +1665,12 @@ ndsrecomp_link_tomlpp(frontend_config_test)
       src/net/mp_beacon.cpp)
   target_include_directories(mp_beacon_test PRIVATE src)
   add_test(NAME mp_beacon_test COMMAND mp_beacon_test)
+
+  add_executable(netplay_chat_test
+      tests/netplay_chat_test.cpp
+      src/net/netplay_chat.cpp)
+  target_include_directories(netplay_chat_test PRIVATE src)
+  add_test(NAME netplay_chat_test COMMAND netplay_chat_test)
 
   add_executable(mp_link_test
       tests/mp_link_test.cpp
