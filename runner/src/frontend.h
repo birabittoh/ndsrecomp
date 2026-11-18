@@ -224,7 +224,7 @@ struct NdsMphPrimeControlBindings {
     std::string weapon4 = "4";
     std::string weapon5 = "5";
     std::string weapon6 = "6";
-    std::string virtual_stylus = "Tab";
+    std::string virtual_stylus = "None";
     std::string menu = "V";
 };
 
@@ -240,7 +240,7 @@ struct NdsVirtualStylusOptions {
     // with mouse left / pad_tap. Title-specific control layers may suppress
     // this when they own the same inputs.
     bool enabled = true;
-    std::string binding = "Tab";
+    std::string binding = "None";
     std::string tap_binding = "None";
     std::string pad_hold_binding = "Pad LT";
     std::string pad_tap_binding = "Pad A";
@@ -418,10 +418,6 @@ struct NdsFrontendOptions {
     // selected by a title launcher; deterministic/headless routes never
     // synthesize mouse input.
     bool relative_mouse_touch = false;
-    // Developer-only speed control. Public title launchers leave this off so
-    // Tab can be safely used by game-specific bindings such as MPH's virtual
-    // stylus.
-    bool tab_turbo = false;
     uint16_t relative_mouse_sensitivity = 100;  // 10%..400%
     uint8_t audio_volume = 100;  // 0..100, host output only
     // Percent of audio_volume while fast-forwarding; 0 discards turbo audio.

@@ -496,7 +496,6 @@ int main(int argc, char** argv) {
     std::string cli_antialiasing;
     std::string cli_frame_interpolation;
     std::string cli_relative_mouse_touch;
-    std::string cli_tab_turbo;
     std::string cli_relative_mouse_sensitivity;
     std::string cli_relative_mouse_invert_y;
     std::string cli_relative_mouse_fire_key;
@@ -697,8 +696,6 @@ int main(int argc, char** argv) {
             cli_frame_interpolation = argv[++i];
         } else if (a == "--relative-mouse-touch" && i + 1 < argc) {
             cli_relative_mouse_touch = argv[++i];
-        } else if (a == "--tab-turbo" && i + 1 < argc) {
-            cli_tab_turbo = argv[++i];
         } else if (a == "--relative-mouse-sensitivity" && i + 1 < argc) {
             cli_relative_mouse_sensitivity = argv[++i];
         } else if (a == "--relative-mouse-invert-y" && i + 1 < argc) {
@@ -853,7 +850,6 @@ int main(int argc, char** argv) {
                 "[--antialiasing 0|2|4|8] "
                 "[--frame-interpolation off|blend] "
                 "[--relative-mouse-touch on|off] "
-                "[--tab-turbo on|off] "
                 "[--relative-mouse-sensitivity 10..400] "
                 "[--relative-mouse-invert-y on|off] "
                 "[--relative-mouse-fire-key none|a|b|l|r|x|y] "
@@ -1271,12 +1267,6 @@ int main(int argc, char** argv) {
                           &frontend_options.relative_mouse_touch)) {
         std::fprintf(stderr,
                      "invalid --relative-mouse-touch (expected on or off)\n");
-        return 2;
-    }
-    if (!cli_tab_turbo.empty() &&
-        !nds_parse_on_off(cli_tab_turbo, &frontend_options.tab_turbo)) {
-        std::fprintf(stderr,
-                     "invalid --tab-turbo (expected on or off)\n");
         return 2;
     }
     if (!cli_relative_mouse_sensitivity.empty() &&
@@ -1986,7 +1976,7 @@ int main(int argc, char** argv) {
         a9.assign(nds_freebios9, nds_freebios9 + sizeof(nds_freebios9));
         a7.assign(nds_freebios7, nds_freebios7 + sizeof(nds_freebios7));
         std::fprintf(stderr,
-            "[bios] FREEBIOS (opt-in, no dumps): arm9 %zu bytes SHA-1 %s, "
+            "[bios] FREEBIOS (no dumps): arm9 %zu bytes SHA-1 %s, "
             "arm7 %zu bytes SHA-1 %s\n",
             a9.size(), gba::sha1(a9.data(), a9.size()).hex().c_str(),
             a7.size(), gba::sha1(a7.data(), a7.size()).hex().c_str());
@@ -2022,7 +2012,7 @@ int main(int argc, char** argv) {
         // Session provenance: a generated-firmware session must never be
         // mistaken for a dump-verified one.
         std::fprintf(stderr,
-            "[firmware] GENERATED image (opt-in, no dump), %zu bytes, "
+            "[firmware] GENERATED image (no dump), %zu bytes, "
             "SHA-1 %s\n", fw.size(),
             gba::sha1(fw.data(), fw.size()).hex().c_str());
     } else if (!use_embedded_dumps) {
@@ -2744,7 +2734,7 @@ int main(int argc, char** argv) {
                              boot_error.c_str());
                 std::exit(1);
             }
-            std::fprintf(stderr, "[boot] direct boot (opt-in): cartridge "
+            std::fprintf(stderr, "[boot] direct boot: cartridge "
                                  "entry state established, firmware not "
                                  "executed\n");
         }

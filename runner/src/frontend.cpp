@@ -3702,8 +3702,7 @@ int nds_run_interactive_frontend(const NdsFrontendOptions& initial_options) {
 
     std::fprintf(stderr,
         "[sdl] controls: gamepad=Player 1 | bottom mouse=touch | "
-        "Esc=settings | hold Shift=fast-forward%s\n",
-        options.tab_turbo ? " | hold Tab=turbo" : "");
+        "Esc=settings | hold Tab=fast-forward\n");
     std::fputs("[sdl] keyboard:", stderr);
     for (size_t row = 0; row < options.keyboard_bindings.size(); ++row)
         std::fprintf(stderr, " %s=%s", kNdsButtonNames[row],
@@ -4275,12 +4274,9 @@ int nds_run_interactive_frontend(const NdsFrontendOptions& initial_options) {
         return presentation_window_focused[0] ||
                (presentation.separate && presentation_window_focused[1]);
     };
-    // Both turbo sources (Shift, and the developer Tab) drop on focus loss so
-    // a key released in another window cannot leave fast-forward latched.
+    // Fast-forward (Tab) drops on focus loss so a key released in another
+    // window cannot leave it latched.
     auto clear_tab_turbo = [&]() { turbo_pressed = false; };
-    auto is_shift_key = [](SDL_Scancode key) {
-        return key == SDL_SCANCODE_LSHIFT || key == SDL_SCANCODE_RSHIFT;
-    };
     uint32_t audio_pace_floor = kAudioQueueFrames;
     // The steady-state queue target. kAudioQueueFrames (~63 ms) leaves about
     // one late frame of runway once a frame's emulation and the device's own
@@ -4899,8 +4895,7 @@ int nds_run_interactive_frontend(const NdsFrontendOptions& initial_options) {
                 } else if (process_mph_prime_key(
                                scancode, true, false)) {
                     // Consumed by the MPH-specific keyboard/mouse layer.
-                } else if (options.tab_turbo &&
-                           scancode == SDL_SCANCODE_TAB) {
+                } else if (scancode == SDL_SCANCODE_TAB) {
                     turbo_pressed = true;
                 } else if (mph_prime_active()) {
                     // Prime Controls replaces the normal keyboard keypad map;
@@ -4909,10 +4904,6 @@ int nds_run_interactive_frontend(const NdsFrontendOptions& initial_options) {
                     ++host_key_presses;
                     keyboard_pressed |= bit;
                     publish_keys();
-                } else if (is_shift_key(scancode)) {
-                    // Hold Shift to fast-forward, unless the user bound Shift
-                    // to a DS button above.
-                    turbo_pressed = true;
                 } else if (scancode == SDL_SCANCODE_M) {
                     // Marks the moment in an NDS_GX_CMD_TRACE (smooth_3d
                     // debugging); nothing without one.
@@ -4926,8 +4917,7 @@ int nds_run_interactive_frontend(const NdsFrontendOptions& initial_options) {
                 } else if (process_mph_prime_key(
                         scancode, false, false)) {
                     // Consumed by the MPH-specific keyboard/mouse layer.
-                } else if (options.tab_turbo &&
-                           scancode == SDL_SCANCODE_TAB) {
+                } else if (scancode == SDL_SCANCODE_TAB) {
                     turbo_pressed = false;
                 } else if (mph_prime_active()) {
                     // See keydown path: ignore generic keyboard bindings
@@ -4935,8 +4925,6 @@ int nds_run_interactive_frontend(const NdsFrontendOptions& initial_options) {
                 } else if (const uint16_t bit = nds_binding_mask(options.keyboard_bindings, scancode)) {
                     keyboard_pressed &= static_cast<uint16_t>(~bit);
                     publish_keys();
-                } else if (is_shift_key(scancode)) {
-                    turbo_pressed = false;
                 }
             }
             if (event.type == SDL_CONTROLLERDEVICEADDED && !controller) {
