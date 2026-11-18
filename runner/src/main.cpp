@@ -432,6 +432,10 @@ int main(int argc, char** argv) {
         std::fprintf(stderr, "convert: wrote %s\n", argv[3]);
         return 0;
     }
+    // Headless setup for an external launcher (player_launch.h).
+    if (const int prepared = nds_prepare_content_command(argc, argv);
+        prepared >= 0)
+        return prepared;
     // A copy of stderr goes to logs/<app>_NNN.log (log_file.h), opened once
     // the arguments and config say where; lines before that are held.
     nds_log_capture_begin();

@@ -1460,7 +1460,9 @@ endif()
 if(WIN32)
     # iphlpapi: the local wireless LAN link lists the network interfaces
     # (net/mp_link.cpp), and the pcap backend uses it too.
-    target_link_libraries(nds_runner PRIVATE ws2_32 iphlpapi)
+    # shell32: --prepare-content reads the UTF-16 command line
+    # (player_launch.cpp).
+    target_link_libraries(nds_runner PRIVATE ws2_32 iphlpapi shell32)
 endif()
 
 # Self-update (src/update/self_update.h, offered to titles through

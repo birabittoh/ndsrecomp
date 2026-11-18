@@ -68,5 +68,16 @@ bool nds_player_embedded_dumps(std::vector<uint8_t>* arm9_bios,
 bool nds_player_prepare(int argc, char** argv, NdsFrontendOptions* options,
                         NdsPlayerLaunch* out);
 
+// `--prepare-content --source <rom.nds or unpacked folder> --destination
+// <folder>`: writes the folder the game runs from (unpacked, its code rebuilt
+// for another release with a built-in recipe) to <folder>, with no window,
+// for an external launcher, which then starts the game with that folder as
+// its argument. Prints `progress <0..1> <text>` lines to stdout and errors
+// to stderr. The folder is built beside the destination and swapped in, so
+// a failure keeps the previous copy; a destination this command did not
+// create is refused. Returns -1 without --prepare-content, else the exit
+// code: 0 done, 1 failed, 2 bad arguments.
+int nds_prepare_content_command(int argc, char** argv);
+
 // Show a fatal startup error: a player has no terminal to read stderr in.
 void nds_player_error(const std::string& message);

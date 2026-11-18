@@ -11,6 +11,17 @@
 #include <utility>
 #include <vector>
 
+#if defined(_WIN32)
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <windows.h>
+#include <shellapi.h>
+#endif
+
 #if defined(NDS_HAVE_SDL3)
 #include <SDL3/SDL.h>
 #elif defined(NDS_HAVE_SDL2)
@@ -881,4 +892,219 @@ bool nds_player_prepare(int argc, char** argv, NdsFrontendOptions* options,
         return false;
     }
     return true;
+}
+
+// ---------------------------------------------------------------------------
+// Headless content preparation (--prepare-content), for external launchers.
+
+namespace {
+
+constexpr const char* kOwnerFile = ".recomplauncher-content";
+constexpr const char* kOwnerText = "ndsrecomp content v1\n";
+
+bool owned(const fs::path& dir) {
+    std::ifstream in(dir / kOwnerFile, std::ios::binary);
+    return std::string(std::istreambuf_iterator<char>(in), {}) == kOwnerText;
+}
+
+bool mark_owned(const fs::path& dir) {
+    std::ofstream out(dir / kOwnerFile, std::ios::binary);
+    out << kOwnerText;
+    out.close();
+    return static_cast<bool>(out);
+}
+
+void report(double fraction, const char* text) {
+    std::printf("progress %.3f %s\n", fraction, text);
+    std::fflush(stdout);
+}
+
+// The arguments as paths. On Windows main's argv is in the ANSI code page,
+// so read the UTF-16 command line instead.
+std::vector<fs::path> path_args(int argc, char** argv) {
+    std::vector<fs::path> args;
+#if defined(_WIN32)
+    int count = 0;
+    if (wchar_t** wide = CommandLineToArgvW(GetCommandLineW(), &count)) {
+        for (int i = 0; i < count; ++i) args.emplace_back(wide[i]);
+        LocalFree(wide);
+        if (count == argc) return args;
+        args.clear();
+    }
+#endif
+    for (int i = 0; i < argc; ++i) args.emplace_back(argv[i]);
+    return args;
+}
+
+// The cartridge image the source holds: a .nds, or a folder unpacked from
+// one (a folder already converted to another release's code is refused,
+// since it no longer packs into the image it came from).
+std::string read_source(const fs::path& source, std::vector<uint8_t>* rom) {
+    std::error_code ec;
+    if (fs::is_directory(source, ec)) {
+        NdsRomFolderInfo info;
+        std::string error;
+        if (!nds_rom_folder_is(source))
+            return "The folder is not an unpacked ROM (it has no rom.toml).";
+        if (!nds_rom_folder_info(source, &info, &error)) return error;
+        if (!info.identity.empty())
+            return "This folder was converted from another release. Select "
+                   "the original ROM instead.";
+        if (!nds_rom_folder_pack(source, rom, &error)) return error;
+        return {};
+    }
+    if (!fs::is_regular_file(source, ec) || !read_bytes(source, rom))
+        return "Cannot read " + source.string() + ".";
+    return {};
+}
+
+// Writes the folder the game runs from for `rom` to `dest`, which must not
+// exist: unpacked, and its code rebuilt when `recipe` is set.
+std::string build_folder(const std::vector<uint8_t>& rom,
+                         const NdsBuiltinRecipe* recipe, const fs::path& dest) {
+    std::string error;
+    if (!recipe) {
+        report(0.1, "Unpacking the ROM");
+        if (!nds_rom_folder_unpack(rom, dest, &error))
+            return "Cannot unpack the ROM: " + error;
+        return {};
+    }
+    fs::path unpacked = dest;
+    unpacked += ".unpacked";
+    report(0.1, "Unpacking the ROM");
+    if (!nds_rom_folder_unpack(rom, unpacked, &error))
+        return "Cannot unpack the ROM: " + error;
+    report(0.5, "Rebuilding the game code");
+    const bool ok = nds_release_convert_folder(unpacked, dest, recipe->data,
+                                               recipe->size, &error);
+    std::error_code ec;
+    fs::remove_all(unpacked, ec);
+    if (!ok) return "Cannot convert the ROM: " + error;
+    return {};
+}
+
+std::string prepare_content(const fs::path& source_arg,
+                            const fs::path& destination_arg) {
+    NdsFrontendOptions options;
+    std::string error;
+    if (!nds_load_frontend_config_text(title_config(), &options, &error))
+        return "Invalid embedded game config: " + error;
+    const std::string& expected = options.expected_rom_sha1;
+    const std::string name = nds_game_display_name(options);
+
+    std::error_code ec;
+    const fs::path source = fs::absolute(source_arg, ec);
+    const fs::path destination =
+        fs::weakly_canonical(fs::absolute(destination_arg, ec), ec);
+    if (ec || destination.filename().empty() ||
+        destination == destination.root_path())
+        return "The destination is not a usable folder.";
+    if (fs::is_symlink(fs::symlink_status(destination_arg, ec)))
+        return "The destination must not be a symbolic link.";
+    if (fs::exists(destination, ec) &&
+        (!fs::is_directory(destination, ec) || !owned(destination)))
+        return "The destination already exists and was not prepared by this "
+               "command.";
+    for (fs::path at = destination; !at.empty(); at = at.parent_path()) {
+        if (fs::equivalent(at, source, ec))
+            return "The source and destination must be separate.";
+        if (at == at.parent_path()) break;
+    }
+
+    report(0, "Identifying your copy");
+    std::vector<uint8_t> rom;
+    error = read_source(source, &rom);
+    if (!error.empty()) return error;
+    const std::string sha1 = gba::sha1(rom.data(), rom.size()).hex();
+    const NdsBuiltinRecipe* recipe =
+        expected.empty() || sha1 == expected ? nullptr
+                                             : recipe_for(sha1, expected);
+    if (!expected.empty() && sha1 != expected && !recipe)
+        return "This is not a ROM this build runs: " + name + ", SHA-1 " +
+               expected + " (got " + sha1 + ").";
+
+    // Everything is built beside the destination and swapped in at the end,
+    // so a failure leaves the previous copy as it was.
+    fs::path work = destination;
+    work += ".preparing";
+    if (fs::exists(fs::symlink_status(work, ec))) {
+        if (!fs::is_directory(work, ec) || !owned(work))
+            return work.string() + " is in the way. Move it aside and retry.";
+        const fs::path old = work / "old";
+        if (fs::exists(old, ec) && !fs::exists(destination, ec))
+            fs::rename(old, destination, ec);  // an interrupted swap
+        fs::remove_all(work, ec);
+        if (ec) return "Cannot remove " + work.string() + ": " + ec.message();
+    }
+    fs::create_directories(work, ec);
+    if (ec || !mark_owned(work))
+        return "Cannot create " + work.string() + ".";
+    const fs::path fresh = work / "new";
+    const fs::path old = work / "old";
+
+    bool moved_old = false;
+    error = build_folder(rom, recipe, fresh);
+    if (error.empty() && !mark_owned(fresh))
+        error = "Cannot write to " + fresh.string() + ".";
+    if (error.empty()) {
+        report(0.95, "Activating the game files");
+        if (fs::exists(destination, ec)) {
+            fs::rename(destination, old, ec);
+            if (ec) error = "Cannot replace " + destination.string() + ": " +
+                            ec.message();
+            else moved_old = true;
+        }
+    }
+    if (error.empty()) {
+        fs::rename(fresh, destination, ec);
+        if (ec) error = "Cannot create " + destination.string() + ": " +
+                        ec.message();
+    }
+    if (!error.empty()) {
+        if (moved_old) {
+            fs::rename(old, destination, ec);
+            if (ec) return error + " The previous copy is in " + old.string();
+        }
+        fs::remove_all(work, ec);
+        return error;
+    }
+    fs::remove_all(work, ec);
+    report(1, "Ready to play");
+    return {};
+}
+
+}  // namespace
+
+int nds_prepare_content_command(int argc, char** argv) {
+    bool requested = false;
+    for (int i = 1; i < argc; ++i)
+        requested |= std::strcmp(argv[i], "--prepare-content") == 0;
+    if (!requested) return -1;
+    const std::vector<fs::path> args = path_args(argc, argv);
+    fs::path source, destination;
+    bool invalid = sizeof(kTitleConfig) <= 1u;
+    for (int i = 1; i < argc && !invalid; ++i) {
+        const std::string arg = argv[i];
+        if (arg == "--prepare-content") continue;
+        fs::path* value = arg == "--source"        ? &source
+                        : arg == "--destination"   ? &destination
+                                                   : nullptr;
+        if (!value || i + 1 >= argc || !value->empty() ||
+            std::strncmp(argv[i + 1], "--", 2) == 0)
+            invalid = true;
+        else
+            *value = args[++i];
+    }
+    if (invalid || source.empty() || destination.empty()) {
+        std::fprintf(stderr, "usage: %s --prepare-content --source <rom.nds "
+                             "or unpacked folder> --destination <folder>\n",
+                     argv[0]);
+        return 2;
+    }
+    const std::string error = prepare_content(source, destination);
+    if (!error.empty()) {
+        std::fprintf(stderr, "%s\n", error.c_str());
+        return 1;
+    }
+    return 0;
 }
