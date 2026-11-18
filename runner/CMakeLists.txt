@@ -833,6 +833,7 @@ cmake_language(CALL ${NDS_RUNNER_TARGET_KIND} nds_runner ${NDS_RUNNER_TARGET_TYP
     src/relative_mouse_touch.cpp
     src/frontend.cpp
     src/chat_overlay.cpp
+    src/touch_buttons.cpp
     src/rom_icon.cpp
     src/rom_title.cpp
     src/cpu_render_handoff.cpp
@@ -1679,6 +1680,12 @@ ndsrecomp_link_tomlpp(frontend_config_test)
       src/net/netplay_chat.cpp)
   target_include_directories(chat_overlay_test PRIVATE src)
   add_test(NAME chat_overlay_test COMMAND chat_overlay_test)
+
+  add_executable(touch_buttons_test
+      tests/touch_buttons_test.cpp
+      src/touch_buttons.cpp)
+  target_include_directories(touch_buttons_test PRIVATE src)
+  add_test(NAME touch_buttons_test COMMAND touch_buttons_test)
 
   add_executable(mp_link_test
       tests/mp_link_test.cpp

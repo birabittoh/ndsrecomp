@@ -424,8 +424,12 @@ void nds_chat_edit_key(NdsChatOverlayInput* input, NdsChatEditKey key) {
 void nds_chat_overlay_layout(int width, int height,
                              const std::vector<NdsChatLine>& lines,
                              const NdsChatOverlayInput& input, int64_t now_ms,
-                             std::vector<NdsChatOverlayRect>* out) {
-    const int cols = (width - 2 * kMargin - kPad - 1) / kNdsChatCellWidth;
+                             std::vector<NdsChatOverlayRect>* out,
+                             int keep_clear) {
+    // Open, the panel goes over whatever is at the right.
+    const int reserve = input.open || keep_clear <= 0 ? 0 : keep_clear;
+    const int cols =
+        (width - 2 * kMargin - kPad - 1 - reserve) / kNdsChatCellWidth;
     const int max_rows = (height - 2 * kMargin) / kNdsChatCellHeight;
     if (cols < 8 || max_rows < 2) return;
 
@@ -518,7 +522,8 @@ void nds_chat_overlay_layout(int width, int height,
 }
 
 bool nds_chat_overlay_frame(int width, int height,
-                            std::vector<NdsChatOverlayRect>* out) {
+                            std::vector<NdsChatOverlayRect>* out,
+                            int keep_clear) {
     out->clear();
     const NdsChatOverlayInput input = nds_chat_overlay_input();
     const int64_t now_ms =
@@ -537,6 +542,7 @@ bool nds_chat_overlay_frame(int width, int height,
     if (!input.open &&
         (cached.empty() || now_ms - cached.back().at_ms >= kNdsChatShowMs))
         return false;
-    nds_chat_overlay_layout(width, height, cached, input, now_ms, out);
+    nds_chat_overlay_layout(width, height, cached, input, now_ms, out,
+                            keep_clear);
     return !out->empty();
 }

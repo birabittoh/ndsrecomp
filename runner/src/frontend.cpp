@@ -1,5 +1,6 @@
 #include "frontend.h"
 #include "chat_overlay.h"
+#include "touch_buttons.h"
 #include "host_profile.h"
 #include "frontend_window_size.h"
 #include "frontend_screen_route.h"
@@ -2753,7 +2754,10 @@ bool chat_overlay_rects(int ds_width, bool fine, ChatFrame* frame) {
     const double scale = fine ? nds_chat_overlay_scale() : 1.0;
     frame->width = static_cast<int>(std::lround(ds_width / scale));
     frame->height = static_cast<int>(std::lround(kScreenHeight / scale));
-    return nds_chat_overlay_frame(frame->width, frame->height, &frame->rects);
+    const int keep_clear = static_cast<int>(
+        std::ceil(nds_touch_buttons_extent() / scale));
+    return nds_chat_overlay_frame(frame->width, frame->height, &frame->rects,
+                                  keep_clear);
 }
 
 // Over the target's dest rect, whatever its canvas.
@@ -2775,6 +2779,25 @@ void draw_chat_overlay(const DsTarget& target) {
     if (chat_overlay_rects(target.canvas.width, target.renderer != nullptr,
                            &frame))
         draw_chat_overlay(target, frame);
+}
+
+// The on-screen buttons (touch_buttons.h), every frame, over the target's
+// canvas in DS pixels. Whether any shows, for the presenter's overlay.
+bool touch_buttons_wanted() { return nds_touch_buttons_extent() > 0; }
+
+void draw_touch_buttons(const DsTarget& target) {
+    if (!target.renderer && !target.pixels) return;
+    static std::vector<NdsTouchButtonRect> rects;
+    rects.clear();
+    nds_touch_buttons_layout(target.canvas.width, &rects);
+    if (rects.empty()) return;
+    DsTarget t = target;
+    if (t.renderer) SDL_SetRenderDrawBlendMode(t.renderer, SDL_BLENDMODE_BLEND);
+    for (const NdsTouchButtonRect& r : rects) {
+        t.set_argb(r.argb);
+        t.fill(r.x, r.y, r.w, r.h);
+    }
+    if (t.renderer) SDL_SetRenderDrawBlendMode(t.renderer, SDL_BLENDMODE_NONE);
 }
 
 #if defined(NDS_HAVE_COMPUTE_RENDERER)
@@ -3249,7 +3272,10 @@ void draw_separate_screen(FrontendPresentation& presentation, int screen,
         renderer, screen_rect, presentation.screen_widths[screen]);
     if (virtual_stylus_visible)
         draw_virtual_stylus(target, virtual_stylus_x, virtual_stylus_y);
-    if (screen == 0) draw_chat_overlay(target);
+    if (screen == 0) {
+        draw_chat_overlay(target);
+        draw_touch_buttons(target);
+    }
     draw_savestate_notice(target, savestate_notice);
     draw_fps_counter(target, fps_counter);
 }
@@ -3287,7 +3313,7 @@ PresentationTicks present_single_screen(FrontendPresentation& presentation,
         const DsTarget target = overlay_target(
             width,
             stylus || (savestate_notice && *savestate_notice) ||
-                (fps_counter && *fps_counter),
+                (fps_counter && *fps_counter) || touch_buttons_wanted(),
             &chat, &want_chat, &overlay);
         const bool want_overlay = target.pixels != nullptr;
         if (want_overlay) {
@@ -3295,6 +3321,7 @@ PresentationTicks present_single_screen(FrontendPresentation& presentation,
                 draw_virtual_stylus(target, virtual_stylus_x,
                                     virtual_stylus_y);
             if (want_chat) draw_chat_overlay(target, chat);
+            draw_touch_buttons(target);
             draw_savestate_notice(target, savestate_notice);
             draw_fps_counter(target, fps_counter);
         }
@@ -3371,6 +3398,7 @@ PresentationTicks present_single_screen(FrontendPresentation& presentation,
     if (stylus)
         draw_virtual_stylus(target, virtual_stylus_x, virtual_stylus_y);
     draw_chat_overlay(target);
+    draw_touch_buttons(target);
     draw_savestate_notice(target, savestate_notice);
     draw_fps_counter(target, fps_counter);
     ticks.draw += SDL_GetPerformanceCounter() - start;
@@ -3416,15 +3444,18 @@ PresentationTicks present_screens(FrontendPresentation& presentation,
                                             presentation.internal_resolution);
         g_touch_ui_scale.store(1.0f);  // the touchscreen has its own window
         if (!owned && !direct) set_fixed_layers(top_width);
-        // The top window's only overlay is the chat.
+        // The top window's overlays: the chat and the on-screen buttons.
         static std::vector<uint32_t> top_overlay;
         static ChatFrame chat;
         bool want_chat = false;
         const DsTarget top_target =
-            overlay_target(top_width, false, &chat, &want_chat, &top_overlay);
+            overlay_target(top_width, touch_buttons_wanted(), &chat,
+                           &want_chat, &top_overlay);
+        const bool want_top_overlay = top_target.pixels != nullptr;
         if (want_chat) draw_chat_overlay(top_target, chat);
+        draw_touch_buttons(top_target);
         nds_compute_host_set_overlay(
-            want_chat ? top_overlay.data() : nullptr,
+            want_top_overlay ? top_overlay.data() : nullptr,
             static_cast<unsigned>(top_target.pixels_width),
             static_cast<unsigned>(top_target.pixels_height));
         const bool top_ok = nds_compute_host_present_top(
@@ -3486,8 +3517,10 @@ PresentationTicks present_screens(FrontendPresentation& presentation,
             presentation.screen_widths[1], kScreenHeight);
         render_screen(presentation, 0, top_rect);
         render_screen(presentation, 1, bottom_rect);
-        draw_chat_overlay(sdl_ds_target(renderer, top_rect,
-                                        presentation.screen_widths[0]));
+        const DsTarget top_target = sdl_ds_target(
+            renderer, top_rect, presentation.screen_widths[0]);
+        draw_chat_overlay(top_target);
+        draw_touch_buttons(top_target);
         const DsTarget target = sdl_ds_target(
             renderer, bottom_rect, presentation.screen_widths[1]);
         if (virtual_stylus_visible)
@@ -4659,6 +4692,28 @@ int nds_run_interactive_frontend(const NdsFrontendOptions& initial_options) {
                 return false;
         }
     };
+    // The on-screen button (touch_buttons.h) a left press (a finger's, a
+    // mouse's) lands on, or Count. They are on the top screen, or the shown
+    // one in the single layout.
+    auto touch_button_at = [&](const SDL_Event& event) {
+        if (event.type != SDL_MOUSEBUTTONDOWN ||
+            event.button.button != SDL_BUTTON_LEFT ||
+            event.button.windowID != presentation.window_ids[0] ||
+            relative_mouse.captured() || virtual_stylus_active())
+            return NdsTouchButton::Count;
+        if (presentation.single && presentation.shown_screen == 1) {
+            // Already the touchscreen's coordinates (-1 on the top inset).
+            return nds_touch_buttons_hit(presentation.screen_widths[1],
+                                         float(event.button.x),
+                                         float(event.button.y));
+        }
+        if (!g_top_logical_hit.valid) return NdsTouchButton::Count;
+        const int left =
+            presentation.separate || presentation.single ? 0 : top_content_left;
+        return nds_touch_buttons_hit(presentation.screen_widths[0],
+                                     g_top_logical_hit.x - left,
+                                     g_top_logical_hit.y);
+    };
     auto show_savestate_result = [&](const NdsSavestateSlotResult& result) {
         savestate_notice = result.message;
         savestate_notice_until = SDL_GetPerformanceCounter() + frequency * 4u;
@@ -4956,20 +5011,27 @@ int nds_run_interactive_frontend(const NdsFrontendOptions& initial_options) {
             }
         }
         {
-            // Discord Rich Presence: the title's activity, about once a
-            // second (the client sends only changes).
+            // The title's presence, about once a second: the player's name
+            // for the chat, and the Discord Rich Presence activity (the
+            // client sends only changes).
             static uint64_t discord_next = 0;
             const uint64_t discord_now = SDL_GetPerformanceCounter();
-            if (kNdsDiscordRpcSupported &&
-                !options.discord_application_id.empty() &&
-                discord_now >= discord_next) {
+            NdsTitlePresence presence;
+            bool have_presence = false;
+            const bool poll = discord_now >= discord_next;
+            if (poll) {
                 discord_next = discord_now + frequency;
+                have_presence = nds_title_presence(&presence);
+                if (have_presence && !presence.player.empty())
+                    nds_netplay_chat_set_name(presence.player);
+            }
+            if (kNdsDiscordRpcSupported &&
+                !options.discord_application_id.empty() && poll) {
                 nds::discord::Activity activity;
                 activity.name = options.app_name.empty()
                                     ? nds_game_display_name(options)
                                     : options.app_name;
-                NdsTitlePresence presence;
-                if (nds_title_presence(&presence)) {
+                if (have_presence) {
                     activity.details = presence.details;
                     activity.state = presence.state;
                 }
@@ -4999,6 +5061,10 @@ int nds_run_interactive_frontend(const NdsFrontendOptions& initial_options) {
             window_resize_save_at = 0;
             persist_window_size(options, presentation.windows[0]);
         }
+        // The chat button shows whenever Start would open the chat.
+        nds_touch_button_set_shown(NdsTouchButton::Chat,
+                                   !chat_input.open &&
+                                       nds_netplay_chat_reachable());
         SDL_Event event{};
         while (SDL_PollEvent(&event)) {
             convert_mouse_event_to_logical_coordinates(event, presentation);
@@ -5102,6 +5168,16 @@ int nds_run_interactive_frontend(const NdsFrontendOptions& initial_options) {
                                   sdl_controller_button(event))) &
                           kChatStartMask)))) {
                 open_chat();
+                continue;
+            } else if (const NdsTouchButton button = touch_button_at(event);
+                       button != NdsTouchButton::Count) {
+                switch (button) {
+                    case NdsTouchButton::Chat:
+                        open_chat();
+                        break;
+                    case NdsTouchButton::Count:
+                        break;
+                }
                 continue;
             }
             if (event.type == SDL_KEYDOWN && !event.key.repeat) {

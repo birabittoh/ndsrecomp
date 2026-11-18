@@ -52,11 +52,13 @@ constexpr int64_t kNdsChatFadeMs = 1000;
 void nds_chat_glyph(uint32_t cp, uint8_t rows[8]);
 
 // Lays out `lines` (oldest first) and `input` over a `width` x `height`
-// screen at time `now_ms` (steady_clock ms). Appends to `out`.
+// screen at time `now_ms` (steady_clock ms). Closed, the lines keep clear
+// of the rightmost `keep_clear` pixels. Appends to `out`.
 void nds_chat_overlay_layout(int width, int height,
                              const std::vector<NdsChatLine>& lines,
                              const NdsChatOverlayInput& input, int64_t now_ms,
-                             std::vector<NdsChatOverlayRect>* out);
+                             std::vector<NdsChatOverlayRect>* out,
+                             int keep_clear = 0);
 
 // Size of the chat against the screen: 1 = a font pixel is a DS pixel,
 // 0.5 = half that, and so on. A title sets a source to tie it to its own UI
@@ -67,6 +69,9 @@ void nds_chat_overlay_set_scale_source(NdsChatScaleSource source);
 double nds_chat_overlay_scale();
 
 // For the frontend, once per presented frame: the current chat over a
-// `width` x `height` screen. False when there is nothing to draw.
+// `width` x `height` screen, its lines kept clear of the rightmost
+// `keep_clear` pixels (the touch buttons, touch_buttons.h). False when
+// there is nothing to draw.
 bool nds_chat_overlay_frame(int width, int height,
-                            std::vector<NdsChatOverlayRect>* out);
+                            std::vector<NdsChatOverlayRect>* out,
+                            int keep_clear = 0);

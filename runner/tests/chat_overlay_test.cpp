@@ -101,6 +101,29 @@ bool TestLayout() {
     return ok;
 }
 
+// Closed, the lines keep clear of the right edge's `keep_clear` pixels;
+// open, the panel does not.
+bool TestKeepClear() {
+    bool ok = true;
+    const std::string long_text(240, 'w');
+    const std::vector<NdsChatLine> lines = {
+        Line("Ally", long_text.c_str(), 0)};
+    std::vector<NdsChatOverlayRect> out;
+    nds_chat_overlay_layout(256, 192, lines, NdsChatOverlayInput{}, 0, &out,
+                            26);
+    bool clear = !out.empty();
+    for (const auto& r : out) clear &= r.x + r.w <= 256 - 26;
+    ok = require(clear, "closed lines keep clear") && ok;
+    NdsChatOverlayInput open;
+    open.open = true;
+    out.clear();
+    nds_chat_overlay_layout(256, 192, lines, open, 0, &out, 26);
+    bool wide = false;
+    for (const auto& r : out) wide |= r.x + r.w > 256 - 26;
+    ok = require(wide, "open panel full width") && ok;
+    return ok;
+}
+
 // Prints `rects` as text: '#' bright, '+' background.
 bool TestEditing() {
     bool ok = true;
@@ -170,6 +193,7 @@ int main(int argc, char** argv) {
     }
     bool ok = TestGlyphs();
     ok = TestLayout() && ok;
+    ok = TestKeepClear() && ok;
     ok = TestEditing() && ok;
     if (!ok) return 1;
     std::printf("chat_overlay_test: ok\n");
