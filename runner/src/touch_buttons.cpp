@@ -7,17 +7,24 @@
 
 namespace {
 
-constexpr int kCount = static_cast<int>(NdsTouchButton::Count);
 constexpr int kScreenHeight = 192;
-// The icons: 11 x 9 cells of 2 x 2 DS pixels ('#' lit), over the button.
 constexpr int kCell = 2;
-constexpr int kArtRows = kNdsTouchButtonHeight / kCell;
 static_assert(kNdsTouchButtonWidth == 11 * kCell &&
-                  kNdsTouchButtonHeight == 9 * kCell,
+                  kNdsTouchButtonHeight == kNdsTouchButtonArtRows * kCell,
               "icons are 11 x 9 cells");
-const char* const kArt[kCount][kArtRows] = {
+constexpr uint32_t kBack = 0xA0000000u;
+constexpr uint32_t kLit = 0xFFFFFFFFu;
+// Extra DS pixels around a button that still count as a press on it.
+constexpr float kSlack = 4.0f;
+
+// Constant-initialized, so a title's static initializer may register first.
+std::atomic<const NdsTouchButtonSpec*> g_specs[kNdsTouchButtonMax] = {};
+std::atomic<int> g_count{0};
+std::atomic<bool> g_shown[kNdsTouchButtonMax] = {};
+
+const NdsTouchButtonSpec kChat = {
     {
-        // Chat: a speech bubble with three dots.
+        // A speech bubble with three dots.
         "...........",
         "..#######..",
         ".#########.",
@@ -28,95 +35,157 @@ const char* const kArt[kCount][kArtRows] = {
         "...#.......",
         "...........",
     },
+    NdsTouchButtonPlace::BottomRight,
+    0,
+    nullptr,
 };
-constexpr uint32_t kBack = 0xA0000000u;
-constexpr uint32_t kLit = 0xFFFFFFFFu;
-// Extra DS pixels around a button that still count as a press on it.
-constexpr float kSlack = 4.0f;
 
-std::atomic<bool> g_shown[kCount] = {};
+struct Box {
+    int id;
+    int x, y;
+};
 
-// The shown buttons, rightmost first, and how many.
-int Shown(NdsTouchButton out[kCount]) {
-    int n = 0;
-    for (int i = 0; i < kCount; ++i)
-        if (g_shown[i].load(std::memory_order_acquire))
-            out[n++] = static_cast<NdsTouchButton>(i);
+// The shown buttons and where they sit; returns how many.
+int Boxes(int ds_width, Box out[kNdsTouchButtonMax]) {
+    const int count = g_count.load(std::memory_order_acquire);
+    int n = 0, row = 0;
+    for (int id = 0; id < count && id < kNdsTouchButtonMax; ++id) {
+        const NdsTouchButtonSpec* spec =
+            g_specs[id].load(std::memory_order_acquire);
+        if (!spec || !g_shown[id].load(std::memory_order_acquire)) continue;
+        int x = kNdsTouchButtonMargin;
+        int y = (kScreenHeight - kNdsTouchButtonHeight) / 2;
+        switch (spec->place) {
+            case NdsTouchButtonPlace::BottomRight:
+                x = ds_width - (++row) * (kNdsTouchButtonWidth +
+                                          kNdsTouchButtonMargin);
+                y = kScreenHeight - kNdsTouchButtonMargin -
+                    kNdsTouchButtonHeight;
+                break;
+            case NdsTouchButtonPlace::LeftMiddle:
+                break;
+            case NdsTouchButtonPlace::RightMiddle:
+                x = ds_width - kNdsTouchButtonMargin - kNdsTouchButtonWidth;
+                break;
+        }
+        if (x < 0) continue;
+        out[n++] = {id, x, y};
+    }
     return n;
 }
 
-// Left edge of the `slot`-th button from the right.
-int SlotX(int ds_width, int slot) {
-    return ds_width - (slot + 1) * (kNdsTouchButtonWidth +
-                                    kNdsTouchButtonMargin);
-}
-
-constexpr int kTop =
-    kScreenHeight - kNdsTouchButtonMargin - kNdsTouchButtonHeight;
-
 }  // namespace
 
-void nds_touch_button_set_shown(NdsTouchButton button, bool shown) {
-    const int i = static_cast<int>(button);
-    if (i >= 0 && i < kCount) g_shown[i].store(shown, std::memory_order_release);
+int nds_touch_button_register(const NdsTouchButtonSpec* spec) {
+    if (!spec) return -1;
+    int id = g_count.load(std::memory_order_relaxed);
+    do {
+        if (id >= kNdsTouchButtonMax) return -1;
+    } while (!g_count.compare_exchange_weak(id, id + 1,
+                                            std::memory_order_acq_rel));
+    g_specs[id].store(spec, std::memory_order_release);
+    return id;
 }
 
-bool nds_touch_button_shown(NdsTouchButton button) {
-    const int i = static_cast<int>(button);
-    return i >= 0 && i < kCount && g_shown[i].load(std::memory_order_acquire);
+const NdsTouchButtonSpec* nds_touch_button_spec(int id) {
+    if (id < 0 || id >= kNdsTouchButtonMax) return nullptr;
+    return g_specs[id].load(std::memory_order_acquire);
+}
+
+int nds_touch_button_chat() {
+    static const int id = nds_touch_button_register(&kChat);
+    return id;
+}
+
+void nds_touch_button_set_shown(int id, bool shown) {
+    if (id >= 0 && id < kNdsTouchButtonMax)
+        g_shown[id].store(shown, std::memory_order_release);
+}
+
+bool nds_touch_button_shown(int id) {
+    return id >= 0 && id < kNdsTouchButtonMax &&
+           g_shown[id].load(std::memory_order_acquire);
+}
+
+void nds_touch_buttons_update() {
+    const int count = g_count.load(std::memory_order_acquire);
+    for (int id = 0; id < count && id < kNdsTouchButtonMax; ++id) {
+        const NdsTouchButtonSpec* spec =
+            g_specs[id].load(std::memory_order_acquire);
+        if (spec && spec->shown)
+            g_shown[id].store(spec->shown(), std::memory_order_release);
+    }
 }
 
 void nds_touch_buttons_layout(int ds_width,
                               std::vector<NdsTouchButtonRect>* out) {
-    NdsTouchButton shown[kCount];
-    const int n = Shown(shown);
-    for (int slot = 0; slot < n; ++slot) {
-        const int x = SlotX(ds_width, slot);
-        if (x < 0) break;
-        out->push_back({x, kTop, kNdsTouchButtonWidth, kNdsTouchButtonHeight,
+    Box boxes[kNdsTouchButtonMax];
+    const int n = Boxes(ds_width, boxes);
+    for (int i = 0; i < n; ++i) {
+        const Box& b = boxes[i];
+        out->push_back({b.x, b.y, kNdsTouchButtonWidth, kNdsTouchButtonHeight,
                         kBack});
-        const char* const* art = kArt[static_cast<int>(shown[slot])];
-        for (int r = 0; r < kArtRows; ++r) {
-            const char* row = art[r];
+        const NdsTouchButtonSpec* spec = nds_touch_button_spec(b.id);
+        for (int r = 0; r < kNdsTouchButtonArtRows; ++r) {
+            const char* row = spec->art[r];
+            if (!row) continue;
             const int len = static_cast<int>(std::strlen(row));
-            for (int c = 0; c < len;) {
+            for (int c = 0; c < len && c < 11;) {
                 if (row[c] != '#') { ++c; continue; }
                 int run = 1;
-                while (c + run < len && row[c + run] == '#') ++run;
-                out->push_back({x + c * kCell, kTop + r * kCell, run * kCell,
-                                kCell, kLit});
+                while (c + run < len && c + run < 11 && row[c + run] == '#')
+                    ++run;
+                out->push_back({b.x + c * kCell, b.y + r * kCell,
+                                run * kCell, kCell, kLit});
                 c += run;
             }
         }
     }
 }
 
-int nds_touch_buttons_extent() {
-    NdsTouchButton shown[kCount];
-    const int n = Shown(shown);
-    return n ? kNdsTouchButtonMargin +
-                   n * (kNdsTouchButtonWidth + kNdsTouchButtonMargin)
-             : 0;
+bool nds_touch_buttons_any() {
+    const int count = g_count.load(std::memory_order_acquire);
+    for (int id = 0; id < count && id < kNdsTouchButtonMax; ++id)
+        if (g_specs[id].load(std::memory_order_acquire) &&
+            g_shown[id].load(std::memory_order_acquire))
+            return true;
+    return false;
 }
 
-NdsTouchButton nds_touch_buttons_hit(int ds_width, float x, float y) {
-    if (y < kTop - kSlack || y >= kScreenHeight || x >= ds_width)
-        return NdsTouchButton::Count;
-    NdsTouchButton shown[kCount];
-    const int n = Shown(shown);
-    for (int slot = 0; slot < n; ++slot) {
-        const int left = SlotX(ds_width, slot);
-        if (left < 0) break;
-        // Up to the screen's edge on the right of the first; halfway into
-        // the room between two; the slack on the left of the last.
-        const float hit_right =
-            slot == 0 ? float(ds_width)
-                      : float(left + kNdsTouchButtonWidth) +
-                            kNdsTouchButtonMargin / 2.0f;
-        const float hit_left = slot == n - 1
-            ? float(left) - kSlack
-            : float(left) - kNdsTouchButtonMargin / 2.0f;
-        if (x >= hit_left && x < hit_right) return shown[slot];
+int nds_touch_buttons_extent() {
+    const int count = g_count.load(std::memory_order_acquire);
+    int row = 0;
+    for (int id = 0; id < count && id < kNdsTouchButtonMax; ++id) {
+        const NdsTouchButtonSpec* spec =
+            g_specs[id].load(std::memory_order_acquire);
+        if (spec && spec->place == NdsTouchButtonPlace::BottomRight &&
+            g_shown[id].load(std::memory_order_acquire))
+            ++row;
     }
-    return NdsTouchButton::Count;
+    return row ? kNdsTouchButtonMargin +
+                     row * (kNdsTouchButtonWidth + kNdsTouchButtonMargin)
+               : 0;
+}
+
+int nds_touch_buttons_hit(int ds_width, float x, float y) {
+    if (x < 0.0f || x >= ds_width || y < 0.0f || y >= kScreenHeight)
+        return -1;
+    Box boxes[kNdsTouchButtonMax];
+    const int n = Boxes(ds_width, boxes);
+    int best = -1;
+    float best_distance = 0.0f;
+    for (int i = 0; i < n; ++i) {
+        const Box& b = boxes[i];
+        if (x < b.x - kSlack || x >= b.x + kNdsTouchButtonWidth + kSlack ||
+            y < b.y - kSlack || y >= b.y + kNdsTouchButtonHeight + kSlack)
+            continue;
+        const float dx = x - (b.x + kNdsTouchButtonWidth / 2.0f);
+        const float dy = y - (b.y + kNdsTouchButtonHeight / 2.0f);
+        const float distance = dx * dx + dy * dy;
+        if (best < 0 || distance < best_distance) {
+            best = b.id;
+            best_distance = distance;
+        }
+    }
+    return best;
 }

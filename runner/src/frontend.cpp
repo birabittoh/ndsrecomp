@@ -2783,7 +2783,7 @@ void draw_chat_overlay(const DsTarget& target) {
 
 // The on-screen buttons (touch_buttons.h), every frame, over the target's
 // canvas in DS pixels. Whether any shows, for the presenter's overlay.
-bool touch_buttons_wanted() { return nds_touch_buttons_extent() > 0; }
+bool touch_buttons_wanted() { return nds_touch_buttons_any(); }
 
 void draw_touch_buttons(const DsTarget& target) {
     if (!target.renderer && !target.pixels) return;
@@ -3986,14 +3986,23 @@ int nds_run_interactive_frontend(const NdsFrontendOptions& initial_options) {
     // The netplay chat's input line (chat_overlay.h). While it is open the
     // keyboard types into it and no host control reaches the guest.
     NdsChatOverlayInput chat_input;
+    // The on-screen button being pressed (touch_buttons.h), -1 for none,
+    // and the DS keys it holds.
+    int touch_button_held = -1;
+    uint16_t touch_button_pressed = 0;
     auto guest_key_mask = [&]() {
         if (chat_input.open) return static_cast<uint16_t>(0x0FFFu);
         return static_cast<uint16_t>(
             0x0FFFu &
             ~(keyboard_pressed | controller_pressed | mouse_pressed |
-              mph_prime_pressed | stick_pressed));
+              mph_prime_pressed | stick_pressed | touch_button_pressed));
     };
     auto publish_keys = [&]() { nds_set_key_mask(guest_key_mask()); };
+    auto release_touch_button = [&]() {
+        touch_button_held = -1;
+        touch_button_pressed = 0;
+        publish_keys();
+    };
     publish_keys();
     nds_set_touch(0, 0, false);
     bool running = true;
@@ -4546,6 +4555,8 @@ int nds_run_interactive_frontend(const NdsFrontendOptions& initial_options) {
         // underneath and nothing comes back by itself once the chat closes.
         keyboard_pressed = controller_pressed = mouse_pressed = 0;
         stick_pressed = 0;
+        touch_button_held = -1;
+        touch_button_pressed = 0;
         clear_mph_prime_controls();
         clear_virtual_stylus();
         clear_tab_turbo();
@@ -4693,21 +4704,21 @@ int nds_run_interactive_frontend(const NdsFrontendOptions& initial_options) {
         }
     };
     // The on-screen button (touch_buttons.h) a left press (a finger's, a
-    // mouse's) lands on, or Count. They are on the top screen, or the shown
+    // mouse's) lands on, or -1. They are on the top screen, or the shown
     // one in the single layout.
     auto touch_button_at = [&](const SDL_Event& event) {
         if (event.type != SDL_MOUSEBUTTONDOWN ||
             event.button.button != SDL_BUTTON_LEFT ||
             event.button.windowID != presentation.window_ids[0] ||
             relative_mouse.captured() || virtual_stylus_active())
-            return NdsTouchButton::Count;
+            return -1;
         if (presentation.single && presentation.shown_screen == 1) {
             // Already the touchscreen's coordinates (-1 on the top inset).
             return nds_touch_buttons_hit(presentation.screen_widths[1],
                                          float(event.button.x),
                                          float(event.button.y));
         }
-        if (!g_top_logical_hit.valid) return NdsTouchButton::Count;
+        if (!g_top_logical_hit.valid) return -1;
         const int left =
             presentation.separate || presentation.single ? 0 : top_content_left;
         return nds_touch_buttons_hit(presentation.screen_widths[0],
@@ -5061,10 +5072,16 @@ int nds_run_interactive_frontend(const NdsFrontendOptions& initial_options) {
             window_resize_save_at = 0;
             persist_window_size(options, presentation.windows[0]);
         }
-        // The chat button shows whenever Start would open the chat.
-        nds_touch_button_set_shown(NdsTouchButton::Chat,
+        // The title's buttons ask their queries; the chat button shows
+        // whenever Start would open the chat. A held button that went away
+        // lets its keys go.
+        nds_touch_buttons_update();
+        nds_touch_button_set_shown(nds_touch_button_chat(),
                                    !chat_input.open &&
                                        nds_netplay_chat_reachable());
+        if (touch_button_held >= 0 &&
+            !nds_touch_button_shown(touch_button_held))
+            release_touch_button();
         SDL_Event event{};
         while (SDL_PollEvent(&event)) {
             convert_mouse_event_to_logical_coordinates(event, presentation);
@@ -5084,6 +5101,8 @@ int nds_run_interactive_frontend(const NdsFrontendOptions& initial_options) {
                     SDL_GetPerformanceCounter() + frequency / 2u;
             if (sdl_window_event_is(event, SDL_EVENT_WINDOW_FOCUS_LOST) &&
                 is_presentation_window(event.window.windowID)) {
+                // The release may never come.
+                if (touch_button_held >= 0) release_touch_button();
                 const int index =
                     presentation_window_focus_index(event.window.windowID);
                 if (index >= 0)
@@ -5169,15 +5188,23 @@ int nds_run_interactive_frontend(const NdsFrontendOptions& initial_options) {
                           kChatStartMask)))) {
                 open_chat();
                 continue;
-            } else if (const NdsTouchButton button = touch_button_at(event);
-                       button != NdsTouchButton::Count) {
-                switch (button) {
-                    case NdsTouchButton::Chat:
-                        open_chat();
-                        break;
-                    case NdsTouchButton::Count:
-                        break;
+            } else if (const int button = touch_button_at(event);
+                       button >= 0) {
+                if (button == nds_touch_button_chat()) {
+                    open_chat();
+                } else if (const NdsTouchButtonSpec* spec =
+                               nds_touch_button_spec(button)) {
+                    touch_button_held = button;
+                    touch_button_pressed = spec->keys;
+                    publish_keys();
                 }
+                continue;
+            } else if (touch_button_held >= 0 &&
+                       event.type == SDL_MOUSEBUTTONUP &&
+                       event.button.button == SDL_BUTTON_LEFT) {
+                // The press on a button ends: so does its keys' hold, and
+                // the release goes nowhere else, like the press.
+                release_touch_button();
                 continue;
             }
             if (event.type == SDL_KEYDOWN && !event.key.repeat) {
