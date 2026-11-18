@@ -372,7 +372,11 @@ bool link_or_copy(const fs::path& from, const fs::path& to) {
     return fs::copy_file(from, to, fs::copy_options::overwrite_existing, ec);
 }
 
+NdsReleasePrepare g_prepare = nullptr;
+
 }  // namespace
+
+void nds_release_set_prepare(NdsReleasePrepare prepare) { g_prepare = prepare; }
 
 bool nds_release_recipe_info(const uint8_t* recipe, size_t size,
                              NdsReleaseRecipeInfo* info, std::string* error) {
@@ -539,11 +543,31 @@ bool nds_code_compress(const std::vector<uint8_t>& data, size_t prefix,
     return true;
 }
 
-bool nds_release_convert_folder(const fs::path& source, const fs::path& dest,
+bool nds_release_convert_folder(const fs::path& unpacked, const fs::path& dest,
                                 const uint8_t* recipe_data, size_t recipe_size,
                                 std::string* error) {
     Recipe recipe;
     if (!parse(recipe_data, recipe_size, &recipe, error)) return false;
+
+    // The title's own step first, if it has one for this release.
+    fs::path prepared_dir = dest;
+    prepared_dir += ".prepared";
+    struct Cleanup {
+        fs::path dir;
+        ~Cleanup() {
+            std::error_code ec;
+            if (!dir.empty()) fs::remove_all(dir, ec);
+        }
+    } cleanup;
+    fs::path source = unpacked;
+    if (g_prepare) {
+        std::error_code ec;
+        fs::remove_all(prepared_dir, ec);
+        cleanup.dir = prepared_dir;
+        bool prepared = false;
+        if (!g_prepare(unpacked, prepared_dir, &prepared, error)) return false;
+        if (prepared) source = prepared_dir;
+    }
 
     Folder folder;
     try {

@@ -33,6 +33,19 @@ bool nds_code_decompress(const std::vector<uint8_t>& data,
 bool nds_code_compress(const std::vector<uint8_t>& data, size_t prefix,
                        std::vector<uint8_t>* out);
 
+// A title's own step before a recipe, for a release whose data differs from
+// the build's as well as its code: it writes to `out` (which does not exist)
+// the folder the recipe applies to, made from the folder `source` unpacked
+// from that release, and sets *prepared. For a release it has nothing to do
+// for it leaves *prepared false and `out` unwritten. False and *error fail
+// the conversion. nds_release_convert_folder runs it first, on a folder
+// next to `dest`, and removes that folder when it is done.
+using NdsReleasePrepare = bool (*)(const std::filesystem::path& source,
+                                   const std::filesystem::path& out,
+                                   bool* prepared, std::string* error);
+// Set from a title's static initializer; one per build.
+void nds_release_set_prepare(NdsReleasePrepare prepare);
+
 // Writes to `dest` (which must not exist) the unpacked ROM folder `source`
 // with its ARM9 code rebuilt by `recipe`: the ARM9 compressed again where
 // the source's was (a game can read those card bytes), the rebuilt overlays
