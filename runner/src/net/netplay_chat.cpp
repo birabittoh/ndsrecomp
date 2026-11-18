@@ -79,13 +79,14 @@ void Mask(std::string* text) {
 #endif
 }
 
-std::string DefaultName() {
+// The signed-in account's handle (Discord's), or empty.
+std::string AccountName() {
 #if NDS_ONLINE
     const char* handle = rnet_account_handle();
     if (rnet_account_state() == RNET_ACCOUNT_SIGNED_IN && handle && handle[0])
         return nds_netplay_chat_clean(handle, kNdsChatNameMax);
 #endif
-    return "Player";
+    return std::string();
 }
 
 bool TakeFresh(std::deque<Outgoing>* queue, Outgoing* out) {
@@ -196,7 +197,8 @@ std::string nds_netplay_chat_name() {
         std::lock_guard<std::mutex> lock(st.mu);
         if (!st.name.empty()) return st.name;
     }
-    return DefaultName();
+    std::string account = AccountName();
+    return account.empty() ? std::string("Player") : account;
 }
 
 bool nds_netplay_chat_reachable() {
@@ -212,10 +214,10 @@ void nds_netplay_chat_set_game_keyboard(NdsChatGameKeyboard start) {
     g_game_keyboard.store(start, std::memory_order_release);
 }
 
-bool nds_netplay_chat_game_keyboard_start(bool pad) {
+bool nds_netplay_chat_game_keyboard_start() {
     const NdsChatGameKeyboard start =
         g_game_keyboard.load(std::memory_order_acquire);
-    return start && start(pad);
+    return start && start();
 }
 
 void nds_netplay_chat_push(NdsChatLine line) {

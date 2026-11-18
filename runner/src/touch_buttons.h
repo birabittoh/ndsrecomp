@@ -50,6 +50,9 @@ const NdsTouchButtonSpec* nds_touch_button_spec(int id);
 
 // The runner's chat button: opens the netplay chat (chat_overlay.h).
 int nds_touch_button_chat();
+// The runner's send button, in the chat button's place while a chat line is
+// being typed (in the chat panel or the title's own text entry): sends it.
+int nds_touch_button_send();
 
 // Whether a button shows. Safe from any thread.
 void nds_touch_button_set_shown(int id, bool shown);

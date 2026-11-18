@@ -62,23 +62,24 @@ std::vector<NdsChatLine> nds_netplay_chat_since(uint64_t after);
 uint64_t nds_netplay_chat_last_id();
 void nds_netplay_chat_clear();
 
-// The name LAN peers see. Empty (the default): the Discord handle when
-// signed in, else "Player". Online lines carry the name the server knows.
+// The name LAN peers see: the name set here (the title's player, e.g. the
+// hero), else the Discord handle when signed in, else "Player". Online
+// lines carry the name the server knows (the Discord handle).
 void nds_netplay_chat_set_name(const std::string& name);
 std::string nds_netplay_chat_name();
 
 // True when a line would reach somebody now.
 bool nds_netplay_chat_reachable();
 
-// The title's own text entry, for players on a gamepad: the title registers
-// a function the runner calls (from any thread) on the chat's Start, `pad`
-// when it came from a gamepad. While the entry is up it sends what was
-// typed; otherwise, on a pad, it asks the game to show the entry. False
-// when it did neither, so the runner opens its own chat input instead. The
-// title sends with nds_netplay_chat_send.
-using NdsChatGameKeyboard = bool (*)(bool pad);
+// The title's own text entry: the title registers a function the runner
+// calls (from any thread) on a long press of the chat's Start or button,
+// and on Start or the send button while the entry is up. While the entry
+// is up it sends what was typed; otherwise it asks the game to show the
+// entry. False when it did neither, so the runner opens its own chat input
+// instead. The title sends with nds_netplay_chat_send.
+using NdsChatGameKeyboard = bool (*)();
 void nds_netplay_chat_set_game_keyboard(NdsChatGameKeyboard start);
-bool nds_netplay_chat_game_keyboard_start(bool pad);
+bool nds_netplay_chat_game_keyboard_start();
 
 // ---- for the transports ----------------------------------------------------
 

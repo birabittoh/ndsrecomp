@@ -52,8 +52,8 @@ constexpr int64_t kNdsChatFadeMs = 1000;
 void nds_chat_glyph(uint32_t cp, uint8_t rows[8]);
 
 // Lays out `lines` (oldest first) and `input` over a `width` x `height`
-// screen at time `now_ms` (steady_clock ms). Closed, the lines keep clear
-// of the rightmost `keep_clear` pixels. Appends to `out`.
+// screen at time `now_ms` (steady_clock ms), clear of the rightmost
+// `keep_clear` pixels. Appends to `out`.
 void nds_chat_overlay_layout(int width, int height,
                              const std::vector<NdsChatLine>& lines,
                              const NdsChatOverlayInput& input, int64_t now_ms,

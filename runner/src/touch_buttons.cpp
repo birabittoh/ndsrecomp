@@ -40,6 +40,24 @@ const NdsTouchButtonSpec kChat = {
     nullptr,
 };
 
+const NdsTouchButtonSpec kSend = {
+    {
+        // An arrow head pointing right.
+        "...........",
+        "..##.......",
+        "..####.....",
+        "..######...",
+        "..########.",
+        "..######...",
+        "..####.....",
+        "..##.......",
+        "...........",
+    },
+    NdsTouchButtonPlace::BottomRight,
+    0,
+    nullptr,
+};
+
 struct Box {
     int id;
     int x, y;
@@ -94,6 +112,11 @@ const NdsTouchButtonSpec* nds_touch_button_spec(int id) {
 
 int nds_touch_button_chat() {
     static const int id = nds_touch_button_register(&kChat);
+    return id;
+}
+
+int nds_touch_button_send() {
+    static const int id = nds_touch_button_register(&kSend);
     return id;
 }
 

@@ -471,8 +471,7 @@ void nds_chat_overlay_layout(int width, int height,
                              const NdsChatOverlayInput& input, int64_t now_ms,
                              std::vector<NdsChatOverlayRect>* out,
                              int keep_clear) {
-    // Open, the panel goes over whatever is at the right.
-    const int reserve = input.open || keep_clear <= 0 ? 0 : keep_clear;
+    const int reserve = keep_clear <= 0 ? 0 : keep_clear;
     const int cols =
         (width - 2 * kMargin - kPad - 1 - reserve) / kNdsChatCellWidth;
     const int max_rows = (height - 2 * kMargin) / kNdsChatCellHeight;

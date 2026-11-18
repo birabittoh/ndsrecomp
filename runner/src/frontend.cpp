@@ -4613,6 +4613,61 @@ int nds_run_interactive_frontend(const NdsFrontendOptions& initial_options) {
         close_chat();
     };
     auto chat_edited = [&]() { nds_chat_overlay_set_input(chat_input); };
+    // The chat's Start (a key, a pad button) or the chat button, while it is
+    // down: let go soon, it opens the chat input here (typed on a keyboard,
+    // the system's or a real one); held, the title's own text entry, where
+    // it has one and can show it now (else the chat input here too).
+    struct ChatPress {
+        enum Kind : uint8_t { None, Key, Pad, Touch } kind = None;
+        int code = 0;     // the scancode or the pad button
+        uint64_t at = 0;  // performance counter at the press
+        bool held = false;  // the hold was taken already
+    };
+    ChatPress chat_press;
+    const uint64_t chat_hold_ticks = frequency * 2u / 5u;  // 400 ms
+    auto begin_chat_press = [&](ChatPress::Kind kind, int code) {
+        chat_press = ChatPress{kind, code, SDL_GetPerformanceCounter(), false};
+    };
+    // Whether `event` is the pending press's own input: its release (`up`)
+    // or a repeat of the press.
+    auto chat_press_event = [&](const SDL_Event& event, bool* up) {
+        *up = false;
+        switch (chat_press.kind) {
+            case ChatPress::Key:
+                if ((event.type == SDL_KEYUP || event.type == SDL_KEYDOWN) &&
+                    int(sdl_event_scancode(event)) == chat_press.code) {
+                    *up = event.type == SDL_KEYUP;
+                    return true;
+                }
+                return false;
+            case ChatPress::Pad:
+                if ((event.type == SDL_CONTROLLERBUTTONUP ||
+                     event.type == SDL_CONTROLLERBUTTONDOWN) &&
+                    int(sdl_controller_button(event)) == chat_press.code) {
+                    *up = event.type == SDL_CONTROLLERBUTTONUP;
+                    return true;
+                }
+                return false;
+            case ChatPress::Touch:
+                if (event.type == SDL_MOUSEBUTTONUP &&
+                    event.button.button == SDL_BUTTON_LEFT) {
+                    *up = true;
+                    return true;
+                }
+                return false;
+            case ChatPress::None:
+                break;
+        }
+        return false;
+    };
+    // Once per frame: a press held long enough takes the title's entry.
+    auto check_chat_hold = [&]() {
+        if (chat_press.kind == ChatPress::None || chat_press.held ||
+            SDL_GetPerformanceCounter() - chat_press.at < chat_hold_ticks)
+            return;
+        chat_press.held = true;
+        if (!nds_netplay_chat_game_keyboard_start()) open_chat();
+    };
     // An event while the chat is open: true when it was input, which then
     // goes to the chat and nowhere else.
     auto chat_event = [&](const SDL_Event& event) {
@@ -5073,12 +5128,16 @@ int nds_run_interactive_frontend(const NdsFrontendOptions& initial_options) {
             persist_window_size(options, presentation.windows[0]);
         }
         // The title's buttons ask their queries; the chat button shows
-        // whenever Start would open the chat. A held button that went away
+        // whenever Start would open the chat, the send button instead while
+        // a line is typed (the chat panel's input row is up, from here or
+        // from the title's own text entry). A held button that went away
         // lets its keys go.
         nds_touch_buttons_update();
+        check_chat_hold();
+        const bool chat_typing = chat_input.open || nds_chat_overlay_input().open;
         nds_touch_button_set_shown(nds_touch_button_chat(),
-                                   !chat_input.open &&
-                                       nds_netplay_chat_reachable());
+                                   !chat_typing && nds_netplay_chat_reachable());
+        nds_touch_button_set_shown(nds_touch_button_send(), chat_typing);
         if (touch_button_held >= 0 &&
             !nds_touch_button_shown(touch_button_held))
             release_touch_button();
@@ -5103,6 +5162,7 @@ int nds_run_interactive_frontend(const NdsFrontendOptions& initial_options) {
                 is_presentation_window(event.window.windowID)) {
                 // The release may never come.
                 if (touch_button_held >= 0) release_touch_button();
+                chat_press = {};
                 const int index =
                     presentation_window_focus_index(event.window.windowID);
                 if (index >= 0)
@@ -5173,30 +5233,58 @@ int nds_run_interactive_frontend(const NdsFrontendOptions& initial_options) {
                     continue;
                 }
             }
+            // The chat's pending press: its repeats go nowhere, its release
+            // before the hold opens the chat input here.
+            if (bool up = false;
+                chat_press.kind != ChatPress::None &&
+                chat_press_event(event, &up)) {
+                if (up) {
+                    const bool tap = !chat_press.held;
+                    chat_press = {};
+                    if (tap && !chat_input.open) open_chat();
+                }
+                continue;
+            }
+            // The title's own text entry is up (its line shows in the chat
+            // panel): Start sends from it.
+            const bool game_entry =
+                !chat_input.open && nds_chat_overlay_input().open;
+            const bool start_key =
+                event.type == SDL_KEYDOWN && !event.key.repeat &&
+                (nds_binding_mask(options.keyboard_bindings,
+                                  sdl_event_scancode(event)) &
+                 kChatStartMask);
+            const bool start_pad =
+                event.type == SDL_CONTROLLERBUTTONDOWN &&
+                (gamepad_button_mask(options,
+                                     static_cast<SDL_GameControllerButton>(
+                                         sdl_controller_button(event))) &
+                 kChatStartMask);
             if (chat_input.open) {
+                if (touch_button_at(event) == nds_touch_button_send()) {
+                    send_chat();
+                    continue;
+                }
                 if (chat_event(event)) continue;
-            } else if (nds_netplay_chat_reachable() &&
-                       ((event.type == SDL_KEYDOWN && !event.key.repeat &&
-                         (nds_binding_mask(options.keyboard_bindings,
-                                           sdl_event_scancode(event)) &
-                          kChatStartMask)) ||
-                        (event.type == SDL_CONTROLLERBUTTONDOWN &&
-                         (gamepad_button_mask(
-                              options,
-                              static_cast<SDL_GameControllerButton>(
-                                  sdl_controller_button(event))) &
-                          kChatStartMask)))) {
-                // On a pad there is no keyboard to type with: the game's own
-                // text entry, where the title has one and can show it now;
-                // Start again sends from it.
-                if (!nds_netplay_chat_game_keyboard_start(
-                        event.type == SDL_CONTROLLERBUTTONDOWN))
-                    open_chat();
+            } else if ((start_key || start_pad) && game_entry) {
+                nds_netplay_chat_game_keyboard_start();
+                continue;
+            } else if ((start_key || start_pad) &&
+                       nds_netplay_chat_reachable()) {
+                if (start_key)
+                    begin_chat_press(ChatPress::Key,
+                                     int(sdl_event_scancode(event)));
+                else
+                    begin_chat_press(ChatPress::Pad,
+                                     int(sdl_controller_button(event)));
                 continue;
             } else if (const int button = touch_button_at(event);
                        button >= 0) {
                 if (button == nds_touch_button_chat()) {
-                    open_chat();
+                    begin_chat_press(ChatPress::Touch, 0);
+                } else if (button == nds_touch_button_send()) {
+                    // The title's text entry is up: it sends, as Start does.
+                    nds_netplay_chat_game_keyboard_start();
                 } else if (const NdsTouchButtonSpec* spec =
                                nds_touch_button_spec(button)) {
                     touch_button_held = button;

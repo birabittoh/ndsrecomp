@@ -130,9 +130,9 @@ bool TestKeepClear() {
     open.open = true;
     out.clear();
     nds_chat_overlay_layout(256, 192, lines, open, 0, &out, 26);
-    bool wide = false;
-    for (const auto& r : out) wide |= r.x + r.w > 256 - 26;
-    ok = require(wide, "open panel full width") && ok;
+    clear = !out.empty();
+    for (const auto& r : out) clear &= r.x + r.w <= 256 - 26;
+    ok = require(clear, "open panel keeps clear") && ok;
     return ok;
 }
 
