@@ -55,6 +55,18 @@ bool TestGlyphs() {
                      std::memcmp(rows + 2, e + 2, 6) == 0, "e acute") && ok;
     nds_chat_glyph(0x3042, rows);  // no kana: the box
     ok = require(rows[0] == 0x1F && rows[6] == 0x1F, "missing glyph") && ok;
+    uint8_t box[8];
+    std::memcpy(box, rows, sizeof box);
+    // Symbols a game keyboard types: drawn, not the box.
+    for (uint32_t cp : {0xA1u, 0xA2u, 0xA3u, 0xAAu, 0xABu, 0xB0u, 0xBBu, 0xBFu,
+                        0xC6u, 0xE6u, 0xF5u, 0x152u, 0x153u, 0x201Eu, 0x20ACu,
+                        0x2190u, 0x2191u, 0x2192u, 0x2193u, 0x2605u, 0x263Au}) {
+        nds_chat_glyph(cp, rows);
+        if (std::memcmp(rows, box, sizeof box) == 0) {
+            std::fprintf(stderr, "U+%04X\n", cp);
+            ok = require(false, "symbol glyph drawn") && ok;
+        }
+    }
     return ok;
 }
 
@@ -179,7 +191,7 @@ int main(int argc, char** argv) {
         std::vector<NdsChatOverlayRect> out;
         NdsChatOverlayInput input;
         input.open = true;
-        input.text = "On my way, ¿qué tal?";
+        input.text = "ÀÉÎÕÜÇÑ àéîõüçñ ¡¢£ª°«»ÆæŒœ„€←↑→↓★☺";
         input.cursor = 6;
         nds_chat_overlay_layout(
             256, 192,

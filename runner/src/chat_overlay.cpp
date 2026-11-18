@@ -116,6 +116,30 @@ const char* const kSharpS[8] = {".##..", "#..#.", "#..#.", "#.#..",
 const char* const kMissing[8] = {"#####", "#...#", "#...#", "#...#",
                                  "#...#", "#...#", "#####", "....."};
 
+// Symbols, ligatures and arrows a game's own keyboard may type.
+struct Extra {
+    uint32_t cp;
+    const char* art[8];
+};
+const Extra kExtra[] = {
+    {0xA2, {"..#..", ".###.", "#.#..", "#.#..", "#.#.#", ".###.", "..#..", "....."}},  // ¢
+    {0xA3, {"..##.", ".#..#", ".#...", "###..", ".#...", ".#..#", "#.##.", "....."}},  // £
+    {0xAA, {".###.", "...#.", ".###.", "#..#.", ".###.", ".....", "####.", "....."}},  // ª
+    {0xB0, {".##..", "#..#.", "#..#.", ".##..", ".....", ".....", ".....", "....."}},  // °
+    {0xC6, {".####", "#.#..", "#.#..", "#####", "#.#..", "#.#..", "#.###", "....."}},  // Æ
+    {0xE6, {".....", ".....", "##.#.", "..#.#", ".####", "#.#..", ".#.##", "....."}},  // æ
+    {0x152, {".####", "#.#..", "#.#..", "#.###", "#.#..", "#.#..", ".####", "....."}},  // Œ
+    {0x153, {".....", ".....", ".#.#.", "#.#.#", "#.###", "#.#..", ".#.##", "....."}},  // œ
+    {0x201E, {".....", ".....", ".....", ".....", ".....", "##.##", ".#..#", "#..#."}},  // „
+    {0x20AC, {"..###", ".#...", "####.", ".#...", "####.", ".#...", "..###", "....."}},  // €
+    {0x2190, {".....", "..#..", ".#...", "#####", ".#...", "..#..", ".....", "....."}},  // ←
+    {0x2191, {"..#..", ".###.", "#.#.#", "..#..", "..#..", "..#..", "..#..", "....."}},  // ↑
+    {0x2192, {".....", "..#..", "...#.", "#####", "...#.", "..#..", ".....", "....."}},  // →
+    {0x2193, {"..#..", "..#..", "..#..", "..#..", "#.#.#", ".###.", "..#..", "....."}},  // ↓
+    {0x2605, {"..#..", "..#..", "#####", ".###.", ".###.", "##.##", "#...#", "....."}},  // ★
+    {0x263A, {".....", ".#.#.", ".#.#.", ".....", "#...#", ".###.", ".....", "....."}},  // ☺
+};
+
 enum Accent { kGrave, kAcute, kCircumflex, kTilde, kDiaeresis, kRing };
 const char* const kAccentArt[6][2] = {
     {".#...", "..#.."},  // grave
@@ -143,26 +167,39 @@ void Ascii(char c, uint8_t rows[8]) {
 
 // A lowercase letter with a mark above: the letter's x-height part (rows
 // 2-7; an i loses its dot) under the mark.
+// An uppercase letter fills rows 0-6, so it is squeezed into rows 2-6
+// (rows 1 and 5 of it dropped) under the mark.
 void Accented(char base, Accent accent, uint8_t rows[8]) {
     Ascii(base, rows);
+    if (base >= 'A' && base <= 'Z') {
+        const uint8_t full[7] = {rows[0], rows[1], rows[2], rows[3],
+                                 rows[4], rows[5], rows[6]};
+        rows[2] = full[0];
+        rows[3] = full[2];
+        rows[4] = full[3];
+        rows[5] = full[4];
+        rows[6] = full[6];
+    }
     rows[0] = ParseRow(kAccentArt[accent][0]);
     rows[1] = ParseRow(kAccentArt[accent][1]);
 }
 
-// Latin-1 letters 0xC0..0xFF: base letter, and the mark for lowercase.
+// Latin-1 letters 0xC0..0xFF: base letter, and its mark.
 struct Latin {
     char base;
     int accent;  // -1: none
 };
 const Latin kLatin[64] = {
     // 0xC0
-    {'A', -1}, {'A', -1}, {'A', -1}, {'A', -1}, {'A', -1}, {'A', -1},
-    {'A', -1}, {'C', -1}, {'E', -1}, {'E', -1}, {'E', -1}, {'E', -1},
-    {'I', -1}, {'I', -1}, {'I', -1}, {'I', -1},
+    {'A', kGrave}, {'A', kAcute}, {'A', kCircumflex}, {'A', kTilde},
+    {'A', kDiaeresis}, {'A', kRing}, {'A', -1}, {'C', -1},
+    {'E', kGrave}, {'E', kAcute}, {'E', kCircumflex}, {'E', kDiaeresis},
+    {'I', kGrave}, {'I', kAcute}, {'I', kCircumflex}, {'I', kDiaeresis},
     // 0xD0
-    {'D', -1}, {'N', -1}, {'O', -1}, {'O', -1}, {'O', -1}, {'O', -1},
-    {'O', -1}, {'x', -1}, {'O', -1}, {'U', -1}, {'U', -1}, {'U', -1},
-    {'U', -1}, {'Y', -1}, {'P', -1}, {'s', -1},
+    {'D', -1}, {'N', kTilde}, {'O', kGrave}, {'O', kAcute},
+    {'O', kCircumflex}, {'O', kTilde}, {'O', kDiaeresis}, {'x', -1},
+    {'O', -1}, {'U', kGrave}, {'U', kAcute}, {'U', kCircumflex},
+    {'U', kDiaeresis}, {'Y', kAcute}, {'P', -1}, {'s', -1},
     // 0xE0
     {'a', kGrave}, {'a', kAcute}, {'a', kCircumflex}, {'a', kTilde},
     {'a', kDiaeresis}, {'a', kRing}, {'a', -1}, {'c', -1},
@@ -297,18 +334,29 @@ void nds_chat_glyph(uint32_t cp, uint8_t rows[8]) {
         Ascii(static_cast<char>(cp), rows);
         return;
     }
+    for (const Extra& e : kExtra) {
+        if (e.cp == cp) {
+            Art(e.art, rows);
+            return;
+        }
+    }
     if (cp == 0xDF) { Art(kSharpS, rows); return; }
     if (cp >= 0xC0 && cp <= 0xFF) {
         const Latin& l = kLatin[cp - 0xC0];
         if (l.accent >= 0) Accented(l.base, Accent(l.accent), rows);
         else Ascii(l.base, rows);
-        if (cp == 0xE7) rows[7] = ParseRow("..#..");  // cedilla
+        if (cp == 0xC7 || cp == 0xE7) rows[7] = ParseRow("..#..");  // cedilla
         return;
     }
-    if (cp == 0xA1 || cp == 0xBF) {  // inverted ! and ?: flipped
+    if (cp == 0xA1 || cp == 0xBF) {  // inverted ! and ?: turned half round
         uint8_t up[8];
         Ascii(cp == 0xA1 ? '!' : '?', up);
-        for (int y = 0; y < 7; ++y) rows[y] = up[6 - y];
+        for (int y = 0; y < 7; ++y) {
+            uint8_t mirrored = 0;
+            for (int x = 0; x < 5; ++x)
+                if (up[6 - y] & (0x10u >> x)) mirrored |= uint8_t(1u << x);
+            rows[y] = mirrored;
+        }
         rows[7] = 0;
         return;
     }
@@ -317,13 +365,10 @@ void nds_chat_glyph(uint32_t cp, uint8_t rows[8]) {
         case 0xAB: Ascii('<', rows); return;
         case 0xBB: Ascii('>', rows); return;
         case 0xD7: Ascii('x', rows); return;
-        case 0x152: Ascii('O', rows); return;
-        case 0x153: Ascii('o', rows); return;
         case 0x2013: case 0x2014: Ascii('-', rows); return;
         case 0x2018: case 0x2019: Ascii('\'', rows); return;
         case 0x201C: case 0x201D: Ascii('"', rows); return;
         case 0x2026: Ascii('.', rows); return;
-        case 0x20AC: Ascii('E', rows); return;
         default: Art(kMissing, rows); return;
     }
 }
