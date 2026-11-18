@@ -2050,6 +2050,63 @@ bool nds_io_load_cartridge(const uint8_t* rom, uint32_t rom_size,
     return true;
 }
 
+bool nds_io_cartridge_file(const char* path, const uint8_t** data,
+                           uint32_t* size) {
+    // Header: FNT offset/size at 0x40/0x44, FAT offset/size at 0x48/0x4C.
+    // FNT: 8-byte directory entries (u32 sub-table offset, u16 first file
+    // id, u16 parent), directory 0xF000 first; a sub-table lists u8
+    // type/length (0 ends it, bit 7 = directory), the name, and for a
+    // directory its u16 id. FAT: u32 start, u32 end per file id.
+    const std::vector<uint8_t>& rom = g_card_rom;
+    if (!path || !data || !size || rom.size() < 0x50u) return false;
+    const uint64_t fnt = load_le32(rom.data() + 0x40u);
+    const uint64_t fnt_size = load_le32(rom.data() + 0x44u);
+    const uint64_t fat = load_le32(rom.data() + 0x48u);
+    const uint64_t fat_size = load_le32(rom.data() + 0x4Cu);
+    if (fnt + fnt_size > rom.size() || fat + fat_size > rom.size()) return false;
+    const uint8_t* table = rom.data() + fnt;
+    uint32_t dir = 0;
+    std::string rest = path;
+    while (!rest.empty()) {
+        const size_t slash = rest.find('/');
+        const std::string name = rest.substr(0, slash);
+        rest = slash == std::string::npos ? std::string() : rest.substr(slash + 1);
+        if (uint64_t{dir} * 8u + 8u > fnt_size) return false;
+        uint64_t p = load_le32(table + dir * 8u);
+        uint32_t id = uint32_t{table[dir * 8u + 4u]} |
+                      (uint32_t{table[dir * 8u + 5u]} << 8u);
+        bool found = false;
+        while (p < fnt_size && table[p] != 0u) {
+            const uint8_t type = table[p];
+            const uint32_t len = type & 0x7Fu;
+            const bool is_dir = (type & 0x80u) != 0u;
+            if (p + 1u + len + (is_dir ? 2u : 0u) > fnt_size) return false;
+            const bool same = name.size() == len &&
+                std::memcmp(table + p + 1u, name.data(), len) == 0;
+            if (is_dir) {
+                const uint32_t sub = (uint32_t{table[p + 1u + len]} |
+                                      (uint32_t{table[p + 2u + len]} << 8u)) & 0x0FFFu;
+                if (same && !rest.empty()) { dir = sub; found = true; break; }
+                p += 3u + len;
+            } else {
+                if (same && rest.empty()) {
+                    if (uint64_t{id} * 8u + 8u > fat_size) return false;
+                    const uint32_t start = load_le32(rom.data() + fat + id * 8u);
+                    const uint32_t end = load_le32(rom.data() + fat + id * 8u + 4u);
+                    if (end < start || end > rom.size()) return false;
+                    *data = rom.data() + start;
+                    *size = end - start;
+                    return true;
+                }
+                p += 1u + len;
+                ++id;
+            }
+        }
+        if (!found) return false;
+    }
+    return false;
+}
+
 void nds_io_configure_cartridge_save(
         const NdsCartridgeSaveConfig& config) {
     g_cart_backup.config = config;

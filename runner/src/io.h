@@ -366,6 +366,20 @@ bool     nds_io_load_cartridge(const uint8_t* rom, uint32_t rom_size,
                                const uint8_t* arm7_bios, uint32_t bios_size);
 void     nds_io_configure_cartridge_save(
              const NdsCartridgeSaveConfig& config);
+// The bytes of the file at `path` in the loaded cartridge image, named as in
+// its file name table ("data/pack/font.gp2"). False when no cartridge is
+// loaded or it has no such file. The pointer stays valid until the next
+// nds_io_load_cartridge.
+bool     nds_io_cartridge_file(const char* path, const uint8_t** data,
+                               uint32_t* size);
+// Read-only memory a title adds for the ARM9, for data that does not fit the
+// game's own heaps: `size` bytes at `data` (kept alive by the caller) appear
+// at `base`, which must lie in the GBA slot's ROM range 0x08000000-0x09FFFFFF
+// (no DS game without a slot-2 accessory reads it). Reads are served
+// whatever EXMEMCNT says; writes are ignored. A null `data` unmaps it. One
+// block at a time; emulation thread only.
+bool     nds_bus_map_title_rom(uint32_t base, const uint8_t* data,
+                               uint32_t size);
 // Interactive play defaults to a battery-save file derived from the ROM.
 // Serve/batch gates leave this path empty unless explicitly requested. A
 // historical savestate load restores guest bytes session-locally and blocks

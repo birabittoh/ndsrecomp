@@ -526,8 +526,30 @@ uint16_t gba_open_bus_rom16(uint32_t addr) {
                                  decay[(ex >> 2u) & 3u]);
 }
 
+// nds_bus_map_title_rom: a title's read-only block in the ARM9's view of
+// the slot-2 ROM range.
+const uint8_t* g_title_rom = nullptr;
+uint32_t g_title_rom_base = 0;
+uint32_t g_title_rom_size = 0;
+
+bool title_rom_read(uint32_t addr, uint32_t width, uint32_t* value) {
+    if (!g_title_rom || g_nds_active != NDS_ARM9 || addr < g_title_rom_base ||
+        addr - g_title_rom_base >= g_title_rom_size)
+        return false;
+    // Aligned as the bus aligns any access; bytes past the end read 0.
+    const uint32_t a = addr & ~(width - 1u);
+    uint32_t v = 0;
+    for (uint32_t i = 0; i < width; ++i) {
+        const uint32_t o = a + i - g_title_rom_base;
+        if (o < g_title_rom_size) v |= uint32_t{g_title_rom[o]} << (8u * i);
+    }
+    *value = v;
+    return true;
+}
+
 bool gba_slot_read(uint32_t addr, uint32_t width, uint32_t* value) {
     if (addr < 0x08000000u || addr >= 0x0B000000u) return false;
+    if (title_rom_read(addr, width, value)) return true;
     if (!gba_slot_selected()) {
         *value = 0u;
         return true;
@@ -688,6 +710,20 @@ void unmapped(uint32_t addr, bool write, uint32_t width, uint32_t value) {
 }
 
 }  // namespace
+
+bool nds_bus_map_title_rom(uint32_t base, const uint8_t* data, uint32_t size) {
+    if (!data) {
+        g_title_rom = nullptr;
+        g_title_rom_base = g_title_rom_size = 0;
+        return true;
+    }
+    if (base < 0x08000000u || size == 0u || size > 0x0A000000u - base)
+        return false;
+    g_title_rom = data;
+    g_title_rom_base = base;
+    g_title_rom_size = size;
+    return true;
+}
 
 // Per-CPU last code-fetch PC, for the sequential/non-sequential distinction in
 // runtime_code_cycles (a sequential fetch is far cheaper than a branch/refill).
