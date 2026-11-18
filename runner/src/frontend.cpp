@@ -6101,6 +6101,9 @@ int nds_run_interactive_frontend(const NdsFrontendOptions& initial_options) {
             audio_pace_floor = audio_start_threshold;
             audio_min_queue = std::numeric_limits<uint32_t>::max();
             audio_max_queue = 0;
+#if defined(NDS_HAVE_COMPUTE_RENDERER)
+            nds_compute_host_set_fast_forward(turbo_active);
+#endif
             std::fprintf(stderr, "[sdl] turbo %s\n",
                          turbo_active ? "on" : "off");
         }

@@ -63,6 +63,9 @@ bool nds_compute_host_read_presented(std::vector<uint32_t>& pixels,
 // window_mode / scaling. Takes effect on the next present.
 void nds_compute_host_set_present_mode(NdsWindowMode mode,
                                        NdsScalingFilter scaling);
+// Fast-forward: a present must not wait for a vblank, or the frame rate
+// stays at the display's refresh. Only acted on where vsync blocks.
+void nds_compute_host_set_fast_forward(bool enabled);
 // Optional host overlay (virtual stylus cursor, notices, chat) for the next
 // present: `width` x `height` straight-alpha ARGB, alpha 0 transparent,
 // drawn over the image in the same rect. It may be finer than the screen:

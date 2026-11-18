@@ -516,6 +516,8 @@ void nds_compute_host_set_present_mode(NdsWindowMode mode,
     g_scaling = scaling;
 }
 
+void nds_compute_host_set_fast_forward(bool enabled) { (void)enabled; }
+
 bool nds_compute_host_present_top(const unsigned int* fallback_pixels,
                                   unsigned short fallback_width,
                                   const NdsGpu2dDirectFrame* direct_frame,

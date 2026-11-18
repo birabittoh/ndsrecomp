@@ -1145,6 +1145,17 @@ void nds_compute_host_set_present_mode(NdsWindowMode mode,
     g_scaling = scaling;
 }
 
+void nds_compute_host_set_fast_forward(bool enabled)
+{
+    // D3D12 presents with a sync interval of 1, which blocks for a whole
+    // refresh, so fast-forward could not pass the display rate. Vulkan's
+    // MAILBOX never blocks, and changing its mode would rebuild the swap
+    // chain, so it is left alone.
+    if (!g_backend.swap_chain || std::strcmp(g_backend.api, "D3D12") != 0)
+        return;
+    g_backend.swap_chain->setVsyncEnabled(!enabled);
+}
+
 bool nds_compute_host_present_top(const unsigned int* fallback_pixels,
                                   unsigned short fallback_width,
                                   const NdsGpu2dDirectFrame* direct_frame,
