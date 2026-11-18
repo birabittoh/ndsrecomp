@@ -63,11 +63,16 @@ bool nds_compute_host_read_presented(std::vector<uint32_t>& pixels,
 // window_mode / scaling. Takes effect on the next present.
 void nds_compute_host_set_present_mode(NdsWindowMode mode,
                                        NdsScalingFilter scaling);
-// Optional host overlay (virtual stylus cursor, notices) for the next
-// present: `width` x 192 ARGB, alpha 0 transparent, drawn over the image in
-// the same rect. The pointer is read during that present only; pass nullptr
-// to clear.
-void nds_compute_host_set_overlay(const uint32_t* argb, unsigned width);
+// Optional host overlay (virtual stylus cursor, notices, chat) for the next
+// present: `width` x `height` straight-alpha ARGB, alpha 0 transparent,
+// drawn over the image in the same rect. It may be finer than the screen:
+// up to nds_compute_host_overlay_max_scale() times 256-or-wider x 192. The
+// pointer is read during that present only; pass nullptr to clear.
+void nds_compute_host_set_overlay(const uint32_t* argb, unsigned width,
+                                  unsigned height = 192);
+// How many times finer than the screen an overlay may be (1 = screen
+// pixels only).
+unsigned nds_compute_host_overlay_max_scale();
 // Optional second LCD for the next present, in the nds_single_layout() inset:
 // `width` x 192 ARGB at `percent` of the main screen, which moves left to make
 // room. The pointer is read during that present only; pass nullptr to clear.

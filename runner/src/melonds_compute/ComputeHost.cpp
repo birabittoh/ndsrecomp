@@ -476,10 +476,17 @@ bool nds_compute_host_read_presented(std::vector<uint32_t>& pixels,
     return true;
 }
 
-void nds_compute_host_set_overlay(const uint32_t* argb, unsigned width)
+void nds_compute_host_set_overlay(const uint32_t* argb, unsigned width,
+                                  unsigned height)
 {
-    g_overlay_pixels = width > 0 && width <= 448 ? argb : nullptr;
+    g_overlay_pixels =
+        width > 0 && width <= 448 && height == 192 ? argb : nullptr;
     g_overlay_width = g_overlay_pixels ? width : 0;
+}
+
+unsigned nds_compute_host_overlay_max_scale()
+{
+    return 1;
 }
 
 // The GL presenter has no layer pass; the frontend keeps the full composite.

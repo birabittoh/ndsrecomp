@@ -1,4 +1,5 @@
 #include "frontend.h"
+#include "chat_overlay.h"
 #include "host_profile.h"
 #include "frontend_window_size.h"
 #include "frontend_screen_route.h"
@@ -2677,6 +2678,15 @@ struct DsTarget {
         if (renderer) SDL_SetRenderDrawColor(renderer, r, g, b, 255);
         color = 0xFF000000u | (uint32_t(r) << 16) | (uint32_t(g) << 8) | b;
     }
+    // With alpha: the renderer needs SDL_BLENDMODE_BLEND for it to show;
+    // the pixel buffer composites it over what is there.
+    void set_argb(uint32_t argb) {
+        if (renderer)
+            SDL_SetRenderDrawColor(renderer, uint8_t(argb >> 16),
+                                   uint8_t(argb >> 8), uint8_t(argb),
+                                   uint8_t(argb >> 24));
+        color = argb;
+    }
     void fill(int x, int y, int w, int h) const {
         if (canvas.width <= 0 || canvas.height <= 0) return;
         auto map_x = [&](int v) {
@@ -2702,11 +2712,92 @@ struct DsTarget {
         // Wholly off the buffer: left > right would make std::fill below
         // write backwards through memory.
         if (left >= right || top >= bottom) return;
+        if ((color >> 24) == 0xFFu) {
+            for (int py = top; py < bottom; ++py)
+                std::fill(pixels + size_t(py) * pixels_width + left,
+                          pixels + size_t(py) * pixels_width + right, color);
+            return;
+        }
         for (int py = top; py < bottom; ++py)
-            std::fill(pixels + size_t(py) * pixels_width + left,
-                      pixels + size_t(py) * pixels_width + right, color);
+            for (int px = left; px < right; ++px) {
+                uint32_t& d = pixels[size_t(py) * pixels_width + px];
+                d = blend_over(color, d);
+            }
+    }
+
+    // Straight-alpha "over": the overlay buffer is blended by its own alpha.
+    static uint32_t blend_over(uint32_t s, uint32_t d) {
+        const uint32_t sa = s >> 24, da = d >> 24;
+        const uint32_t oa = sa + da * (255u - sa) / 255u;
+        if (oa == 0) return 0;
+        auto channel = [&](int shift) {
+            const uint32_t sc = (s >> shift) & 255u, dc = (d >> shift) & 255u;
+            return (sc * sa + dc * da * (255u - sa) / 255u) / oa;
+        };
+        return (oa << 24) | (channel(16) << 16) | (channel(8) << 8) |
+               channel(0);
     }
 };
+
+// The netplay chat (chat_overlay.h) over one screen, laid out in chat
+// pixels: (DS width / scale) x (192 / scale) of them over the screen's rect,
+// so it follows the title's UI size. `fine` is whether the target can show
+// pixels finer than the screen's (an SDL renderer can; a presenter overlay
+// buffer only up to nds_compute_host_overlay_max_scale()).
+struct ChatFrame {
+    std::vector<NdsChatOverlayRect> rects;
+    int width = 0, height = 0;  // the canvas, in chat pixels
+};
+
+bool chat_overlay_rects(int ds_width, bool fine, ChatFrame* frame) {
+    const double scale = fine ? nds_chat_overlay_scale() : 1.0;
+    frame->width = static_cast<int>(std::lround(ds_width / scale));
+    frame->height = static_cast<int>(std::lround(kScreenHeight / scale));
+    return nds_chat_overlay_frame(frame->width, frame->height, &frame->rects);
+}
+
+// Over the target's dest rect, whatever its canvas.
+void draw_chat_overlay(const DsTarget& target, const ChatFrame& frame) {
+    if ((!target.renderer && !target.pixels) || frame.rects.empty()) return;
+    DsTarget t = target;
+    t.canvas.width = frame.width;
+    t.canvas.height = frame.height;
+    if (t.renderer) SDL_SetRenderDrawBlendMode(t.renderer, SDL_BLENDMODE_BLEND);
+    for (const NdsChatOverlayRect& r : frame.rects) {
+        t.set_argb(r.argb);
+        t.fill(r.x, r.y, r.w, r.h);
+    }
+    if (t.renderer) SDL_SetRenderDrawBlendMode(t.renderer, SDL_BLENDMODE_NONE);
+}
+
+void draw_chat_overlay(const DsTarget& target) {
+    static ChatFrame frame;
+    if (chat_overlay_rects(target.canvas.width, target.renderer != nullptr,
+                           &frame))
+        draw_chat_overlay(target, frame);
+}
+
+#if defined(NDS_HAVE_COMPUTE_RENDERER)
+// The presenter's overlay for one screen of `ds_width`: screen pixels, or
+// the chat's finer pixels while the chat shows and the presenter takes them.
+// Returns the target to draw into (canvas in DS pixels); empty pixels =
+// nothing to show. `want` says whether something besides the chat shows.
+DsTarget overlay_target(int ds_width, bool want, ChatFrame* chat,
+                        bool* want_chat, std::vector<uint32_t>* buffer) {
+    *want_chat = chat_overlay_rects(
+        ds_width, nds_compute_host_overlay_max_scale() > 1, chat);
+    DsTarget target{};
+    if (!want && !*want_chat) return target;
+    const int w = *want_chat ? chat->width : ds_width;
+    const int h = *want_chat ? chat->height : kScreenHeight;
+    buffer->assign(size_t(w) * h, 0u);
+    target.pixels = buffer->data();
+    target.pixels_width = w;
+    target.pixels_height = h;
+    target.canvas = {SDL_Rect{0, 0, w, h}, ds_width, kScreenHeight};
+    return target;
+}
+#endif
 
 void draw_notice_glyph(const DsTarget& target, int x, int y, char ch) {
     const char* glyph = notice_glyph(ch);
@@ -3158,6 +3249,7 @@ void draw_separate_screen(FrontendPresentation& presentation, int screen,
         renderer, screen_rect, presentation.screen_widths[screen]);
     if (virtual_stylus_visible)
         draw_virtual_stylus(target, virtual_stylus_x, virtual_stylus_y);
+    if (screen == 0) draw_chat_overlay(target);
     draw_savestate_notice(target, savestate_notice);
     draw_fps_counter(target, fps_counter);
 }
@@ -3190,25 +3282,26 @@ PresentationTicks present_single_screen(FrontendPresentation& presentation,
         NdsGpu2dDirectFrame direct_frame{};
         const bool direct = shown == 0 && nds_gpu2d_direct_frame(&direct_frame);
         static std::vector<uint32_t> overlay;
-        const bool want_overlay =
+        static ChatFrame chat;
+        bool want_chat = false;
+        const DsTarget target = overlay_target(
+            width,
             stylus || (savestate_notice && *savestate_notice) ||
-            (fps_counter && *fps_counter);
+                (fps_counter && *fps_counter),
+            &chat, &want_chat, &overlay);
+        const bool want_overlay = target.pixels != nullptr;
         if (want_overlay) {
-            overlay.assign(size_t(width) * kScreenHeight, 0u);
-            DsTarget target{};
-            target.pixels = overlay.data();
-            target.pixels_width = width;
-            target.pixels_height = kScreenHeight;
-            target.canvas = {SDL_Rect{0, 0, width, kScreenHeight}, width,
-                             kScreenHeight};
             if (stylus)
                 draw_virtual_stylus(target, virtual_stylus_x,
                                     virtual_stylus_y);
+            if (want_chat) draw_chat_overlay(target, chat);
             draw_savestate_notice(target, savestate_notice);
             draw_fps_counter(target, fps_counter);
         }
-        nds_compute_host_set_overlay(want_overlay ? overlay.data() : nullptr,
-                                     static_cast<unsigned>(width));
+        nds_compute_host_set_overlay(
+            want_overlay ? overlay.data() : nullptr,
+            static_cast<unsigned>(target.pixels_width),
+            static_cast<unsigned>(target.pixels_height));
         NdsComputePresentTicks gl_ticks{};
         gl_ticks.diagnostic =
             nds_frontend_latency::enabled.load(std::memory_order_relaxed);
@@ -3277,6 +3370,7 @@ PresentationTicks present_single_screen(FrontendPresentation& presentation,
     const DsTarget target = sdl_ds_target(renderer, screen_rect, width);
     if (stylus)
         draw_virtual_stylus(target, virtual_stylus_x, virtual_stylus_y);
+    draw_chat_overlay(target);
     draw_savestate_notice(target, savestate_notice);
     draw_fps_counter(target, fps_counter);
     ticks.draw += SDL_GetPerformanceCounter() - start;
@@ -3322,10 +3416,22 @@ PresentationTicks present_screens(FrontendPresentation& presentation,
                                             presentation.internal_resolution);
         g_touch_ui_scale.store(1.0f);  // the touchscreen has its own window
         if (!owned && !direct) set_fixed_layers(top_width);
+        // The top window's only overlay is the chat.
+        static std::vector<uint32_t> top_overlay;
+        static ChatFrame chat;
+        bool want_chat = false;
+        const DsTarget top_target =
+            overlay_target(top_width, false, &chat, &want_chat, &top_overlay);
+        if (want_chat) draw_chat_overlay(top_target, chat);
+        nds_compute_host_set_overlay(
+            want_chat ? top_overlay.data() : nullptr,
+            static_cast<unsigned>(top_target.pixels_width),
+            static_cast<unsigned>(top_target.pixels_height));
         const bool top_ok = nds_compute_host_present_top(
                 top_pixels, static_cast<uint16_t>(top_width),
                 direct ? &direct_frame : nullptr, &gl_ticks,
                 presentation.antialiasing,owned);
+        nds_compute_host_set_overlay(nullptr, 0);
         nds_compute_host_set_layer(nullptr, nullptr, 0, 0, 0, 0, 0);
         if (!top_ok) {
             std::fprintf(stderr, "[gpu3d] direct top presentation failed\n");
@@ -3380,6 +3486,8 @@ PresentationTicks present_screens(FrontendPresentation& presentation,
             presentation.screen_widths[1], kScreenHeight);
         render_screen(presentation, 0, top_rect);
         render_screen(presentation, 1, bottom_rect);
+        draw_chat_overlay(sdl_ds_target(renderer, top_rect,
+                                        presentation.screen_widths[0]));
         const DsTarget target = sdl_ds_target(
             renderer, bottom_rect, presentation.screen_widths[1]);
         if (virtual_stylus_visible)

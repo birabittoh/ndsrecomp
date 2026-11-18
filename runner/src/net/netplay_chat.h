@@ -44,6 +44,7 @@ struct NdsChatLine {
     std::string from;   // display name, empty for System
     std::string text;   // masked
     std::string mid;    // the server's id, Online lines only
+    int64_t at_ms = 0;  // when listed, steady_clock milliseconds
 };
 
 enum class NdsChatSendResult : uint8_t {

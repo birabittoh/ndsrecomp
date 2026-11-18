@@ -120,6 +120,12 @@ struct ComposeConstants {
 constexpr RenderFormat kHdFormat = RenderFormat::R32G32B32A32_UINT;
 constexpr uint32_t kHdRowPitch = kMaxWidth * 16u;   // 7168, a multiple of 256
 constexpr uint64_t kHdImageBytes = uint64_t(kHdRowPitch) * kHeight;
+// An overlay finer than the screen (text drawn at window density) has its
+// own staging, made on first use.
+constexpr uint32_t kOverlayMaxScale = 4;
+constexpr uint32_t kOverlayRowPitch = kMaxWidth * kOverlayMaxScale * 4u;  // 7168
+constexpr uint64_t kOverlayBytes =
+    uint64_t(kOverlayRowPitch) * kHeight * kOverlayMaxScale;
 
 // The images one present uploads: the shown LCD, the other one as the
 // single-screen inset, the frontend overlay (stylus, notices, FPS), and an
@@ -130,6 +136,7 @@ struct ImageSlot {
     std::unique_ptr<RenderTexture> texture;
     std::unique_ptr<RenderDescriptorSet> set;
     int width = 0;
+    int height = 0;
 };
 
 // The offscreen HD composite, when it is not drawn straight into the rect:
@@ -154,6 +161,8 @@ struct FrameSlot {
     int hd_width = 0;
     std::unique_ptr<RenderDescriptorSet> compose_set;
     ComposeTarget compose;
+    // A fine overlay (g_overlay_height != kHeight): kOverlayBytes.
+    std::unique_ptr<RenderBuffer> overlay_staging;
     bool submitted = false;
 };
 
@@ -205,6 +214,7 @@ NdsWindowMode g_window_mode = NdsWindowMode::Letterbox;
 NdsScalingFilter g_scaling = NdsScalingFilter::Integer;
 const uint32_t* g_overlay_pixels = nullptr;
 unsigned g_overlay_width = 0;
+unsigned g_overlay_height = 0;
 // nds_compute_host_set_layer: the layer, the image without it, and where
 // the layer goes, as fractions of the main rect.
 const uint32_t* g_layer_pixels = nullptr;
@@ -735,11 +745,13 @@ void release_backend() {
 bool stage_image(FrameSlot& slot, uint8_t* staging, Image image,
                  const uint32_t* pixels, int width) {
     ImageSlot& target = slot.images[image];
-    if (target.width != width || !target.texture) {
+    if (target.width != width || target.height != int(kHeight) ||
+        !target.texture) {
         target.texture = g_backend.device->createTexture(
             RenderTextureDesc::Texture2D(uint32_t(width), kHeight, 1, kImageFormat));
         if (!target.texture) return false;
         target.width = width;
+        target.height = int(kHeight);
         target.set->setTexture(0, target.texture.get(),
                                RenderTextureLayout::SHADER_READ);
     }
@@ -749,6 +761,50 @@ bool stage_image(FrameSlot& slot, uint8_t* staging, Image image,
         std::memcpy(dst + size_t(y) * kRowPitch, pixels + size_t(y) * width,
                     row_bytes);
     return true;
+}
+
+// A fine overlay (any size up to kOverlayMaxScale times the screen), into
+// its own staging.
+bool stage_fine_overlay(FrameSlot& slot) {
+    ImageSlot& target = slot.images[kOverlay];
+    const int width = int(g_overlay_width), height = int(g_overlay_height);
+    if (!slot.overlay_staging) {
+        slot.overlay_staging = g_backend.device->createBuffer(
+            RenderBufferDesc::UploadBuffer(kOverlayBytes));
+        if (!slot.overlay_staging) return false;
+    }
+    if (target.width != width || target.height != height || !target.texture) {
+        target.texture = g_backend.device->createTexture(
+            RenderTextureDesc::Texture2D(uint32_t(width), uint32_t(height), 1,
+                                         kImageFormat));
+        if (!target.texture) return false;
+        target.width = width;
+        target.height = height;
+        target.set->setTexture(0, target.texture.get(),
+                               RenderTextureLayout::SHADER_READ);
+    }
+    auto* dst = static_cast<uint8_t*>(slot.overlay_staging->map());
+    if (!dst) return false;
+    for (int y = 0; y < height; ++y)
+        std::memcpy(dst + size_t(y) * kOverlayRowPitch,
+                    g_overlay_pixels + size_t(y) * width, size_t(width) * 4u);
+    slot.overlay_staging->unmap();
+    return true;
+}
+
+void record_fine_overlay_upload(FrameSlot& slot) {
+    RenderCommandList& commands = *slot.commands;
+    const ImageSlot& image = slot.images[kOverlay];
+    RenderTexture* texture = image.texture.get();
+    commands.barriers(RenderBarrierStage::COPY,
+                      RenderTextureBarrier(texture, RenderTextureLayout::COPY_DEST));
+    commands.copyTextureRegion(
+        RenderTextureCopyLocation::Subresource(texture),
+        RenderTextureCopyLocation::PlacedFootprint(
+            slot.overlay_staging.get(), kImageFormat, uint32_t(image.width),
+            uint32_t(image.height), 1, kOverlayRowPitch / 4u, 0));
+    commands.barriers(RenderBarrierStage::GRAPHICS,
+                      RenderTextureBarrier(texture, RenderTextureLayout::SHADER_READ));
 }
 
 void record_upload(FrameSlot& slot, Image image) {
@@ -1037,10 +1093,20 @@ bool nds_compute_host_read_presented(std::vector<uint32_t>& pixels,
     return false;
 }
 
-void nds_compute_host_set_overlay(const uint32_t* argb, unsigned width)
+void nds_compute_host_set_overlay(const uint32_t* argb, unsigned width,
+                                  unsigned height)
 {
-    g_overlay_pixels = width > 0 && width <= kMaxWidth ? argb : nullptr;
-    g_overlay_width = g_overlay_pixels ? width : 0;
+    const bool ok = width > 0 && height > 0 &&
+                    width <= kMaxWidth * kOverlayMaxScale &&
+                    height <= kHeight * kOverlayMaxScale;
+    g_overlay_pixels = ok ? argb : nullptr;
+    g_overlay_width = ok ? width : 0;
+    g_overlay_height = ok ? height : 0;
+}
+
+unsigned nds_compute_host_overlay_max_scale()
+{
+    return kOverlayMaxScale;
 }
 
 bool nds_compute_host_supports_layer()
@@ -1139,6 +1205,8 @@ bool nds_compute_host_present_top(const unsigned int* fallback_pixels,
     if (!staging) return false;
     const bool inset = g_inset_pixels != nullptr;
     const bool overlay = g_overlay_pixels != nullptr;
+    const bool fine_overlay = overlay && (g_overlay_height != kHeight ||
+                                          g_overlay_width > kMaxWidth);
     // The layer goes with an image of the same width that lacks it.
     const bool layer = g_layer_pixels != nullptr && int(g_layer_width) == width;
     const uint32_t* main_pixels = layer ? g_layer_base : fallback_pixels;
@@ -1147,10 +1215,11 @@ bool nds_compute_host_present_top(const unsigned int* fallback_pixels,
         staged = stage_image(slot, staging, kLayer, g_layer_pixels, width);
     if (staged && inset)
         staged = stage_image(slot, staging, kInset, g_inset_pixels, int(g_inset_width));
-    if (staged && overlay)
+    if (staged && overlay && !fine_overlay)
         staged = stage_image(slot, staging, kOverlay, g_overlay_pixels,
                              int(g_overlay_width));
     slot.staging->unmap();
+    if (staged && fine_overlay) staged = stage_fine_overlay(slot);
     if (staged && hd_active) staged = stage_hd(slot, hd);
     if (!staged) return false;
     ticks->upload += SDL_GetPerformanceCounter() - start;
@@ -1185,7 +1254,8 @@ bool nds_compute_host_present_top(const unsigned int* fallback_pixels,
     commands.begin();
     if (!hd_active) record_upload(slot, kMain);
     if (inset) record_upload(slot, kInset);
-    if (overlay) record_upload(slot, kOverlay);
+    if (overlay && !fine_overlay) record_upload(slot, kOverlay);
+    if (fine_overlay) record_fine_overlay_upload(slot);
     if (layer) record_upload(slot, kLayer);
     if (hd_active) record_hd_upload(slot);
     if (compose_offscreen) {

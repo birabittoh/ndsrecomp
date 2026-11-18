@@ -61,6 +61,8 @@ size_t SequenceLength(const std::string& s, size_t i) {
 
 void Push(ChatState& st, NdsChatLine&& line) {
     line.id = st.next_id++;
+    line.at_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                     Clock::now().time_since_epoch()).count();
     st.lines.push_back(std::move(line));
     while (st.lines.size() > kNdsChatKeep) st.lines.pop_front();
 }
