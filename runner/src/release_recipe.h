@@ -25,10 +25,18 @@ bool nds_release_recipe_info(const uint8_t* recipe, size_t size,
 bool nds_code_decompress(const std::vector<uint8_t>& data,
                          std::vector<uint8_t>* out, std::string* error);
 
+// Code compression of `data` past its first `prefix` bytes (0x4000 for an
+// ARM9, 0 for an overlay): ndspy.codeCompression.compress's output, except
+// that trailing literals under the last flag byte stay in the stream, as
+// Nintendo's compressor leaves them (only the footer's length differs).
+// False if the data does not compress.
+bool nds_code_compress(const std::vector<uint8_t>& data, size_t prefix,
+                       std::vector<uint8_t>* out);
+
 // Writes to `dest` (which must not exist) the unpacked ROM folder `source`
-// with its ARM9 code rebuilt by `recipe`: the rebuilt files uncompressed,
-// the ARM9 moved past the end of the image (so it no longer has a secure
-// area), the overlay table marking nothing compressed, and rom.toml naming
+// with its ARM9 code rebuilt by `recipe`: the ARM9 compressed again where
+// the source's was (a game can read those card bytes), the rebuilt overlays
+// uncompressed, the overlay table marking them so, and rom.toml naming
 // the recipe's runs_as as its identity. Data files are hard links where the
 // file system allows, else copies. The validation copies come from the
 // title banks configured for runs_as (title_banks.h). Works in

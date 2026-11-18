@@ -441,6 +441,104 @@ bool nds_code_decompress(const std::vector<uint8_t>& data,
     return true;
 }
 
+bool nds_code_compress(const std::vector<uint8_t>& data, size_t prefix,
+                       std::vector<uint8_t>* out) {
+    if (prefix > data.size()) return false;
+    // ndspy's _lzCommon.compress over the body reversed (window 0x1002,
+    // matches 3..18 that end before the current byte, the longest and of
+    // those the nearest), with hash chains in place of its substring search.
+    std::vector<uint8_t> rev(data.rbegin(), data.rend() - prefix);
+    const size_t n = rev.size();
+    constexpr size_t kWindow = 0x1002, kMaxLen = 18, kHashSize = 1u << 16;
+    auto hash3 = [&](size_t i) {
+        return ((size_t{rev[i]} << 8) ^ (size_t{rev[i + 1]} << 4) ^ rev[i + 2]) &
+               (kHashSize - 1);
+    };
+    std::vector<int64_t> head(kHashSize, -1), prev(n, -1);
+    for (size_t i = 0; i + 3 <= n; ++i) {
+        const size_t h = hash3(i);
+        prev[i] = head[h];
+        head[h] = static_cast<int64_t>(i);
+    }
+    auto search = [&](size_t pos, size_t* match_pos) {
+        const size_t cap = std::min(kMaxLen, n - pos);
+        const size_t start = pos > kWindow ? pos - kWindow : 0;
+        size_t best = 0;
+        if (cap < 3) return best;
+        for (int64_t c = prev[pos]; c >= 0 && size_t(c) >= start; c = prev[c]) {
+            const size_t p = size_t(c);
+            if (p + 3 > pos) continue;
+            const size_t limit = std::min(cap, pos - p);
+            size_t len = 0;
+            while (len < limit && rev[p + len] == rev[pos + len]) ++len;
+            if (len > best) {
+                best = len;
+                *match_pos = p;
+                if (best == cap) break;
+            }
+        }
+        return best;
+    };
+    std::vector<uint8_t> result;
+    size_t current = 0, ignorable_data = 0, ignorable_comp = 0;
+    int64_t best_savings = 0;
+    while (current < n) {
+        const size_t flags_at = result.size();
+        result.push_back(0);
+        ++ignorable_comp;
+        uint8_t flags = 0;
+        for (int i = 0; i < 8; ++i) {
+            if (current >= n) continue;
+            size_t match_pos = 0;
+            const size_t len = search(current, &match_pos);
+            if (len > 2) {
+                const size_t disp = current - match_pos - 3;
+                flags |= static_cast<uint8_t>(1u << (7 - i));
+                result.push_back(static_cast<uint8_t>(((len - 3) << 4) | (disp >> 8)));
+                result.push_back(static_cast<uint8_t>(disp));
+                current += len;
+                ignorable_data += len;
+                ignorable_comp += 2;
+            } else {
+                result.push_back(rev[current++]);
+                ++ignorable_data;
+                ++ignorable_comp;
+            }
+            const int64_t savings = int64_t(current) - int64_t(result.size());
+            if (savings > best_savings) {
+                ignorable_data = ignorable_comp = 0;
+                best_savings = savings;
+            }
+        }
+        result[flags_at] = flags;
+    }
+    std::reverse(result.begin(), result.end());
+    if (result.empty() || n + 4 < ((result.size() + 3) & ~size_t{4}) + 8)
+        return false;
+    // ndspy leaves the stream's last bytes (the first ones in the file) raw
+    // when they save nothing. Nintendo's compressor does too, except when
+    // they are only literals under the last flag byte: then it keeps them in
+    // the stream, which changes nothing but the footer's compressed length.
+    if (ignorable_data == ignorable_comp) ignorable_data = ignorable_comp = 0;
+    std::vector<uint8_t> body(data.begin() + prefix,
+                              data.begin() + prefix + ignorable_data);
+    body.insert(body.end(), result.begin() + ignorable_comp, result.end());
+    const size_t comp_len = result.size() - ignorable_comp;
+    size_t header_len = 8;
+    const size_t extra = n - body.size();
+    while (body.size() % 4) {
+        body.push_back(0xFF);
+        ++header_len;
+    }
+    out->assign(data.begin(), data.begin() + prefix);
+    out->insert(out->end(), body.begin(), body.end());
+    out->resize(out->size() + 8);
+    put32(*out, out->size() - 8,
+          static_cast<uint32_t>((comp_len + header_len) | (header_len << 24)));
+    put32(*out, out->size() - 4, static_cast<uint32_t>(extra - header_len));
+    return true;
+}
+
 bool nds_release_convert_folder(const fs::path& source, const fs::path& dest,
                                 const uint8_t* recipe_data, size_t recipe_size,
                                 std::string* error) {
@@ -487,14 +585,36 @@ bool nds_release_convert_folder(const fs::path& source, const fs::path& dest,
         if (!apply(f, other, known, have, &rebuilt[f.name], error)) return false;
     }
 
-    // ARM9: stored uncompressed, so its module params say so.
+    // ARM9: compressed again and put back where the source's was. A game
+    // can read its own ARM9 from the card (DQ9's camp menu never opens when
+    // those card bytes are blank), so the card has to hold the bytes the
+    // runs_as image does there. Code compression is deterministic, and its
+    // output rebuilt from YDQE matches YDQP's arm9.bin byte for byte.
     std::vector<uint8_t>& arm9 = rebuilt["arm9.bin"];
     if (arm9.empty()) return fail(error, "the recipe rebuilds no ARM9");
     uint32_t params = 0;
     if (!arm9_params(source, folder, &params, error)) return false;
-    if (uint64_t{params} + 0x18 > arm9.size())
-        return fail(error, "the rebuilt ARM9 is shorter than its module params");
-    put32(arm9, params + 0x14, 0);
+    if (uint64_t{params} + 0x18 > arm9.size() || params + 0x18 > 0x4000)
+        return fail(error, "the rebuilt ARM9's module params are out of place");
+    {
+        std::vector<uint8_t> packed, check;
+        if (!nds_code_compress(arm9, 0x4000, &packed))
+            return fail(error, "the rebuilt ARM9 does not compress");
+        // Its compressed end, in the part left raw.
+        put32(packed, params + 0x14,
+              u32(folder.header, 0x28) + static_cast<uint32_t>(packed.size()));
+        put32(arm9, params + 0x14, u32(packed, params + 0x14));
+        if (!nds_code_decompress(packed, &check, error) || check != arm9)
+            return fail(error, "the rebuilt ARM9 does not compress back to itself");
+        arm9 = std::move(packed);
+    }
+    const uint32_t arm9_offset = u32(folder.header, 0x20);
+    const uint32_t old_footer = arm9_offset + u32(folder.header, 0x2C);
+    const uint32_t new_footer = arm9_offset + static_cast<uint32_t>(arm9.size());
+    std::string old_footer_name;
+    std::vector<uint8_t> footer;
+    char footer_name[32];
+    std::snprintf(footer_name, sizeof footer_name, "extra/%08X.bin", new_footer);
 
     // Overlay table: rebuilt overlays are uncompressed.
     std::vector<uint8_t> y9 = folder.y9;
@@ -508,34 +628,44 @@ bool nds_release_convert_folder(const fs::path& source, const fs::path& dest,
         put32(y9, at + 0x1C, static_cast<uint32_t>(it->second.size()));
     }
 
-    // Layout: the ARM9 goes after everything else, past the secure area.
-    uint64_t end = u32(folder.header, 0x80);
+    // Layout: the ARM9 and its footer (moved to the ARM9's new end) have to
+    // fit before whatever the source places after its ARM9.
+    uint64_t room = UINT64_MAX;
     for (const char* table : {"regions", "extra"}) {
         if (const toml::table* t = folder.manifest[table].as_table()) {
             for (const auto& [key, value] : *t) {
-                std::error_code ec;
-                const uint64_t size = fs::file_size(source / std::string(key.str()), ec);
-                end = std::max<uint64_t>(end, value.value<int64_t>().value_or(0) +
-                                                  (ec ? 0 : size));
+                const std::string name(key.str());
+                const int64_t offset = value.value<int64_t>().value_or(0);
+                if (name == "arm9.bin") continue;
+                if (offset == int64_t{old_footer}) {
+                    old_footer_name = name;
+                    if (!read_file(source / name, &footer))
+                        return fail(error, "cannot read " + (source / name).string());
+                    continue;
+                }
+                if (offset > int64_t{arm9_offset})
+                    room = std::min<uint64_t>(room, uint64_t(offset));
             }
         }
     }
+    if (old_footer_name.empty())
+        return fail(error, "the ARM9 has no footer naming its module params");
     const toml::array* fat = folder.manifest["files"]["fat"].as_array();
     if (!fat) return fail(error, (source / "rom.toml").string() + " has no FAT");
     for (const toml::node& node : *fat) {
         const toml::array* entry = node.as_array();
         if (!entry || entry->size() != 3)
             return fail(error, (source / "rom.toml").string() + ": bad FAT entry");
-        end = std::max<uint64_t>(end, (*entry)[1].value<int64_t>().value_or(0) +
-                                          (*entry)[2].value<int64_t>().value_or(0));
+        const int64_t offset = (*entry)[1].value<int64_t>().value_or(0);
+        if (offset > int64_t{arm9_offset})
+            room = std::min<uint64_t>(room, uint64_t(offset));
     }
-    const uint32_t arm9_offset =
-        static_cast<uint32_t>((std::max<uint64_t>(end, 0x8000) + 0xFFF) & ~uint64_t{0xFFF});
+    if (uint64_t{new_footer} + footer.size() > room)
+        return fail(error, "the rebuilt ARM9 does not fit where the source's was");
 
     std::vector<uint8_t> header = folder.header;
     std::copy(rebuilt["header.bin"].begin(), rebuilt["header.bin"].end(),
               header.begin());
-    put32(header, 0x20, arm9_offset);
     put32(header, 0x2C, static_cast<uint32_t>(arm9.size()));
     const uint16_t crc = crc16(header.data(), 0x15E);
     header[0x15E] = static_cast<uint8_t>(crc);
@@ -551,7 +681,7 @@ bool nds_release_convert_folder(const fs::path& source, const fs::path& dest,
     };
 
     std::map<std::string, const std::vector<uint8_t>*> written = {
-        {"header.bin", &header}, {"y9.bin", &y9}};
+        {"header.bin", &header}, {"y9.bin", &y9}, {footer_name, &footer}};
     for (const auto& [name, data] : rebuilt)
         if (name != "header.bin") written[name] = &data;
     for (const auto& [name, data] : written)
@@ -559,7 +689,7 @@ bool nds_release_convert_folder(const fs::path& source, const fs::path& dest,
             return abandon("cannot write " + (tmp / name).string());
 
     auto copy_rest = [&](const std::string& name) {
-        if (written.count(name)) return true;
+        if (written.count(name) || name == old_footer_name) return true;
         return link_or_copy(source / name, tmp / name);
     };
     for (const char* table : {"regions", "extra"})
@@ -572,7 +702,8 @@ bool nds_release_convert_folder(const fs::path& source, const fs::path& dest,
         if (!copy_rest(name)) return abandon("cannot copy " + name);
     }
 
-    // rom.toml: the source's, with the ARM9 moved and the identity named.
+    // rom.toml: the source's, with the ARM9 footer moved and the identity
+    // named.
     std::ostringstream m;
     std::string game_code(reinterpret_cast<const char*>(&header[0x0C]), 4);
     m << "# An unpacked Nintendo DS ROM (ndsrecomp tools/nds_folder.py),\n"
@@ -591,9 +722,12 @@ bool nds_release_convert_folder(const fs::path& source, const fs::path& dest,
         if (const toml::table* t = folder.manifest[table].as_table()) {
             for (const auto& [key, value] : *t) {
                 const std::string name(key.str());
-                const int64_t offset = name == "arm9.bin"
-                    ? int64_t{arm9_offset} : value.value<int64_t>().value_or(0);
-                m << toml_string(name) << " = 0x" << hex(offset) << "\n";
+                if (name == old_footer_name) {
+                    m << toml_string(footer_name) << " = 0x" << hex(new_footer) << "\n";
+                    continue;
+                }
+                m << toml_string(name) << " = 0x"
+                  << hex(value.value<int64_t>().value_or(0)) << "\n";
             }
         }
     }
