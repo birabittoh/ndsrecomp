@@ -204,6 +204,20 @@ bool nds_netplay_chat_reachable() {
            g_lan_peers.load(std::memory_order_acquire) > 0;
 }
 
+namespace {
+std::atomic<NdsChatGameKeyboard> g_game_keyboard{nullptr};
+}  // namespace
+
+void nds_netplay_chat_set_game_keyboard(NdsChatGameKeyboard start) {
+    g_game_keyboard.store(start, std::memory_order_release);
+}
+
+bool nds_netplay_chat_game_keyboard_start(bool pad) {
+    const NdsChatGameKeyboard start =
+        g_game_keyboard.load(std::memory_order_acquire);
+    return start && start(pad);
+}
+
 void nds_netplay_chat_push(NdsChatLine line) {
     line.from = nds_netplay_chat_clean(line.from, kNdsChatNameMax);
     line.text = nds_netplay_chat_clean(line.text, kNdsChatTextMax);

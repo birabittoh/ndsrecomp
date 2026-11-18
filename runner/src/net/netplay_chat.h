@@ -70,6 +70,16 @@ std::string nds_netplay_chat_name();
 // True when a line would reach somebody now.
 bool nds_netplay_chat_reachable();
 
+// The title's own text entry, for players on a gamepad: the title registers
+// a function the runner calls (from any thread) on the chat's Start, `pad`
+// when it came from a gamepad. While the entry is up it sends what was
+// typed; otherwise, on a pad, it asks the game to show the entry. False
+// when it did neither, so the runner opens its own chat input instead. The
+// title sends with nds_netplay_chat_send.
+using NdsChatGameKeyboard = bool (*)(bool pad);
+void nds_netplay_chat_set_game_keyboard(NdsChatGameKeyboard start);
+bool nds_netplay_chat_game_keyboard_start(bool pad);
+
 // ---- for the transports ----------------------------------------------------
 
 // Removes control characters, folds the line to one, trims spaces and cuts

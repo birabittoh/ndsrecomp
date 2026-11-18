@@ -5186,7 +5186,12 @@ int nds_run_interactive_frontend(const NdsFrontendOptions& initial_options) {
                               static_cast<SDL_GameControllerButton>(
                                   sdl_controller_button(event))) &
                           kChatStartMask)))) {
-                open_chat();
+                // On a pad there is no keyboard to type with: the game's own
+                // text entry, where the title has one and can show it now;
+                // Start again sends from it.
+                if (!nds_netplay_chat_game_keyboard_start(
+                        event.type == SDL_CONTROLLERBUTTONDOWN))
+                    open_chat();
                 continue;
             } else if (const int button = touch_button_at(event);
                        button >= 0) {

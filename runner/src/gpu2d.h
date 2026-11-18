@@ -73,6 +73,11 @@ void nds_gpu2d_finish_frame();
 // StartScanline order.
 void nds_gpu2d_vblank();
 const uint32_t* nds_gpu2d_framebuffer(int screen);
+// Presentation only: for the next `frames` finished frames, LCD `screen`
+// (0 top, 1 bottom) keeps showing the frame shown when the hold began;
+// 0 lets it go. Calling it again restarts the count. Any thread. A title
+// keeps its own screen up this way while a page of its own covers it.
+void nds_gpu2d_hold_screen(int screen, uint32_t frames);
 // Engine A's routing for the frame nds_gpu2d_framebuffer() exposes, as the
 // scanlines latched it (POWCNT1 bit 15 of the last line), never the live
 // register: 0 when engine A ("main") drew the top LCD, 1 for the bottom.

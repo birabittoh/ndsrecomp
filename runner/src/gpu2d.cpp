@@ -2580,9 +2580,39 @@ void nds_gpu2d_start_frame(){
         }
     }
 }
+namespace {
+// nds_gpu2d_hold_screen: frames still to hold per LCD, and the image held.
+std::array<std::atomic<uint32_t>, 2> g_hold_frames{};
+std::array<std::atomic<bool>, 2> g_hold_valid{};  // read by the presenter too
+std::array<Frame, 2> g_hold_image{};
+}  // namespace
+
+void nds_gpu2d_hold_screen(int screen, uint32_t frames) {
+    g_hold_frames[screen & 1].store(frames, std::memory_order_release);
+}
+
 void nds_gpu2d_finish_frame(){
     drain_pool(NDS_GPU2D_FENCE_FRAME);
-    g_front ^= 1;
+    // The held image goes into the back buffer before it becomes the front
+    // one, so the presenter never sees it being written.
+    const int previous = g_front;
+    const int next = g_front ^ 1;
+    for (int s = 0; s < 2; ++s) {
+        uint32_t left = g_hold_frames[s].load(std::memory_order_acquire);
+        if (left == 0u) {
+            g_hold_valid[s] = false;
+            continue;
+        }
+        // The frame shown before the hold began, kept from then on.
+        if (!g_hold_valid[s]) {
+            g_hold_image[s] = g_fb[previous][s];
+            g_hold_valid[s] = true;
+        }
+        g_fb[next][s] = g_hold_image[s];
+        g_hold_frames[s].compare_exchange_strong(left, left - 1u,
+                                                 std::memory_order_acq_rel);
+    }
+    g_front = next;
 }
 void nds_gpu2d_vblank(){
     drain_pool(NDS_GPU2D_FENCE_FRAME);
@@ -3202,6 +3232,11 @@ const uint32_t* nds_gpu2d_adaptive_framebuffer(int screen, uint16_t* width) {
     // screen, and an unguarded reset here would let the engine-B call wipe
     // the flag the engine-A call just set, silently disabling HD entirely.
     if (engine == 0) g_hd_frame_valid = g_fixed_frame_valid = false;
+    // A held screen shows its native frame (nds_gpu2d_hold_screen).
+    if (g_hold_valid[screen & 1]) {
+        if (width) *width = 256;
+        return native;
+    }
     const int output_width = nds_gpu3d_output_width();
     const bool fixed_wanted =
         engine == 0 && screen == g_hd_screen &&
