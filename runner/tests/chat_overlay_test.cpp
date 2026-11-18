@@ -102,6 +102,40 @@ bool TestLayout() {
 }
 
 // Prints `rects` as text: '#' bright, '+' background.
+bool TestEditing() {
+    bool ok = true;
+    NdsChatOverlayInput in;
+    nds_chat_edit_insert(&in, "caf\xC3\xA9");  // café
+    ok = require(in.text == "caf\xC3\xA9" && in.cursor == 5, "insert") && ok;
+    nds_chat_edit_key(&in, NdsChatEditKey::Left);
+    ok = require(in.cursor == 3, "left over a 2-byte char") && ok;
+    nds_chat_edit_insert(&in, "a\tb\x7F\xC2\x85\x80\xFF");
+    ok = require(in.text == "cafab\xC3\xA9" && in.cursor == 5,
+                 "controls and stray bytes dropped") && ok;
+    nds_chat_edit_key(&in, NdsChatEditKey::Delete);
+    ok = require(in.text == "cafab" && in.cursor == 5, "delete") && ok;
+    nds_chat_edit_key(&in, NdsChatEditKey::Home);
+    nds_chat_edit_key(&in, NdsChatEditKey::Backspace);
+    ok = require(in.text == "cafab" && in.cursor == 0,
+                 "backspace at start") && ok;
+    nds_chat_edit_key(&in, NdsChatEditKey::End);
+    nds_chat_edit_key(&in, NdsChatEditKey::Right);
+    nds_chat_edit_key(&in, NdsChatEditKey::Backspace);
+    ok = require(in.text == "cafa" && in.cursor == 4, "backspace") && ok;
+
+    NdsChatOverlayInput full;
+    full.text.assign(kNdsChatTextMax - 1, 'x');
+    full.cursor = full.text.size();
+    nds_chat_edit_insert(&full, "\xE2\x82\xAC");  // € does not fit
+    ok = require(full.text.size() == kNdsChatTextMax - 1,
+                 "a character never split at the limit") && ok;
+    nds_chat_edit_insert(&full, "yz");
+    ok = require(full.text.size() == kNdsChatTextMax &&
+                 full.text.back() == 'y' && full.cursor == kNdsChatTextMax,
+                 "text kept within the limit") && ok;
+    return ok;
+}
+
 void Print(int w, int h, const std::vector<NdsChatOverlayRect>& rects) {
     std::vector<std::string> screen(size_t(h), std::string(size_t(w), ' '));
     for (const auto& r : rects) {
@@ -136,6 +170,7 @@ int main(int argc, char** argv) {
     }
     bool ok = TestGlyphs();
     ok = TestLayout() && ok;
+    ok = TestEditing() && ok;
     if (!ok) return 1;
     std::printf("chat_overlay_test: ok\n");
     return 0;

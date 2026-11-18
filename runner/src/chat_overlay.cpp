@@ -338,6 +338,89 @@ NdsChatOverlayInput nds_chat_overlay_input() {
     return g_input;
 }
 
+namespace {
+
+bool Continuation(char c) {
+    return (static_cast<unsigned char>(c) & 0xC0u) == 0x80u;
+}
+
+// Bytes of the character starting with `lead`; 0 when no character starts
+// with it.
+size_t CharBytes(unsigned char lead) {
+    if (lead < 0x80u) return 1;
+    if (lead < 0xC2u) return 0;
+    if (lead < 0xE0u) return 2;
+    if (lead < 0xF0u) return 3;
+    if (lead < 0xF5u) return 4;
+    return 0;
+}
+
+size_t PrevBoundary(const std::string& s, size_t at) {
+    if (at == 0) return 0;
+    --at;
+    while (at > 0 && Continuation(s[at])) --at;
+    return at;
+}
+
+size_t NextBoundary(const std::string& s, size_t at) {
+    if (at >= s.size()) return s.size();
+    ++at;
+    while (at < s.size() && Continuation(s[at])) ++at;
+    return at;
+}
+
+}  // namespace
+
+void nds_chat_edit_insert(NdsChatOverlayInput* input, const char* utf8) {
+    if (!input || !utf8) return;
+    std::string add;
+    for (size_t i = 0; utf8[i] != '\0';) {
+        const auto lead = static_cast<unsigned char>(utf8[i]);
+        const size_t n = CharBytes(lead);
+        bool whole = n != 0;
+        for (size_t k = 1; k < n && whole; ++k)
+            whole = utf8[i + k] != '\0' && Continuation(utf8[i + k]);
+        if (!whole) {  // malformed: skip the byte
+            ++i;
+            continue;
+        }
+        // C0 controls, DEL and C1 controls (U+0080..U+009F).
+        const bool control = lead < 0x20u || lead == 0x7Fu ||
+            (lead == 0xC2u &&
+             static_cast<unsigned char>(utf8[i + 1]) < 0xA0u);
+        if (!control) {
+            if (input->text.size() + add.size() + n > kNdsChatTextMax) break;
+            add.append(utf8 + i, n);
+        }
+        i += n;
+    }
+    input->cursor = std::min(input->cursor, input->text.size());
+    input->text.insert(input->cursor, add);
+    input->cursor += add.size();
+}
+
+void nds_chat_edit_key(NdsChatOverlayInput* input, NdsChatEditKey key) {
+    if (!input) return;
+    std::string& s = input->text;
+    size_t& at = input->cursor;
+    at = std::min(at, s.size());
+    switch (key) {
+        case NdsChatEditKey::Backspace: {
+            const size_t from = PrevBoundary(s, at);
+            s.erase(from, at - from);
+            at = from;
+            break;
+        }
+        case NdsChatEditKey::Delete:
+            s.erase(at, NextBoundary(s, at) - at);
+            break;
+        case NdsChatEditKey::Left: at = PrevBoundary(s, at); break;
+        case NdsChatEditKey::Right: at = NextBoundary(s, at); break;
+        case NdsChatEditKey::Home: at = 0; break;
+        case NdsChatEditKey::End: at = s.size(); break;
+    }
+}
+
 void nds_chat_overlay_layout(int width, int height,
                              const std::vector<NdsChatLine>& lines,
                              const NdsChatOverlayInput& input, int64_t now_ms,
@@ -434,46 +517,6 @@ void nds_chat_overlay_layout(int width, int height,
     }
 }
 
-namespace {
-
-// Test aid: NDS_CHAT_DEMO=1 lists a sample line every few seconds, to see
-// the overlay without anybody to chat with.
-void DemoLines(int64_t now_ms) {
-    static const bool enabled = [] {
-        const char* env = std::getenv("NDS_CHAT_DEMO");
-        return env && env[0] == '1';
-    }();
-    if (!enabled) return;
-    static int64_t next_ms = 0;
-    static int index = 0;
-    if (now_ms < next_ms) return;
-    next_ms = now_ms + 3500;
-    static const struct {
-        const char* from;
-        const char* text;
-        NdsChatSource source;
-        bool self;
-    } kSamples[] = {
-        {"Ally", "Anyone up for the Quarantomb grotto?", NdsChatSource::Online,
-         false},
-        {"Me", "Sure, give me a minute to heal up", NdsChatSource::Lan, true},
-        {"Élodie", "Ça marche ! J'arrive tout de suite.", NdsChatSource::Lan,
-         false},
-        {"Ally", "This is a much longer line, to see how the chat wraps "
-                 "it across rows on the top screen without running off "
-                 "the edge.", NdsChatSource::Online, false},
-    };
-    const auto& s = kSamples[index++ % (sizeof(kSamples) / sizeof(*kSamples))];
-    NdsChatLine line;
-    line.from = s.from;
-    line.text = s.text;
-    line.source = s.source;
-    line.self = s.self;
-    nds_netplay_chat_push(std::move(line));
-}
-
-}  // namespace
-
 bool nds_chat_overlay_frame(int width, int height,
                             std::vector<NdsChatOverlayRect>* out) {
     out->clear();
@@ -481,7 +524,6 @@ bool nds_chat_overlay_frame(int width, int height,
     const int64_t now_ms =
         std::chrono::duration_cast<std::chrono::milliseconds>(
             std::chrono::steady_clock::now().time_since_epoch()).count();
-    DemoLines(now_ms);
     // Most frames: no chat open and nothing recent. Checked on the newest
     // line alone, before copying the list.
     static uint64_t cached_id = ~0ull;

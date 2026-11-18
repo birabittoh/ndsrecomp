@@ -3950,12 +3950,17 @@ int nds_run_interactive_frontend(const NdsFrontendOptions& initial_options) {
     int pinch_start_zoom = -1;
     bool pinch_changed_zoom = false;
 #endif
-    auto publish_keys = [&]() {
-        nds_set_key_mask(static_cast<uint16_t>(
+    // The netplay chat's input line (chat_overlay.h). While it is open the
+    // keyboard types into it and no host control reaches the guest.
+    NdsChatOverlayInput chat_input;
+    auto guest_key_mask = [&]() {
+        if (chat_input.open) return static_cast<uint16_t>(0x0FFFu);
+        return static_cast<uint16_t>(
             0x0FFFu &
             ~(keyboard_pressed | controller_pressed | mouse_pressed |
-              mph_prime_pressed | stick_pressed)));
+              mph_prime_pressed | stick_pressed));
     };
+    auto publish_keys = [&]() { nds_set_key_mask(guest_key_mask()); };
     publish_keys();
     nds_set_touch(0, 0, false);
     bool running = true;
@@ -4458,10 +4463,7 @@ int nds_run_interactive_frontend(const NdsFrontendOptions& initial_options) {
         g_input_debug.stick_pressed = stick_pressed;
         g_input_debug.pad_engaged = mph_prime_pad_engaged ? 1 : 0;
         g_input_debug.pad_aim_writes = mph_pad_aim_writes;
-        g_input_debug.published_key_mask = static_cast<uint16_t>(
-            0x0FFFu & ~(keyboard_pressed | controller_pressed |
-                        mouse_pressed | mph_prime_pressed |
-                        stick_pressed));
+        g_input_debug.published_key_mask = guest_key_mask();
         g_input_debug.relative_direct_writes = relative_direct_writes;
         g_input_debug.mph_prime_key_downs = mph_prime_key_downs;
         g_input_debug.mph_prime_mouse_downs = mph_prime_mouse_downs;
@@ -4493,6 +4495,170 @@ int nds_run_interactive_frontend(const NdsFrontendOptions& initial_options) {
         options.fullscreen != NdsFullscreenMode::Off
             ? options.fullscreen : NdsFullscreenMode::Borderless;
 
+    // Start opens the chat whenever a line would reach somebody (an online
+    // room, or LAN peers in session), and then never reaches the guest: DQ9
+    // uses it nowhere but the title screen, where the radio is off. Enter
+    // sends, Escape (Back on Android, B on a pad) closes; Start on a pad
+    // sends, or closes an empty line. The text comes from text input events,
+    // so the system's on-screen keyboard types too (Android shows it).
+    constexpr uint16_t kChatStartMask = 1u << 3;
+    constexpr uint16_t kChatBMask = 1u << 1;
+    bool chat_screen_keyboard_seen = false;
+    SDL_Window* chat_window = nullptr;
+    auto open_chat = [&]() {
+        chat_input = {};
+        chat_input.open = true;
+        chat_screen_keyboard_seen = false;
+        // Drop everything held, so nothing stays pressed for the guest
+        // underneath and nothing comes back by itself once the chat closes.
+        keyboard_pressed = controller_pressed = mouse_pressed = 0;
+        stick_pressed = 0;
+        clear_mph_prime_controls();
+        clear_virtual_stylus();
+        clear_tab_turbo();
+        mouse_down = false;
+        touch_release_pending = false;
+        nds_set_touch(0, 0, false);
+        right_mouse_button_held = touch_right_held = false;
+        touch_right_release_pending = false;
+        publish_right_mouse();
+#if defined(NDS_HAVE_SDL3)
+        if (pinch_changed_zoom) runtime_menu_save(&runtime_menu_state);
+        touch_fingers.clear();
+        pinch_start_zoom = -1;
+        pinch_changed_zoom = false;
+#endif
+        if (g_top_dragging) {
+            g_top_dragging = false;
+            nds_title_set_top_drag(0, 0, false);
+        }
+        publish_keys();
+        nds_chat_overlay_set_input(chat_input);
+        chat_window = SDL_GetKeyboardFocus();
+        if (!chat_window) chat_window = presentation.windows[0];
+#if defined(NDS_HAVE_SDL3)
+        SDL_PropertiesID props = SDL_CreateProperties();
+        SDL_SetBooleanProperty(props, SDL_PROP_TEXTINPUT_MULTILINE_BOOLEAN,
+                               false);
+        SDL_StartTextInputWithProperties(chat_window, props);
+        SDL_DestroyProperties(props);
+#else
+        SDL_StartTextInput();
+#endif
+    };
+    auto close_chat = [&]() {
+#if defined(NDS_HAVE_SDL3)
+        if (chat_window) SDL_StopTextInput(chat_window);
+#else
+        SDL_StopTextInput();
+#endif
+        chat_window = nullptr;
+        chat_input = {};
+        nds_chat_overlay_set_input(chat_input);
+        keyboard_pressed = controller_pressed = 0;
+        publish_keys();
+    };
+    auto send_chat = [&]() {
+        const NdsChatSendResult result = nds_netplay_chat_send(chat_input.text);
+        if (result == NdsChatSendResult::NoOne) {
+            NdsChatLine line;
+            line.source = NdsChatSource::System;
+            line.text = "Nobody else is here to read that.";
+            nds_netplay_chat_push(std::move(line));
+        }
+        close_chat();
+    };
+    auto chat_edited = [&]() { nds_chat_overlay_set_input(chat_input); };
+    // An event while the chat is open: true when it was input, which then
+    // goes to the chat and nowhere else.
+    auto chat_event = [&](const SDL_Event& event) {
+        switch (event.type) {
+            case SDL_KEYDOWN: {
+                const bool repeat = event.key.repeat != 0;
+                switch (sdl_event_scancode(event)) {
+                    case SDL_SCANCODE_RETURN:
+                    case SDL_SCANCODE_KP_ENTER:
+                        if (!repeat) send_chat();
+                        break;
+                    case SDL_SCANCODE_ESCAPE:
+                    case SDL_SCANCODE_AC_BACK:
+                        if (!repeat) close_chat();
+                        break;
+                    case SDL_SCANCODE_BACKSPACE:
+                        nds_chat_edit_key(&chat_input,
+                                          NdsChatEditKey::Backspace);
+                        chat_edited();
+                        break;
+                    case SDL_SCANCODE_DELETE:
+                        nds_chat_edit_key(&chat_input, NdsChatEditKey::Delete);
+                        chat_edited();
+                        break;
+                    case SDL_SCANCODE_LEFT:
+                        nds_chat_edit_key(&chat_input, NdsChatEditKey::Left);
+                        chat_edited();
+                        break;
+                    case SDL_SCANCODE_RIGHT:
+                        nds_chat_edit_key(&chat_input, NdsChatEditKey::Right);
+                        chat_edited();
+                        break;
+                    case SDL_SCANCODE_HOME:
+                        nds_chat_edit_key(&chat_input, NdsChatEditKey::Home);
+                        chat_edited();
+                        break;
+                    case SDL_SCANCODE_END:
+                        nds_chat_edit_key(&chat_input, NdsChatEditKey::End);
+                        chat_edited();
+                        break;
+                    default:
+                        break;
+                }
+                return true;
+            }
+#if defined(NDS_HAVE_SDL3)
+            case SDL_EVENT_TEXT_INPUT:
+#else
+            case SDL_TEXTINPUT:
+#endif
+                nds_chat_edit_insert(&chat_input, event.text.text);
+                chat_edited();
+                return true;
+            case SDL_CONTROLLERBUTTONDOWN: {
+                const uint16_t mask = gamepad_button_mask(
+                    options, static_cast<SDL_GameControllerButton>(
+                                 sdl_controller_button(event)));
+                if (mask & kChatStartMask) {
+                    if (chat_input.text.empty()) close_chat();
+                    else send_chat();
+                } else if (mask & kChatBMask) {
+                    close_chat();
+                }
+                return true;
+            }
+#if defined(NDS_HAVE_SDL3)
+            case SDL_EVENT_SCREEN_KEYBOARD_SHOWN:
+                chat_screen_keyboard_seen = true;
+                return true;
+            case SDL_EVENT_SCREEN_KEYBOARD_HIDDEN:
+                // Dismissed on a touchscreen: nothing would type any more.
+                if (chat_screen_keyboard_seen) close_chat();
+                return true;
+            case SDL_EVENT_TEXT_EDITING:
+            case SDL_EVENT_FINGER_DOWN:
+            case SDL_EVENT_FINGER_UP:
+            case SDL_EVENT_FINGER_MOTION:
+            case SDL_EVENT_FINGER_CANCELED:
+#endif
+            case SDL_KEYUP:
+            case SDL_CONTROLLERBUTTONUP:
+            case SDL_MOUSEBUTTONDOWN:
+            case SDL_MOUSEBUTTONUP:
+            case SDL_MOUSEMOTION:
+            case SDL_MOUSEWHEEL:
+                return true;
+            default:
+                return false;
+        }
+    };
     auto show_savestate_result = [&](const NdsSavestateSlotResult& result) {
         savestate_notice = result.message;
         savestate_notice_until = SDL_GetPerformanceCounter() + frequency * 4u;
@@ -4921,6 +5087,22 @@ int nds_run_interactive_frontend(const NdsFrontendOptions& initial_options) {
                     }
                     continue;
                 }
+            }
+            if (chat_input.open) {
+                if (chat_event(event)) continue;
+            } else if (nds_netplay_chat_reachable() &&
+                       ((event.type == SDL_KEYDOWN && !event.key.repeat &&
+                         (nds_binding_mask(options.keyboard_bindings,
+                                           sdl_event_scancode(event)) &
+                          kChatStartMask)) ||
+                        (event.type == SDL_CONTROLLERBUTTONDOWN &&
+                         (gamepad_button_mask(
+                              options,
+                              static_cast<SDL_GameControllerButton>(
+                                  sdl_controller_button(event))) &
+                          kChatStartMask)))) {
+                open_chat();
+                continue;
             }
             if (event.type == SDL_KEYDOWN && !event.key.repeat) {
                 const SDL_Scancode scancode = sdl_event_scancode(event);

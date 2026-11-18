@@ -34,6 +34,13 @@ struct NdsChatOverlayInput {
 void nds_chat_overlay_set_input(const NdsChatOverlayInput& input);
 NdsChatOverlayInput nds_chat_overlay_input();
 
+// Editing the line being typed; the cursor stays on a character boundary.
+// Inserting drops control characters and whatever would take the text past
+// kNdsChatTextMax bytes, cutting only between characters.
+void nds_chat_edit_insert(NdsChatOverlayInput* input, const char* utf8);
+enum class NdsChatEditKey : uint8_t { Backspace, Delete, Left, Right, Home, End };
+void nds_chat_edit_key(NdsChatOverlayInput* input, NdsChatEditKey key);
+
 // Glyph cell: 5x8 pixels (7 above the baseline, 1 below) in a 6x9 cell.
 constexpr int kNdsChatCellWidth = 6;
 constexpr int kNdsChatCellHeight = 9;
