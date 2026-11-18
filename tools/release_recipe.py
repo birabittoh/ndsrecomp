@@ -9,12 +9,20 @@ how to rebuild each of A's code files from those copies plus the same file
 of release B, so a player who owns B can run the build:
 
     usage: release_recipe.py make BASE OTHER RECOMP OUT [--report out.json]
-           release_recipe.py apply RECIPE OTHER RECOMP OUTDIR   (self-check)
+           release_recipe.py blank RECIPE OUT
+           release_recipe.py fill RECIPE BASE RECOMP OUT
 
 BASE and OTHER are unpacked ROMs (nds_folder.py), RECOMP the generated bank
 directory. `make` checks that applying the recipe to OTHER gives back BASE's
 files byte for byte before writing it, and prints how many bytes the recipe
 has to carry itself (literals): those are the only bytes of BASE in it.
+
+`blank` zeroes the literals, leaving a recipe with no bytes of BASE at
+all, which can be kept in version control. `fill` puts them back from BASE
+and checks the recipe still works with the banks in RECOMP (every KNOWN
+span still covered by validation copies that agree with BASE), so someone
+who owns BASE only can build. What a recipe takes from OTHER cannot change:
+OTHER is a fixed image, named by its SHA-1.
 
 Code files are rebuilt decompressed. "header.bin" is the header's first
 0x20 bytes (title, game code, ...), written over OTHER's. Everything else
@@ -544,6 +552,143 @@ def make(args):
         args.report.write_text(json.dumps(report, indent=1) + "\n")
 
 
+def parse(blob: bytes):
+    """(base SHA-1, other SHA-1, [file dicts]) of a recipe."""
+    if blob[:4] != MAGIC:
+        raise SystemExit("not a recipe")
+    version, = struct.unpack_from("<I", blob, 4)
+    if version != VERSION:
+        raise SystemExit(f"recipe version {version}, expected {VERSION}")
+    base_sha1, other_sha1 = blob[8:28], blob[28:48]
+    count, = struct.unpack_from("<I", blob, 48)
+    pos, files = 52, []
+    for _ in range(count):
+        n, = struct.unpack_from("<H", blob, pos)
+        name = blob[pos + 2:pos + 2 + n].decode()
+        pos += 2 + n
+        n, = struct.unpack_from("<H", blob, pos)
+        bank = blob[pos + 2:pos + 2 + n].decode()
+        pos += 2 + n
+        size, = struct.unpack_from("<I", blob, pos)
+        sha1 = blob[pos + 4:pos + 24]
+        nseg, = struct.unpack_from("<I", blob, pos + 24)
+        pos += 28
+        segments = [struct.unpack_from("<III", blob, pos + 12 * i)
+                    for i in range(nseg)]
+        pos += 12 * nseg
+        nops, = struct.unpack_from("<I", blob, pos)
+        ops = blob[pos + 4:pos + 4 + nops]
+        pos += 4 + nops
+        files.append(dict(name=name, bank=bank, size=size, sha1=sha1,
+                          segments=segments, ops=ops, ops_at=pos - nops))
+    if pos != len(blob):
+        raise SystemExit(f"{len(blob) - pos} bytes after the last file")
+    return base_sha1, other_sha1, files
+
+
+def literals(ops):
+    """(file position, op position, length) of each LIT's bytes."""
+    out = []
+    pos = p = 0
+    while p < len(ops):
+        kind = ops[p]
+        p += 1
+        if kind in (KNOWN, COPY, LIT):
+            n, p = read_leb(ops, p)
+            if kind == LIT:
+                out.append((pos, p, n))
+                p += n
+            pos += n
+        elif kind == SHIFT:
+            _, p = read_leb(ops, p)
+        elif kind in (WORD, BL):
+            _, p = read_leb(ops, p)
+            pos += 4
+        else:
+            raise SystemExit(f"bad op {kind}")
+    return out
+
+
+def known_spans(ops):
+    """(file position, length) of each KNOWN op, and the bytes covered."""
+    out = []
+    pos = p = 0
+    while p < len(ops):
+        kind = ops[p]
+        p += 1
+        if kind in (KNOWN, COPY, LIT):
+            n, p = read_leb(ops, p)
+            if kind == KNOWN:
+                out.append((pos, n))
+            elif kind == LIT:
+                p += n
+            pos += n
+        elif kind == SHIFT:
+            _, p = read_leb(ops, p)
+        elif kind in (WORD, BL):
+            _, p = read_leb(ops, p)
+            pos += 4
+    return out, pos
+
+
+def blank(args):
+    blob = bytearray(args.recipe.read_bytes())
+    _base, _other, files = parse(bytes(blob))
+    count = 0
+    for f in files:
+        for _pos, at, n in literals(f["ops"]):
+            blob[f["ops_at"] + at:f["ops_at"] + at + n] = bytes(n)
+            count += n
+    args.out.write_bytes(bytes(blob))
+    print(f"{args.out}: {count} literal bytes blanked")
+
+
+def fill(args):
+    blob = bytearray(args.recipe.read_bytes())
+    base_sha1, _other, files = parse(bytes(blob))
+    if base_sha1 != folder_sha1(args.base):
+        raise SystemExit(f"{args.recipe} rebuilds {base_sha1.hex()}, "
+                         f"not {args.base}")
+    base = code_files(args.base)
+    base["header.bin"] = ((args.base / "header.bin").read_bytes()
+                          [:HEADER_IDENTITY], 0, "", None)
+    names = {f["name"] for f in files}
+    problems = [f"{name}: not in the recipe" for name in base if name not in names]
+    for f in files:
+        if f["name"] not in base:
+            problems.append(f"{f['name']}: not a code file of {args.base}")
+            continue
+        target = base[f["name"]][0]
+        if f["size"] != len(target):
+            problems.append(f"{f['name']}: size {f['size']:#x}, "
+                            f"{args.base} has {len(target):#x}")
+            continue
+        rows = []
+        if f["bank"]:
+            source = args.recomp / f"{f['bank']}_dispatch.c"
+            if not source.is_file():
+                problems.append(f"{f['name']}: {source} missing")
+                continue
+            rows = list(validation_rows(source))
+        known, have = known_bytes(rows, f["segments"], f["size"])
+        spans, covered = known_spans(f["ops"])
+        if covered != f["size"]:
+            problems.append(f"{f['name']}: ops cover {covered:#x} of "
+                            f"{f['size']:#x} bytes")
+        bad = [pos for pos, n in spans
+               if not all(have[pos:pos + n])
+               or known[pos:pos + n] != target[pos:pos + n]]
+        if bad:
+            problems.append(f"{f['name']}: {len(bad)} spans no longer match "
+                            f"the banks (first at {bad[0]:#x})")
+        for pos, at, n in literals(f["ops"]):
+            blob[f["ops_at"] + at:f["ops_at"] + at + n] = target[pos:pos + n]
+    if problems:
+        raise SystemExit("\n".join([f"{args.recipe} is stale:"] + problems))
+    args.out.write_bytes(bytes(blob))
+    print(f"{args.out}: filled from {args.base}, matches {args.recomp}")
+
+
 def main():
     parser = argparse.ArgumentParser(
         description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -563,9 +708,21 @@ def main():
                         "padding that need not be BASE's (e.g. the ARM9 "
                         "secure area's filler); repeatable")
     m.add_argument("--report", type=Path)
+    b = sub.add_parser("blank")
+    b.add_argument("recipe", type=Path)
+    b.add_argument("out", type=Path)
+    f = sub.add_parser("fill")
+    f.add_argument("recipe", type=Path)
+    f.add_argument("base", type=Path)
+    f.add_argument("recomp", type=Path)
+    f.add_argument("out", type=Path)
     args = parser.parse_args()
     if args.command == "make":
         make(args)
+    elif args.command == "blank":
+        blank(args)
+    elif args.command == "fill":
+        fill(args)
 
 
 if __name__ == "__main__":
