@@ -20,9 +20,12 @@
 #include <vector>
 
 // Where a button sits. BottomRight ones make a row from the bottom right
-// corner leftwards, in the order they were registered; the others sit
-// halfway down the left or right edge.
-enum class NdsTouchButtonPlace : uint8_t { BottomRight, LeftMiddle, RightMiddle };
+// corner leftwards, in the order they were registered; LeftMiddle and
+// RightMiddle sit halfway down the left or right edge, TopCenter and
+// BottomCenter halfway along the top or bottom edge.
+enum class NdsTouchButtonPlace : uint8_t {
+    BottomRight, LeftMiddle, RightMiddle, TopCenter, BottomCenter
+};
 
 // Each button, and the room between buttons and to the screen's edges.
 constexpr int kNdsTouchButtonWidth = 22;
@@ -40,6 +43,15 @@ struct NdsTouchButtonSpec {
     // Whether it shows, asked by nds_touch_buttons_update; nullptr for a
     // button shown and hidden with nds_touch_button_set_shown.
     bool (*shown)();
+    // A latch: a tap holds its keys past the press, until the next touch on
+    // the touchscreen ends (a pick from a menu those keys bring up) and a
+    // few frames more, a second tap on it, or focus loss; drawn as on
+    // meanwhile.
+    bool latch = false;
+    // For a latch: the keys a touchscreen press at (x, y) (DS pixels) adds
+    // to its own, instead of the touch, for a pick made with keys (a pad
+    // direction); 0, or nullptr, lets the touch through as a touch.
+    uint16_t (*touch_keys)(int x, int y) = nullptr;
 };
 
 constexpr int kNdsTouchButtonMax = 8;
@@ -53,6 +65,18 @@ int nds_touch_button_chat();
 // The runner's send button, in the chat button's place while a chat line is
 // being typed (in the chat panel or the title's own text entry): sends it.
 int nds_touch_button_send();
+
+// The runner's fast-forward button, top center: a press turns fast-forward
+// on or off (as holding Tab does while held). Hidden unless a title gives
+// it a query (nds_touch_button_set_query).
+int nds_touch_button_fast_forward();
+
+// Gives a button (one of the runner's, say) a query that
+// nds_touch_buttons_update asks in place of its spec's.
+void nds_touch_button_set_query(int id, bool (*shown)());
+
+// Whether a button draws as on (lit, dark icon), for a toggle.
+void nds_touch_button_set_active(int id, bool active);
 
 // Whether a button shows. Safe from any thread.
 void nds_touch_button_set_shown(int id, bool shown);

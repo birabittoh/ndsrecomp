@@ -1062,30 +1062,38 @@ bool touch_ui_unscale(float* x, float* y) {
            *y < kScreenHeight;
 }
 
-void set_touch_from_mouse(float x, float y, bool down,
-                          NdsScreenLayout layout, int logical_width) {
-    // Coordinates are expected in the renderer's logical DS-space.
+// The touchscreen point (DS pixels) under a pointer in the renderer's
+// logical DS-space; false when it is off the touchscreen.
+bool touch_point_from_mouse(float x, float y, NdsScreenLayout layout,
+                            int logical_width, uint16_t* touch_x,
+                            uint16_t* touch_y) {
     const float bottom_origin =
         layout == NdsScreenLayout::Separate ||
                 layout == NdsScreenLayout::Single
             ? 0.0f : kScreenHeight;
     const float left =
         static_cast<float>((logical_width - kScreenWidth) / 2);
-    if (!down || x < left || x >= left + kScreenWidth ||
-        y < bottom_origin || y >= bottom_origin + kScreenHeight) {
-        nds_set_touch(0, 0, false);
-        return;
-    }
+    if (x < left || x >= left + kScreenWidth || y < bottom_origin ||
+        y >= bottom_origin + kScreenHeight)
+        return false;
     float ds_x = x - left;
     float ds_y = y - bottom_origin;
-    if (!touch_ui_unscale(&ds_x, &ds_y)) {
+    if (!touch_ui_unscale(&ds_x, &ds_y)) return false;
+    *touch_x = static_cast<uint16_t>(std::clamp<int>(
+        static_cast<int>(ds_x), 0, kScreenWidth - 1));
+    *touch_y = static_cast<uint16_t>(std::clamp<int>(
+        static_cast<int>(ds_y), 0, kScreenHeight - 1));
+    return true;
+}
+
+void set_touch_from_mouse(float x, float y, bool down,
+                          NdsScreenLayout layout, int logical_width) {
+    uint16_t touch_x = 0, touch_y = 0;
+    if (!down || !touch_point_from_mouse(x, y, layout, logical_width,
+                                         &touch_x, &touch_y)) {
         nds_set_touch(0, 0, false);
         return;
     }
-    const auto touch_x = static_cast<uint16_t>(std::clamp<int>(
-        static_cast<int>(ds_x), 0, kScreenWidth - 1));
-    const auto touch_y = static_cast<uint16_t>(std::clamp<int>(
-        static_cast<int>(ds_y), 0, kScreenHeight - 1));
     nds_set_touch(touch_x, touch_y, true);
 }
 
@@ -3843,7 +3851,7 @@ int nds_run_interactive_frontend(const NdsFrontendOptions& initial_options) {
 
     std::fprintf(stderr,
         "[sdl] controls: gamepad=Player 1 | bottom mouse=touch | "
-        "Esc=settings | hold Tab=fast-forward\n");
+        "Esc=settings | hold Tab or RT=fast-forward\n");
     std::fputs("[sdl] keyboard:", stderr);
     for (size_t row = 0; row < options.keyboard_bindings.size(); ++row)
         std::fprintf(stderr, " %s=%s", kNdsButtonNames[row],
@@ -3990,14 +3998,30 @@ int nds_run_interactive_frontend(const NdsFrontendOptions& initial_options) {
     // and the DS keys it holds.
     int touch_button_held = -1;
     uint16_t touch_button_pressed = 0;
+    // A latch button's (NdsTouchButtonSpec::latch) keys, held from its tap
+    // until the next touchscreen press ends, -1 / 0 for none; the frames
+    // left before they go, once that press has ended (the guest sees the
+    // release with the keys still down), -1 while it has not.
+    int touch_button_latched = -1;
+    uint16_t touch_button_latched_pressed = 0;
+    int touch_button_latch_frames = -1;
     auto guest_key_mask = [&]() {
         if (chat_input.open) return static_cast<uint16_t>(0x0FFFu);
         return static_cast<uint16_t>(
             0x0FFFu &
             ~(keyboard_pressed | controller_pressed | mouse_pressed |
-              mph_prime_pressed | stick_pressed | touch_button_pressed));
+              mph_prime_pressed | stick_pressed | touch_button_pressed |
+              touch_button_latched_pressed));
     };
     auto publish_keys = [&]() { nds_set_key_mask(guest_key_mask()); };
+    auto release_touch_latch = [&]() {
+        if (touch_button_latched < 0) return;
+        nds_touch_button_set_active(touch_button_latched, false);
+        touch_button_latched = -1;
+        touch_button_latched_pressed = 0;
+        touch_button_latch_frames = -1;
+        publish_keys();
+    };
     auto release_touch_button = [&]() {
         touch_button_held = -1;
         touch_button_pressed = 0;
@@ -4415,6 +4439,11 @@ int nds_run_interactive_frontend(const NdsFrontendOptions& initial_options) {
     bool audio_queue_error = false;
     uint64_t audio_presentation_epoch = nds_spu_presentation_epoch();
     bool turbo_pressed = false;
+    // Fast-forward held on the pad's right trigger, when Prime's controls
+    // and the virtual stylus leave it free.
+    bool turbo_pad_pressed = false;
+    // Fast-forward turned on with the on-screen button (touch_buttons.h).
+    bool turbo_toggled = false;
     bool turbo_active = false;
     bool turbo_audio = false;  // turbo_active with fast_forward_volume > 0
     bool focus_release_pending = false;
@@ -4557,6 +4586,11 @@ int nds_run_interactive_frontend(const NdsFrontendOptions& initial_options) {
         stick_pressed = 0;
         touch_button_held = -1;
         touch_button_pressed = 0;
+        if (touch_button_latched >= 0)
+            nds_touch_button_set_active(touch_button_latched, false);
+        touch_button_latched = -1;
+        touch_button_latched_pressed = 0;
+        touch_button_latch_frames = -1;
         clear_mph_prime_controls();
         clear_virtual_stylus();
         clear_tab_turbo();
@@ -5141,6 +5175,16 @@ int nds_run_interactive_frontend(const NdsFrontendOptions& initial_options) {
         if (touch_button_held >= 0 &&
             !nds_touch_button_shown(touch_button_held))
             release_touch_button();
+        // The fast-forward toggle goes off with its button.
+        if (turbo_toggled &&
+            !nds_touch_button_shown(nds_touch_button_fast_forward()))
+            turbo_toggled = false;
+        // Lit while it is on, from the toggle, a held Tab or RT.
+        nds_touch_button_set_active(
+            nds_touch_button_fast_forward(),
+            turbo_toggled || turbo_pressed || turbo_pad_pressed);
+        if (touch_button_latch_frames > 0 && --touch_button_latch_frames == 0)
+            release_touch_latch();
         SDL_Event event{};
         while (SDL_PollEvent(&event)) {
             convert_mouse_event_to_logical_coordinates(event, presentation);
@@ -5162,6 +5206,7 @@ int nds_run_interactive_frontend(const NdsFrontendOptions& initial_options) {
                 is_presentation_window(event.window.windowID)) {
                 // The release may never come.
                 if (touch_button_held >= 0) release_touch_button();
+                release_touch_latch();
                 chat_press = {};
                 const int index =
                     presentation_window_focus_index(event.window.windowID);
@@ -5287,8 +5332,19 @@ int nds_run_interactive_frontend(const NdsFrontendOptions& initial_options) {
                     nds_netplay_chat_game_keyboard_start();
                 } else if (const NdsTouchButtonSpec* spec =
                                nds_touch_button_spec(button)) {
+                    if (button == nds_touch_button_fast_forward()) {
+                        turbo_toggled = !turbo_toggled;
+                        nds_touch_button_set_active(button, turbo_toggled);
+                    }
+                    const bool was_latched = button == touch_button_latched;
+                    release_touch_latch();
+                    if (spec->latch && !was_latched) {
+                        touch_button_latched = button;
+                        touch_button_latched_pressed = spec->keys;
+                        nds_touch_button_set_active(button, true);
+                    }
                     touch_button_held = button;
-                    touch_button_pressed = spec->keys;
+                    touch_button_pressed = spec->latch ? 0 : spec->keys;
                     publish_keys();
                 }
                 continue;
@@ -5676,6 +5732,28 @@ int nds_run_interactive_frontend(const NdsFrontendOptions& initial_options) {
                           event.button.y < kScreenHeight
                     : stacked_left_route ==
                           NdsStackedRelativeMouseRoute::Touchscreen)) {
+                // A latch button's pick: the touch becomes the keys its
+                // spec gives for the point, held with the latch's for a
+                // few frames, and the guest sees no touch.
+                const NdsTouchButtonSpec* latch_spec =
+                    touch_button_latched >= 0 && touch_button_latch_frames < 0
+                        ? nds_touch_button_spec(touch_button_latched)
+                        : nullptr;
+                uint16_t pick_x = 0, pick_y = 0;
+                const uint16_t pick_keys =
+                    latch_spec && latch_spec->touch_keys &&
+                            touch_point_from_mouse(
+                                event.button.x, event.button.y,
+                                options.screen_layout, bottom_logical_width,
+                                &pick_x, &pick_y)
+                        ? latch_spec->touch_keys(pick_x, pick_y)
+                        : 0;
+                if (pick_keys) {
+                    touch_button_latched_pressed |= pick_keys;
+                    touch_button_latch_frames = 6;
+                    publish_keys();
+                    continue;
+                }
                 mouse_down = true;
                 ++host_touch_presses;
                 last_touch_event_x = event.button.x;
@@ -5692,6 +5770,8 @@ int nds_run_interactive_frontend(const NdsFrontendOptions& initial_options) {
                 event.button.windowID == presentation.window_ids[1] &&
                 mouse_down) {
                 mouse_down = false;
+                if (touch_button_latched >= 0 && touch_button_latch_frames < 0)
+                    touch_button_latch_frames = 6;
                 // A host click can begin and end while the emulation thread is
                 // rendering one slow frame. Keep such a click asserted long
                 // enough for the ARM7 touchscreen polling path to observe it.
@@ -5893,6 +5973,15 @@ int nds_run_interactive_frontend(const NdsFrontendOptions& initial_options) {
             stick_dir(ly, 1u << 6, false);   // Up (SDL Y axis points down)
             stick_dir(ly, 1u << 7, true);    // Down
 
+            // Right trigger held -> fast-forward, as Tab.
+            if (!virtual_stylus_available && !mph_prime_controls_available) {
+                const int rt = SDL_GameControllerGetAxis(
+                    controller, SDL_CONTROLLER_AXIS_TRIGGERRIGHT);
+                turbo_pad_pressed = rt > (turbo_pad_pressed ? 6554 : 9830);
+            } else {
+                turbo_pad_pressed = false;
+            }
+
             // Right stick up/down -> a title's zoom (title_settings.h): up
             // lowers the value, down raises it, at a speed that follows the
             // deflection (up to 15 units, 1.5%, a frame). The stick belongs to the
@@ -6041,6 +6130,7 @@ int nds_run_interactive_frontend(const NdsFrontendOptions& initial_options) {
                 }
             }
         } else {
+            turbo_pad_pressed = false;
             if (stick_pressed != 0) {
                 stick_pressed = 0;
                 publish_keys();
@@ -6080,7 +6170,9 @@ int nds_run_interactive_frontend(const NdsFrontendOptions& initial_options) {
                 MphPrimeAction::VirtualStylus)];
         const bool generic_virtual_stylus = virtual_stylus_active();
 
-        const bool turbo_want = turbo_pressed || nds_debug_turbo();
+        const bool turbo_want =
+            turbo_pressed || turbo_pad_pressed || turbo_toggled ||
+            nds_debug_turbo();
         if (turbo_want != turbo_active) {
             turbo_active = turbo_want;
             turbo_audio = turbo_active && options.audio_fast_forward_volume > 0;

@@ -14,6 +14,9 @@ static_assert(kNdsTouchButtonWidth == 11 * kCell &&
               "icons are 11 x 9 cells");
 constexpr uint32_t kBack = 0xA0000000u;
 constexpr uint32_t kLit = 0xFFFFFFFFu;
+// A button that is on (a toggle): the other way round.
+constexpr uint32_t kActiveBack = 0xE0FFFFFFu;
+constexpr uint32_t kActiveLit = 0xFF000000u;
 // Extra DS pixels around a button that still count as a press on it.
 constexpr float kSlack = 4.0f;
 
@@ -21,6 +24,8 @@ constexpr float kSlack = 4.0f;
 std::atomic<const NdsTouchButtonSpec*> g_specs[kNdsTouchButtonMax] = {};
 std::atomic<int> g_count{0};
 std::atomic<bool> g_shown[kNdsTouchButtonMax] = {};
+std::atomic<bool> g_active[kNdsTouchButtonMax] = {};
+std::atomic<bool (*)()> g_query[kNdsTouchButtonMax] = {};
 
 const NdsTouchButtonSpec kChat = {
     {
@@ -58,6 +63,24 @@ const NdsTouchButtonSpec kSend = {
     nullptr,
 };
 
+const NdsTouchButtonSpec kFastForward = {
+    {
+        // Two arrow heads pointing right.
+        "...........",
+        ".#....#....",
+        ".##...##...",
+        ".###..###..",
+        ".####.####.",
+        ".###..###..",
+        ".##...##...",
+        ".#....#....",
+        "...........",
+    },
+    NdsTouchButtonPlace::TopCenter,
+    0,
+    nullptr,
+};
+
 struct Box {
     int id;
     int x, y;
@@ -84,6 +107,15 @@ int Boxes(int ds_width, Box out[kNdsTouchButtonMax]) {
                 break;
             case NdsTouchButtonPlace::RightMiddle:
                 x = ds_width - kNdsTouchButtonMargin - kNdsTouchButtonWidth;
+                break;
+            case NdsTouchButtonPlace::TopCenter:
+                x = (ds_width - kNdsTouchButtonWidth) / 2;
+                y = kNdsTouchButtonMargin;
+                break;
+            case NdsTouchButtonPlace::BottomCenter:
+                x = (ds_width - kNdsTouchButtonWidth) / 2;
+                y = kScreenHeight - kNdsTouchButtonMargin -
+                    kNdsTouchButtonHeight;
                 break;
         }
         if (x < 0) continue;
@@ -120,6 +152,21 @@ int nds_touch_button_send() {
     return id;
 }
 
+int nds_touch_button_fast_forward() {
+    static const int id = nds_touch_button_register(&kFastForward);
+    return id;
+}
+
+void nds_touch_button_set_query(int id, bool (*shown)()) {
+    if (id >= 0 && id < kNdsTouchButtonMax)
+        g_query[id].store(shown, std::memory_order_release);
+}
+
+void nds_touch_button_set_active(int id, bool active) {
+    if (id >= 0 && id < kNdsTouchButtonMax)
+        g_active[id].store(active, std::memory_order_release);
+}
+
 void nds_touch_button_set_shown(int id, bool shown) {
     if (id >= 0 && id < kNdsTouchButtonMax)
         g_shown[id].store(shown, std::memory_order_release);
@@ -135,8 +182,10 @@ void nds_touch_buttons_update() {
     for (int id = 0; id < count && id < kNdsTouchButtonMax; ++id) {
         const NdsTouchButtonSpec* spec =
             g_specs[id].load(std::memory_order_acquire);
-        if (spec && spec->shown)
-            g_shown[id].store(spec->shown(), std::memory_order_release);
+        bool (*shown)() = g_query[id].load(std::memory_order_acquire);
+        if (!shown && spec) shown = spec->shown;
+        if (spec && shown)
+            g_shown[id].store(shown(), std::memory_order_release);
     }
 }
 
@@ -146,8 +195,9 @@ void nds_touch_buttons_layout(int ds_width,
     const int n = Boxes(ds_width, boxes);
     for (int i = 0; i < n; ++i) {
         const Box& b = boxes[i];
+        const bool active = g_active[b.id].load(std::memory_order_acquire);
         out->push_back({b.x, b.y, kNdsTouchButtonWidth, kNdsTouchButtonHeight,
-                        kBack});
+                        active ? kActiveBack : kBack});
         const NdsTouchButtonSpec* spec = nds_touch_button_spec(b.id);
         for (int r = 0; r < kNdsTouchButtonArtRows; ++r) {
             const char* row = spec->art[r];
@@ -159,7 +209,8 @@ void nds_touch_buttons_layout(int ds_width,
                 while (c + run < len && c + run < 11 && row[c + run] == '#')
                     ++run;
                 out->push_back({b.x + c * kCell, b.y + r * kCell,
-                                run * kCell, kCell, kLit});
+                                run * kCell, kCell,
+                                active ? kActiveLit : kLit});
                 c += run;
             }
         }
