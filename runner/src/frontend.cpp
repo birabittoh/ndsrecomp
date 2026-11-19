@@ -3568,6 +3568,8 @@ int nds_run_interactive_frontend(const NdsFrontendOptions& initial_options) {
     SDL_SetHint(SDL_HINT_APP_ID, options.app_name.empty()
                                      ? "ndsrecomp" : options.app_name.c_str());
 #endif
+    // Gamepads keep driving the game while its window is not focused.
+    SDL_SetHint(SDL_HINT_JOYSTICK_ALLOW_BACKGROUND_EVENTS, "1");
 #if defined(__ANDROID__)
     // Any orientation the sensor reports: the window follows the rotation,
     // and in portrait the single layout puts the second screen above the
