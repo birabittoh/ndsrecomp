@@ -186,21 +186,20 @@ void nds_gpu2d_invalidate_hd_frame();
 // A title names engine A text BGs (bg_mask bit n = BGn, n = 1..3) that hold
 // its windows, and with bit 4 (the BLDCNT OBJ bit) all of engine A's OBJs
 // too (cursors, icons drawn over the windows); OBJs go into the layer only
-// on frames that also split a BG (or, with bit 4 alone, by themselves), and
-// only when EVA + EVB = 16 (their semi-transparency blends in any mode). On a presenter that can draw a layer image, engine A's LCD
-// (the HD screen, nds_gpu2d_set_hd_screen) is then presented split: those
-// BGs alone into a straight-alpha image, shown at `scale` of the game rect
-// about the native point
-// (anchor_x, anchor_y), and the rest of the stack without them (the CPU
-// image and the HD surfaces alike). The guest framebuffer, display capture
-// and nds_gpu2d_framebuffer() keep the full composite.
+// on frames that also split a BG (or, with bit 4 alone, by themselves). On
+// a presenter that can draw a layer image, engine A's LCD (the HD screen,
+// nds_gpu2d_set_hd_screen) is then presented split: those BGs alone into a
+// premultiplied-alpha image, shown at `scale` of the game rect about the
+// native point (anchor_x, anchor_y), and the rest of the stack without them
+// (the CPU image and the HD surfaces alike). The guest framebuffer, display
+// capture and nds_gpu2d_framebuffer() keep the full composite.
 //
-// The split is exact for alpha blending only when EVA + EVB = 16 (then
-// EVA*A + EVB*B is A at alpha EVA/16 over B); a frame whose masked BGs
-// would need another blend is presented unsplit. A masked BG is drawn over
-// every unmasked layer, so an unmasked layer above it (an OBJ left out of
-// the mask) would be hidden where they overlap. Native aspect only (output width 256), and
-// not combined with the adaptive HUD anchor.
+// The split is exact for any alpha blend of a masked BG over the rest:
+// EVA*A + EVB*B is the colour EVA/16 * A at alpha 1 - EVB/16 over B. A
+// masked BG is drawn over every unmasked layer, so an unmasked layer above
+// it (an OBJ left out of the mask) would be hidden where they overlap.
+// Native aspect only (output width 256), and not combined with the adaptive
+// HUD anchor.
 //
 // bg_mask 0 or scale >= 1 turns it off. Title thread; latched by the
 // adaptive compositor when it runs for the frame.
@@ -220,7 +219,7 @@ void nds_gpu2d_set_fixed_layers_consumer(bool enabled);
 bool nds_gpu2d_fixed_layers_requested();
 struct NdsGpu2dFixedLayersFrame {
     const uint32_t* base;   // 256 x 192, 0xFFRRGGBB: the stack without them
-    const uint32_t* layer;  // 256 x 192, straight alpha ARGB: them alone
+    const uint32_t* layer;  // 256 x 192, premultiplied ARGB: them alone
     float scale;
     uint16_t anchor_x;      // native pixels
     uint16_t anchor_y;

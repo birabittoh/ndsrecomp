@@ -95,6 +95,9 @@ constexpr uint64_t kImageBytes = uint64_t(kRowPitch) * kHeight;
 // Mirrors blit.frag.hlsl.
 constexpr uint32_t kBlitBoxResolve = 1u;
 constexpr uint32_t kBlitKeepAlpha = 2u;
+// Host only (the shader ignores it): with kBlitKeepAlpha, the image's colour
+// is premultiplied by its alpha, drawn with (ONE, INV_SRC_ALPHA).
+constexpr uint32_t kBlitPremultiplied = 4u;
 struct BlitConstants {
     uint32_t flags;
     uint32_t pad;
@@ -178,6 +181,7 @@ struct Backend {
     std::unique_ptr<RenderShader> blit_shader;
     std::unique_ptr<RenderPipeline> opaque_pipeline;
     std::unique_ptr<RenderPipeline> blended_pipeline;
+    std::unique_ptr<RenderPipeline> premultiplied_pipeline;
     std::unique_ptr<RenderPipelineLayout> compose_layout;
     std::unique_ptr<RenderShader> compose_shader;
     std::unique_ptr<RenderPipeline> compose_pipeline;
@@ -404,7 +408,13 @@ bool create_pipelines() {
     // ONE_MINUS_SRC_ALPHA) in the GL presenter.
     desc.renderTargetBlend[0] = RenderBlendDesc::AlphaBlend();
     g_backend.blended_pipeline = g_backend.device->createGraphicsPipeline(desc);
-    if (!g_backend.opaque_pipeline || !g_backend.blended_pipeline) return false;
+    // The fixed-size layer is premultiplied (nds_compute_host_set_layer).
+    desc.renderTargetBlend[0].srcBlend = RenderBlend::ONE;
+    g_backend.premultiplied_pipeline =
+        g_backend.device->createGraphicsPipeline(desc);
+    if (!g_backend.opaque_pipeline || !g_backend.blended_pipeline ||
+        !g_backend.premultiplied_pipeline)
+        return false;
 
     // The HD composite writes opaque swap-chain-format pixels, into the rect
     // or into an offscreen target of the same format.
@@ -713,6 +723,7 @@ void release_backend() {
     g_backend.release_semaphores.clear();
     g_backend.swap_chain.reset();
     g_backend.blended_pipeline.reset();
+    g_backend.premultiplied_pipeline.reset();
     g_backend.opaque_pipeline.reset();
     g_backend.compose_pipeline.reset();
     g_backend.compose_shader.reset();
@@ -845,9 +856,11 @@ void record_blit(FrameSlot& slot, RenderDescriptorSet* set, const NdsPresentRect
     commands.setGraphicsPipelineLayout(g_backend.layout.get());
     set->setSampler(1, linear ? g_backend.linear.get()
                               : g_backend.nearest.get());
-    commands.setPipeline((flags & kBlitKeepAlpha)
-                             ? g_backend.blended_pipeline.get()
-                             : g_backend.opaque_pipeline.get());
+    commands.setPipeline(
+        (flags & kBlitKeepAlpha) == 0u    ? g_backend.opaque_pipeline.get()
+        : (flags & kBlitPremultiplied) != 0u
+            ? g_backend.premultiplied_pipeline.get()
+            : g_backend.blended_pipeline.get());
     commands.setGraphicsDescriptorSet(set, 0);
     const BlitConstants constants{flags, 0u, {rect.w, rect.h}};
     commands.setGraphicsPushConstants(0, &constants, 0, sizeof(constants));
@@ -1328,10 +1341,9 @@ bool nds_compute_host_present_top(const unsigned int* fallback_pixels,
             rect.y + pixels(rect.h, g_layer_rect[1]),
             std::max(pixels(rect.w, g_layer_rect[2]), 1),
             std::max(pixels(rect.h, g_layer_rect[3]), 1)};
-        // The main filter. No box resolve: it would average the colour of
-        // transparent texels into the edges of a straight-alpha image.
-        record_blit(slot, kLayer, layer_rect, bilinear, kBlitKeepAlpha,
-                    fb_width, fb_height);
+        // The main filter, on a premultiplied image. No box resolve.
+        record_blit(slot, kLayer, layer_rect, bilinear,
+                    kBlitKeepAlpha | kBlitPremultiplied, fb_width, fb_height);
     }
     if (inset && layout.inset.w > 0 && layout.inset.h > 0) {
         // Point sampling a shrunk inset drops whole rows of text.

@@ -2757,33 +2757,39 @@ struct AdaptiveCtx {
     bool no_3d = false;
     uint32_t front = 0;
     // Fixed-size layers: BGs in this mask (bit n = BGn) are left out of the
-    // stack and resolved into `layer` (256 x 192, straight alpha) instead.
+    // stack and resolved into `layer` (256 x 192, premultiplied) instead.
     uint8_t fixed_mask = 0;
     uint32_t* layer = nullptr;
     uint16_t obj_keep[4] = {0, 0, 0, 0};
 };
 
 // One fixed-size-layer pixel: the masked BGs at this position resolved on
-// their own, as straight-alpha ARGB (0 = nothing). `first` and `second` are
+// their own, as premultiplied ARGB (0 = nothing). `first` and `second` are
 // the top two masked pixels (second may be invalid), `rest` the top of the
 // remaining stack at the same native position, which decides whether a
-// first-target BG blends with what lies under it. The caller guarantees
-// EVA + EVB = 16 whenever such a blend can happen.
+// first-target BG blends with what lies under it. Such a blend,
+// (EVA * A + EVB * B) / 16, is the colour EVA/16 * A at alpha 1 - EVB/16
+// over B, whatever EVA and EVB are; the saturation at 31 is the presenter's
+// clamp.
 uint32_t fixed_layer_pixel(const Unit& u, const Pixel& first,
                            const Pixel& second, const Pixel& rest,
                            bool effects, uint32_t mbmode, uint32_t mb) {
     if (!first.valid) return 0u;
     uint32_t color = first.color;
-    uint32_t alpha = 255u;
+    // Weights of the layer's colour and of what lies under it, in 16ths:
+    // 16 / 0 is opaque.
+    uint32_t eva = 16u, evb = 0u;
     const uint32_t mode = (u.bldcnt >> 6) & 3u;
+    const bool over_target2 =
+        (u.bldcnt & (static_cast<uint16_t>(rest.target) << 8)) != 0;
     if (first.alpha) {
         // A semi-transparent or bitmap OBJ: it blends with a second target
         // under it whatever the color effect (see compose()).
         if (second.valid) {
             color = compose(u, first, second, effects);
-        } else if (u.bldcnt & (static_cast<uint16_t>(rest.target) << 8)) {
-            const uint32_t eva = first.alpha == 0xFFu ? u.eva : first.alpha;
-            alpha = (std::min<uint32_t>(16u, eva) * 255u + 8u) / 16u;
+        } else if (over_target2) {
+            eva = first.alpha == 0xFFu ? u.eva : first.alpha;
+            evb = first.alpha == 0xFFu ? u.evb : 16u - std::min(16u, eva);
         } else {
             color = compose(u, first, rest, effects);
         }
@@ -2792,10 +2798,11 @@ uint32_t fixed_layer_pixel(const Unit& u, const Pixel& first,
             if (second.valid) {
                 // Both inside the layer: blend there, opaque.
                 color = compose(u, first, second, true);
-            } else if (u.bldcnt & (static_cast<uint16_t>(rest.target) << 8)) {
-                // Over the rest of the stack: EVA/16 of alpha does it in
-                // the presenter, wherever the shrunk pixel lands.
-                alpha = (std::min<uint32_t>(16u, u.eva) * 255u + 8u) / 16u;
+            } else if (over_target2) {
+                // Over the rest of the stack: blended in the presenter,
+                // wherever the shrunk pixel lands.
+                eva = u.eva;
+                evb = u.evb;
             }
         } else {
             color = compose(u, first, second.valid ? second : rest, true);
@@ -2805,7 +2812,14 @@ uint32_t fixed_layer_pixel(const Unit& u, const Pixel& first,
         color = brighten(color, mb, 0u);
     else if (mbmode == 2u)
         color = darken(color, mb, 15u);
-    return (alpha << 24) | (to_rgb32(color) & 0x00FFFFFFu);
+    eva = std::min(16u, eva);
+    evb = std::min(16u, evb);
+    const uint32_t rgb = to_rgb32(color);
+    if (eva == 16u && evb == 0u) return 0xFF000000u | (rgb & 0x00FFFFFFu);
+    const auto weigh = [eva](uint32_t c) { return (c * eva + 8u) / 16u; };
+    const uint32_t alpha = ((16u - evb) * 255u + 8u) / 16u;
+    return (alpha << 24) | (weigh((rgb >> 16) & 0xFFu) << 16) |
+           (weigh((rgb >> 8) & 0xFFu) << 8) | weigh(rgb & 0xFFu);
 }
 
 void composite_adaptive_line(const AdaptiveCtx& c, int y,
@@ -3368,23 +3382,19 @@ const uint32_t* nds_gpu2d_adaptive_framebuffer(int screen, uint16_t* width) {
         }
     }
     // Fixed-size layers: only the masked BGs that are on (and the OBJs when
-    // asked for), and only when their blend can be split exactly (see
-    // gpu2d.h). A semi-transparent OBJ blends with EVA/EVB in any mode.
+    // asked for). Any alpha blend with the rest of the stack splits exactly
+    // (fixed_layer_pixel).
     uint8_t fixed_mask = 0;
     if (fixed_wanted && output_width == 256) {
         for (size_t i = 0; i < hud_bg_count; ++i)
             fixed_mask |= static_cast<uint8_t>(
                 g_fixed_mask & (1u << hud_bgs[i]));
-        const bool exact = u.eva + u.evb == 16u;
         // With BGs named, OBJs join only a frame that splits one of them;
         // the OBJ bit alone splits the OBJs by themselves.
         const bool obj_alone = (g_fixed_mask & 0x0Eu) == 0u;
-        if ((fixed_mask || obj_alone) && exact && (g_fixed_mask & 0x10u) &&
+        if ((fixed_mask || obj_alone) && (g_fixed_mask & 0x10u) &&
             (u.dispcnt & 0x1000u))
             fixed_mask |= 0x10u;
-        const bool alpha_mode = ((u.bldcnt >> 6) & 3u) == 1u;
-        if (fixed_mask && alpha_mode && (u.bldcnt & fixed_mask) && !exact)
-            fixed_mask = 0;
     }
     if (fixed_mask && g_fixed_layer_pixels.size() != 256u * 192u)
         g_fixed_layer_pixels.resize(256u * 192u);
