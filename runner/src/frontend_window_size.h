@@ -137,6 +137,13 @@ inline std::atomic<bool>& nds_stack_vertically_flag() {
     return flag;
 }
 
+// The gap between the stacked screens, in content pixels (see title_settings.h,
+// nds_title_set_stacked_gap_query): used only with stack_vertically.
+inline std::atomic<int>& nds_stack_gap_flag() {
+    static std::atomic<int> gap{0};
+    return gap;
+}
+
 // Set while a game mode wants the second screen below the main one in a
 // portrait drawable, as before the inset moved above it (see title_settings.h,
 // nds_title_set_inset_below_query). Unlike the stacked layout it keeps the
@@ -164,27 +171,32 @@ inline NdsSingleLayout nds_single_layout(NdsWindowMode mode,
         return layout;
     }
     if (stack_vertically || drawable_h > drawable_w) {
-        const int total_h = content_h + content_h * inset_percent / 100;
+        const int gap = stack_vertically
+            ? std::max(0, nds_stack_gap_flag().load(std::memory_order_relaxed))
+            : 0;
+        const int total_h = content_h + content_h * inset_percent / 100 + gap;
         const NdsPresentRect all = nds_present_rect(
             mode, scaling, drawable_w, drawable_h, content_w, total_h);
         layout.main = all;
         layout.main.h = static_cast<int>(
             static_cast<long long>(all.h) * content_h / total_h);
-        layout.inset.h = all.h - layout.main.h;
+        const int gap_px = static_cast<int>(
+            static_cast<long long>(all.h) * gap / total_h);
+        layout.inset.h = all.h - layout.main.h - gap_px;
         layout.inset.w = all.w * inset_percent / 100;
         layout.inset.x = all.x + (all.w - layout.inset.w) / 2;
-        layout.inset.y = all.y + layout.main.h;
-        const int room = drawable_h - layout.main.h;
+        layout.inset.y = all.y + layout.main.h + gap_px;
+        const int room = drawable_h - layout.main.h - gap_px;
         if (mode == NdsWindowMode::Letterbox && room > layout.inset.h) {
             layout.inset.h = std::min(room, layout.main.h);
             layout.inset.w = static_cast<int>(
                 static_cast<long long>(layout.inset.h) * content_w /
                 content_h);
-            layout.main.y =
-                (drawable_h - layout.main.h - layout.inset.h) / 2;
+            layout.main.y = (drawable_h - layout.main.h - gap_px -
+                             layout.inset.h) / 2;
             layout.inset.x =
                 layout.main.x + (layout.main.w - layout.inset.w) / 2;
-            layout.inset.y = layout.main.y + layout.main.h;
+            layout.inset.y = layout.main.y + layout.main.h + gap_px;
         }
         if (!stack_vertically &&
             !nds_inset_below_flag().load(std::memory_order_relaxed)) {

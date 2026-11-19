@@ -138,6 +138,21 @@ bool nds_title_stacked_layout_wanted() {
 }
 
 namespace {
+std::atomic<NdsTitleStackedGapQuery> g_stacked_gap_query{nullptr};
+}  // namespace
+
+void nds_title_set_stacked_gap_query(NdsTitleStackedGapQuery query) {
+    g_stacked_gap_query.store(query, std::memory_order_relaxed);
+}
+
+int nds_title_stacked_gap() {
+    const NdsTitleStackedGapQuery query =
+        g_stacked_gap_query.load(std::memory_order_relaxed);
+    const int gap = query ? query() : 0;
+    return gap > 0 ? gap : 0;
+}
+
+namespace {
 std::atomic<NdsTitleInsetBelowQuery> g_inset_below_query{nullptr};
 }  // namespace
 

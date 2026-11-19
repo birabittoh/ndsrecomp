@@ -165,6 +165,12 @@ typedef bool (*NdsTitleStackedLayoutQuery)();
 void nds_title_set_stacked_layout_query(NdsTitleStackedLayoutQuery query);
 // For the frontend: the query's answer (false with none registered).
 bool nds_title_stacked_layout_wanted();
+// A gap between the two stacked screens, in LCD pixels, for the modes that
+// want one: asked each frame while the stacked layout is on. Same rules as
+// the stacked query; 0 with none registered.
+typedef int (*NdsTitleStackedGapQuery)();
+void nds_title_set_stacked_gap_query(NdsTitleStackedGapQuery query);
+int nds_title_stacked_gap();
 
 // A game mode that wants the second screen below the main one in a portrait
 // window (the default puts it above), at the usual second_screen_size.
