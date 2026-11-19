@@ -2202,12 +2202,9 @@ int main(int argc, char** argv) {
     if (!cli_savestate_dir.empty() && !rom_sha1.empty()) {
         frontend_options.savestate_directory =
             (std::filesystem::path(cli_savestate_dir) / rom_sha1).string();
-        // Measurement escape hatch: savestate identity is build-exact
-        // (savestate.cpp load refuses any other build id), which is right for
-        // players but makes a cross-build A/B on a pinned state impossible --
-        // and a pinned state IS the perf methodology (the Kanden slots,
-        // beads-lqa.42). The override swaps only the IDENTITY the states are
-        // checked and stamped with; the diagnostics identity above still
+        // Measurement override: the build id stamped into states (a load
+        // from another build only logs it, savestate.cpp) is
+        // NDS_SAVESTATE_BUILD_ID when set. The diagnostics identity above still
         // reports the real NDS_RUNNER_BUILD_ID, so perf bundles never lie
         // about what code ran. Unset (the norm, and every shipped launcher)
         // this is byte-for-byte the old behaviour.

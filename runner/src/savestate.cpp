@@ -1525,9 +1525,14 @@ bool nds_savestate_load_core(const std::string& path,
         set_error(error, "savestate identity section is missing or corrupt");
         return false;
     }
+    // A state from another build loads anyway (the guest state it holds does
+    // not depend on the build); only the ROM must match.
     if (identity.build_id != expected_identity.build_id) {
-        set_error(error, "savestate build id mismatch");
-        return false;
+        std::fprintf(stderr,
+                     "[savestate] loading a state from another build (%s, "
+                     "this one is %s)\n",
+                     identity.build_id.c_str(),
+                     expected_identity.build_id.c_str());
     }
     if (identity.rom_sha1 != expected_identity.rom_sha1) {
         set_error(error, "savestate ROM SHA-1 mismatch");
