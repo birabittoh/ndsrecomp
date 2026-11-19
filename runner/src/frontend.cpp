@@ -4149,15 +4149,28 @@ int nds_run_interactive_frontend(const NdsFrontendOptions& initial_options) {
     int touch_button_latched = -1;
     uint16_t touch_button_latched_pressed = 0;
     int touch_button_latch_frames = -1;
+    // A second finger on another button while one is held (both turn
+    // buttons at once, say, as L+R on a pad): its button, -1 for none, the
+    // finger, and the DS keys it adds.
+    int touch_button_second = -1;
+    uint64_t touch_button_second_touch = 0;
+    uint64_t touch_button_second_finger = 0;
+    uint16_t touch_button_second_pressed = 0;
     auto guest_key_mask = [&]() {
         if (chat_input.open) return static_cast<uint16_t>(0x0FFFu);
         return static_cast<uint16_t>(
             0x0FFFu &
             ~(keyboard_pressed | controller_pressed | mouse_pressed |
               mph_prime_pressed | stick_pressed | touch_button_pressed |
-              touch_button_latched_pressed));
+              touch_button_latched_pressed | touch_button_second_pressed));
     };
     auto publish_keys = [&]() { nds_set_key_mask(guest_key_mask()); };
+    auto release_touch_second = [&]() {
+        if (touch_button_second < 0) return;
+        touch_button_second = -1;
+        touch_button_second_pressed = 0;
+        publish_keys();
+    };
     auto release_touch_latch = [&]() {
         if (touch_button_latched < 0) return;
         nds_touch_button_set_active(touch_button_latched, false);
@@ -4730,6 +4743,8 @@ int nds_run_interactive_frontend(const NdsFrontendOptions& initial_options) {
         stick_pressed = 0;
         touch_button_held = -1;
         touch_button_pressed = 0;
+        touch_button_second = -1;
+        touch_button_second_pressed = 0;
         if (touch_button_latched >= 0)
             nds_touch_button_set_active(touch_button_latched, false);
         touch_button_latched = -1;
@@ -5319,6 +5334,9 @@ int nds_run_interactive_frontend(const NdsFrontendOptions& initial_options) {
         if (touch_button_held >= 0 &&
             !nds_touch_button_shown(touch_button_held))
             release_touch_button();
+        if (touch_button_second >= 0 &&
+            !nds_touch_button_shown(touch_button_second))
+            release_touch_second();
         // The fast-forward toggle goes off with its button.
         if (turbo_toggled &&
             !nds_touch_button_shown(nds_touch_button_fast_forward()))
@@ -5360,6 +5378,7 @@ int nds_run_interactive_frontend(const NdsFrontendOptions& initial_options) {
                 is_presentation_window(event.window.windowID)) {
                 // The release may never come.
                 if (touch_button_held >= 0) release_touch_button();
+                release_touch_second();
                 release_touch_latch();
                 chat_press = {};
                 const int index =
@@ -5723,7 +5742,48 @@ int nds_run_interactive_frontend(const NdsFrontendOptions& initial_options) {
                     return std::hypot(touch_fingers[0].x - touch_fingers[1].x,
                                       touch_fingers[0].y - touch_fingers[1].y);
                 };
+                // A second finger landing on another button with keys while
+                // the first holds one adds that button's keys, until it
+                // lifts; it is not a two-finger tap or pinch.
+                int second_button = -1;
                 if (event.type == SDL_EVENT_FINGER_DOWN &&
+                    finger == touch_fingers.end() &&
+                    touch_fingers.size() == 1 && touch_button_held >= 0 &&
+                    touch_button_second < 0) {
+                    SDL_Event probe{};
+                    probe.type = SDL_MOUSEBUTTONDOWN;
+                    probe.button.button = SDL_BUTTON_LEFT;
+                    probe.button.windowID = event.tfinger.windowID;
+                    probe.button.x = finger_x;
+                    probe.button.y = finger_y;
+                    convert_mouse_event_to_logical_coordinates(probe,
+                                                               presentation);
+                    const int hit = touch_button_at(probe);
+                    const NdsTouchButtonSpec* spec =
+                        nds_touch_button_spec(hit);
+                    if (hit != touch_button_held && spec && spec->keys &&
+                        !spec->latch)
+                        second_button = hit;
+                }
+                const bool second_finger =
+                    touch_button_second >= 0 &&
+                    uint64_t(event.tfinger.touchID) ==
+                        touch_button_second_touch &&
+                    uint64_t(event.tfinger.fingerID) ==
+                        touch_button_second_finger;
+                if (second_button >= 0) {
+                    touch_button_second = second_button;
+                    touch_button_second_touch = uint64_t(event.tfinger.touchID);
+                    touch_button_second_finger =
+                        uint64_t(event.tfinger.fingerID);
+                    touch_button_second_pressed =
+                        nds_touch_button_spec(second_button)->keys;
+                    publish_keys();
+                } else if (second_finger) {
+                    if (event.type == SDL_EVENT_FINGER_UP ||
+                        event.type == SDL_EVENT_FINGER_CANCELED)
+                        release_touch_second();
+                } else if (event.type == SDL_EVENT_FINGER_DOWN &&
                     finger == touch_fingers.end() &&
                     touch_fingers.size() < 2) {
                     touch_fingers.push_back({event.tfinger.touchID,
