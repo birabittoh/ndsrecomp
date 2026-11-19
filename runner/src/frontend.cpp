@@ -16,6 +16,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <ctime>
 #include <filesystem>
 #include <fstream>
 #include <initializer_list>
@@ -1873,8 +1874,23 @@ std::string serve_title_save(SDL_Window* parent, bool* reset) {
             const std::filesystem::path save = nds_io_cartridge_save_path();
             const char* folder = SDL_GetUserFolder(SDL_FOLDER_DOCUMENTS);
             if (!folder) folder = SDL_GetUserFolder(SDL_FOLDER_HOME);
-            const std::string name =
-                save.empty() ? "save.sav" : save.filename().string();
+            // Suggested as <save name>_<yyyymmdd><ext>, so exports
+            // made on different days don't overwrite each other.
+            const std::time_t now = std::time(nullptr);
+            std::tm local{};
+#if defined(_WIN32)
+            localtime_s(&local, &now);
+#else
+            localtime_r(&now, &local);
+#endif
+            char date[16];
+            std::strftime(date, sizeof(date), "%Y%m%d", &local);
+            const std::string stem =
+                save.empty() ? "save" : save.stem().string();
+            const std::string extension =
+                save.empty() || !save.has_extension()
+                    ? ".sav" : save.extension().string();
+            const std::string name = stem + "_" + date + extension;
             location = folder ? (std::filesystem::path(folder) / name).string()
                               : name;
             SDL_SetStringProperty(properties,
