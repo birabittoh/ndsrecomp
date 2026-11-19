@@ -264,21 +264,27 @@ void wait_all_slots() {
     for (FrameSlot& slot : g_backend.slots) wait_slot(slot);
 }
 
-void create_framebuffers() {
-    g_backend.framebuffers.clear();
-    RenderSwapChain& chain = *g_backend.swap_chain;
+void create_framebuffers_for(
+    RenderSwapChain& chain,
+    std::vector<std::unique_ptr<RenderFramebuffer>>& framebuffers,
+    std::vector<std::unique_ptr<RenderCommandSemaphore>>& release_semaphores) {
+    framebuffers.clear();
     for (uint32_t i = 0; i < chain.getTextureCount(); ++i) {
         const RenderTexture* color = chain.getTexture(i);
         RenderFramebufferDesc desc;
         desc.colorAttachments = &color;
         desc.colorAttachmentsCount = 1;
-        g_backend.framebuffers.push_back(g_backend.device->createFramebuffer(desc));
+        framebuffers.push_back(g_backend.device->createFramebuffer(desc));
     }
     // One release semaphore per swap chain image: present waits on the one
     // its image's submission signalled.
-    while (g_backend.release_semaphores.size() < chain.getTextureCount())
-        g_backend.release_semaphores.push_back(
-            g_backend.device->createCommandSemaphore());
+    while (release_semaphores.size() < chain.getTextureCount())
+        release_semaphores.push_back(g_backend.device->createCommandSemaphore());
+}
+
+void create_framebuffers() {
+    create_framebuffers_for(*g_backend.swap_chain, g_backend.framebuffers,
+                            g_backend.release_semaphores);
 }
 
 // A minimised window has a 0x0 client area: nothing to draw into, and a
@@ -644,6 +650,58 @@ bool SDLCALL lifecycle_watch(void*, SDL_Event* event) {
     }
     return true;
 }
+
+// The bottom LCD on a second display (nds_compute_host_set_bottom_window):
+// its own swap chain and frame slots on the same device and queue, recorded
+// and submitted on the same thread as the top window's frames.
+struct BottomTarget {
+    ANativeWindow* window = nullptr;
+    std::unique_ptr<RenderSwapChain> swap_chain;
+    std::vector<std::unique_ptr<RenderFramebuffer>> framebuffers;
+    std::vector<std::unique_ptr<RenderCommandSemaphore>> release_semaphores;
+    FrameSlot slots[kFramesInFlight];
+    bool slots_ready = false;
+    uint32_t slot = 0;
+    bool resize_pending = false;
+    bool resize_failing = false;
+    uint64_t presented = 0;
+    uint64_t dropped = 0;
+    // Present timing over the current log window: answers whether this
+    // panel's present ever blocks the frame loop.
+    uint64_t window_ticks = 0;
+    uint64_t window_max_ticks = 0;
+};
+BottomTarget g_bottom;
+
+void wait_bottom_slots() {
+    for (FrameSlot& slot : g_bottom.slots) wait_slot(slot);
+}
+
+// Lets go of the bottom swap chain (and with it the VkSurfaceKHR on the
+// surface) once nothing in flight draws into it.
+void release_bottom_chain() {
+    if (g_backend.queue) wait_bottom_slots();
+    g_bottom.framebuffers.clear();
+    if (g_bottom.swap_chain)
+        std::fprintf(stderr, "[plume] bottom swap chain released (%llu frames, "
+                             "%llu dropped)\n",
+                     static_cast<unsigned long long>(g_bottom.presented),
+                     static_cast<unsigned long long>(g_bottom.dropped));
+    g_bottom.swap_chain.reset();
+    g_bottom.window = nullptr;
+    g_bottom.slot = 0;
+    g_bottom.resize_pending = false;
+    g_bottom.resize_failing = false;
+    g_bottom.presented = g_bottom.dropped = 0;
+    g_bottom.window_ticks = g_bottom.window_max_ticks = 0;
+}
+
+void release_bottom() {
+    release_bottom_chain();
+    for (FrameSlot& slot : g_bottom.slots) slot = FrameSlot{};
+    g_bottom.release_semaphores.clear();
+    g_bottom.slots_ready = false;
+}
 #endif
 
 bool start_presenter(SDL_Window* window) {
@@ -711,6 +769,7 @@ bool start_presenter(SDL_Window* window) {
 
 void release_backend() {
 #if defined(__ANDROID__)
+    release_bottom();
     if (g_lifecycle_watch) SDL_RemoveEventWatch(lifecycle_watch, nullptr);
     g_lifecycle_watch = false;
     g_backgrounded = false;
@@ -776,9 +835,10 @@ bool stage_image(FrameSlot& slot, uint8_t* staging, Image image,
 
 // A fine overlay (any size up to kOverlayMaxScale times the screen), into
 // its own staging.
-bool stage_fine_overlay(FrameSlot& slot) {
+bool stage_fine_overlay(FrameSlot& slot, const uint32_t* pixels,
+                        unsigned overlay_width, unsigned overlay_height) {
     ImageSlot& target = slot.images[kOverlay];
-    const int width = int(g_overlay_width), height = int(g_overlay_height);
+    const int width = int(overlay_width), height = int(overlay_height);
     if (!slot.overlay_staging) {
         slot.overlay_staging = g_backend.device->createBuffer(
             RenderBufferDesc::UploadBuffer(kOverlayBytes));
@@ -798,7 +858,7 @@ bool stage_fine_overlay(FrameSlot& slot) {
     if (!dst) return false;
     for (int y = 0; y < height; ++y)
         std::memcpy(dst + size_t(y) * kOverlayRowPitch,
-                    g_overlay_pixels + size_t(y) * width, size_t(width) * 4u);
+                    pixels + size_t(y) * width, size_t(width) * 4u);
     slot.overlay_staging->unmap();
     return true;
 }
@@ -1000,7 +1060,11 @@ const NdsPlumeContext* nds_plume_context()
 
 void nds_plume_host_wait_idle()
 {
-    if (g_backend.queue) wait_all_slots();
+    if (!g_backend.queue) return;
+    wait_all_slots();
+#if defined(__ANDROID__)
+    wait_bottom_slots();
+#endif
 }
 
 std::unique_ptr<RenderShader> nds_plume_create_shader(
@@ -1243,7 +1307,9 @@ bool nds_compute_host_present_top(const unsigned int* fallback_pixels,
         staged = stage_image(slot, staging, kOverlay, g_overlay_pixels,
                              int(g_overlay_width));
     slot.staging->unmap();
-    if (staged && fine_overlay) staged = stage_fine_overlay(slot);
+    if (staged && fine_overlay)
+        staged = stage_fine_overlay(slot, g_overlay_pixels, g_overlay_width,
+                                    g_overlay_height);
     if (staged && hd_active) staged = stage_hd(slot, hd);
     if (!staged) return false;
     ticks->upload += SDL_GetPerformanceCounter() - start;
@@ -1384,6 +1450,207 @@ bool nds_compute_host_present_top(const unsigned int* fallback_pixels,
                      static_cast<unsigned long long>(g_dropped));
     return true;
 }
+
+#if defined(__ANDROID__)
+namespace {
+// The bottom swap chain at the surface's current size; false when there is
+// nothing to present to this frame.
+bool bottom_resize_if_needed() {
+    RenderSwapChain& chain = *g_bottom.swap_chain;
+    if (!g_bottom.resize_pending && !chain.needsResize())
+        return !g_bottom.framebuffers.empty();
+    g_bottom.resize_pending = false;
+    wait_bottom_slots();
+    g_bottom.framebuffers.clear();
+    if (!chain.resize()) {
+        g_bottom.resize_pending = true;
+        const bool zero_sized = chain.getWidth() == 0 || chain.getHeight() == 0;
+        if (!zero_sized && !g_bottom.resize_failing) {
+            g_bottom.resize_failing = true;
+            std::fprintf(stderr, "[plume] bottom swap chain resize to %ux%u "
+                                 "failed (0x%llx); retrying every frame\n",
+                         chain.getWidth(), chain.getHeight(),
+                         static_cast<unsigned long long>(chain.getLastError()));
+        }
+        return false;
+    }
+    g_bottom.resize_failing = false;
+    if (chain.isEmpty()) return false;
+    create_framebuffers_for(chain, g_bottom.framebuffers,
+                            g_bottom.release_semaphores);
+    std::fprintf(stderr, "[plume] bottom swap chain %ux%u, %u images, vsync %s\n",
+                 chain.getWidth(), chain.getHeight(), chain.getTextureCount(),
+                 chain.isVsyncEnabled() ? "on (MAILBOX if offered, else FIFO)"
+                                        : "off");
+    return !g_bottom.framebuffers.empty();
+}
+
+bool create_bottom_slots() {
+    for (FrameSlot& slot : g_bottom.slots) {
+        slot.commands = g_backend.queue->createCommandList();
+        slot.fence = g_backend.device->createCommandFence();
+        slot.acquire = g_backend.device->createCommandSemaphore();
+        slot.staging = g_backend.device->createBuffer(
+            RenderBufferDesc::UploadBuffer(kImageBytes * kImageCount));
+        if (!slot.commands || !slot.fence || !slot.acquire || !slot.staging)
+            return false;
+        for (ImageSlot& image : slot.images) {
+            image.set = g_backend.device->createDescriptorSet(image_set_desc());
+            if (!image.set) return false;
+        }
+    }
+    return true;
+}
+}  // namespace
+
+void nds_compute_host_set_bottom_window(ANativeWindow* window)
+{
+    if (window == g_bottom.window) return;
+    release_bottom_chain();
+    if (!window) return;
+    if (!g_active || !g_backend.device || !g_backend.queue) {
+        std::fprintf(stderr, "[plume] no device for the second display\n");
+        return;
+    }
+    if (!g_bottom.slots_ready) {
+        g_bottom.slots_ready = create_bottom_slots();
+        if (!g_bottom.slots_ready) {
+            std::fprintf(stderr, "[plume] bottom frame slot creation failed\n");
+            for (FrameSlot& slot : g_bottom.slots) slot = FrameSlot{};
+            return;
+        }
+    }
+    g_bottom.swap_chain = g_backend.queue->createSwapChain(RenderSwapChainDesc(
+        window, kSwapChainFormat, kSwapChainBuffers));
+    if (!g_bottom.swap_chain) {
+        std::fprintf(stderr, "[plume] no swap chain on the second display's "
+                             "surface\n");
+        return;
+    }
+    g_bottom.swap_chain->setVsyncEnabled(true);
+    g_bottom.window = window;
+    g_bottom.resize_pending = true;
+    std::fprintf(stderr, "[plume] bottom swap chain made on the second display "
+                         "(%dx%d surface)\n",
+                 ANativeWindow_getWidth(window), ANativeWindow_getHeight(window));
+}
+
+bool nds_compute_host_has_bottom_window()
+{
+    return g_active && g_bottom.swap_chain != nullptr;
+}
+
+bool nds_compute_host_present_bottom(const uint32_t* pixels, unsigned width,
+                                     const uint32_t* overlay,
+                                     unsigned overlay_width,
+                                     unsigned overlay_height,
+                                     NdsComputePresentTicks* ticks)
+{
+    if (!g_active || !g_bottom.swap_chain || !pixels) return false;
+    if (width == 0 || width > kMaxWidth) return false;
+    const uint64_t begin = SDL_GetPerformanceCounter();
+    if (!bottom_resize_if_needed()) return true;
+    RenderSwapChain& chain = *g_bottom.swap_chain;
+    if (chain.isEmpty()) return true;
+    const uint32_t fb_width = chain.getWidth();
+    const uint32_t fb_height = chain.getHeight();
+    const NdsPresentRect rect = nds_present_rect(
+        g_window_mode, g_scaling, int(fb_width), int(fb_height), int(width),
+        int(kHeight));
+
+    FrameSlot& slot = g_bottom.slots[g_bottom.slot];
+    const bool have_overlay = overlay && overlay_width > 0 && overlay_height > 0 &&
+                              overlay_width <= kMaxWidth * kOverlayMaxScale &&
+                              overlay_height <= kHeight * kOverlayMaxScale;
+    const bool fine_overlay = have_overlay && (overlay_height != kHeight ||
+                                               overlay_width > kMaxWidth);
+    auto* staging = static_cast<uint8_t*>(slot.staging->map());
+    if (!staging) return false;
+    bool staged = stage_image(slot, staging, kMain, pixels, int(width));
+    if (staged && have_overlay && !fine_overlay)
+        staged = stage_image(slot, staging, kOverlay, overlay, int(overlay_width));
+    slot.staging->unmap();
+    if (staged && fine_overlay)
+        staged = stage_fine_overlay(slot, overlay, overlay_width, overlay_height);
+    if (!staged) return false;
+    if (ticks) ticks->upload += SDL_GetPerformanceCounter() - begin;
+
+    // As on the top window: acquired only once nothing else can fail.
+    uint32_t image_index = 0;
+    if (!chain.acquireTexture(slot.acquire.get(), &image_index) ||
+        image_index >= g_bottom.framebuffers.size()) {
+        g_bottom.resize_pending = true;
+        if (++g_bottom.dropped == 1)
+            std::fprintf(stderr, "[plume] bottom swap chain acquire failed; "
+                                 "frames are dropped until it recovers\n");
+        return true;
+    }
+
+    uint64_t start = SDL_GetPerformanceCounter();
+    RenderTexture* backbuffer = chain.getTexture(image_index);
+    RenderCommandList& commands = *slot.commands;
+    commands.begin();
+    record_upload(slot, kMain);
+    if (have_overlay && !fine_overlay) record_upload(slot, kOverlay);
+    if (fine_overlay) record_fine_overlay_upload(slot);
+    commands.barriers(RenderBarrierStage::GRAPHICS,
+                      RenderTextureBarrier(backbuffer, RenderTextureLayout::COLOR_WRITE));
+    commands.setFramebuffer(g_bottom.framebuffers[image_index].get());
+    commands.setViewports(RenderViewport(0.0f, 0.0f, float(fb_width), float(fb_height)));
+    commands.setScissors(RenderRect(0, 0, int32_t(fb_width), int32_t(fb_height)));
+    commands.clearColor(0, RenderColor(0.0f, 0.0f, 0.0f, 1.0f));
+    // The top window's CPU-composite filters.
+    const bool bilinear = g_scaling == NdsScalingFilter::Bilinear;
+    const bool supersampled = int(width) > rect.w || int(kHeight) > rect.h;
+    const bool box_resolve =
+        (g_scaling == NdsScalingFilter::Integer && supersampled) ||
+        (g_scaling == NdsScalingFilter::Nearest && int(width) >= 2 * rect.w &&
+         int(kHeight) >= 2 * rect.h);
+    record_blit(slot, kMain, rect, bilinear && !box_resolve,
+                box_resolve ? kBlitBoxResolve : 0u, fb_width, fb_height);
+    if (have_overlay)
+        record_blit(slot, kOverlay, rect, bilinear, kBlitKeepAlpha, fb_width,
+                    fb_height);
+    commands.barriers(RenderBarrierStage::NONE,
+                      RenderTextureBarrier(backbuffer, RenderTextureLayout::PRESENT));
+    commands.end();
+
+    const RenderCommandList* submit = slot.commands.get();
+    RenderCommandSemaphore* wait = slot.acquire.get();
+    RenderCommandSemaphore* signal = g_bottom.release_semaphores[image_index].get();
+    g_backend.queue->executeCommandLists(&submit, 1, &wait, 1, &signal, 1,
+                                         slot.fence.get());
+    slot.submitted = true;
+    if (ticks) ticks->draw += SDL_GetPerformanceCounter() - start;
+
+    start = SDL_GetPerformanceCounter();
+    if (!chain.present(image_index, &signal, 1)) {
+        g_bottom.resize_pending = true;
+        if (++g_bottom.dropped == 1)
+            std::fprintf(stderr, "[plume] bottom present failed (0x%llx)\n",
+                         static_cast<unsigned long long>(chain.getLastError()));
+    }
+    g_bottom.slot = (g_bottom.slot + 1u) % kFramesInFlight;
+    wait_slot(g_bottom.slots[g_bottom.slot]);
+    const uint64_t present_ticks = SDL_GetPerformanceCounter() - start;
+    if (ticks) ticks->swap += present_ticks;
+
+    const uint64_t total = SDL_GetPerformanceCounter() - begin;
+    g_bottom.window_ticks += total;
+    g_bottom.window_max_ticks = std::max(g_bottom.window_max_ticks, total);
+    if (++g_bottom.presented % 600 == 0) {
+        const double ms = 1000.0 / double(SDL_GetPerformanceFrequency());
+        std::fprintf(stderr, "[plume] bottom: %llu frames, %llu dropped, last 600 "
+                             "took %.2f ms avg, %.2f ms max\n",
+                     static_cast<unsigned long long>(g_bottom.presented),
+                     static_cast<unsigned long long>(g_bottom.dropped),
+                     double(g_bottom.window_ticks) * ms / 600.0,
+                     double(g_bottom.window_max_ticks) * ms);
+        g_bottom.window_ticks = g_bottom.window_max_ticks = 0;
+    }
+    return true;
+}
+#endif
 
 void nds_compute_host_stop()
 {

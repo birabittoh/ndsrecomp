@@ -1553,9 +1553,11 @@ if(WIN32)
 elseif(ANDROID)
     # Bionic has no libcurl: HTTP goes through HttpURLConnection over JNI,
     # and the update is handed to the package installer the same way.
+    # The bottom LCD on a dual-screen handheld's second panel.
     target_sources(nds_runner PRIVATE
         src/update/http_android.cpp
-        src/update/self_update_android.cpp)
+        src/update/self_update_android.cpp
+        src/android_second_display.cpp)
     # liblog: stdout/stderr forwarded to logcat (src/main.cpp); libandroid:
     # ANativeWindow, which Plume's Vulkan backend sizes its swapchain from.
     target_link_libraries(nds_runner PRIVATE log android)

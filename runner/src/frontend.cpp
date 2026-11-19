@@ -54,6 +54,11 @@
 #include "wifi_net.h"
 #if defined(NDS_HAVE_COMPUTE_RENDERER)
 #include "melonds_compute/ComputeHost.h"
+#if defined(__ANDROID__) && defined(NDS_USE_PLUME)
+// The bottom LCD on a dual-screen handheld's second panel.
+#define NDS_SECOND_DISPLAY 1
+#include "android_second_display.h"
+#endif
 #endif
 
 namespace {
@@ -2095,6 +2100,11 @@ struct FrontendPresentation {
     // layout only): inset_percent is 100 and the top LCD is the main one.
     bool stacked = false;
     bool gl_top = false;
+    // Single layout with the bottom LCD on a second display's surface (an
+    // Android dual-screen handheld): the window shows the top LCD alone, and
+    // window_ids[1] is kSecondDisplayWindowId, the id the surface's touches
+    // arrive under, already in bottom-LCD content coordinates.
+    bool dual = false;
     SDL_Window* windows[2]{};
     SDL_Renderer* renderers[2]{};
     SDL_Texture* textures[2]{};
@@ -2114,6 +2124,9 @@ struct FrontendPresentation {
     uint16_t resolution_scale = 0;
     uint8_t internal_resolution = 1;
 };
+
+// No SDL window has this id (they count up from 1).
+constexpr uint32_t kSecondDisplayWindowId = 0x7FFFFF01u;
 
 // The top window's host presenter composes the 3D layer itself (direct OBJ and
 // HD frames). Only then are those surfaces worth emitting; otherwise the CPU
@@ -2485,6 +2498,9 @@ bool g_top_dragging = false;
 void convert_mouse_event_to_logical_coordinates(
     SDL_Event& event, const FrontendPresentation& presentation) {
     auto screen_for_window = [&](uint32_t window_id) -> int {
+        // The second display's touches come converted already.
+        if (presentation.dual && window_id == kSecondDisplayWindowId)
+            return -1;
         for (int screen = 0; screen < 2; ++screen) {
             if (window_id == presentation.window_ids[screen] &&
                 presentation.windows[screen])
@@ -3416,6 +3432,113 @@ PresentationTicks present_single_screen(FrontendPresentation& presentation,
     return ticks;
 }
 
+#if defined(NDS_SECOND_DISPLAY)
+// The interpolated in-between present re-shows the top LCD only: the second
+// panel runs at its own refresh, and a second present into it per DS frame
+// could block on its vsync.
+bool g_present_synthetic = false;
+
+// Dual: the top LCD alone in the window (the single layout's path, its inset
+// off), then the bottom LCD into the second display with the stylus, the
+// savestate notice and the FPS counter over it, as on a separate bottom
+// window.
+PresentationTicks present_dual(FrontendPresentation& presentation,
+                               const uint32_t* top_pixels, int top_width,
+                               const uint32_t* bottom_pixels, int bottom_width,
+                               bool virtual_stylus_visible,
+                               float virtual_stylus_x, float virtual_stylus_y,
+                               const char* savestate_notice,
+                               const char* fps_counter) {
+    presentation.shown_screen = 0;
+    presentation.inset_percent = 0;
+    PresentationTicks ticks = present_single_screen(
+        presentation, top_pixels, top_width, bottom_pixels, bottom_width,
+        false, 0.0f, 0.0f, nullptr, nullptr);
+    if (!ticks.ok || g_present_synthetic) return ticks;
+    static std::vector<uint32_t> overlay;
+    const bool want_overlay = virtual_stylus_visible ||
+                              (savestate_notice && *savestate_notice) ||
+                              (fps_counter && *fps_counter);
+    DsTarget target{};
+    if (want_overlay) {
+        overlay.assign(size_t(bottom_width) * kScreenHeight, 0u);
+        target.pixels = overlay.data();
+        target.pixels_width = bottom_width;
+        target.pixels_height = kScreenHeight;
+        target.canvas = {SDL_Rect{0, 0, bottom_width, kScreenHeight},
+                         bottom_width, kScreenHeight};
+        if (virtual_stylus_visible)
+            draw_virtual_stylus(target, virtual_stylus_x, virtual_stylus_y);
+        draw_savestate_notice(target, savestate_notice);
+        draw_fps_counter(target, fps_counter);
+    }
+    NdsComputePresentTicks bottom_ticks{};
+    if (!nds_compute_host_present_bottom(
+            bottom_pixels, static_cast<unsigned>(bottom_width),
+            want_overlay ? overlay.data() : nullptr,
+            static_cast<unsigned>(bottom_width), kScreenHeight, &bottom_ticks)) {
+        // Not fatal: the game goes on on the main display.
+        static bool logged = false;
+        if (!logged) {
+            logged = true;
+            std::fprintf(stderr, "[second-display] bottom present failed\n");
+        }
+    }
+    ticks.upload += bottom_ticks.upload;
+    ticks.draw += bottom_ticks.draw;
+    ticks.swap += bottom_ticks.swap;
+    return ticks;
+}
+
+// A touch on the second display as the SDL mouse event the touchscreen
+// handlers take, in bottom-LCD content coordinates through the rect the
+// bottom present draws into. Only the first finger is sent.
+void push_second_display_touch(const NdsSecondDisplayTouch& touch,
+                               const FrontendPresentation& presentation,
+                               bool* held) {
+    if (touch.width <= 0 || touch.height <= 0) return;
+    const int content_w = presentation.screen_widths[1];
+    const NdsPresentRect rect = nds_present_rect(
+        presentation.window_mode, presentation.scaling, touch.width,
+        touch.height, content_w, kScreenHeight);
+    float cx = 0.0f, cy = 0.0f;
+    nds_present_rect_to_content(rect, content_w, kScreenHeight, touch.x,
+                                touch.y, &cx, &cy);
+    SDL_Event event{};
+    switch (touch.action) {
+        case NdsSecondDisplayTouch::Down:
+            event.type = SDL_EVENT_MOUSE_BUTTON_DOWN;
+            *held = true;
+            break;
+        case NdsSecondDisplayTouch::Move:
+            if (!*held) return;
+            event.type = SDL_EVENT_MOUSE_MOTION;
+            break;
+        default:  // Up, Cancel
+            if (!*held) return;
+            event.type = SDL_EVENT_MOUSE_BUTTON_UP;
+            *held = false;
+            break;
+    }
+    if (event.type == SDL_EVENT_MOUSE_MOTION) {
+        event.motion.windowID = kSecondDisplayWindowId;
+        event.motion.which = SDL_TOUCH_MOUSEID;
+        event.motion.state = SDL_BUTTON_LMASK;
+        event.motion.x = std::floor(cx);
+        event.motion.y = std::floor(cy);
+    } else {
+        event.button.windowID = kSecondDisplayWindowId;
+        event.button.which = SDL_TOUCH_MOUSEID;
+        event.button.button = SDL_BUTTON_LEFT;
+        event.button.down = event.type == SDL_EVENT_MOUSE_BUTTON_DOWN;
+        event.button.clicks = 1;
+        event.button.x = std::floor(cx);
+        event.button.y = std::floor(cy);
+    }
+    sdl_push_event(event);
+}
+#endif
+
 PresentationTicks present_screens(FrontendPresentation& presentation,
                                   const uint32_t* top_pixels,
                                   int top_width,
@@ -3431,6 +3554,13 @@ PresentationTicks present_screens(FrontendPresentation& presentation,
 #endif
                                   ) {
     PresentationTicks ticks{};
+#if defined(NDS_SECOND_DISPLAY)
+    if (presentation.dual)
+        return present_dual(presentation, top_pixels, top_width, bottom_pixels,
+                            bottom_width, virtual_stylus_visible,
+                            virtual_stylus_x, virtual_stylus_y,
+                            savestate_notice, fps_counter);
+#endif
     if (presentation.single)
         return present_single_screen(
             presentation, top_pixels, top_width, bottom_pixels, bottom_width,
@@ -3723,6 +3853,18 @@ int nds_run_interactive_frontend(const NdsFrontendOptions& initial_options) {
     nds_gpu2d_set_direct_present(
         nds_compute_host_has_visible_context() &&
         nds_compute_host_composes_3d() && nds_compute_host_presents_direct());
+#if defined(NDS_SECOND_DISPLAY)
+    // A second built-in panel takes the bottom LCD (single layout on the
+    // Plume window only); the frame loop picks its surface up when it comes.
+    uint64_t second_display_generation = 0;
+    bool second_display_touch_held = false;
+    if (presentation.single && presentation.gl_top &&
+        nds_compute_host_active())
+        nds_second_display_start();
+    else
+        std::fprintf(stderr, "[second-display] off: needs the single layout on "
+                             "the Plume presenter\n");
+#endif
     const char* window_direct = std::getenv("NDS_COMPUTE_WINDOW_DIRECT");
     nds_gpu2d_set_direct_windows(window_direct &&
         std::strcmp(window_direct, "1") == 0 && options.internal_resolution == 1u &&
@@ -5187,6 +5329,16 @@ int nds_run_interactive_frontend(const NdsFrontendOptions& initial_options) {
             turbo_toggled || turbo_pressed || turbo_pad_pressed);
         if (touch_button_latch_frames > 0 && --touch_button_latch_frames == 0)
             release_touch_latch();
+#if defined(NDS_SECOND_DISPLAY)
+        {
+            NdsSecondDisplayTouch touch;
+            while (nds_second_display_pop_touch(&touch)) {
+                if (presentation.dual)
+                    push_second_display_touch(touch, presentation,
+                                              &second_display_touch_held);
+            }
+        }
+#endif
         SDL_Event event{};
         while (SDL_PollEvent(&event)) {
             convert_mouse_event_to_logical_coordinates(event, presentation);
@@ -5725,7 +5877,7 @@ int nds_run_interactive_frontend(const NdsFrontendOptions& initial_options) {
                 !(mph_prime_unified_window_focus &&
                   relative_mouse.captured()) &&
                 (presentation.separate || presentation.single
-                    ? (!presentation.single ||
+                    ? (!presentation.single || presentation.dual ||
                        presentation.shown_screen == 1 ||
                        presentation.inset_percent > 0) &&
                           event.button.x >= bottom_content_left &&
@@ -5798,7 +5950,8 @@ int nds_run_interactive_frontend(const NdsFrontendOptions& initial_options) {
                 const uint32_t window = motion ? event.motion.windowID
                                                : event.button.windowID;
                 const bool touchscreen_shown =
-                    !presentation.single || presentation.shown_screen == 1 ||
+                    !presentation.single || presentation.dual ||
+                    presentation.shown_screen == 1 ||
                     presentation.inset_percent > 0;
                 const bool hovering =
                     window == presentation.window_ids[1] &&
@@ -6232,7 +6385,8 @@ int nds_run_interactive_frontend(const NdsFrontendOptions& initial_options) {
             // A single-screen peek at the top LCD hides the touchscreen, so
             // taps do not reach it.
             const bool stylus_on_touchscreen =
-                !presentation.single || presentation.shown_screen == 1;
+                !presentation.single || presentation.dual ||
+                presentation.shown_screen == 1;
             nds_set_touch(static_cast<uint16_t>(std::lround(mph_virtual_x)),
                           static_cast<uint16_t>(std::lround(mph_virtual_y)),
                           virtual_stylus_tap_held && stylus_on_touchscreen);
@@ -6400,6 +6554,43 @@ int nds_run_interactive_frontend(const NdsFrontendOptions& initial_options) {
             touch_release_pending = false;
         }
 
+#if defined(NDS_SECOND_DISPLAY)
+        // The second display's surface, picked up or let go of between
+        // frames: the layout switches with it, the windows stay as they are.
+        {
+            uint64_t generation = 0;
+            ANativeWindow* const surface =
+                nds_second_display_surface(&generation);
+            if (generation != second_display_generation) {
+                nds_compute_host_set_bottom_window(nullptr);
+                nds_second_display_release(generation);
+                second_display_generation = generation;
+                if (surface && presentation.single && presentation.gl_top)
+                    nds_compute_host_set_bottom_window(surface);
+                const bool dual = nds_compute_host_has_bottom_window();
+                if (dual != presentation.dual) {
+                    // A held touch belongs to the panel it started on.
+                    if (mouse_down) {
+                        mouse_down = false;
+                        touch_release_pending = false;
+                        nds_set_touch(0, 0, false);
+                    }
+                    second_display_touch_held = false;
+                    presentation.dual = dual;
+                    presentation.window_ids[1] =
+                        dual ? kSecondDisplayWindowId
+                             : presentation.window_ids[0];
+                    if (dual) {
+                        presentation.shown_screen = 0;
+                        presentation.stacked = false;
+                    }
+                    std::fprintf(stderr, "[second-display] bottom screen %s\n",
+                                 dual ? "on the second display"
+                                      : "back in the main window");
+                }
+            }
+        }
+#endif
         const uint64_t phase1 = SDL_GetPerformanceCounter();
         uint64_t latency_cycles_present = latency_trace ? nds_frontend_latency::cycles() : 0;
         const uint32_t* native_top=nullptr;
@@ -6436,7 +6627,9 @@ int nds_run_interactive_frontend(const NdsFrontendOptions& initial_options) {
                                  static_cast<unsigned long long>(shown_frames));
                     screen_toggled = false;
                 }
-                presentation.stacked = nds_title_stacked_layout_wanted();
+                // With the second display each LCD has a panel of its own.
+                presentation.stacked =
+                    !presentation.dual && nds_title_stacked_layout_wanted();
                 nds_stack_vertically_flag().store(
                     presentation.stacked, std::memory_order_relaxed);
                 nds_stack_gap_flag().store(
@@ -6444,7 +6637,7 @@ int nds_run_interactive_frontend(const NdsFrontendOptions& initial_options) {
                     std::memory_order_relaxed);
                 nds_inset_below_flag().store(nds_title_inset_below_wanted(),
                                              std::memory_order_relaxed);
-                const int shown = presentation.stacked
+                const int shown = presentation.stacked || presentation.dual
                     ? 0
                     : nds_single_shown_screen(
                           main_screen.main, screen_toggled,
@@ -6506,8 +6699,11 @@ int nds_run_interactive_frontend(const NdsFrontendOptions& initial_options) {
             presentation.resolution_scale = options.resolution_scale;
             presentation.internal_resolution = options.internal_resolution;
             presentation.inset_percent =
-                !presentation.single ? 0 : presentation.stacked ? 100
-                : options.second_screen_size;
+                !presentation.single || presentation.dual ? 0
+                : presentation.stacked ? 100 : options.second_screen_size;
+#if defined(NDS_SECOND_DISPLAY)
+            g_present_synthetic = true;
+#endif
             const PresentationTicks synthetic_ticks = present_screens(
                 presentation, blend_cache.blended[0].data(), top_width,
                 blend_cache.blended[1].data(), bottom_width,
@@ -6515,6 +6711,9 @@ int nds_run_interactive_frontend(const NdsFrontendOptions& initial_options) {
                 mph_virtual_x, mph_virtual_y,
                 savestate_notice.empty() ? nullptr : savestate_notice.c_str(),
                 options.show_fps ? fps_counter.c_str() : nullptr);
+#if defined(NDS_SECOND_DISPLAY)
+            g_present_synthetic = false;
+#endif
             if (!synthetic_ticks.ok) {
                 compute_failed = true;
                 running = false;
@@ -6545,8 +6744,8 @@ int nds_run_interactive_frontend(const NdsFrontendOptions& initial_options) {
         presentation.resolution_scale = options.resolution_scale;
         presentation.internal_resolution = options.internal_resolution;
         presentation.inset_percent =
-            !presentation.single ? 0 : presentation.stacked ? 100
-            : options.second_screen_size;
+            !presentation.single || presentation.dual ? 0
+            : presentation.stacked ? 100 : options.second_screen_size;
         const PresentationTicks presentation_ticks = present_screens(
             presentation, top_pixels, top_width,
             bottom_pixels, bottom_width,
@@ -6977,6 +7176,10 @@ int nds_run_interactive_frontend(const NdsFrontendOptions& initial_options) {
     const bool audio_opened = static_cast<bool>(audio);
     close_audio(audio);
     nds_frontend_latency::finish();
+#if defined(NDS_SECOND_DISPLAY)
+    nds_compute_host_set_bottom_window(nullptr);
+    nds_second_display_stop();
+#endif
 #if defined(NDS_HAVE_COMPUTE_RENDERER)
     nds_gpu2d_set_direct_present(false);
     nds_compute_host_stop();

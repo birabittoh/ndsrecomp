@@ -98,6 +98,23 @@ bool nds_compute_host_present_top(const unsigned int* fallback_pixels,
                                   NdsComputePresentTicks* ticks,
                                   unsigned antialiasing = 0,
                                   const NdsComputePresentationFrame* owned = nullptr);
+#if defined(__ANDROID__) && defined(NDS_USE_PLUME)
+// Plume on Android only: the bottom LCD on a second display's surface
+// (android_second_display.h), in a swap chain of its own on the host's
+// device. Setting a new window, or nullptr, first waits for every frame in
+// flight to the old one and drops its swap chain.
+struct ANativeWindow;
+void nds_compute_host_set_bottom_window(ANativeWindow* window);
+bool nds_compute_host_has_bottom_window();
+// `width` x 192 ARGB into the bottom window's present rect (the current
+// present mode), with an optional overlay as for the top window. True also
+// when the frame is skipped (no size yet, surface out of date).
+bool nds_compute_host_present_bottom(const uint32_t* pixels, unsigned width,
+                                     const uint32_t* overlay,
+                                     unsigned overlay_width,
+                                     unsigned overlay_height,
+                                     NdsComputePresentTicks* ticks);
+#endif
 void nds_compute_host_stop();
 bool nds_compute_host_active();
 
