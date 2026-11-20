@@ -26,6 +26,13 @@ std::atomic<int> g_count{0};
 std::atomic<bool> g_shown[kNdsTouchButtonMax] = {};
 std::atomic<bool> g_active[kNdsTouchButtonMax] = {};
 std::atomic<bool (*)()> g_query[kNdsTouchButtonMax] = {};
+std::atomic<int (*)()> g_opacity[kNdsTouchButtonMax] = {};
+
+// `argb` with its alpha scaled to `percent`.
+uint32_t Faded(uint32_t argb, int percent) {
+    const uint32_t alpha = (argb >> 24) * static_cast<uint32_t>(percent) / 100;
+    return (alpha << 24) | (argb & 0x00FFFFFFu);
+}
 
 const NdsTouchButtonSpec kChat = {
     {
@@ -162,6 +169,11 @@ void nds_touch_button_set_query(int id, bool (*shown)()) {
         g_query[id].store(shown, std::memory_order_release);
 }
 
+void nds_touch_button_set_opacity_query(int id, int (*opacity)()) {
+    if (id >= 0 && id < kNdsTouchButtonMax)
+        g_opacity[id].store(opacity, std::memory_order_release);
+}
+
 void nds_touch_button_set_active(int id, bool active) {
     if (id >= 0 && id < kNdsTouchButtonMax)
         g_active[id].store(active, std::memory_order_release);
@@ -196,8 +208,13 @@ void nds_touch_buttons_layout(int ds_width,
     for (int i = 0; i < n; ++i) {
         const Box& b = boxes[i];
         const bool active = g_active[b.id].load(std::memory_order_acquire);
+        int (*opacity)() = g_opacity[b.id].load(std::memory_order_acquire);
+        int percent = opacity ? opacity() : 100;
+        percent = percent < 0 ? 0 : percent > 100 ? 100 : percent;
+        const uint32_t back = Faded(active ? kActiveBack : kBack, percent);
+        const uint32_t lit = Faded(active ? kActiveLit : kLit, percent);
         out->push_back({b.x, b.y, kNdsTouchButtonWidth, kNdsTouchButtonHeight,
-                        active ? kActiveBack : kBack});
+                        back});
         const NdsTouchButtonSpec* spec = nds_touch_button_spec(b.id);
         for (int r = 0; r < kNdsTouchButtonArtRows; ++r) {
             const char* row = spec->art[r];
@@ -209,8 +226,7 @@ void nds_touch_buttons_layout(int ds_width,
                 while (c + run < len && c + run < 11 && row[c + run] == '#')
                     ++run;
                 out->push_back({b.x + c * kCell, b.y + r * kCell,
-                                run * kCell, kCell,
-                                active ? kActiveLit : kLit});
+                                run * kCell, kCell, lit});
                 c += run;
             }
         }

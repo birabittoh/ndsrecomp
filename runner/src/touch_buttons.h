@@ -75,6 +75,10 @@ int nds_touch_button_fast_forward();
 // nds_touch_buttons_update asks in place of its spec's.
 void nds_touch_button_set_query(int id, bool (*shown)());
 
+// Gives a button a query for its opacity, in percent (100 when it has
+// none), asked by nds_touch_buttons_layout: a title's setting can fade it.
+void nds_touch_button_set_opacity_query(int id, int (*opacity)());
+
 // Whether a button draws as on (lit, dark icon), for a toggle.
 void nds_touch_button_set_active(int id, bool active);
 
