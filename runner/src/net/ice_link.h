@@ -8,7 +8,7 @@
 // as a fake IPv4 address in TEST-NET-1 (SeatAddr), so the transport's peer
 // table works unchanged.
 //
-// Relay only. No STUN server is configured, and every candidate that is not
+// Relay only unless SetDirect(true). No STUN server is configured, and every candidate that is not
 // "typ relay" is dropped: from the local description, from trickle, and
 // from what the remote side sends (a remote host candidate would make this
 // agent send checks to it from a local socket, revealing this machine's
@@ -35,6 +35,7 @@
 
 #include "net/mp_link.h"
 
+#include <atomic>
 #include <chrono>
 #include <condition_variable>
 #include <cstdint>
@@ -109,6 +110,12 @@ public:
     // The seats this runner links to. Hub: every guest. Guest: the hub.
     // Agents of seats not listed are dropped; a guest starts its offer.
     void SetPeers(const std::vector<int>& seats);
+    // Direct (unsafe): also gather the public address through a STUN
+    // server and accept any candidate pair, so players connect without the
+    // relay when they can. Their addresses are then visible to each other.
+    // Read when an agent is created, so it applies to the next negotiation.
+    void SetDirect(bool direct);
+    bool Direct() const;
     void PushSignal(const IceSignal& signal);
     std::vector<IceSignal> TakeSignals();
     // Timers: a guest retries an agent that failed or took too long; any
@@ -142,6 +149,7 @@ private:
     void SendOnAgent(const std::shared_ptr<Peer>& peer,
                      const std::vector<uint8_t>& bytes);
     void ForwardLoop();
+    std::string FilterSdp(const std::string& sdp) const;
 
     // libjuice callbacks
     void OnState(Peer* peer, int state);
@@ -154,6 +162,7 @@ private:
     std::condition_variable rx_cv_;
     std::condition_variable fwd_cv_;
 
+    std::atomic<bool> direct_{false};
     bool in_room_ = false;
     int self_seat_ = -1;
     int hub_seat_ = -1;

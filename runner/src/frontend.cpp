@@ -1772,9 +1772,12 @@ void runtime_menu_save(const RuntimeMenuState* state) {
                            std::to_string(options.relative_mouse_sensitivity)});
 #if NDS_ONLINE
     bool netplay = false;
+    bool direct = false;
     std::string lobby_name;
-    if (nds_netplay_menu_settings(&netplay, &lobby_name)) {
+    if (nds_netplay_menu_settings(&netplay, &direct, &lobby_name)) {
         updates.push_back({"online", "enabled", netplay ? "true" : "false"});
+        updates.push_back(
+            {"online", "direct", direct ? "true" : "false"});
         updates.push_back({"online", "lobby_name", quoted(lobby_name.c_str())});
     }
 #endif

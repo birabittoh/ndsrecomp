@@ -168,6 +168,7 @@ public:
         if (thread_.joinable()) return;
         config_ = config;
         enabled_ = config.enabled;
+        direct_ = config.direct;
         lobby_name_ = config.lobby_name;
         sign_in_request_ = config.sign_in;
         auto_join_ = config.join;
@@ -200,6 +201,17 @@ public:
     bool Enabled() {
         std::lock_guard<std::mutex> lock(mu_);
         return enabled_;
+    }
+
+    void SetDirect(bool on) {
+        std::lock_guard<std::mutex> lock(mu_);
+        direct_ = on;
+        if (link_) link_->SetDirect(on);
+    }
+
+    bool Direct() {
+        std::lock_guard<std::mutex> lock(mu_);
+        return direct_;
     }
 
     void SetLobbyName(const std::string& name) {
@@ -278,6 +290,7 @@ private:
     // ---- link ownership (mu_ held) ----------------------------------------
     void NewLinkLocked() {
         link_ = std::make_shared<mpnet::IceLink>();
+        link_->SetDirect(direct_);
         link_epoch_.fetch_add(1);
     }
     void DropLinkLocked() {
@@ -1165,6 +1178,7 @@ private:
     NdsOnlineConfig config_;
     // Requests, under mu_.
     bool enabled_ = false;
+    bool direct_ = false;
     bool sign_in_request_ = false;
     std::string logged_sign_in_error_;  // the last failure written to the log
     bool sign_out_request_ = false;
@@ -1236,6 +1250,8 @@ void nds_online_stop() { Instance().Stop(); }
 bool nds_online_available() { return Instance().Running(); }
 void nds_online_set_enabled(bool enabled) { Instance().SetEnabled(enabled); }
 bool nds_online_enabled() { return Instance().Enabled(); }
+void nds_online_set_direct(bool direct) { Instance().SetDirect(direct); }
+bool nds_online_direct() { return Instance().Direct(); }
 void nds_online_set_lobby_name(const std::string& name) {
     Instance().SetLobbyName(name);
 }

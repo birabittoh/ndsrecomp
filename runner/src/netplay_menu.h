@@ -31,4 +31,5 @@ void nds_netplay_menu_tick();
 // The values to write to settings.toml's [online] once the player changed
 // one of them here; false before that, so command-line flags such as
 // --netplay on are never saved by a change elsewhere in the settings.
-bool nds_netplay_menu_settings(bool* enabled, std::string* lobby_name);
+bool nds_netplay_menu_settings(bool* enabled, bool* direct,
+                               std::string* lobby_name);

@@ -567,7 +567,7 @@ bool nds_is_local_wireless_tuning_flag(const std::string& flag) {
            flag == "--local-wireless-link" ||
            flag == "--local-wireless-peer" ||
            flag == "--netplay" || flag == "--netplay-sign-in" ||
-           flag == "--netplay-join" || flag == "--netplay-lobby-name" ||
+           flag == "--netplay-join" || flag == "--netplay-direct" || flag == "--netplay-lobby-name" ||
            flag == "--netplay-lobby-url";
 }
 
@@ -611,6 +611,9 @@ bool nds_parse_local_wireless_tuning(const std::string& flag,
     }
     if (flag == "--netplay")
         return nds_parse_on_off(value, &out->online.enabled) ||
+               fail("on or off");
+    if (flag == "--netplay-direct")
+        return nds_parse_on_off(value, &out->online.direct) ||
                fail("on or off");
     if (flag == "--netplay-sign-in")
         return nds_parse_on_off(value, &out->online.sign_in) ||
@@ -1427,6 +1430,8 @@ static bool apply_frontend_config(toml::table& root,
         NdsOnlineOptions& o = options->local_wireless.online;
         if (const auto value = (*online)["enabled"].value<bool>())
             o.enabled = *value;
+        if (const auto value = (*online)["direct"].value<bool>())
+            o.direct = *value;
         if (const auto value = (*online)["lobby_url"].value<std::string>()) {
             if (!value->empty() && value->rfind("ws://", 0) != 0) {
                 if (error) *error = "online.lobby_url must be a ws:// URL";

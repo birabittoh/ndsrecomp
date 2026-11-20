@@ -166,6 +166,7 @@ struct NdsNetworkOptions {
 // NDS_ONLINE ignore it.
 struct NdsOnlineOptions {
     bool enabled = false;
+    bool direct = false;     // Online (unsafe): direct connections, no relay
     std::string lobby_url;   // empty = the public lobby server
     std::string game_name;   // lobby list filter; empty = the ROM game code
     std::string lobby_name;  // empty = "<host's name>'s lobby"

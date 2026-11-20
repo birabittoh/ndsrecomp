@@ -43,6 +43,8 @@ struct NdsOnlineConfig {
     // Discord device key file (recomp-net auth.h). Empty = next to the exe.
     std::string secret_path;
     bool enabled = false;
+    // Direct (unsafe) connections, see IceLink::SetDirect.
+    bool direct = false;
     // Test aids from the command line: begin Discord sign-in at startup
     // when there is no stored key; join this lobby id, or "first" for the
     // first listed lobby of this game that is not our own.
@@ -89,6 +91,11 @@ bool nds_online_available();
 
 void nds_online_set_enabled(bool enabled);
 bool nds_online_enabled();
+// Direct (unsafe) connections instead of relay only: the players see each
+// other's addresses, and datagrams skip the relay. Applies to the next link
+// negotiation.
+void nds_online_set_direct(bool direct);
+bool nds_online_direct();
 void nds_online_set_lobby_name(const std::string& name);
 std::string nds_online_lobby_name();
 void nds_online_sign_in();

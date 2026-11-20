@@ -83,6 +83,10 @@ int SeatOf(const PeerAddr& addr) {
     return seat < kMaxSeats ? seat : -1;
 }
 
+// STUN server for direct connections (public, no account).
+constexpr const char* kDirectStunHost = "stun.l.google.com";
+constexpr int kDirectStunPort = 19302;
+
 bool IsRelayCandidate(const std::string& line) {
     return CandidateType(line.c_str()) == "relay";
 }
@@ -170,6 +174,18 @@ IceLink::~IceLink() {
 }
 
 // ---- control half ---------------------------------------------------------
+
+void IceLink::SetDirect(bool direct) {
+    if (direct_.exchange(direct) != direct)
+        std::fprintf(stderr, "[online] link: %s connections\n",
+                     direct ? "direct (unsafe)" : "relay-only");
+}
+
+bool IceLink::Direct() const { return direct_.load(); }
+
+std::string IceLink::FilterSdp(const std::string& sdp) const {
+    return Direct() ? sdp : FilterRelayOnly(sdp);
+}
 
 void IceLink::SetRoom(int self_seat, int hub_seat, const TurnConfig& turn) {
     std::map<int, std::shared_ptr<Peer>> doomed;
@@ -280,7 +296,15 @@ std::shared_ptr<IceLink::Peer> IceLink::CreateAgent(int seat, int gen,
     juice_config_t config;
     std::memset(&config, 0, sizeof(config));
     config.concurrency_mode = JUICE_CONCURRENCY_MODE_POLL;
-    config.stun_server_host = nullptr;  // no server-reflexive candidates
+    // Relay only, unless the player chose direct connections (SetDirect):
+    // then a STUN server gives the agent its public address, and a direct
+    // pair is used when one works, the relay otherwise.
+    if (Direct()) {
+        config.stun_server_host = kDirectStunHost;
+        config.stun_server_port = kDirectStunPort;
+    } else {
+        config.stun_server_host = nullptr;  // no server-reflexive candidates
+    }
     config.turn_servers = &peer->turn;
     config.turn_servers_count = 1;
     config.cb_state_changed = IceLinkCallbacks::State;
@@ -312,7 +336,7 @@ void IceLink::StartOffer(int seat, int gen) {
         auto& slot = peers_[seat];
         old = std::move(slot);
         slot = peer;
-        signals_out_.push_back({seat, kIceSignalSdp, gen, FilterRelayOnly(sdp)});
+        signals_out_.push_back({seat, kIceSignalSdp, gen, FilterSdp(sdp)});
     }
     old.reset();
     std::fprintf(stderr, "[online] link: offer to seat %d (gen %d)\n", seat,
@@ -332,7 +356,7 @@ void IceLink::Answer(int seat, int gen, const std::string& remote_sdp) {
     std::shared_ptr<Peer> peer = CreateAgent(seat, gen, false);
     if (!peer) return;
     if (juice_set_remote_description(peer->agent,
-                                     FilterRelayOnly(remote_sdp).c_str()) !=
+                                     FilterSdp(remote_sdp).c_str()) !=
         0) {
         std::fprintf(stderr, "[online] link: bad offer from seat %d\n", seat);
         return;
@@ -347,7 +371,7 @@ void IceLink::Answer(int seat, int gen, const std::string& remote_sdp) {
         auto& slot = peers_[seat];
         old = std::move(slot);
         slot = peer;
-        signals_out_.push_back({seat, kIceSignalSdp, gen, FilterRelayOnly(sdp)});
+        signals_out_.push_back({seat, kIceSignalSdp, gen, FilterSdp(sdp)});
     }
     old.reset();
     std::fprintf(stderr, "[online] link: answer to seat %d (gen %d)\n", seat,
@@ -378,7 +402,7 @@ void IceLink::PushSignal(const IceSignal& signal) {
     switch (signal.type) {
     case kIceSignalSdp: {  // the hub's answer to our offer
         if (juice_set_remote_description(
-                peer->agent, FilterRelayOnly(signal.text).c_str()) != 0) {
+                peer->agent, FilterSdp(signal.text).c_str()) != 0) {
             std::fprintf(stderr, "[online] link: bad answer from seat %d\n",
                          signal.seat);
             break;
@@ -388,7 +412,7 @@ void IceLink::PushSignal(const IceSignal& signal) {
         break;
     }
     case kIceSignalCandidate:
-        if (IsRelayCandidate(signal.text))
+        if (Direct() || IsRelayCandidate(signal.text))
             juice_add_remote_candidate(peer->agent, signal.text.c_str());
         break;
     case kIceSignalDone:
@@ -457,7 +481,7 @@ void IceLink::Poll(Clock::time_point now) {
             continue;
         const std::string lt = CandidateType(local);
         const std::string rt = CandidateType(remote);
-        const bool relay = lt == "relay" && rt == "relay";
+        const bool relay = Direct() || (lt == "relay" && rt == "relay");
         {
             std::lock_guard<std::mutex> lock(mutex_);
             peer->relay_checked = true;
@@ -475,7 +499,9 @@ void IceLink::Poll(Clock::time_point now) {
         std::fprintf(stderr,
                      "[online] link: seat %d connected, local %s, remote %s%s\n",
                      peer->seat, lt.c_str(), rt.c_str(),
-                     relay ? "" : ": not relay, closed");
+                     !relay ? ": not relay, closed"
+                     : (lt == "relay" && rt == "relay") ? ""
+                                                         : ": direct");
     }
     doomed.clear();
 
@@ -517,7 +543,7 @@ void IceLink::OnState(Peer* peer, int state) {
 }
 
 void IceLink::OnCandidate(Peer* peer, const char* sdp) {
-    if (!sdp || !IsRelayCandidate(sdp)) return;
+    if (!sdp || (!Direct() && !IsRelayCandidate(sdp))) return;
     std::lock_guard<std::mutex> lock(mutex_);
     signals_out_.push_back({peer->seat, kIceSignalCandidate, peer->gen, sdp});
 }

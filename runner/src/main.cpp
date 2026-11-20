@@ -2169,6 +2169,7 @@ int main(int argc, char** argv) {
                  "netplay_secret")
                     .string();
             config.enabled = online.enabled;
+            config.direct = online.direct;
             config.sign_in = online.sign_in;
             config.join = online.join;
             nds_online_start(config);

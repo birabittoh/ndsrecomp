@@ -15,6 +15,8 @@ using Clock = std::chrono::steady_clock;
 
 constexpr const char* kSection = "Netplay";
 constexpr const char* kEnabledKey = "netplay.enabled";
+// Local, Online (the relay), Online (unsafe) (direct connections).
+constexpr const char* kModeChoices[] = {"Local", "Online", "Online (unsafe)"};
 constexpr const char* kAccountKey = "netplay.account";
 // Signing out takes a second press within this time.
 constexpr auto kConfirmTime = std::chrono::seconds(3);
@@ -92,9 +94,12 @@ void nds_netplay_menu_append_items(std::vector<NdsMenuItem>* items) {
     enabled.section = kSection;
     enabled.label = "Netplay";
     enabled.description = m.server_status.data();
-    enabled.type = NdsMenuItemType::Bool;
-    enabled.maximum = 1;
+    enabled.type = NdsMenuItemType::Choice;
+    enabled.minimum = 0;
+    enabled.maximum = 2;
     enabled.step = 1;
+    enabled.choices = kModeChoices;
+    enabled.choice_count = 3;
     items->push_back(enabled);
     NdsMenuItem account{};
     account.key = kAccountKey;
@@ -111,12 +116,13 @@ bool nds_netplay_menu_owns(const NdsMenuItem* item) {
 
 int nds_netplay_menu_get_value(const NdsMenuItem* item, int* value) {
     if (!is(item, kEnabledKey)) return 0;
-    *value = nds_online_enabled() ? 1 : 0;
+    *value = !nds_online_enabled() ? 0 : nds_online_direct() ? 2 : 1;
     return 1;
 }
 
 int nds_netplay_menu_set_value(const NdsMenuItem* item, int value) {
-    if (!is(item, kEnabledKey) || value < 0 || value > 1) return 0;
+    if (!is(item, kEnabledKey) || value < 0 || value > 2) return 0;
+    nds_online_set_direct(value == 2);
     nds_online_set_enabled(value != 0);
     state().dirty = true;
     std::fprintf(stderr, "[online] Netplay %s from the menu\n",
@@ -167,10 +173,12 @@ void nds_netplay_menu_tick() {
     refresh_label(m);
 }
 
-bool nds_netplay_menu_settings(bool* enabled, std::string* lobby_name) {
+bool nds_netplay_menu_settings(bool* enabled, bool* direct,
+                               std::string* lobby_name) {
     const MenuState& m = state();
     if (!m.dirty) return false;
     *enabled = nds_online_enabled();
+    *direct = nds_online_direct();
     *lobby_name = m.lobby_name;
     return true;
 }
