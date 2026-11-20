@@ -1466,6 +1466,9 @@ if(WIN32)
     # shell32: --prepare-content reads the UTF-16 command line
     # (player_launch.cpp).
     target_link_libraries(nds_runner PRIVATE ws2_32 iphlpapi shell32)
+    # Common Controls v6, merged into the embedded manifest: TaskDialog, for
+    # the player's prompts with the game's icon (player_launch.cpp).
+    target_sources(nds_runner PRIVATE src/windows/common_controls.manifest)
 endif()
 
 # Self-update (src/update/self_update.h, offered to titles through

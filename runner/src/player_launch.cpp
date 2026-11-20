@@ -8,6 +8,7 @@
 #include <cstring>
 #include <filesystem>
 #include <fstream>
+#include <initializer_list>
 #include <utility>
 #include <vector>
 
@@ -19,6 +20,7 @@
 #define NOMINMAX
 #endif
 #include <windows.h>
+#include <commctrl.h>
 #include <shellapi.h>
 #endif
 
@@ -161,6 +163,153 @@ const char* locale_language() {
     return nullptr;
 }
 
+// The player's prompts and errors, in the system's language when it is one
+// of the DS firmware's five, else in English. {key} placeholders are filled
+// in by tr().
+enum class Text {
+    AskRom, NoRomSelected, ChooseRom, Quit, PickRomTitle, ErrorTitle,
+    FileUnreadable, SelectedFile, NotThisRom, NotThisFolder, NoPicker,
+    CannotUnpack, CannotConvert, PickBiosTitle, PutBios, BiosMissing, And,
+    Count
+};
+
+const char* const kTexts[][static_cast<int>(Text::Count)] = {
+    {   // English
+        "To play, select your own {game} ROM (a .nds file) on the next "
+        "screen.",
+        "No ROM was selected.",
+        "Choose ROM",
+        "Quit",
+        "Select your {game} ROM",
+        "Cannot start the game",
+        "The selected file could not be read.",
+        "The selected file",
+        "{file} is not the ROM this build runs: {game}, SHA-1 {sha1}.",
+        "{path} is not the unpacked ROM this build runs.",
+        "No file picker is available. Start the game with the ROM's path as "
+        "its only argument.",
+        "Cannot unpack the ROM: {error}",
+        "Cannot convert the ROM: {error}",
+        "Select the folder with {files}",
+        "Put {files} in {dir}.",
+        "{dir} must contain {files}.",
+        "and",
+    },
+    {   // French
+        "Pour jouer, sélectionnez votre propre ROM de {game} (un fichier "
+        ".nds) sur l'écran suivant.",
+        "Aucune ROM n'a été sélectionnée.",
+        "Choisir la ROM",
+        "Quitter",
+        "Sélectionnez votre ROM de {game}",
+        "Impossible de lancer le jeu",
+        "Le fichier sélectionné n'a pas pu être lu.",
+        "Le fichier sélectionné",
+        "{file} n'est pas la ROM que cette version utilise : {game}, SHA-1 "
+        "{sha1}.",
+        "{path} n'est pas la ROM décompressée que cette version utilise.",
+        "Aucun sélecteur de fichiers n'est disponible. Lancez le jeu avec le "
+        "chemin de la ROM comme seul argument.",
+        "Impossible de décompresser la ROM : {error}",
+        "Impossible de convertir la ROM : {error}",
+        "Sélectionnez le dossier contenant {files}",
+        "Placez {files} dans {dir}.",
+        "{dir} doit contenir {files}.",
+        "et",
+    },
+    {   // German
+        "Wähle zum Spielen auf dem nächsten Bildschirm dein eigenes ROM von "
+        "{game} (eine .nds-Datei) aus.",
+        "Es wurde kein ROM ausgewählt.",
+        "ROM auswählen",
+        "Beenden",
+        "Wähle dein ROM von {game} aus",
+        "Das Spiel kann nicht gestartet werden",
+        "Die ausgewählte Datei konnte nicht gelesen werden.",
+        "Die ausgewählte Datei",
+        "{file} ist nicht das ROM, das diese Version ausführt: {game}, SHA-1 "
+        "{sha1}.",
+        "{path} ist nicht das entpackte ROM, das diese Version ausführt.",
+        "Es ist keine Dateiauswahl verfügbar. Starte das Spiel mit dem Pfad "
+        "des ROMs als einzigem Argument.",
+        "Das ROM kann nicht entpackt werden: {error}",
+        "Das ROM kann nicht umgewandelt werden: {error}",
+        "Wähle den Ordner mit {files} aus",
+        "Lege {files} in {dir} ab.",
+        "{dir} muss {files} enthalten.",
+        "und",
+    },
+    {   // Italian
+        "Per giocare, seleziona la tua ROM di {game} (un file .nds) nella "
+        "schermata successiva.",
+        "Nessuna ROM selezionata.",
+        "Scegli ROM",
+        "Esci",
+        "Seleziona la tua ROM di {game}",
+        "Impossibile avviare il gioco",
+        "Impossibile leggere il file selezionato.",
+        "Il file selezionato",
+        "{file} non è la ROM che questa versione esegue: {game}, SHA-1 "
+        "{sha1}.",
+        "{path} non è la ROM estratta che questa versione esegue.",
+        "Nessun selettore di file disponibile. Avvia il gioco con il percorso "
+        "della ROM come unico argomento.",
+        "Impossibile estrarre la ROM: {error}",
+        "Impossibile convertire la ROM: {error}",
+        "Seleziona la cartella con {files}",
+        "Metti {files} in {dir}.",
+        "{dir} deve contenere {files}.",
+        "e",
+    },
+    {   // Spanish
+        "Para jugar, selecciona tu propia ROM de {game} (un archivo .nds) en "
+        "la siguiente pantalla.",
+        "No se ha seleccionado ninguna ROM.",
+        "Elegir ROM",
+        "Salir",
+        "Selecciona tu ROM de {game}",
+        "No se puede iniciar el juego",
+        "No se ha podido leer el archivo seleccionado.",
+        "El archivo seleccionado",
+        "{file} no es la ROM que ejecuta esta versión: {game}, SHA-1 "
+        "{sha1}.",
+        "{path} no es la ROM descomprimida que ejecuta esta versión.",
+        "No hay ningún selector de archivos disponible. Inicia el juego con "
+        "la ruta de la ROM como único argumento.",
+        "No se puede descomprimir la ROM: {error}",
+        "No se puede convertir la ROM: {error}",
+        "Selecciona la carpeta con {files}",
+        "Coloca {files} en {dir}.",
+        "{dir} debe contener {files}.",
+        "y",
+    },
+};
+
+int text_language() {
+    static const int language = [] {
+        const char* name = locale_language();
+        const char* const names[] = {"english", "french", "german",
+                                     "italian", "spanish"};
+        for (int i = 0; i < 5; ++i)
+            if (name && std::strcmp(name, names[i]) == 0) return i;
+        return 0;
+    }();
+    return language;
+}
+
+std::string tr(Text text,
+               std::initializer_list<std::pair<const char*, std::string>>
+                   values = {}) {
+    std::string out = kTexts[text_language()][static_cast<int>(text)];
+    for (const auto& [key, value] : values) {
+        const std::string token = std::string("{") + key + "}";
+        for (size_t at = out.find(token); at != std::string::npos;
+             at = out.find(token, at + value.size()))
+            out.replace(at, token.size(), value);
+    }
+    return out;
+}
+
 bool write_default_settings(const fs::path& path,
                             const NdsFrontendOptions& options) {
     const char* language = locale_language();
@@ -301,6 +450,93 @@ DialogResult pick_folder(const std::string&, std::string*) {
 }
 #endif
 
+#if defined(NDS_HAVE_SDL3)
+// Says what the file picker is for before it opens (the Android one has no
+// title, so on its own it looks like the app handed over to the file
+// manager), and comes back here when it is cancelled. False: the player
+// chose to quit.
+#if defined(_WIN32)
+std::wstring widen(const std::string& text) {
+    const int size = MultiByteToWideChar(CP_UTF8, 0, text.c_str(), -1,
+                                         nullptr, 0);
+    std::wstring wide(size > 0 ? size - 1 : 0, L'\0');
+    if (size > 0)
+        MultiByteToWideChar(CP_UTF8, 0, text.c_str(), -1, wide.data(), size);
+    return wide;
+}
+
+// SDL's Windows message box only has the stock icons: a TaskDialog (Common
+// Controls v6, from the embedded manifest) shows the .exe's own, the
+// cartridge banner icon (resource 101, CMakeLists.txt). -1: unavailable.
+int task_dialog_choice(const std::string& title, const std::string& message,
+                       const char* yes, const char* no) {
+    using TaskDialogIndirectFn =
+        HRESULT(WINAPI*)(const TASKDIALOGCONFIG*, int*, int*, BOOL*);
+    const HMODULE comctl = LoadLibraryW(L"comctl32.dll");
+    const auto task_dialog = comctl
+        ? reinterpret_cast<TaskDialogIndirectFn>(
+              GetProcAddress(comctl, "TaskDialogIndirect"))
+        : nullptr;
+    using LoadIconMetricFn = HRESULT(WINAPI*)(HINSTANCE, PCWSTR, int, HICON*);
+    const auto load_icon_metric = comctl
+        ? reinterpret_cast<LoadIconMetricFn>(
+              GetProcAddress(comctl, "LoadIconMetric"))
+        : nullptr;
+    if (!task_dialog) return -1;
+    const std::wstring wtitle = widen(title), wmessage = widen(message),
+                       wyes = widen(yes), wno = widen(no);
+    const TASKDIALOG_BUTTON buttons[] = {{IDOK, wyes.c_str()},
+                                         {IDCANCEL, wno.c_str()}};
+    TASKDIALOGCONFIG config{};
+    config.cbSize = sizeof(config);
+    config.hInstance = GetModuleHandleW(nullptr);
+    config.dwFlags = TDF_ALLOW_DIALOG_CANCELLATION;
+    config.pszWindowTitle = wtitle.c_str();
+    config.pszContent = wmessage.c_str();
+    config.pButtons = buttons;
+    config.cButtons = 2;
+    config.nDefaultButton = IDOK;
+    HICON icon = nullptr;
+    if (load_icon_metric &&
+        SUCCEEDED(load_icon_metric(config.hInstance, MAKEINTRESOURCEW(101),
+                                   LIM_LARGE, &icon))) {
+        config.dwFlags |= TDF_USE_HICON_MAIN;
+        config.hMainIcon = icon;
+    } else {
+        config.pszMainIcon = TD_INFORMATION_ICON;
+    }
+    int pressed = 0;
+    const HRESULT result = task_dialog(&config, &pressed, nullptr, nullptr);
+    if (icon) DestroyIcon(icon);
+    if (FAILED(result)) return -1;
+    return pressed == IDOK ? 1 : 0;
+}
+#endif
+
+bool ask_to_pick_rom(const NdsFrontendOptions& options, bool again) {
+    const std::string name = nds_game_display_name(options);
+    const std::string message =
+        (again ? tr(Text::NoRomSelected) + "\n\n" : std::string()) +
+        tr(Text::AskRom, {{"game", name}});
+    const std::string choose = tr(Text::ChooseRom), quit = tr(Text::Quit);
+#if defined(_WIN32)
+    const int choice =
+        task_dialog_choice(name, message, choose.c_str(), quit.c_str());
+    if (choice >= 0) return choice == 1;
+#endif
+    const SDL_MessageBoxButtonData buttons[] = {
+        {SDL_MESSAGEBOX_BUTTON_ESCAPEKEY_DEFAULT, 0, quit.c_str()},
+        {SDL_MESSAGEBOX_BUTTON_RETURNKEY_DEFAULT, 1, choose.c_str()},
+    };
+    const SDL_MessageBoxData data{
+        SDL_MESSAGEBOX_INFORMATION, nullptr, name.c_str(), message.c_str(),
+        static_cast<int>(SDL_arraysize(buttons)), buttons, nullptr};
+    int chosen = 0;
+    if (!SDL_ShowMessageBox(&data, &chosen)) return true;  // straight on
+    return chosen == 1;
+}
+#endif
+
 #if defined(__ANDROID__) && defined(NDS_HAVE_SDL3)
 // The Android picker hands out a content:// URI, which only SDL (through the
 // ContentResolver) can open: copy it to `dest` so the rest reads a file.
@@ -413,7 +649,7 @@ Install install_rom(const fs::path& library, const NdsFrontendOptions& options,
         std::fprintf(stderr, "[player] unpacking the ROM to %s\n",
                      dir->string().c_str());
         if (!nds_rom_folder_unpack(rom, *dir, &error)) {
-            nds_player_error("Cannot unpack the ROM: " + error);
+            nds_player_error(tr(Text::CannotUnpack, {{"error", error}}));
             return Install::Failed;
         }
         return Install::Done;
@@ -427,7 +663,7 @@ Install install_rom(const fs::path& library, const NdsFrontendOptions& options,
         std::fprintf(stderr, "[player] unpacking the ROM to %s\n",
                      source.string().c_str());
         if (!nds_rom_folder_unpack(rom, source, &error)) {
-            nds_player_error("Cannot unpack the ROM: " + error);
+            nds_player_error(tr(Text::CannotUnpack, {{"error", error}}));
             return Install::Failed;
         }
     }
@@ -440,7 +676,7 @@ Install install_rom(const fs::path& library, const NdsFrontendOptions& options,
                                     recipe->size, &error)) {
         fs::remove_all(converted, ec);
         if (!unpacked) fs::remove_all(source, ec);
-        nds_player_error("Cannot convert the ROM: " + error);
+        nds_player_error(tr(Text::CannotConvert, {{"error", error}}));
         return Install::Failed;
     }
     fs::remove_all(source, ec);
@@ -477,10 +713,12 @@ bool bios_complete(const fs::path& dir, DumpNeeds needs) {
                        });
 }
 
-const char* bios_files_wanted(DumpNeeds needs) {
+std::string bios_files_wanted(DumpNeeds needs) {
+    const std::string conjunction = " " + tr(Text::And) + " ";
     if (needs.bios && needs.firmware)
-        return "biosnds7.rom, biosnds9.rom and firmware.bin";
-    return needs.bios ? "biosnds7.rom and biosnds9.rom" : "firmware.bin";
+        return "biosnds7.rom, biosnds9.rom" + conjunction + "firmware.bin";
+    return needs.bios ? "biosnds7.rom" + conjunction + "biosnds9.rom"
+                      : std::string("firmware.bin");
 }
 
 bool remember(const fs::path& settings, const char* key,
@@ -545,19 +783,32 @@ bool resolve_rom(const fs::path& root, const fs::path& settings,
         }
     }
     std::string candidate = argument ? argument : "";
+#if defined(NDS_HAVE_SDL3)
+    bool asked_before = false;
+#endif
     for (;;) {
         if (candidate.empty()) {
-            switch (pick_file("Select your " + nds_game_display_name(options) + " ROM",
+#if defined(NDS_HAVE_SDL3)
+            if (!ask_to_pick_rom(options, asked_before)) {
+                *cancelled = true;
+                return false;
+            }
+#endif
+            switch (pick_file(tr(Text::PickRomTitle,
+                                 {{"game", nds_game_display_name(options)}}),
                               &candidate)) {
                 case DialogResult::Picked:
                     break;
                 case DialogResult::Cancelled:
+#if defined(NDS_HAVE_SDL3)
+                    asked_before = true;
+                    continue;
+#else
                     *cancelled = true;
                     return false;
+#endif
                 case DialogResult::Unavailable:
-                    nds_player_error(
-                        "No file picker is available. Start the game with "
-                        "the ROM's path as its only argument.");
+                    nds_player_error(tr(Text::NoPicker));
                     return false;
             }
         }
@@ -567,7 +818,7 @@ bool resolve_rom(const fs::path& root, const fs::path& settings,
         if (candidate.rfind("content://", 0) == 0) {
             const fs::path copy = root / (options.app_name + ".import.nds");
             if (!import_uri(candidate, copy)) {
-                nds_player_error("The selected file could not be read.");
+                nds_player_error(tr(Text::FileUnreadable));
                 candidate.clear();
                 continue;
             }
@@ -582,8 +833,8 @@ bool resolve_rom(const fs::path& root, const fs::path& settings,
                 remember(settings, "rom", to_stored(root, *rom));
                 return true;
             }
-            nds_player_error(path.string() +
-                             " is not the unpacked ROM this build runs.");
+            nds_player_error(
+                tr(Text::NotThisFolder, {{"path", path.string()}}));
             if (argument) return false;
             candidate.clear();
             continue;
@@ -602,11 +853,12 @@ bool resolve_rom(const fs::path& root, const fs::path& settings,
                 return true;
             }
         }
-        nds_player_error((imported ? std::string("The selected file")
-                                   : path.filename().string()) +
-                         " is not the ROM this build runs: " +
-                         nds_game_display_name(options) + ", SHA-1 " +
-                         expected + ".");
+        nds_player_error(tr(
+            Text::NotThisRom,
+            {{"file", imported ? tr(Text::SelectedFile)
+                               : path.filename().string()},
+             {"game", nds_game_display_name(options)},
+             {"sha1", expected}}));
         if (argument) return false;
         candidate.clear();
     }
@@ -633,17 +885,17 @@ bool resolve_bios(const fs::path& root, const fs::path& settings,
     for (;;) {
         std::string picked;
         switch (pick_folder(
-            std::string("Select the folder with ") +
-                bios_files_wanted(needs), &picked)) {
+            tr(Text::PickBiosTitle, {{"files", bios_files_wanted(needs)}}),
+            &picked)) {
             case DialogResult::Picked:
                 break;
             case DialogResult::Cancelled:
                 *cancelled = true;
                 return false;
             case DialogResult::Unavailable:
-                nds_player_error(std::string("Put ") +
-                                 bios_files_wanted(needs) + " in " +
-                                 (root / "bios").string() + ".");
+                nds_player_error(
+                    tr(Text::PutBios, {{"files", bios_files_wanted(needs)},
+                                       {"dir", (root / "bios").string()}}));
                 return false;
         }
         if (bios_complete(picked, needs)) {
@@ -651,8 +903,9 @@ bool resolve_bios(const fs::path& root, const fs::path& settings,
             remember(settings, "bios", to_stored(root, picked));
             return true;
         }
-        nds_player_error(picked + " must contain " +
-                         bios_files_wanted(needs) + ".");
+        nds_player_error(tr(Text::BiosMissing,
+                            {{"dir", picked},
+                             {"files", bios_files_wanted(needs)}}));
     }
 }
 
@@ -771,8 +1024,9 @@ bool nds_player_requested(int argc, char** argv) {
 void nds_player_error(const std::string& message) {
     std::fprintf(stderr, "%s\n", message.c_str());
 #if defined(NDS_HAVE_SDL3) || defined(NDS_HAVE_SDL2)
-    SDL_ShowSimpleMessageBox(SDL_MESSAGEBOX_ERROR, "Cannot start the game",
-                             message.c_str(), nullptr);
+    SDL_ShowSimpleMessageBox(SDL_MESSAGEBOX_ERROR,
+                             tr(Text::ErrorTitle).c_str(), message.c_str(),
+                             nullptr);
 #endif
 }
 
