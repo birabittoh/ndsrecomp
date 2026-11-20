@@ -1,7 +1,9 @@
 #!/usr/bin/env python3
-"""Writes the cartridge banner icon of a .nds as a Windows .ico and its .rc.
+"""Writes the cartridge banner icon of a .nds as a Windows .ico and its .rc,
+or as a macOS .icns.
 
 usage: gen_nds_icon.py <rom.nds or unpacked folder> <out.ico> <out.rc>
+       gen_nds_icon.py --icns <rom.nds or unpacked folder> <out.icns>
 
 Same decoding as runner/src/rom_icon.cpp. The .ico holds PNG entries at
 32 (native) and 64/128/256 (nearest-neighbour), which Explorer, the taskbar
@@ -53,7 +55,22 @@ def png(px, scale):
             chunk(b"IDAT", zlib.compress(bytes(raw), 9)) + chunk(b"IEND", b""))
 
 
+def write_icns(px, path):
+    """A macOS .icns of PNG entries, 32 to 1024 pixels."""
+    types = ((b"icp5", 1), (b"icp6", 2), (b"ic07", 4), (b"ic08", 8),
+             (b"ic09", 16), (b"ic10", 32))
+    body = b""
+    for tag, scale in types:
+        data = png(px, scale)
+        body += tag + struct.pack(">I", 8 + len(data)) + data
+    with open(path, "wb") as f:
+        f.write(b"icns" + struct.pack(">I", 8 + len(body)) + body)
+
+
 def main():
+    if len(sys.argv) == 4 and sys.argv[1] == "--icns":
+        write_icns(banner_icon(banner_image(sys.argv[2])), sys.argv[3])
+        return
     rom_path, ico_path, rc_path = sys.argv[1:4]
     px = banner_icon(banner_image(rom_path))
     images = [(32 * s, png(px, s)) for s in (1, 2, 4, 8)]
