@@ -49,7 +49,15 @@ NdsTitleUpdateStatus nds_title_update_status();
 // Ignored unless the state is Available (or Failed after an install).
 void nds_title_update_install();
 
+// The notice shown while the update downloads, in the title's language:
+// "{version}" becomes the version being downloaded and "{percent}" the
+// progress ("42%", or nothing while the size is unknown). ASCII only, as the
+// notice font has no other glyphs. Unset, the frontend shows it in English.
+void nds_title_update_set_download_text(std::string text);
+
 // For the frontend.
 void nds_title_update_publish(NdsTitleUpdateStatus status);
+// The text set above, "" when none was.
+std::string nds_title_update_download_text();
 // True once per install request, oldest first.
 bool nds_title_update_take_install_request();

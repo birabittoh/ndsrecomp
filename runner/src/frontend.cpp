@@ -2160,16 +2160,21 @@ std::string serve_title_update(bool* quit) {
             notice = "Update failed: " + failure;
         }
     } else if (installing) {
-        char text[64];
+        std::string percent;
         if (install.total_bytes > 0) {
-            std::snprintf(text, sizeof(text), "Downloading update %d%%",
-                          static_cast<int>(100.0 *
-                                           static_cast<double>(install.downloaded_bytes) /
-                                           static_cast<double>(install.total_bytes)));
-        } else {
-            std::snprintf(text, sizeof(text), "Downloading update");
+            percent = std::to_string(static_cast<int>(
+                          100.0 * static_cast<double>(install.downloaded_bytes) /
+                          static_cast<double>(install.total_bytes))) + "%";
         }
-        notice = text;
+        notice = nds_title_update_download_text();
+        if (notice.empty()) notice = "Downloading {version} {percent}";
+        auto fill = [&](const std::string& key, const std::string& value) {
+            const size_t at = notice.find(key);
+            if (at != std::string::npos) notice.replace(at, key.size(), value);
+        };
+        fill("{version}", info ? info->version : std::string());
+        fill("{percent}", percent);
+        while (!notice.empty() && notice.back() == ' ') notice.pop_back();
     }
 
     NdsTitleUpdateStatus status;

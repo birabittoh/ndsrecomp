@@ -14,6 +14,7 @@ struct State {
     bool published = false;
     NdsTitleUpdateStatus status;
     bool install_requested = false;
+    std::string download_text;
 };
 
 State& state() {
@@ -36,6 +37,18 @@ void nds_title_update_install() {
     State& s = state();
     std::lock_guard<std::mutex> lock(s.mutex);
     s.install_requested = true;
+}
+
+void nds_title_update_set_download_text(std::string text) {
+    State& s = state();
+    std::lock_guard<std::mutex> lock(s.mutex);
+    s.download_text = std::move(text);
+}
+
+std::string nds_title_update_download_text() {
+    State& s = state();
+    std::lock_guard<std::mutex> lock(s.mutex);
+    return s.download_text;
 }
 
 void nds_title_update_publish(NdsTitleUpdateStatus status) {
