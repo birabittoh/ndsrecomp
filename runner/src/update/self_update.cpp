@@ -6,6 +6,7 @@
 #include <algorithm>
 #include <cctype>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <fstream>
 #include <iterator>
@@ -293,7 +294,21 @@ void SelfUpdater::CheckAsync() {
 void SelfUpdater::CheckWorker(std::string repo, std::string format,
                               std::string current_version) {
     const std::string url = "https://api.github.com/repos/" + repo + "/releases/latest";
-    const auto response = net::HttpGet(url);
+    net::HttpResponse response;
+    // Testing aid: NDS_UPDATE_RELEASE_FILE names a local JSON file that
+    // stands in for the releases/latest response.
+    if (const char* fake = std::getenv("NDS_UPDATE_RELEASE_FILE"); fake && *fake) {
+        std::ifstream in(fake, std::ios::binary);
+        if (in) {
+            response.status = 200;
+            response.body.assign(std::istreambuf_iterator<char>(in), {});
+            std::fprintf(stderr, "[update] using release response from %s\n", fake);
+        } else {
+            response.error = std::string("cannot read NDS_UPDATE_RELEASE_FILE ") + fake;
+        }
+    } else {
+        response = net::HttpGet(url);
+    }
     if (!response.ok()) {
         std::fprintf(stderr, "[update] release lookup failed: %s\n",
                      response.error.empty()
