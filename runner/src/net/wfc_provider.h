@@ -34,6 +34,9 @@ struct NdsWfcProviderInfo {
 // name -- callers (main.cpp CLI/config validation) must reject rather
 // than silently falling back to some default.
 const NdsWfcProviderInfo* nds_wfc_provider_lookup(const char* name);
+// "built-in": no DNS provider, the runner's own server answers Nintendo's
+// names (net/wfc_local_server.h).
+bool nds_wfc_provider_is_builtin(const char* name);
 
 // Every built-in provider, for --help / error-message enumeration.
 extern const NdsWfcProviderInfo kNdsWfcProviders[];

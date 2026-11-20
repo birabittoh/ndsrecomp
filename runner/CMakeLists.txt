@@ -793,6 +793,7 @@ cmake_language(CALL ${NDS_RUNNER_TARGET_KIND} nds_runner ${NDS_RUNNER_TARGET_TYP
     src/net/net_sanitize.cpp
     src/net/net_replay.cpp
     src/net/wfc_provider.cpp
+    src/net/wfc_local_server.cpp
     src/net/mp_wire.cpp
     src/net/mp_reliable.cpp
     src/net/mp_link.cpp
@@ -808,6 +809,7 @@ cmake_language(CALL ${NDS_RUNNER_TARGET_KIND} nds_runner ${NDS_RUNNER_TARGET_TYP
     src/title_settings.cpp
     src/title_menu.cpp
     src/title_presence.cpp
+    src/title_dls.cpp
     src/discord_rpc.cpp
     src/title_save.cpp
     ${NDS_TIER3_SOURCE}

@@ -73,6 +73,7 @@
 #include "net/net_classify.h"
 #include "net/net_capture.h"
 #include "net/net_replay.h"
+#include "net/wfc_local_server.h"
 #include "net/mp_beacon.h"
 #include "net/mp_link.h"
 #include "net/mp_reliable.h"
@@ -2765,6 +2766,8 @@ struct WifiBridgeState {
     NdsNetCaptureWriter capture_writer;
     LocalMpTransport local_mp;
     LocalWfcPeerBridge local_wfc_peer;
+    // Emulation thread only (Net_SendPacket).
+    NdsWfcLocalServer wfc_server;
 
     NdsWifiNetworkState network_state;
 
@@ -2983,6 +2986,21 @@ int Net_SendPacket(u8* data, int len, void* userdata) {
 
     if (g_bridge->local_wfc_peer.ForwardIfPeerFrame(data, len))
         return len;
+
+    // provider = "built-in": Nintendo's servers answered here, on the
+    // emulation thread; the answers join the frames from the backend.
+    if (g_network_config.wfc_builtin_server && !g_bridge->replay_driver) {
+        std::vector<std::vector<uint8_t>> replies;
+        if (g_bridge->wfc_server.HandleTx(data, len, &replies)) {
+            for (auto& reply : replies) {
+                if (!g_bridge->rx_queue.TryPush(std::move(reply)))
+                    net_ring_push(NDS_NET_EVENT_BACKEND_DROP, /*direction=*/1,
+                                  0, 0, nullptr, nullptr, 0, 0, 0, 0, 0,
+                                  /*aux=*/1u);
+            }
+            return len;
+        }
+    }
 
     if (g_bridge->replay_driver) {
         // Synchronous, in-memory comparison -- no host I/O, no queue, no

@@ -47,3 +47,7 @@ const NdsWfcProviderInfo* nds_wfc_provider_lookup(const char* name) {
     }
     return nullptr;
 }
+
+bool nds_wfc_provider_is_builtin(const char* name) {
+    return name && (iequals(name, "built-in") || iequals(name, "builtin"));
+}

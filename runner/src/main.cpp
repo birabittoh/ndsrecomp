@@ -881,7 +881,7 @@ int main(int argc, char** argv) {
                 "[--network on|off] [--network-backend slirp|replay|pcap] "
                 "[--pcap-adapter NAME] "
                 "[--wfc on|off] "
-                "[--wfc-provider kaeru|wiimmfi|wiimmfi-direct|local|<ipv4>] "
+                "[--wfc-provider built-in|kaeru|wiimmfi|wiimmfi-direct|local|<ipv4>] "
                 "[--local-wireless on|off] [--local-wireless-port 1024..65520] "
                 "[--local-wireless-delay-ms MS] [--local-wireless-jitter-ms MS] "
                 "[--local-wireless-loss-pct PCT] "
@@ -1487,7 +1487,8 @@ int main(int argc, char** argv) {
             // logging/reporting purposes only.
             frontend_options.network.wfc_provider.name = "custom";
             frontend_options.network.wfc_provider.dns_server = cli_wfc_provider;
-        } else if (nds_wfc_provider_lookup(cli_wfc_provider.c_str())) {
+        } else if (nds_wfc_provider_is_builtin(cli_wfc_provider.c_str()) ||
+                   nds_wfc_provider_lookup(cli_wfc_provider.c_str())) {
             frontend_options.network.wfc_provider.name = cli_wfc_provider;
             frontend_options.network.wfc_provider.dns_server.clear();
         } else {
@@ -1728,6 +1729,14 @@ int main(int argc, char** argv) {
     }
 
     if (resolved_network.wfc_enabled &&
+        resolved_network.backend != NdsNetBackendKind::Replay &&
+        nds_wfc_provider_is_builtin(
+            frontend_options.network.wfc_provider.name.c_str())) {
+        resolved_network.wfc_builtin_server = true;
+        std::fprintf(stderr,
+            "[network] WFC: built-in server (no internet needed for "
+            "Nintendo's servers)\n");
+    } else if (resolved_network.wfc_enabled &&
         resolved_network.backend != NdsNetBackendKind::Replay) {
         const NdsWfcProvider& wfc = frontend_options.network.wfc_provider;
         std::string dns_str = wfc.dns_server;

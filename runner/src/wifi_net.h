@@ -67,6 +67,10 @@ struct NdsWifiNetworkConfig {
     // Only meaningful/nonzero when wfc_enabled is true.
     bool wfc_enabled = false;
     uint32_t wfc_dns_ipv4 = 0;
+    // provider = "built-in": the runner answers Nintendo's servers itself
+    // (net/wfc_local_server.h); wfc_dns_ipv4 stays 0, so other names go to
+    // the normal resolver.
+    bool wfc_builtin_server = false;
 
     // ---- Wiimmfi M8: capture/replay at the Ethernet backend boundary ----
     NdsNetBackendKind backend = NdsNetBackendKind::Slirp;
