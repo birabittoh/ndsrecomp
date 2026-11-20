@@ -4235,9 +4235,11 @@ int nds_run_interactive_frontend(const NdsFrontendOptions& initial_options) {
     float zoom_stick_rem = 0.0f;
     bool zoom_save_pending = false;
     // The right mouse button as the title sees it (title_settings.h) is held
-    // by the mouse or by two fingers on a touchscreen.
+    // by the mouse, by two fingers on a touchscreen or by the gamepad's left
+    // trigger (when neither the virtual stylus nor Prime uses it).
     bool right_mouse_button_held = false;
     bool touch_right_held = false;
+    bool pad_right_held = false;
     // A two-finger tap stays held this long, so the title's per-frame hooks
     // see it even when both fingers lift within one frame.
     constexpr uint64_t kTouchRightMinHoldMs = 80;
@@ -4245,7 +4247,7 @@ int nds_run_interactive_frontend(const NdsFrontendOptions& initial_options) {
     bool touch_right_release_pending = false;
     auto publish_right_mouse = [&]() {
         nds_title_set_right_mouse_held(right_mouse_button_held ||
-                                       touch_right_held);
+                                       touch_right_held || pad_right_held);
     };
 #if defined(NDS_HAVE_SDL3)
     // Fingers down on the touchscreen (window pixels), for the two-finger
@@ -4908,7 +4910,7 @@ int nds_run_interactive_frontend(const NdsFrontendOptions& initial_options) {
         mouse_down = false;
         touch_release_pending = false;
         nds_set_touch(0, 0, false);
-        right_mouse_button_held = touch_right_held = false;
+        right_mouse_button_held = touch_right_held = pad_right_held = false;
         touch_right_release_pending = false;
         publish_right_mouse();
 #if defined(NDS_HAVE_SDL3)
@@ -6403,6 +6405,22 @@ int nds_run_interactive_frontend(const NdsFrontendOptions& initial_options) {
                 turbo_pad_pressed = false;
             }
 
+            // Left trigger held -> the right mouse button, as a two-finger
+            // tap (a title's text skip / advance).
+            {
+                bool lt_held = false;
+                if (!virtual_stylus_available &&
+                    !mph_prime_controls_available) {
+                    const int lt = SDL_GameControllerGetAxis(
+                        controller, SDL_CONTROLLER_AXIS_TRIGGERLEFT);
+                    lt_held = lt > (pad_right_held ? 6554 : 9830);
+                }
+                if (lt_held != pad_right_held) {
+                    pad_right_held = lt_held;
+                    publish_right_mouse();
+                }
+            }
+
             // Right stick up/down -> a title's zoom (title_settings.h): up
             // lowers the value, down raises it, at a speed that follows the
             // deflection (up to 15 units, 1.5%, a frame). The stick belongs to the
@@ -6552,6 +6570,10 @@ int nds_run_interactive_frontend(const NdsFrontendOptions& initial_options) {
             }
         } else {
             turbo_pad_pressed = false;
+            if (pad_right_held) {
+                pad_right_held = false;
+                publish_right_mouse();
+            }
             if (stick_pressed != 0) {
                 stick_pressed = 0;
                 publish_keys();
