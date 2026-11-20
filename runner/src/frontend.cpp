@@ -301,6 +301,8 @@ namespace {
 #define SDL_GameControllerButton SDL_GamepadButton
 #define SDL_GameControllerClose SDL_CloseGamepad
 #define SDL_GameControllerGetAxis SDL_GetGamepadAxis
+#undef SDL_GameControllerGetButton
+#define SDL_GameControllerGetButton SDL_GetGamepadButton
 #define SDL_GameControllerName SDL_GetGamepadName
 #define SDL_GameControllerOpen SDL_OpenGamepad
 #define SDL_CONTROLLER_AXIS_LEFTX SDL_GAMEPAD_AXIS_LEFTX
@@ -1373,6 +1375,11 @@ constexpr const char* kRuntimeMuteKey = "audio.mute";
 constexpr const char* kRuntimeDiscordKey = "discord.activity";
 // Rows for the title's own settings (title_settings.h): "title.<key>".
 constexpr const char* kRuntimeTitlePrefix = "title.";
+// The keyboard rows: "input.key_<button>", one per DS button, and
+// "input.key_fast_forward", value = the key's scancode.
+constexpr const char* kRuntimeKeyPrefix = "input.key_";
+// The fast-forward key's row, after the DS buttons' (kNdsButtonNames).
+constexpr int kFastForwardKeyRow = static_cast<int>(kNdsButtonNames.size());
 
 struct RuntimeMenuState {
     NdsFrontendOptions* options = nullptr;
@@ -1384,7 +1391,73 @@ struct RuntimeMenuState {
     // to the window (and saves it) on its next frame.
     bool fullscreen_pending = false;
     NdsFullscreenMode fullscreen_on_mode = NdsFullscreenMode::Borderless;
+    // The keyboard button (kNdsButtonNames index) waiting for its next key
+    // press, -1 for none: the frontend binds that key (Esc cancels).
+    int key_capture = -1;
 };
+
+// The DS button (kNdsButtonNames index) behind an "input.key_<button>" row,
+// kFastForwardKeyRow for the fast-forward key's, or -1.
+int runtime_menu_key_button(const NdsMenuItem* item) {
+    const size_t prefix = std::strlen(kRuntimeKeyPrefix);
+    if (!item || std::strncmp(item->key, kRuntimeKeyPrefix, prefix) != 0)
+        return -1;
+    const char* name = item->key + prefix;
+    if (std::strcmp(name, "fast_forward") == 0) return kFastForwardKeyRow;
+    for (size_t i = 0; i < kNdsButtonNames.size(); ++i) {
+        const char* button = kNdsButtonNames[i];
+        size_t n = 0;
+        while (button[n] && name[n] &&
+               std::tolower(static_cast<unsigned char>(button[n])) == name[n])
+            ++n;
+        if (!button[n] && !name[n]) return static_cast<int>(i);
+    }
+    return -1;
+}
+
+// Whether keyboard row `row` is offered: on Android only with a physical
+// keyboard attached, and the DS buttons' not with --keyboard-bindings.
+bool runtime_menu_keyboard_available(const NdsFrontendOptions& options,
+                                     int row) {
+    if (options.custom_keyboard_bindings && row != kFastForwardKeyRow)
+        return false;
+#if defined(__ANDROID__) && defined(NDS_HAVE_SDL3)
+    return SDL_HasKeyboard();
+#else
+    return true;
+#endif
+}
+
+// Binds `scancode` to keyboard row `row` (a DS button, or fast-forward); a
+// key another row had swaps with it, so every row keeps a key. False
+// (nothing changed) for a key that cannot be bound: a function key (the
+// savestates'), or, with --keyboard-bindings, a DS button's for
+// fast-forward.
+bool runtime_menu_bind_key(NdsFrontendOptions& options, int row,
+                           int scancode) {
+    if (row < 0 || row > kFastForwardKeyRow || scancode <= 0 ||
+        scancode >= 512)
+        return false;
+    if (scancode >= SDL_SCANCODE_F1 && scancode <= SDL_SCANCODE_F12)
+        return false;
+    NdsButtonBindings& keys = options.keyboard_bindings;
+    auto key = [&](int i) -> int& {
+        return i == kFastForwardKeyRow ? options.fast_forward_key
+                                       : keys[static_cast<size_t>(i)];
+    };
+    if (options.custom_keyboard_bindings) {
+        for (const int bound : keys)
+            if (bound == scancode) return false;
+    }
+    for (int i = 0; i <= kFastForwardKeyRow; ++i) {
+        if (i != row && key(i) == scancode) key(i) = key(row);
+    }
+    key(row) = scancode;
+    std::fprintf(stderr, "[sdl] keyboard %s -> %s\n",
+                 row == kFastForwardKeyRow ? "Fast-forward" : kNdsButtonNames[row],
+                 SDL_GetScancodeName(static_cast<SDL_Scancode>(scancode)));
+    return true;
+}
 
 // The title setting behind a "title.<key>" row, or -1.
 int runtime_menu_title_setting(const NdsMenuItem* item) {
@@ -1453,6 +1526,12 @@ int runtime_menu_get_value(RuntimeMenuState* state, const NdsMenuItem* item,
     }
     if (std::strcmp(item->key, kRuntimeGamepadLayoutKey) == 0) {
         *value_out = state->options->gamepad_positional ? 1 : 0;
+        return 1;
+    }
+    if (const int button = runtime_menu_key_button(item); button >= 0) {
+        *value_out = state->key_capture == button ? -1
+            : button == kFastForwardKeyRow ? state->options->fast_forward_key
+            : state->options->keyboard_bindings[static_cast<size_t>(button)];
         return 1;
     }
     if (std::strcmp(item->key, kRuntimeResolutionScaleKey) == 0) {
@@ -1599,8 +1678,13 @@ int runtime_menu_set_value(RuntimeMenuState* state, const NdsMenuItem* item,
     return 0;
 }
 
-int runtime_menu_run_action(const NdsMenuItem* item) {
+int runtime_menu_run_action(RuntimeMenuState* state, const NdsMenuItem* item) {
     if (!item) return 0;
+    if (const int button = runtime_menu_key_button(item); button >= 0) {
+        // Chosen again while waiting: stop waiting.
+        state->key_capture = state->key_capture == button ? -1 : button;
+        return 0;
+    }
 #if NDS_ONLINE
     if (nds_netplay_menu_owns(item)) return nds_netplay_menu_run_action(item);
 #endif
@@ -1615,6 +1699,8 @@ int runtime_menu_is_enabled(const RuntimeMenuState* state,
 #endif
     if (std::strcmp(item->key, kRuntimeGamepadLayoutKey) == 0)
         return state->options->custom_gamepad_bindings ? 0 : 1;
+    if (const int row = runtime_menu_key_button(item); row >= 0)
+        return runtime_menu_keyboard_available(*state->options, row) ? 1 : 0;
 #if defined(__ANDROID__)
     // Always fullscreen there (nds_run_interactive_frontend).
     if (std::strcmp(item->key, kRuntimeFullscreenKey) == 0) return 0;
@@ -1667,6 +1753,12 @@ void runtime_menu_save(const RuntimeMenuState* state) {
         {"controls", "gamepad_layout",
          quoted(options.gamepad_positional ? "positional" : "labels")},
     };
+    if (!options.custom_keyboard_bindings)
+        updates.push_back(
+            {"controls", "keyboard_bindings",
+             quoted(nds_format_bindings(options.keyboard_bindings).c_str())});
+    updates.push_back({"controls", "fast_forward_key",
+                       std::to_string(options.fast_forward_key)});
     // The two are exclusive in TOML unless the scale is off.
     if (options.resolution_scale != 0)
         updates.push_back({"display", "internal_resolution", "", true});
@@ -1943,8 +2035,9 @@ void runtime_menu_serve_title(RuntimeMenuState* state,
             if (request.key != item.key) continue;
             if (!runtime_menu_is_enabled(state, &item)) break;
             if (request.run) {
-                if (item.type == NdsMenuItemType::Action)
-                    changed |= runtime_menu_run_action(&item) != 0;
+                if (item.type == NdsMenuItemType::Action ||
+                    item.type == NdsMenuItemType::Key)
+                    changed |= runtime_menu_run_action(state, &item) != 0;
             } else {
                 changed |=
                     runtime_menu_set_value(state, &item, request.value) != 0;
@@ -1971,6 +2064,8 @@ void runtime_menu_serve_title(RuntimeMenuState* state,
             row.type = NdsTitleMenuRowType::Choice; break;
         case NdsMenuItemType::Action:
             row.type = NdsTitleMenuRowType::Action; break;
+        case NdsMenuItemType::Key:
+            row.type = NdsTitleMenuRowType::Key; break;
         }
         row.minimum = item.minimum;
         row.maximum = item.maximum;
@@ -1982,6 +2077,9 @@ void runtime_menu_serve_title(RuntimeMenuState* state,
                                    : item.minimum + static_cast<int>(i));
         }
         runtime_menu_get_value(state, &item, &row.value);
+        if (item.type == NdsMenuItemType::Key && row.value > 0)
+            row.value_text =
+                SDL_GetScancodeName(static_cast<SDL_Scancode>(row.value));
         row.enabled = runtime_menu_is_enabled(state, &item) != 0;
         rows.push_back(std::move(row));
     }
@@ -4011,7 +4109,8 @@ int nds_run_interactive_frontend(const NdsFrontendOptions& initial_options) {
 
     std::fprintf(stderr,
         "[sdl] controls: gamepad=Player 1 | bottom mouse=touch | "
-        "Esc=settings | hold Tab or RT=fast-forward\n");
+        "Esc=settings | hold %s or RT=fast-forward\n",
+        SDL_GetScancodeName(static_cast<SDL_Scancode>(options.fast_forward_key)));
     std::fputs("[sdl] keyboard:", stderr);
     for (size_t row = 0; row < options.keyboard_bindings.size(); ++row)
         std::fprintf(stderr, " %s=%s", kNdsButtonNames[row],
@@ -4120,6 +4219,9 @@ int nds_run_interactive_frontend(const NdsFrontendOptions& initial_options) {
     // everywhere), kept separate from button-event state so a wobbling
     // stick never fights explicit D-pad presses.
     uint16_t stick_pressed = 0;
+    // The keys the right stick holds to turn a title's camera
+    // (nds_title_camera_stick).
+    uint16_t camera_stick_pressed = 0;
     int zoom_stick_frames = 0;
     float zoom_stick_rem = 0.0f;
     bool zoom_save_pending = false;
@@ -4176,8 +4278,10 @@ int nds_run_interactive_frontend(const NdsFrontendOptions& initial_options) {
         if (chat_input.open) return static_cast<uint16_t>(0x0FFFu);
         return static_cast<uint16_t>(
             0x0FFFu &
-            ~(keyboard_pressed | controller_pressed | mouse_pressed |
-              mph_prime_pressed | stick_pressed | touch_button_pressed |
+            ~(keyboard_pressed |
+              controller_pressed | mouse_pressed |
+              mph_prime_pressed | stick_pressed | camera_stick_pressed |
+              touch_button_pressed |
               touch_button_latched_pressed | touch_button_second_pressed));
     };
     auto publish_keys = [&]() { nds_set_key_mask(guest_key_mask()); };
@@ -4255,9 +4359,32 @@ int nds_run_interactive_frontend(const NdsFrontendOptions& initial_options) {
          NdsMenuItemType::Choice, 0, 1, 1, gamepad_layout_choices, 2,
          nullptr},
     };
+    // The keyboard's DS buttons and fast-forward (kRuntimeKeyPrefix).
+    static const char* const key_description =
+        "Choose, then press the key for this button (Esc cancels). A key "
+        "another button had swaps with it.";
+    static const struct {
+        const char* key;
+        const char* label;
+    } keyboard_rows[] = {
+        {"input.key_a", "A"},         {"input.key_b", "B"},
+        {"input.key_x", "X"},         {"input.key_y", "Y"},
+        {"input.key_l", "L"},         {"input.key_r", "R"},
+        {"input.key_up", "Up"},       {"input.key_down", "Down"},
+        {"input.key_left", "Left"},   {"input.key_right", "Right"},
+        {"input.key_start", "Start"}, {"input.key_select", "Select"},
+        {"input.key_fast_forward", "Fast-forward"},
+    };
+    std::vector<NdsMenuItem> keyboard_items;
+    for (const auto& row : keyboard_rows)
+        keyboard_items.push_back({row.key, "Input", row.label, key_description,
+                                  NdsMenuItemType::Key, 0, 511, 1, nullptr, 0,
+                                  nullptr});
     // Then the title's own settings, then Netplay when the lobby thread runs.
     std::vector<NdsMenuItem> runtime_menu_list(
         std::begin(runtime_menu_items), std::end(runtime_menu_items));
+    runtime_menu_list.insert(runtime_menu_list.end(), std::begin(keyboard_items),
+                             std::end(keyboard_items));
     // Discord Rich Presence, where the build talks to Discord and the game
     // names a Discord application.
     if (kNdsDiscordRpcSupported && !options.discord_application_id.empty())
@@ -5467,6 +5594,29 @@ int nds_run_interactive_frontend(const NdsFrontendOptions& initial_options) {
                     continue;
                 }
             }
+            // A keyboard row of the Options pages waits for its key: the
+            // next key press binds it (Esc cancels) and goes nowhere else;
+            // a pad button cancels, and reaches the game as usual.
+            if (runtime_menu_state.key_capture >= 0) {
+                if (event.type == SDL_KEYDOWN && !event.key.repeat) {
+                    const SDL_Scancode scancode = sdl_event_scancode(event);
+                    const int button = runtime_menu_state.key_capture;
+                    if (scancode == SDL_SCANCODE_ESCAPE) {
+                        runtime_menu_state.key_capture = -1;
+                    } else if (runtime_menu_bind_key(options, button,
+                                                     static_cast<int>(scancode))) {
+                        runtime_menu_state.key_capture = -1;
+                        // A held key may have changed buttons: let go of all.
+                        keyboard_pressed = 0;
+                        publish_keys();
+                        runtime_menu_save(&runtime_menu_state);
+                    }
+                    continue;
+                }
+                if (event.type == SDL_KEYDOWN) continue;  // repeats
+                if (event.type == SDL_CONTROLLERBUTTONDOWN)
+                    runtime_menu_state.key_capture = -1;
+            }
             // The chat's pending press: its repeats go nowhere, its release
             // before the hold opens the chat input here.
             if (bool up = false;
@@ -5626,7 +5776,8 @@ int nds_run_interactive_frontend(const NdsFrontendOptions& initial_options) {
                 } else if (process_mph_prime_key(
                                scancode, true, false)) {
                     // Consumed by the MPH-specific keyboard/mouse layer.
-                } else if (scancode == SDL_SCANCODE_TAB) {
+                } else if (static_cast<int>(scancode) ==
+                           options.fast_forward_key) {
                     turbo_pressed = true;
                 } else if (mph_prime_active()) {
                     // Prime Controls replaces the normal keyboard keypad map;
@@ -5648,7 +5799,8 @@ int nds_run_interactive_frontend(const NdsFrontendOptions& initial_options) {
                 } else if (process_mph_prime_key(
                         scancode, false, false)) {
                     // Consumed by the MPH-specific keyboard/mouse layer.
-                } else if (scancode == SDL_SCANCODE_TAB) {
+                } else if (static_cast<int>(scancode) ==
+                           options.fast_forward_key) {
                     turbo_pressed = false;
                 } else if (mph_prime_active()) {
                     // See keydown path: ignore generic keyboard bindings
@@ -5674,6 +5826,7 @@ int nds_run_interactive_frontend(const NdsFrontendOptions& initial_options) {
                 controller = nullptr;
                 controller_id = -1;
                 controller_pressed = 0;
+                camera_stick_pressed = 0;
                 // Pad-held Prime actions must not survive the device; the
                 // keyboard/mouse can re-press theirs on the next event.
                 clear_mph_prime_controls();
@@ -6203,6 +6356,34 @@ int nds_run_interactive_frontend(const NdsFrontendOptions& initial_options) {
             stick_dir(lx, 1u << 5, false);   // Left
             stick_dir(ly, 1u << 6, false);   // Up (SDL Y axis points down)
             stick_dir(ly, 1u << 7, true);    // Down
+
+            // Right stick left/right -> a title's camera turn keys, its
+            // press -> both (nds_title_camera_stick), while the title asks;
+            // the stick is the virtual stylus's while that is held (LT) and
+            // Prime's aim.
+            {
+                uint16_t left_keys = 0, right_keys = 0;
+                const bool camera = !virtual_stylus_active() &&
+                                    !mph_prime_controls_available &&
+                                    nds_title_camera_stick(&left_keys,
+                                                           &right_keys);
+                uint16_t pressed = 0;
+                if (camera) {
+                    const float rx = SDL_GameControllerGetAxis(
+                        controller, SDL_CONTROLLER_AXIS_RIGHTX) / 32767.0f;
+                    const bool was_left = (camera_stick_pressed & left_keys) != 0;
+                    const bool was_right = (camera_stick_pressed & right_keys) != 0;
+                    if (rx < -(was_left ? 0.35f : 0.5f)) pressed |= left_keys;
+                    if (rx > (was_right ? 0.35f : 0.5f)) pressed |= right_keys;
+                    if (SDL_GameControllerGetButton(
+                            controller, SDL_CONTROLLER_BUTTON_RIGHTSTICK))
+                        pressed = static_cast<uint16_t>(left_keys | right_keys);
+                }
+                if (pressed != camera_stick_pressed) {
+                    camera_stick_pressed = pressed;
+                    publish_keys();
+                }
+            }
 
             // Right trigger held -> fast-forward, as Tab.
             if (!virtual_stylus_available && !mph_prime_controls_available) {

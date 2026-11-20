@@ -8,7 +8,8 @@
 
 #include <cstddef>
 
-enum class NdsMenuItemType { Bool, Int, Choice, Action };
+// Key: a keyboard binding, chosen to wait for the next key press.
+enum class NdsMenuItemType { Bool, Int, Choice, Action, Key };
 
 struct NdsMenuItem {
     const char* key;

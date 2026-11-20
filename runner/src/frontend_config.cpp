@@ -1460,6 +1460,30 @@ static bool apply_frontend_config(toml::table& root,
                 return false;
             }
         }
+        if (const auto value =
+                (*controls)["fast_forward_key"].value<int64_t>()) {
+            if (*value <= 0 || *value >= 512) {
+                if (error) {
+                    *error = "controls.fast_forward_key must be an SDL "
+                             "scancode (1..511)";
+                }
+                return false;
+            }
+            options->fast_forward_key = static_cast<int>(*value);
+        }
+        if (const auto value =
+                (*controls)["keyboard_bindings"].value<std::string>()) {
+            NdsButtonBindings bindings{};
+            if (!nds_parse_bindings(*value, false, &bindings)) {
+                if (error) {
+                    *error = "controls.keyboard_bindings must be 12 "
+                             "comma-separated SDL scancodes";
+                }
+                return false;
+            }
+            if (!options->custom_keyboard_bindings)
+                options->keyboard_bindings = bindings;
+        }
         if (const auto value = (*controls)["mouse_sensitivity"].value<int64_t>()) {
             if (!nds_parse_mouse_sensitivity(
                     std::to_string(*value),

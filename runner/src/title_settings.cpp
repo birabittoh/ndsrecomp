@@ -219,6 +219,28 @@ void nds_title_set_right_mouse_held(bool held) {
 }
 
 namespace {
+std::atomic<NdsTitleCameraStickQuery> g_camera_stick_query{nullptr};
+std::atomic<uint32_t> g_camera_stick_keys{0};  // right << 16 | left
+}  // namespace
+
+void nds_title_set_camera_stick(NdsTitleCameraStickQuery query,
+                                uint16_t left_keys, uint16_t right_keys) {
+    g_camera_stick_keys.store(uint32_t{right_keys} << 16 | left_keys,
+                              std::memory_order_relaxed);
+    g_camera_stick_query.store(query, std::memory_order_relaxed);
+}
+
+bool nds_title_camera_stick(uint16_t* left_keys, uint16_t* right_keys) {
+    const NdsTitleCameraStickQuery query =
+        g_camera_stick_query.load(std::memory_order_relaxed);
+    if (!query || !query()) return false;
+    const uint32_t keys = g_camera_stick_keys.load(std::memory_order_relaxed);
+    *left_keys = static_cast<uint16_t>(keys & 0xFFFF);
+    *right_keys = static_cast<uint16_t>(keys >> 16);
+    return true;
+}
+
+namespace {
 // bit 32 = active, then int16 y << 16 | uint16 x.
 std::atomic<uint64_t> g_left_stick{0};
 }  // namespace

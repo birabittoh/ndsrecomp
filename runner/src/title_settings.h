@@ -20,6 +20,7 @@
 #pragma once
 
 #include <stddef.h>
+#include <stdint.h>
 
 struct NdsTitleSetting {
     const char* key;          // [title] key; the menu row is "title.<key>"
@@ -204,6 +205,19 @@ bool nds_title_zoom_add(int delta);
 // For the frontend: the bound value, or -1 when unbound or not in the active
 // mode (then nds_title_zoom_add changes nothing).
 int nds_title_zoom_value();
+
+// Binds the gamepad's right stick to keys a title turns its camera with:
+// while `query` answers true, stick X past a dead zone holds `left_keys` or
+// `right_keys` and pressing the stick holds both, on top of whatever else
+// presses them (the pad's own buttons included). The query
+// runs on the frontend thread once per polled frame and may only read
+// settings or what the title sampled of the guest (host state). Call from a
+// static initializer, like a setting. Unbound by default.
+typedef bool (*NdsTitleCameraStickQuery)();
+void nds_title_set_camera_stick(NdsTitleCameraStickQuery query,
+                                uint16_t left_keys, uint16_t right_keys);
+// For the frontend: true while the query answers true, with the keys.
+bool nds_title_camera_stick(uint16_t* left_keys, uint16_t* right_keys);
 
 // For the frontend.
 size_t nds_title_setting_count();

@@ -672,6 +672,7 @@ int main(int argc, char** argv) {
                 return 2;
             }
             if (pad) frontend_options.custom_gamepad_bindings = true;
+            else frontend_options.custom_keyboard_bindings = true;
         } else if (a == "--fullscreen" && i + 1 < argc) {
             cli_fullscreen = argv[++i];
         } else if (a == "--window-mode" && i + 1 < argc) {

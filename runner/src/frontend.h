@@ -301,7 +301,14 @@ struct NdsFrontendOptions {
     // use it.
     int window_width = 0;
     int window_height = 0;
+    // [controls] keyboard_bindings (12 scancodes, as --keyboard-bindings),
+    // changed from the Options pages' keyboard rows; --keyboard-bindings
+    // takes priority (custom_keyboard_bindings: not loaded, not changeable).
     NdsButtonBindings keyboard_bindings = kNdsDefaultKeys;
+    bool custom_keyboard_bindings = false;
+    // [controls] fast_forward_key: the SDL scancode held to fast-forward
+    // (43, Tab, by default), changed from the Options pages too.
+    int fast_forward_key = 43;
     NdsButtonBindings gamepad_bindings = kNdsDefaultPad;
     bool custom_gamepad_bindings = false;
     // Face buttons by position (kNdsPositionalPad) rather than by label.

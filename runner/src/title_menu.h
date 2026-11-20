@@ -16,7 +16,10 @@
 #include <string>
 #include <vector>
 
-enum class NdsTitleMenuRowType { Bool, Int, Choice, Action };
+// Key: a keyboard binding; `value` is its SDL scancode, -1 while the
+// frontend waits for the key to bind (nds_title_menu_run starts that), and
+// `value_text` the key's name.
+enum class NdsTitleMenuRowType { Bool, Int, Choice, Action, Key };
 
 struct NdsTitleMenuRow {
     std::string key;          // "display.scaling", "title.<key>", ...
@@ -30,7 +33,8 @@ struct NdsTitleMenuRow {
     // Choice rows: the names and the value each one stands for.
     std::vector<std::string> choices;
     std::vector<int> choice_values;
-    int value = 0;        // Bool, Int and Choice rows
+    int value = 0;        // Bool, Int, Choice and Key rows
+    std::string value_text;  // Key rows
     bool enabled = true;  // false: shown, but cannot be changed now
 };
 
