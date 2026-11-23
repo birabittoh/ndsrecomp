@@ -67,6 +67,9 @@ void nds_netplay_chat_clear();
 // lines carry the name the server knows (the Discord handle).
 void nds_netplay_chat_set_name(const std::string& name);
 std::string nds_netplay_chat_name();
+// The same name without the "Player" fallback: empty while neither the
+// title nor a signed-in account has given one.
+std::string nds_netplay_chat_known_name();
 
 // True when a line would reach somebody now.
 bool nds_netplay_chat_reachable();

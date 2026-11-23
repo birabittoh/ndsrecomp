@@ -462,6 +462,11 @@ private:
             return;
         }
         connect_backoff_ = {};
+        // The hero's name arrives once a save is loaded, and a sign-in can
+        // finish after connecting: the server takes a new hello as a
+        // rename (and a session as an upgrade to the account's handle).
+        if (HelloName() != hello_name_ || SessionNow() != hello_session_)
+            SendHello();
 
         if (now - last_ping_ >= kPingInterval) {
             Send(JsonOp("ping").Text());
@@ -519,6 +524,28 @@ private:
                 "Lobby connection lost (" + why + "), retrying");
     }
 
+    // ---- identity -----------------------------------------------------------
+
+    static std::string SessionNow() {
+        const char* session = rnet_account_session();
+        return session ? session : "";
+    }
+
+    // The name this runner asks for: the chat's (the title's player, else
+    // the signed-in handle). A server that knows the account names the seat
+    // after its handle whatever is sent. Empty leaves the server's own.
+    static std::string HelloName() { return nds_netplay_chat_known_name(); }
+
+    void SendHello() {
+        hello_name_ = HelloName();
+        hello_session_ = SessionNow();
+        JsonOp hello("hello");
+        if (!hello_name_.empty()) hello.Str("display_name", hello_name_);
+        hello.Str("game_name", config_.game_name);
+        if (!hello_session_.empty()) hello.Str("session", hello_session_);
+        Send(hello.Text());
+    }
+
     // ---- server messages --------------------------------------------------
 
     void Handle(const Json& msg) {
@@ -527,13 +554,7 @@ private:
         if (op == "welcome") {
             player_id_ = msg.Str("player_id", "");
             welcomed_ = !player_id_.empty();
-            const char* handle = rnet_account_handle();
-            JsonOp hello("hello");
-            hello.Str("display_name", handle && handle[0] ? handle : "Player")
-                .Str("game_name", config_.game_name);
-            const char* session = rnet_account_session();
-            if (session && session[0]) hello.Str("session", session);
-            Send(hello.Text());
+            SendHello();
             if (!TurnOverride()) Send(JsonOp("get_turn_credentials").Text());
         } else if (op == "turn_credentials") {
             OnTurn(msg);
@@ -1203,6 +1224,9 @@ private:
     bool need_login_ = false;
     std::string refused_session_;
     std::string player_id_;
+    // What the last hello carried.
+    std::string hello_name_;
+    std::string hello_session_;
     mpnet::TurnConfig turn_;
     bool turn_ok_ = false;
     std::string turn_error_;

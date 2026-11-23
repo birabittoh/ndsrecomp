@@ -191,14 +191,18 @@ void nds_netplay_chat_set_name(const std::string& name) {
     st.name = nds_netplay_chat_clean(name, kNdsChatNameMax);
 }
 
-std::string nds_netplay_chat_name() {
+std::string nds_netplay_chat_known_name() {
     {
         ChatState& st = State();
         std::lock_guard<std::mutex> lock(st.mu);
         if (!st.name.empty()) return st.name;
     }
-    std::string account = AccountName();
-    return account.empty() ? std::string("Player") : account;
+    return AccountName();
+}
+
+std::string nds_netplay_chat_name() {
+    std::string name = nds_netplay_chat_known_name();
+    return name.empty() ? std::string("Player") : name;
 }
 
 bool nds_netplay_chat_reachable() {
