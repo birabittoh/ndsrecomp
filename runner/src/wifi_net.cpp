@@ -1022,6 +1022,8 @@ private:
         rx_cv_.notify_all();
         g_savestate_network_guard.SetLocalMpListening(false);
         packet_queue_.Clear();
+        packet_queued_.store(0, std::memory_order_relaxed);
+        last_host_cmd_ts_ = 0;
         reply_queue_.Clear();
         for (auto& q : late_queue_) q.clear();
         for (auto& t : late_seen_) t = {};
@@ -1029,9 +1031,12 @@ private:
         for (auto& n : late_node_) n = 0;
         for (auto& t : late_client_ts_) t = 0;
         for (auto& t : late_client_heard_) t = {};
+        for (auto& t : reply_heard_) t = {};
+        for (auto& t : poll_since_) t = {};
+        poll_last_mask_ = 0;
         late_last_mask_ = 0;
         late_known_macs_ = 0;
-        last_host_frame_wall_ = {};
+        ForgetHostLocked();
         late_ack_only_ = 0;
         late_mask_used_ = 0;
         late_aid_known_ = 0;
@@ -1108,7 +1113,7 @@ public:
     int RecvPacket(uint8_t* data, uint64_t* timestamp) {
         std::unique_lock<std::mutex> lock(mutex_);
         EmuEnterLocked();
-        return RecvPacketGeneric(lock, data, timestamp, false);
+        return RecvPacketGeneric(lock, data, timestamp, false, /*beacon=*/true);
     }
 
     int SendCmd(uint8_t* data, int len, uint64_t timestamp) {
@@ -1130,15 +1135,43 @@ public:
         return SendGeneric(lock, 3, data, len, timestamp);
     }
 
+    // A client of a lobby member's host does not wait for the host's
+    // frames: it gets the next queued one or "nothing yet" (0) at once, as
+    // a DS that hears nothing for a moment, and its guest keeps running.
+    // DQ9's data sharing then just retries its step on a later frame.
+    // The model calls this on every 8 us tick past NextSync, so the empty
+    // case takes no lock. A client of a LAN host waits as before.
     int RecvHostPacket(uint8_t* data, uint64_t* timestamp) {
+        if (host_online_.load(std::memory_order_acquire) &&
+            packet_queued_.load(std::memory_order_acquire) == 0) {
+            diag_host_dry_polls_.fetch_add(1, std::memory_order_relaxed);
+            const int64_t last =
+                last_host_frame_ns_.load(std::memory_order_relaxed);
+            if (last == 0 || SteadyNowNs() - last <=
+                    std::chrono::duration_cast<std::chrono::nanoseconds>(
+                        kHostGoneAfter).count())
+                return 0;
+            std::unique_lock<std::mutex> lock(mutex_);
+            if (packet_queued_.load(std::memory_order_relaxed) != 0 ||
+                last_host_frame_ns_.load(std::memory_order_relaxed) != last)
+                return 0;
+            melonDS::Platform::Log(melonDS::Platform::Warn,
+                "[local_mp] no host frame for %lld ms, host gone\n",
+                static_cast<long long>(kHostGoneAfter.count()));
+            ForgetHostLocked();
+            return -1;
+        }
         std::unique_lock<std::mutex> lock(mutex_);
         EmuEnterLocked();
-        return RecvPacketGeneric(lock, data, timestamp, true);
+        const bool online = host_online_.load(std::memory_order_relaxed);
+        return RecvPacketGeneric(lock, data, timestamp, /*block=*/!online,
+                                 /*beacon=*/false);
     }
 
     uint16_t RecvReplies(uint8_t* data, uint64_t timestamp, uint16_t aidmask) {
         std::unique_lock<std::mutex> lock(mutex_);
         EmuEnterLocked();
+        NotePolled(aidmask, std::chrono::steady_clock::now());
         const uint16_t late = LateMask(aidmask);
         if (late != late_mask_used_) {
             std::fprintf(stderr,
@@ -1167,6 +1200,16 @@ public:
             LocalMpFrame frame;
             if (!reply_queue_.TryPop(&frame)) {
                 if ((received & aidmask) == aidmask) break;
+                // A client gone quiet (its wifi went off, the app closed)
+                // is not waited for: until WM drops its AID it would cost
+                // every exchange the whole kLockstepWait.
+                const uint16_t quiet = QuietMask(
+                    static_cast<uint16_t>(aidmask & ~received),
+                    std::chrono::steady_clock::now());
+                if (((received | quiet) & aidmask) == aidmask) {
+                    ++diag_quiet_skips_;
+                    break;
+                }
                 // Woken as soon as the network thread queues a frame.
                 // Sleeping a fixed tick here instead costs every MP
                 // cmd/reply exchange a millisecond-scale round trip on
@@ -1269,9 +1312,19 @@ public:
                 if (!q.empty()) ready |= bit;
             }
             if ((ready & aidmask) == aidmask) break;
+            // A client gone quiet (it left, or its link is down) is not
+            // waited for: it ends the wait as if ready, and its gap does
+            // not count. The delivery below treats it as before.
+            const uint16_t quiet = QuietMask(
+                static_cast<uint16_t>(aidmask & ~ready),
+                std::chrono::steady_clock::now());
+            if (((ready | quiet) & aidmask) == aidmask) {
+                ++diag_quiet_skips_;
+                break;
+            }
             const uint16_t late_missing =
-                static_cast<uint16_t>(aidmask & ~lockstep & ~ready);
-            if ((aidmask & lockstep & ~ready) != 0) {
+                static_cast<uint16_t>(aidmask & ~lockstep & ~ready & ~quiet);
+            if ((aidmask & lockstep & ~ready & ~quiet) != 0) {
                 // A lockstep client's reply is due: wait for it. The late
                 // clients' replies keep arriving meanwhile.
                 if (!WaitForRx(lock, lockstep_deadline)) {
@@ -1520,6 +1573,12 @@ private:
     // TakeLateAckOnly. Well above any relay round trip, well below WM's
     // own MP lifetime, so a client that really left is still reported.
     static constexpr std::chrono::milliseconds kLateAliveWindow{500};
+    // A client silent this long is not waited for any more, late or
+    // lockstep (QuietMask): its replies come once per cmd, so a client still
+    // there is heard from many times over within it. One that left would
+    // otherwise cost every exchange the whole reply budget until
+    // kPeerTimeout drops it.
+    static constexpr std::chrono::milliseconds kLateQuietAfter{250};
     // A client that has just joined is polled for a whole round trip
     // before its first reply can arrive (7+ cmds at 100 ms). Reporting
     // those cmds failed brings back the retransmissions and duplicates
@@ -1553,7 +1612,7 @@ private:
         return now - polled < kLateJoinGrace;
     }
 
-    // A late client in `mask`, heard from within kLateAliveWindow, whose
+    // A late client in `mask`, heard from within kLateQuietAfter, whose
     // newest reply is more than kLateMaxLeadUs of guest time behind
     // `timestamp`. Replies count even when dropped as stale, so a host that
     // got too far ahead still sees the client and waits for it. A lead
@@ -1568,9 +1627,43 @@ private:
             const uint64_t lead = timestamp - ts;
             if (lead <= kLateMaxLeadUs || lead >= kLateUnsyncedLeadUs)
                 continue;
-            if (now - late_client_heard_[aid] < kLateAliveWindow) return true;
+            if (now - late_client_heard_[aid] < kLateQuietAfter) return true;
         }
         return false;
+    }
+
+    // Notes the AIDs the host starts polling (RecvReplies, both paths): a
+    // client's polling stretch starts when its AID enters the cmd's mask.
+    void NotePolled(uint16_t aidmask,
+                    std::chrono::steady_clock::time_point now) {
+        const uint16_t fresh = static_cast<uint16_t>(aidmask & ~poll_last_mask_);
+        for (uint32_t aid = 1; aid < 16; ++aid)
+            if (fresh & (1u << aid)) poll_since_[aid] = now;
+        poll_last_mask_ = aidmask;
+    }
+
+    // The clients in `mask` (late or lockstep) not to wait for: no reply
+    // arrived for kLateQuietAfter, or none in this polling stretch and past
+    // kLateJoinGrace (a client that has just joined still gets its grace:
+    // the game's join handshake needs those first replies). Every reply
+    // counts, stale ones too (Deliver), so a slow client is never quiet.
+    uint16_t QuietMask(uint16_t mask,
+                       std::chrono::steady_clock::time_point now) const {
+        uint16_t quiet = 0;
+        for (uint32_t aid = 1; aid < 16; ++aid) {
+            if ((mask & (1u << aid)) == 0) continue;
+            const auto heard = reply_heard_[aid];
+            const auto polled = poll_since_[aid];
+            const bool polled_set = polled.time_since_epoch().count() != 0;
+            bool q;
+            if (heard.time_since_epoch().count() != 0 &&
+                (!polled_set || heard >= polled))
+                q = now - heard > kLateQuietAfter;
+            else
+                q = polled_set && now - polled > kLateJoinGrace;
+            if (q) quiet |= static_cast<uint16_t>(1u << aid);
+        }
+        return quiet;
     }
 
     // A lockstep client's replies to earlier cmds are not this one's
@@ -1683,7 +1776,7 @@ private:
     };
 
     int RecvPacketGeneric(std::unique_lock<std::mutex>& lock, uint8_t* data,
-                          uint64_t* timestamp, bool block) {
+                          uint64_t* timestamp, bool block, bool beacon) {
         const auto start = std::chrono::steady_clock::now();
         const auto deadline = start + std::chrono::milliseconds(25);
         if (block)
@@ -1694,7 +1787,7 @@ private:
             if (!packet_queue_.TryPop(&frame)) {
                 if (!block) {
                     if (timestamp) *timestamp = 0;
-                    return GiveReplayBeacon(data);
+                    return beacon ? GiveReplayBeacon(data) : 0;
                 }
                 // See RecvReplies: wake on the frame's arrival, never on a
                 // sleep tick. The client sits here at every NextSync point
@@ -1715,16 +1808,17 @@ private:
                     melonDS::Platform::Log(melonDS::Platform::Warn,
                         "[local_mp] no host frame for %lld ms, host gone\n",
                         static_cast<long long>(kHostGoneAfter.count()));
-                    last_host_frame_wall_ = {};
+                    ForgetHostLocked();
                     return -1;
                 }
                 return 0;
             }
+            packet_queued_.fetch_sub(1, std::memory_order_relaxed);
             if (tuning_.trace)
                 TraceFrame("rx-take", frame.type, frame.payload.data(),
                            static_cast<int>(frame.payload.size()));
             if (timestamp) *timestamp = frame.timestamp;
-            if ((frame.type & 0xFFFFu) == 1u) diag_host_ts_ = frame.timestamp;
+            if ((frame.type & 0xFFFFu) == 1u) last_host_cmd_ts_ = frame.timestamp;
             diag_backlog_max_ =
                 std::max(diag_backlog_max_, packet_queue_.Size());
             if (!frame.payload.empty())
@@ -1732,6 +1826,19 @@ private:
             if (block) RecordHostWait(start);
             return static_cast<int>(frame.payload.size());
         }
+    }
+
+    static int64_t SteadyNowNs() {
+        return std::chrono::duration_cast<std::chrono::nanoseconds>(
+            std::chrono::steady_clock::now().time_since_epoch()).count();
+    }
+
+    // The host was declared gone: forget when it was last heard (and that
+    // it was a lobby member, until its next cmd). With mutex_ held.
+    void ForgetHostLocked() {
+        last_host_frame_wall_ = {};
+        last_host_frame_ns_.store(0, std::memory_order_relaxed);
+        host_online_.store(false, std::memory_order_relaxed);
     }
 
     // A lobby beacon due on the channel the guest listens on, or 0. Only on
@@ -2076,6 +2183,15 @@ private:
         LocalMpFrame frame;
         frame.type = type;
         frame.timestamp = timestamp;
+        // A client that does not wait for its host's frames
+        // (RecvHostPacket) runs its guest clock ahead of the host's on every
+        // late frame, for good. Its replies carry the stamp of the newest
+        // host cmd it has taken instead, so the host's reply age (stale
+        // filter, lead) still reads "how far behind this client is". The
+        // host's model never sees reply stamps.
+        if (low_type == 2u && last_host_cmd_ts_ != 0 &&
+            host_online_.load(std::memory_order_relaxed))
+            frame.timestamp = last_host_cmd_ts_;
         if (len > 0) frame.payload.assign(data, data + len);
         // Every radio frame but beacons must arrive: late-reply mode has
         // no radio-level retransmission left (see mp_reliable.h).
@@ -2330,8 +2446,20 @@ private:
         const uint32_t low_type = frame.type & 0xFFFFu;
         stats_received_by_type_[low_type & 3u].fetch_add(
             1, std::memory_order_relaxed);
-        if (low_type != 2u)
+        if (low_type == 2u) {
+            const uint32_t aid = frame.type >> 16u;
+            if (aid != 0 && aid < 16)
+                reply_heard_[aid] = std::chrono::steady_clock::now();
+        }
+        if (low_type != 2u) {
             last_host_frame_wall_ = std::chrono::steady_clock::now();
+            last_host_frame_ns_.store(SteadyNowNs(), std::memory_order_relaxed);
+        }
+        // Only the host sends cmds: whether it is a lobby member decides
+        // whether RecvHostPacket waits for its frames.
+        if (low_type == 1u)
+            host_online_.store(IsOnlineAddr(frame.from),
+                               std::memory_order_release);
         if (low_type == 1u) {
             last_cmd_recv_wall_ = std::chrono::steady_clock::now();
         } else if (low_type == 2u &&
@@ -2344,9 +2472,14 @@ private:
             TraceFrame("rx-ready", frame.type, frame.payload.data(),
                        static_cast<int>(frame.payload.size()));
         NoteOrigin(frame);
-        const bool queued = low_type == 2u
-            ? reply_queue_.TryPush(std::move(frame))
-            : packet_queue_.TryPush(std::move(frame));
+        bool queued;
+        if (low_type == 2u) {
+            queued = reply_queue_.TryPush(std::move(frame));
+        } else {
+            queued = packet_queue_.TryPush(std::move(frame));
+            if (queued)
+                packet_queued_.fetch_add(1, std::memory_order_release);
+        }
         if (queued) {
             ++rx_seq_;
             rx_cv_.notify_all();
@@ -2476,7 +2609,8 @@ private:
                 "give_ups=%.0f waiting=%llu peers=%llu | "
                 "reply_lat_ms[<1/2/4/8/16/32/32+]=%s turnaround=%s | "
                 "clock guest_ms/s=%.0f reply_age_max_ms=%.1f "
-                "host_backlog_max=%zu ahead_of_host_ms=%.1f lead_waits=%u\n",
+                "host_backlog_max=%zu ahead_of_host_ms=%.1f lead_waits=%u "
+                "quiet_skips=%u dry_polls=%llu\n",
                 static_cast<unsigned>(instance_),
                 rate(cur.sent_by_type[0], p.sent_by_type[0]),
                 rate(cur.sent_by_type[1], p.sent_by_type[1]),
@@ -2521,12 +2655,16 @@ private:
                     : 0.0,
                 static_cast<double>(diag_reply_age_max_us_) / 1000.0,
                 diag_backlog_max_,
-                diag_host_ts_ ? (static_cast<double>(diag_tx_ts_) -
-                                 static_cast<double>(diag_host_ts_)) / 1000.0
+                last_host_cmd_ts_ ? (static_cast<double>(diag_tx_ts_) -
+                                 static_cast<double>(last_host_cmd_ts_)) / 1000.0
                               : 0.0,
-                diag_lead_waits_);
+                diag_lead_waits_, diag_quiet_skips_,
+                static_cast<unsigned long long>(diag_host_dry_polls_.load(
+                    std::memory_order_relaxed)));
         }
         diag_lead_waits_ = 0;
+        diag_quiet_skips_ = 0;
+        diag_host_dry_polls_.store(0, std::memory_order_relaxed);
         diag_tx_ts_prev_ = diag_tx_ts_;
         diag_reply_age_max_us_ = 0;
         diag_backlog_max_ = 0;
@@ -2645,12 +2783,28 @@ private:
     uint64_t diag_tx_ts_prev_ = 0;
     int64_t diag_reply_age_max_us_ = 0;
     size_t diag_backlog_max_ = 0;
-    uint64_t diag_host_ts_ = 0;
+    // The newest host MP cmd stamp this client took; its replies carry it
+    // while the host is a lobby member (SendGeneric).
+    uint64_t last_host_cmd_ts_ = 0;
     uint32_t diag_lead_waits_ = 0;  // RecvRepliesLate calls held for lead
+    uint32_t diag_quiet_skips_ = 0;  // RecvRepliesLate waits cut by quiet
+    // RecvHostPacket's lock-free empty returns (online host only).
+    std::atomic<uint64_t> diag_host_dry_polls_{0};
+    // The host's last MP cmd came over the Netplay link (Deliver).
+    std::atomic<bool> host_online_{false};
+    // last_host_frame_wall_ as steady_clock ns, for the lock-free path.
+    std::atomic<int64_t> last_host_frame_ns_{0};
+    // Frames in packet_queue_, for RecvHostPacket's lock-free empty check.
+    std::atomic<uint32_t> packet_queued_{0};
     std::deque<LocalMpFrame> late_queue_[16];
     std::chrono::steady_clock::time_point late_seen_[16]{};
     std::chrono::steady_clock::time_point late_polled_since_[16]{};
     uint16_t late_last_mask_ = 0;
+    // QuietMask: when each AID's last reply arrived (Deliver, net thread,
+    // mutex_ held), and when the host started polling it (NotePolled).
+    std::chrono::steady_clock::time_point reply_heard_[16]{};
+    std::chrono::steady_clock::time_point poll_since_[16]{};
+    uint16_t poll_last_mask_ = 0;
     std::chrono::steady_clock::time_point last_host_frame_wall_{};
     uint8_t late_client_mac_[16][6]{};
     uint8_t late_bssid_[6]{};
