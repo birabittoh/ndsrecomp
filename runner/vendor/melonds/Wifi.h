@@ -238,6 +238,8 @@ private:
     u16 MPClientMask, MPClientFail;
     u16 MPClientNoFrame; // answered without a frame (patch 0027)
     u32 MPClientMissStreak = 0; // latency trace only
+    u64 MPClientStateLogAt = 0; // latency trace only
+    u32 MPClientChecks = 0;     // latency trace only
 
     u8 MPClientReplies[15*1024];
 

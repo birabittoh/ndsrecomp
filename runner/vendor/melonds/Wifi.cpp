@@ -1840,6 +1840,23 @@ void Wifi::USTimer(u32 param)
 {
     USTimestamp += kTimerInterval;
 
+    // ndsrecomp: once per 250 ms of guest time, what keeps an MP client
+    // from looking for the host's frames (NDS_LOCAL_MP_TRACE=1).
+    if (IsMPClient && USTimestamp >= MPClientStateLogAt &&
+        ::nds_wifi_local_mp_trace_enabled())
+    {
+        MPClientStateLogAt = USTimestamp + 250000;
+        fprintf(stderr, "[mp-client] state us=%llu com=%u nextsync_in=%lld "
+                "rx_in=%lld checks=%u txbusy=%04X power=%04X rxcnt=%04X "
+                "txslot=%d\n",
+                (unsigned long long)USTimestamp, (unsigned)ComStatus,
+                (long long)NextSync - (long long)USTimestamp,
+                RXTimestamp ? (long long)RXTimestamp - (long long)USTimestamp : 0LL,
+                MPClientChecks, IOPORT(W_TXBusy), IOPORT(W_PowerState),
+                IOPORT(W_RXCnt), TXCurSlot);
+        MPClientChecks = 0;
+    }
+
     if (IsMPClient && (!ComStatus))
     {
         if (RXTimestamp && (USTimestamp >= RXTimestamp))
@@ -1852,6 +1869,7 @@ void Wifi::USTimer(u32 param)
         {
             // TODO: not do this every tick if it fails to receive a frame!
             const bool got = CheckRX(2);
+            ++MPClientChecks;
             if (::nds_wifi_local_mp_trace_enabled())
             {
                 if (!got) ++MPClientMissStreak;
