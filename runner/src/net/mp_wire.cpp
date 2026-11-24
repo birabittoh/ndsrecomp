@@ -32,15 +32,55 @@ void PutLe64(uint8_t* p, uint64_t value) {
     PutLe32(p + 4u, static_cast<uint32_t>(value >> 32u));
 }
 
+constexpr uint16_t kBundlePacked = 0x8000u;
+
 }  // namespace
 
+void PackZeros(const uint8_t* data, size_t len, std::vector<uint8_t>* out) {
+    out->clear();
+    out->reserve(len);
+    for (size_t i = 0; i < len;) {
+        if (data[i] != 0) {
+            out->push_back(data[i++]);
+            continue;
+        }
+        size_t run = 0;
+        while (i < len && data[i] == 0 && run < 255) {
+            ++i;
+            ++run;
+        }
+        out->push_back(0);
+        out->push_back(static_cast<uint8_t>(run));
+    }
+}
+
+bool UnpackZeros(const uint8_t* data, size_t len, size_t max_len,
+                 std::vector<uint8_t>* out) {
+    out->clear();
+    for (size_t i = 0; i < len; ++i) {
+        if (data[i] != 0) {
+            if (out->size() >= max_len) return false;
+            out->push_back(data[i]);
+            continue;
+        }
+        if (++i == len || data[i] == 0) return false;
+        if (out->size() + data[i] > max_len) return false;
+        out->insert(out->end(), data[i], 0);
+    }
+    return true;
+}
+
 void Encode(const Frame& frame, std::vector<uint8_t>* out) {
-    out->resize(kHeaderBytes + frame.payload.size());
+    std::vector<uint8_t> packed;
+    PackZeros(frame.payload.data(), frame.payload.size(), &packed);
+    const bool use_packed = packed.size() < frame.payload.size();
+    const std::vector<uint8_t>& body = use_packed ? packed : frame.payload;
+    out->resize(kHeaderBytes + body.size());
     uint8_t* p = out->data();
     PutLe32(p + 0, kMagic);
     PutLe32(p + 4, frame.node);
     PutLe32(p + 8, frame.type);
-    PutLe32(p + 12, static_cast<uint32_t>(frame.payload.size()));
+    PutLe32(p + 12, static_cast<uint32_t>(body.size()));
     PutLe64(p + 16, frame.timestamp);
     PutLe64(p + 24, static_cast<uint64_t>(frame.sent_ns));
     PutLe32(p + 32, frame.seq);
@@ -48,9 +88,9 @@ void Encode(const Frame& frame, std::vector<uint8_t>* out) {
     PutLe32(p + 40, frame.ack_node);
     PutLe32(p + 44, frame.ack_next);
     PutLe32(p + 48, frame.ack_bits);
-    PutLe32(p + 52, frame.flags);
-    for (size_t i = 0; i < frame.payload.size(); ++i)
-        p[kHeaderBytes + i] = frame.payload[i];
+    PutLe32(p + 52, use_packed ? frame.flags | kFlagPacked
+                               : frame.flags & ~kFlagPacked);
+    for (size_t i = 0; i < body.size(); ++i) p[kHeaderBytes + i] = body[i];
 }
 
 bool Decode(const uint8_t* data, size_t len, Frame* out) {
@@ -72,12 +112,21 @@ bool Decode(const uint8_t* data, size_t len, Frame* out) {
     out->ack_bits = ReadLe32(data + 48);
     out->flags = ReadLe32(data + 52);
     size_t at = kHeaderBytes + payload_len;
-    out->payload.assign(data + kHeaderBytes, data + at);
+    if (out->flags & kFlagPacked) {
+        if (!UnpackZeros(data + kHeaderBytes, payload_len, kMaxPayloadBytes,
+                         &out->payload))
+            return false;
+        out->flags &= ~kFlagPacked;
+    } else {
+        out->payload.assign(data + kHeaderBytes, data + at);
+    }
     out->bundled.clear();
     while (at != len) {
         if (len - at < kBundleHeaderBytes) return false;
-        const size_t blen = static_cast<size_t>(data[at + 16]) |
-                            (static_cast<size_t>(data[at + 17]) << 8u);
+        const uint16_t word = static_cast<uint16_t>(
+            data[at + 16] | (data[at + 17] << 8u));
+        const bool packed = (word & kBundlePacked) != 0;
+        const size_t blen = word & ~kBundlePacked;
         if (len - at - kBundleHeaderBytes < blen) return false;
         Frame b;
         b.node = out->node;
@@ -87,7 +136,12 @@ bool Decode(const uint8_t* data, size_t len, Frame* out) {
         b.timestamp = ReadLe64(data + at + 8);
         b.sent_ns = out->sent_ns;
         at += kBundleHeaderBytes;
-        b.payload.assign(data + at, data + at + blen);
+        if (packed) {
+            if (!UnpackZeros(data + at, blen, kMaxPayloadBytes, &b.payload))
+                return false;
+        } else {
+            b.payload.assign(data + at, data + at + blen);
+        }
         at += blen;
         out->bundled.push_back(std::move(b));
     }
@@ -104,8 +158,10 @@ bool AppendBundled(std::vector<uint8_t>* out, const uint8_t* source) {
     PutLe32(p, ReadLe32(source + 32));
     PutLe32(p + 4, ReadLe32(source + 8));
     PutLe64(p + 8, ReadLe64(source + 16));
-    p[16] = static_cast<uint8_t>(blen);
-    p[17] = static_cast<uint8_t>(blen >> 8u);
+    const uint16_t word = static_cast<uint16_t>(
+        blen | ((ReadLe32(source + 52) & kFlagPacked) ? kBundlePacked : 0u));
+    p[16] = static_cast<uint8_t>(word);
+    p[17] = static_cast<uint8_t>(word >> 8u);
     for (size_t i = 0; i < blen; ++i)
         p[kBundleHeaderBytes + i] = source[kHeaderBytes + i];
     return true;

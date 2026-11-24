@@ -6,10 +6,10 @@
 // sender's acknowledgement of the receiver's stream, see mp_reliable.h.
 //
 // Layout, little-endian:
-//   0  magic 'NIF3'          28 sent_ns hi
+//   0  magic 'NIF4'          28 sent_ns hi
 //   4  node                  32 seq
 //   8  type                  36 next_seq
-//  12  len                   40 ack_node
+//  12  len (as sent)         40 ack_node
 //  16  guest timestamp u64   44 ack_next
 //  24  sent_ns lo            48 ack_bits
 //                            52 flags
@@ -18,7 +18,13 @@
 //  reliable frames of the same sender that the receiver has not
 //  acknowledged yet, sent again so that a lost datagram costs no round
 //  trip (mp_reliable.h). Each: seq u32, type u32, guest timestamp u64,
-//  len u16, payload.
+//  len u16 (bit 15 = packed), payload.
+//
+// A payload is sent packed when that is shorter (kFlagPacked, or bit 15 of
+// a bundled frame's length): every run of zero bytes becomes a 0 and the
+// run's length (1-255). Radio frames are mostly zeros (an MP dataset of a
+// two-player game: the two empty member blocks, the unused message slots),
+// so this about halves them, their bundled copies included.
 
 #pragma once
 
@@ -28,7 +34,7 @@
 
 namespace mpnet {
 
-constexpr uint32_t kMagic = 0x3346494Eu;  // "NIF3"
+constexpr uint32_t kMagic = 0x3446494Eu;  // "NIF4"
 constexpr size_t kHeaderBytes = 56;
 // melonDS's largest TX buffer (12-byte TX header + 802.11 frame).
 constexpr size_t kMaxPayloadBytes = 0x948;
@@ -42,6 +48,7 @@ constexpr size_t kBundleLimitBytes = 1100;
 enum : uint32_t {
     kFlagHello = 1u << 0,    // discovery and keepalive, no payload
     kFlagAckOnly = 1u << 1,  // standalone acknowledgement, no payload
+    kFlagPacked = 1u << 2,   // payload packed (wire only, Decode clears it)
 };
 
 // A peer as the link addresses it: IPv4 address and UDP port, host order.
@@ -84,6 +91,12 @@ struct Frame {
 };
 
 void Encode(const Frame& frame, std::vector<uint8_t>* out);
+
+// The zero-run packing of a payload (see the layout above). Unpack is false
+// for a malformed packing or one that unpacks past `max_len`.
+void PackZeros(const uint8_t* data, size_t len, std::vector<uint8_t>* out);
+bool UnpackZeros(const uint8_t* data, size_t len, size_t max_len,
+                 std::vector<uint8_t>* out);
 
 // False for anything that is not a well-formed datagram of this format.
 bool Decode(const uint8_t* data, size_t len, Frame* out);

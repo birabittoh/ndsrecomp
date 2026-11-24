@@ -229,6 +229,10 @@ struct NdsLocalMpStats {
     uint64_t injected_drops = 0;     // latency lab: --local-wireless-loss-pct
     uint64_t bytes_sent = 0;         // per logical frame, header included
     uint64_t bytes_received = 0;
+    // Datagrams as sent / received on the link (packed, with the bundled
+    // copies, hellos and acks).
+    uint64_t wire_bytes_sent = 0;
+    uint64_t wire_bytes_received = 0;
     // Reliable delivery (net/mp_reliable.h): datagrams sent again, received
     // again, received after a gap; gaps given up on and sent frames dropped
     // unacknowledged (both lose data); frames waiting behind a gap now.

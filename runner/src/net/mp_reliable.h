@@ -108,6 +108,10 @@ public:
     static constexpr uint32_t kMaxRedundancy = 4;
     static constexpr std::chrono::milliseconds kRedundancyWindow{5000};
     static constexpr uint32_t kRedundancyRaiseAt = 1;
+    // Bytes of bundled copies per datagram, the newest first: on a lossy
+    // mobile link the copies were twice the data itself. A frame they do
+    // not cover still has fast retransmit.
+    static constexpr size_t kBundleBudgetBytes = 700;
 
     explicit Reliable(uint32_t self_node = 0) { Reset(self_node); }
 

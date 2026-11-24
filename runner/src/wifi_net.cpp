@@ -1485,6 +1485,10 @@ public:
         out->bytes_sent = stats_bytes_sent_.load(std::memory_order_relaxed);
         out->bytes_received =
             stats_bytes_received_.load(std::memory_order_relaxed);
+        out->wire_bytes_sent =
+            stats_wire_bytes_sent_.load(std::memory_order_relaxed);
+        out->wire_bytes_received =
+            stats_wire_bytes_received_.load(std::memory_order_relaxed);
         out->rel_retransmits =
             stats_rel_retransmits_.load(std::memory_order_relaxed);
         out->rel_duplicates =
@@ -2151,8 +2155,11 @@ private:
         return [this](uint32_t node, const uint8_t* data, size_t len) {
             const auto it = peers_.find(node);
             if (it == peers_.end() || !link_) return;
-            if (link_->SendTo(it->second.addr, data, len))
+            if (link_->SendTo(it->second.addr, data, len)) {
                 stats_frames_sent_.fetch_add(1, std::memory_order_relaxed);
+                stats_wire_bytes_sent_.fetch_add(len,
+                                                 std::memory_order_relaxed);
+            }
         };
     }
 
@@ -2295,6 +2302,8 @@ private:
             mpnet::PeerAddr from;
             const int got = link_->Recv(datagram, sizeof(datagram), &from);
             if (got <= 0) break;
+            stats_wire_bytes_received_.fetch_add(static_cast<uint64_t>(got),
+                                                 std::memory_order_relaxed);
             LocalMpFrame frame;
             if (!mpnet::Decode(datagram, static_cast<size_t>(got), &frame))
                 continue;
@@ -2697,8 +2706,10 @@ private:
             }
             std::fprintf(stderr,
                 "[local_mp] stats inst=%u "
-                "tx/s pkt=%.0f cmd=%.0f reply=%.0f ack=%.0f kB=%.1f | "
-                "rx/s pkt=%.0f cmd=%.0f reply=%.0f ack=%.0f kB=%.1f | "
+                "tx/s pkt=%.0f cmd=%.0f reply=%.0f ack=%.0f kB=%.1f "
+                "wire_kB=%.1f | "
+                "rx/s pkt=%.0f cmd=%.0f reply=%.0f ack=%.0f kB=%.1f "
+                "wire_kB=%.1f | "
                 "host replies calls=%.0f timeouts=%.0f wait_ms=%.1f "
                 "late=%.0f ack_only=%.0f trimmed=%.0f stale=%.0f "
                 "gap_waits=%.0f | "
@@ -2717,11 +2728,13 @@ private:
                 rate(cur.sent_by_type[2], p.sent_by_type[2]),
                 rate(cur.sent_by_type[3], p.sent_by_type[3]),
                 rate(cur.bytes_sent, p.bytes_sent) / 1024.0,
+                rate(cur.wire_bytes_sent, p.wire_bytes_sent) / 1024.0,
                 rate(cur.received_by_type[0], p.received_by_type[0]),
                 rate(cur.received_by_type[1], p.received_by_type[1]),
                 rate(cur.received_by_type[2], p.received_by_type[2]),
                 rate(cur.received_by_type[3], p.received_by_type[3]),
                 rate(cur.bytes_received, p.bytes_received) / 1024.0,
+                rate(cur.wire_bytes_received, p.wire_bytes_received) / 1024.0,
                 rate(cur.recv_replies_calls, p.recv_replies_calls),
                 rate(cur.recv_replies_timeouts, p.recv_replies_timeouts),
                 rate(cur.recv_replies_wait_us, p.recv_replies_wait_us) /
@@ -2998,6 +3011,8 @@ private:
     std::atomic<uint64_t> stats_injected_drops_{0};
     std::atomic<uint64_t> stats_bytes_sent_{0};
     std::atomic<uint64_t> stats_bytes_received_{0};
+    std::atomic<uint64_t> stats_wire_bytes_sent_{0};      // datagrams, all peers
+    std::atomic<uint64_t> stats_wire_bytes_received_{0};
     std::mutex title_mutex_;
     std::vector<uint8_t> title_rx_;
     std::chrono::steady_clock::time_point title_rx_at_;

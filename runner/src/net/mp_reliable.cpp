@@ -138,9 +138,23 @@ void Reliable::SendWithBundle(uint32_t node, Peer& peer,
         send(node, datagram->data(), datagram->size());
         return;
     }
+    // The newest copies that fit the budget, then sent oldest first.
+    size_t budget = kBundleBudgetBytes;
+    uint32_t kept = 0;
+    for (uint32_t i = 0; i < picked; ++i) {
+        const size_t bytes =
+            kBundleHeaderBytes + pick[i]->datagram.size() - kHeaderBytes;
+        if (bytes > budget) break;
+        budget -= bytes;
+        ++kept;
+    }
+    if (kept == 0) {
+        send(node, datagram->data(), datagram->size());
+        return;
+    }
     scratch_ = *datagram;
-    while (picked > 0) {
-        const Sent& sent = *pick[--picked];
+    while (kept > 0) {
+        const Sent& sent = *pick[--kept];
         const size_t before = scratch_.size();
         if (!AppendBundled(&scratch_, sent.datagram.data())) continue;
         stats_.redundant_bytes += scratch_.size() - before;

@@ -112,13 +112,55 @@ bool TestWireRoundTrip() {
         Frame fat;
         fat.node = in.node;
         fat.seq = 9;
-        fat.payload.assign(mpnet::kBundleLimitBytes, 0);
+        fat.payload.assign(mpnet::kBundleLimitBytes, 0xA5);
         std::vector<uint8_t> bf;
         mpnet::Encode(fat, &bf);
         const size_t before = dg.size();
         ok = ok && require(!mpnet::AppendBundled(&dg, bf.data()) &&
                                dg.size() == before,
                            "a bundle past the size limit is refused");
+    }
+
+    // Zero runs pack: a mostly empty frame shrinks, round-trips (on its
+    // own and bundled), and a packing that runs past the limit is refused.
+    {
+        Frame sparse;
+        sparse.node = in.node;
+        sparse.seq = 11;
+        sparse.type = 1;
+        sparse.payload.assign(518, 0);
+        sparse.payload[0] = 0xB6;
+        sparse.payload[300] = 0x42;
+        sparse.payload[517] = 0x07;
+        std::vector<uint8_t> enc;
+        mpnet::Encode(sparse, &enc);
+        Frame got;
+        ok = ok && require(enc.size() < mpnet::kHeaderBytes + 40,
+                           "sparse frame packed") &&
+             require(mpnet::Decode(enc.data(), enc.size(), &got) &&
+                         got.payload == sparse.payload &&
+                         (got.flags & mpnet::kFlagPacked) == 0,
+                     "packed frame round-trips");
+        std::vector<uint8_t> dg;
+        mpnet::Encode(in, &dg);
+        ok = ok && require(mpnet::AppendBundled(&dg, enc.data()) &&
+                               mpnet::Decode(dg.data(), dg.size(), &got) &&
+                               got.bundled.size() == 1 &&
+                               got.bundled[0].payload == sparse.payload,
+                           "packed bundled frame round-trips");
+        std::vector<uint8_t> unpacked;
+        const uint8_t over[] = {0, 200, 0, 200};
+        const uint8_t dangling[] = {5, 0};
+        const uint8_t zero_run[] = {0, 0};
+        ok = ok && require(!mpnet::UnpackZeros(over, sizeof(over), 300,
+                                               &unpacked),
+                           "packing past the limit refused") &&
+             require(!mpnet::UnpackZeros(dangling, sizeof(dangling), 300,
+                                         &unpacked),
+                     "dangling zero refused") &&
+             require(!mpnet::UnpackZeros(zero_run, sizeof(zero_run), 300,
+                                         &unpacked),
+                     "empty run refused");
     }
 
     uint8_t beacon[12 + 24] = {};
@@ -145,6 +187,9 @@ struct Sim {
     };
 
     uint32_t loss_pct = 0;
+    // Reliable frames: 64 bytes, or a DQ9 MP dataset's shape (518 bytes,
+    // about 200 of them non-zero, so it packs to about 200).
+    bool dataset_frames = false;
     milliseconds delay{0};
     milliseconds jitter{0};
     bool reorder = false;
@@ -243,7 +288,10 @@ struct Sim {
                     Frame frame;
                     frame.type = 1;
                     const uint32_t counter = next_counter[id]++;
-                    frame.payload.resize(64);
+                    frame.payload.assign(dataset_frames ? 518 : 64, 0);
+                    if (dataset_frames)
+                        std::fill(frame.payload.begin() + 4,
+                                  frame.payload.begin() + 200, 0x5A);
                     std::memcpy(frame.payload.data(), &counter, 4);
                     sent_at[{id, counter}] = now;
                     rel.Send(&frame, true, now, Sender(id, now));
@@ -442,6 +490,22 @@ bool TestBurstLoss() {
                    "bursts: no stall of 400 ms");
 }
 
+// The bad link with dataset-sized frames: the bundle budget
+// (kBundleBudgetBytes) holds fewer copies of them.
+bool TestBadLinkDatasets() {
+    Sim sim;
+    sim.loss_pct = 10;
+    sim.delay = milliseconds(125);
+    sim.jitter = milliseconds(40);
+    sim.dataset_frames = true;
+    sim.Run({0x1111, 0x2222}, milliseconds(16), milliseconds(40000),
+            milliseconds(46000));
+    sim.Report("loss 10% D=125 jitter 40, datasets");
+    return sim.CheckExactlyOnceInOrder("bad link, datasets") &&
+           require(sim.LatePerMille(80) < 20.0,
+                   "bad link, datasets: 98 % of frames within jitter + 40 ms");
+}
+
 // A quarter second of round trip with heavy jitter and loss.
 bool TestBadLink() {
     Sim sim;
@@ -554,6 +618,7 @@ int main() {
     ok = TestHeavyLoss() && ok;
     ok = TestBurstLoss() && ok;
     ok = TestBadLink() && ok;
+    ok = TestBadLinkDatasets() && ok;
     ok = TestRedundancyCost() && ok;
     if (!ok) return 1;
     std::printf("mp_reliable_test: ok\n");
