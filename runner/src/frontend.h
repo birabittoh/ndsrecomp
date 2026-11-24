@@ -239,11 +239,11 @@ struct NdsMphPrimeControlBindings {
 NdsMphPrimeControlBindings nds_default_mph_pad_bindings();
 
 struct NdsVirtualStylusOptions {
-    // Opt-in lower-screen pointer helper: hold key/pad_hold to show the
+    // Default-on lower-screen pointer helper: hold key/pad_hold to show the
     // cursor, move it with relative mouse motion or the right stick, and tap
     // with mouse left / pad_tap. Title-specific control layers may suppress
     // this when they own the same inputs.
-    bool enabled = false;
+    bool enabled = true;
     std::string binding = "None";
     std::string tap_binding = "None";
     std::string pad_hold_binding = "Pad LT";

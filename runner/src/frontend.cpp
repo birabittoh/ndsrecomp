@@ -2705,6 +2705,105 @@ void convert_mouse_event_to_logical_coordinates(
     }
 }
 
+// The plane the virtual stylus moves in, with both LCDs placed on it. Single
+// layout: window 0's drawable pixels, holding the shown LCD's rect and the
+// inset's (when there is one), so the cursor goes from one to the other as
+// the mouse does. Otherwise the two LCDs stacked, top over bottom, in DS
+// pixels. A rect with w == 0 is an LCD not shown.
+struct VirtualStylusSpace {
+    NdsPresentRect rects[2]{};
+    int content_w = kScreenWidth;
+    int over = -1;       // the LCD drawn over the other where they overlap
+    float scale = 1.0f;  // plane units per DS pixel of the main LCD
+};
+
+VirtualStylusSpace virtual_stylus_space(
+    const FrontendPresentation& presentation) {
+    VirtualStylusSpace space{};
+    if (presentation.single && !presentation.dual &&
+        presentation.windows[0]) {
+        int drawable_w = 0, drawable_h = 0;
+        window_drawable_size(presentation, 0, &drawable_w, &drawable_h);
+        int content_w = 0, content_h = 0;
+        window_content_size(presentation, 0, &content_w, &content_h);
+        if (drawable_w > 0 && drawable_h > 0 && content_w > 0 &&
+            content_h > 0) {
+            const NdsSingleLayout layout = nds_single_layout(
+                presentation.window_mode, presentation.scaling, drawable_w,
+                drawable_h, content_w, content_h, presentation.inset_percent,
+                presentation.stacked);
+            const int shown = presentation.shown_screen & 1;
+            space.rects[shown] = layout.main;
+            if (layout.inset.w > 0 && layout.inset.h > 0) {
+                space.rects[shown ^ 1] = layout.inset;
+                space.over = shown ^ 1;
+            }
+            space.content_w = content_w;
+            space.scale = static_cast<float>(layout.main.w) / content_w;
+            return space;
+        }
+    }
+    space.rects[0] = {0, 0, kScreenWidth, kScreenHeight};
+    space.rects[1] = {0, kScreenHeight, kScreenWidth, kScreenHeight};
+    return space;
+}
+
+// A plane point as DS pixels of `screen` (as displayed, not clamped).
+void virtual_stylus_to_ds(const VirtualStylusSpace& space, int screen,
+                          float px, float py, float* ds_x, float* ds_y) {
+    float cx = 0.0f, cy = 0.0f;
+    nds_present_rect_to_content(space.rects[screen], space.content_w,
+                                kScreenHeight, px, py, &cx, &cy);
+    *ds_x = cx - static_cast<float>((space.content_w - kScreenWidth) / 2);
+    *ds_y = cy;
+}
+
+// DS pixels of `screen` as a plane point.
+void virtual_stylus_from_ds(const VirtualStylusSpace& space, int screen,
+                            float ds_x, float ds_y, float* px, float* py) {
+    const NdsPresentRect& r = space.rects[screen];
+    const float cx =
+        ds_x + static_cast<float>((space.content_w - kScreenWidth) / 2);
+    *px = r.x + cx * r.w / static_cast<float>(space.content_w);
+    *py = r.y + ds_y * r.h / static_cast<float>(kScreenHeight);
+}
+
+// The LCD under a plane point: the one it is in (the one drawn over the
+// other first), else the nearest shown one.
+int virtual_stylus_screen_at(const VirtualStylusSpace& space, float px,
+                             float py) {
+    auto inside = [&](int s) {
+        const NdsPresentRect& r = space.rects[s];
+        return r.w > 0 && px >= r.x && px < r.x + r.w && py >= r.y &&
+               py < r.y + r.h;
+    };
+    if (space.over >= 0 && inside(space.over)) return space.over;
+    if (inside(0)) return 0;
+    if (inside(1)) return 1;
+    float best = 0.0f;
+    int best_screen = space.rects[1].w > 0 ? 1 : 0;
+    bool first = true;
+    for (int s = 0; s < 2; ++s) {
+        const NdsPresentRect& r = space.rects[s];
+        if (r.w <= 0) continue;
+        const float dx = std::max({float(r.x) - px, 0.0f,
+                                   px - float(r.x + r.w)});
+        const float dy = std::max({float(r.y) - py, 0.0f,
+                                   py - float(r.y + r.h)});
+        const float d = dx * dx + dy * dy;
+        if (first || d < best) {
+            best = d;
+            best_screen = s;
+            first = false;
+        }
+    }
+    return best_screen;
+}
+
+// Where the stylus cursor is drawn: the LCD and DS pixels there. Read by
+// the presenters (the cursor's position travels with the present call).
+int g_virtual_stylus_screen = 1;
+
 bool set_texture_scale_nearest(SDL_Texture* texture) {
 #if defined(NDS_HAVE_SDL3)
     return SDL_SetTextureScaleMode(texture, SDL_SCALEMODE_NEAREST);
@@ -3428,8 +3527,8 @@ void draw_separate_screen(FrontendPresentation& presentation, int screen,
 }
 
 // Single-screen layout: present presentation.shown_screen, with the other LCD
-// as an optional inset next to it, and the virtual stylus (bottom LCD only)
-// and savestate notice on the shown screen.
+// as an optional inset next to it, the virtual stylus on the LCD it is over
+// (g_virtual_stylus_screen) and the savestate notice on the shown screen.
 // The GL window has no SDL renderer, so there the stylus and notice go
 // through the presenter's overlay layer.
 PresentationTicks present_single_screen(FrontendPresentation& presentation,
@@ -3448,7 +3547,23 @@ PresentationTicks present_single_screen(FrontendPresentation& presentation,
     const int width = shown ? bottom_width : top_width;
     const uint32_t* other_pixels = shown ? top_pixels : bottom_pixels;
     const int other_width = shown ? top_width : bottom_width;
-    const bool stylus = virtual_stylus_visible && shown == 1;
+    const bool stylus =
+        virtual_stylus_visible && shown == g_virtual_stylus_screen;
+    // On the inset, the cursor is drawn on a copy of its LCD.
+    if (virtual_stylus_visible && g_virtual_stylus_screen == (shown ^ 1) &&
+        presentation.inset_percent > 0 && other_pixels && other_width > 0) {
+        static std::vector<uint32_t> inset_stylus;
+        inset_stylus.assign(other_pixels,
+                            other_pixels + size_t(other_width) * kScreenHeight);
+        DsTarget target{};
+        target.pixels = inset_stylus.data();
+        target.pixels_width = other_width;
+        target.pixels_height = kScreenHeight;
+        target.canvas = {SDL_Rect{0, 0, other_width, kScreenHeight},
+                         other_width, kScreenHeight};
+        draw_virtual_stylus(target, virtual_stylus_x, virtual_stylus_y);
+        other_pixels = inset_stylus.data();
+    }
     if (presentation.gl_top) {
 #if defined(NDS_HAVE_COMPUTE_RENDERER)
         // The OBJ-only direct path draws engine A on the top LCD only.
@@ -3576,8 +3691,11 @@ PresentationTicks present_dual(FrontendPresentation& presentation,
     presentation.inset_percent = 0;
     PresentationTicks ticks = present_single_screen(
         presentation, top_pixels, top_width, bottom_pixels, bottom_width,
-        false, 0.0f, 0.0f, nullptr, nullptr);
+        virtual_stylus_visible && g_virtual_stylus_screen == 0,
+        virtual_stylus_x, virtual_stylus_y, nullptr, nullptr);
     if (!ticks.ok || g_present_synthetic) return ticks;
+    virtual_stylus_visible =
+        virtual_stylus_visible && g_virtual_stylus_screen == 1;
     static std::vector<uint32_t> overlay;
     const bool want_overlay = virtual_stylus_visible ||
                               (savestate_notice && *savestate_notice) ||
@@ -3709,10 +3827,15 @@ PresentationTicks present_screens(FrontendPresentation& presentation,
         static std::vector<uint32_t> top_overlay;
         static ChatFrame chat;
         bool want_chat = false;
+        const bool top_stylus =
+            virtual_stylus_visible && g_virtual_stylus_screen == 0;
         const DsTarget top_target =
-            overlay_target(top_width, touch_buttons_wanted(), &chat,
-                           &want_chat, &top_overlay);
+            overlay_target(top_width, touch_buttons_wanted() || top_stylus,
+                           &chat, &want_chat, &top_overlay);
         const bool want_top_overlay = top_target.pixels != nullptr;
+        if (top_stylus && want_top_overlay)
+            draw_virtual_stylus(top_target, virtual_stylus_x,
+                                virtual_stylus_y);
         if (want_chat) draw_chat_overlay(top_target, chat);
         draw_touch_buttons(top_target);
         nds_compute_host_set_overlay(
@@ -3741,7 +3864,9 @@ PresentationTicks present_screens(FrontendPresentation& presentation,
         ticks.upload += SDL_GetPerformanceCounter() - start;
         SDL_Renderer* renderer = presentation.renderers[1];
         start = SDL_GetPerformanceCounter();
-        draw_separate_screen(presentation, 1, virtual_stylus_visible,
+        draw_separate_screen(presentation, 1,
+                             virtual_stylus_visible &&
+                                 g_virtual_stylus_screen == 1,
                              virtual_stylus_x, virtual_stylus_y,
                              savestate_notice, fps_counter);
         ticks.draw += SDL_GetPerformanceCounter() - start;
@@ -3780,11 +3905,14 @@ PresentationTicks present_screens(FrontendPresentation& presentation,
         render_screen(presentation, 1, bottom_rect);
         const DsTarget top_target = sdl_ds_target(
             renderer, top_rect, presentation.screen_widths[0]);
+        if (virtual_stylus_visible && g_virtual_stylus_screen == 0)
+            draw_virtual_stylus(top_target, virtual_stylus_x,
+                                virtual_stylus_y);
         draw_chat_overlay(top_target);
         draw_touch_buttons(top_target);
         const DsTarget target = sdl_ds_target(
             renderer, bottom_rect, presentation.screen_widths[1]);
-        if (virtual_stylus_visible)
+        if (virtual_stylus_visible && g_virtual_stylus_screen == 1)
             draw_virtual_stylus(target, virtual_stylus_x, virtual_stylus_y);
         draw_savestate_notice(target, savestate_notice);
         draw_fps_counter(target, fps_counter);
@@ -3799,7 +3927,8 @@ PresentationTicks present_screens(FrontendPresentation& presentation,
         SDL_Renderer* renderer = presentation.renderers[screen];
         start = SDL_GetPerformanceCounter();
         draw_separate_screen(presentation, screen,
-                             screen == 1 && virtual_stylus_visible,
+                             screen == g_virtual_stylus_screen &&
+                                 virtual_stylus_visible,
                              virtual_stylus_x, virtual_stylus_y,
                              screen == 1 ? savestate_notice : nullptr,
                              screen == 1 ? fps_counter : nullptr);
@@ -4204,6 +4333,9 @@ int nds_run_interactive_frontend(const NdsFrontendOptions& initial_options) {
         SDL_Quit();
         return 1;
     }
+    const bool virtual_stylus_uses_rt = virtual_stylus_available &&
+        (virtual_stylus_pad_hold.kind == MphPadInputKind::TriggerRight ||
+         virtual_stylus_pad_tap.kind == MphPadInputKind::TriggerRight);
     if (virtual_stylus_available) {
         std::fprintf(stderr,
             "[sdl] Virtual Stylus: hold %s or %s; tap %s/%s or mouse left; "
@@ -4231,15 +4363,16 @@ int nds_run_interactive_frontend(const NdsFrontendOptions& initial_options) {
     // The keys the right stick holds to turn a title's camera
     // (nds_title_camera_stick).
     uint16_t camera_stick_pressed = 0;
+    // L3 held shows the other LCD in the single layout, unless a custom
+    // binding gives it a DS button.
+    bool screen_swap_pad_held = false;
     int zoom_stick_frames = 0;
     float zoom_stick_rem = 0.0f;
     bool zoom_save_pending = false;
     // The right mouse button as the title sees it (title_settings.h) is held
-    // by the mouse, by two fingers on a touchscreen or by the gamepad's left
-    // trigger (when neither the virtual stylus nor Prime uses it).
+    // by the mouse or by two fingers on a touchscreen.
     bool right_mouse_button_held = false;
     bool touch_right_held = false;
-    bool pad_right_held = false;
     // A two-finger tap stays held this long, so the title's per-frame hooks
     // see it even when both fingers lift within one frame.
     constexpr uint64_t kTouchRightMinHoldMs = 80;
@@ -4247,7 +4380,7 @@ int nds_run_interactive_frontend(const NdsFrontendOptions& initial_options) {
     bool touch_right_release_pending = false;
     auto publish_right_mouse = [&]() {
         nds_title_set_right_mouse_held(right_mouse_button_held ||
-                                       touch_right_held || pad_right_held);
+                                       touch_right_held);
     };
 #if defined(NDS_HAVE_SDL3)
     // Fingers down on the touchscreen (window pixels), for the two-finger
@@ -4467,9 +4600,24 @@ int nds_run_interactive_frontend(const NdsFrontendOptions& initial_options) {
     bool virtual_stylus_pointer_held = false;
     bool virtual_stylus_pad_held = false;
     bool virtual_stylus_tap_held = false;
+    // RT while the stylus is held: a second tap button, free of the right
+    // stick's thumb so a drag can steer (RT fast-forwards otherwise).
+    bool virtual_stylus_rt_tap = false;
     bool virtual_stylus_capture_owned = false;
-    float virtual_stylus_pad_rem_x = 0.0f;
-    float virtual_stylus_pad_rem_y = 0.0f;
+    // The generic virtual stylus moves on virtual_stylus_space's plane: the
+    // point there, the LCD and DS pixels under it (where the cursor is
+    // drawn), the LCD a tap started on (-1: none; a tap stays on it, as a
+    // mouse press does) and the motion still to apply, in DS pixels of the
+    // main LCD.
+    VirtualStylusSpace virtual_stylus_plane{};
+    bool virtual_stylus_placed = false;
+    float virtual_stylus_px = 0.0f, virtual_stylus_py = 0.0f;
+    int virtual_stylus_screen = 1;
+    float virtual_stylus_ds_x = 128.0f, virtual_stylus_ds_y = 96.0f;
+    int virtual_stylus_press_screen = -1;
+    bool virtual_stylus_touching = false;
+    bool virtual_stylus_was_active = false;
+    float virtual_stylus_move_x = 0.0f, virtual_stylus_move_y = 0.0f;
     bool virtual_stylus_pad_trigger_left_held = false;
     bool virtual_stylus_pad_trigger_right_held = false;
     int mph_pad_idle_frames = 0;
@@ -4607,10 +4755,123 @@ int nds_run_interactive_frontend(const NdsFrontendOptions& initial_options) {
         virtual_stylus_pointer_held = false;
         virtual_stylus_pad_held = false;
         virtual_stylus_tap_held = false;
-        virtual_stylus_pad_rem_x = 0.0f;
-        virtual_stylus_pad_rem_y = 0.0f;
+        virtual_stylus_rt_tap = false;
+        virtual_stylus_move_x = virtual_stylus_move_y = 0.0f;
         nds_set_touch(0, 0, false);
         release_virtual_stylus_capture();
+    };
+    // The generic virtual stylus as a mouse: over the touchscreen it hovers
+    // and A touches; over the top screen it is the top-screen pointer and A
+    // clicks and drags there (title_settings.h).
+    auto release_virtual_stylus_pointer = [&]() {
+        if (virtual_stylus_touching) nds_set_touch(0, 0, false);
+        if (virtual_stylus_press_screen == 0)
+            nds_title_set_top_drag(0, 0, false);
+        nds_title_set_pointer_hover(0, 0, false);
+        nds_title_set_top_pointer(0, 0, false);
+        virtual_stylus_touching = false;
+        virtual_stylus_press_screen = -1;
+    };
+    auto update_virtual_stylus = [&](const FrontendPresentation& shown) {
+        const VirtualStylusSpace space = virtual_stylus_space(shown);
+        auto same_rect = [](const NdsPresentRect& a, const NdsPresentRect& b) {
+            return a.x == b.x && a.y == b.y && a.w == b.w && a.h == b.h;
+        };
+        // A new layout (a resize, the main LCD moving) keeps the cursor on
+        // the same DS pixel.
+        if (!virtual_stylus_placed ||
+            !same_rect(space.rects[0], virtual_stylus_plane.rects[0]) ||
+            !same_rect(space.rects[1], virtual_stylus_plane.rects[1])) {
+            int screen = virtual_stylus_screen;
+            if (space.rects[screen].w <= 0) {
+                screen ^= 1;
+                virtual_stylus_ds_x = kScreenWidth / 2.0f;
+                virtual_stylus_ds_y = kScreenHeight / 2.0f;
+            }
+            virtual_stylus_from_ds(space, screen, virtual_stylus_ds_x,
+                                   virtual_stylus_ds_y, &virtual_stylus_px,
+                                   &virtual_stylus_py);
+            virtual_stylus_placed = true;
+        }
+        virtual_stylus_plane = space;
+        virtual_stylus_px += virtual_stylus_move_x * space.scale;
+        virtual_stylus_py += virtual_stylus_move_y * space.scale;
+        virtual_stylus_move_x = virtual_stylus_move_y = 0.0f;
+        // Within the box around the shown LCDs, so a gap between them can
+        // be crossed but the bars around them hold nothing to come back from.
+        float x0 = 0.0f, y0 = 0.0f, x1 = 0.0f, y1 = 0.0f;
+        bool any = false;
+        for (const NdsPresentRect& r : space.rects) {
+            if (r.w <= 0) continue;
+            if (!any) {
+                x0 = r.x; y0 = r.y; x1 = r.x + r.w; y1 = r.y + r.h;
+                any = true;
+            } else {
+                x0 = std::min(x0, float(r.x));
+                y0 = std::min(y0, float(r.y));
+                x1 = std::max(x1, float(r.x + r.w));
+                y1 = std::max(y1, float(r.y + r.h));
+            }
+        }
+        virtual_stylus_px = std::clamp(virtual_stylus_px, x0, x1 - 1.0f);
+        virtual_stylus_py = std::clamp(virtual_stylus_py, y0, y1 - 1.0f);
+        virtual_stylus_screen = virtual_stylus_screen_at(
+            space, virtual_stylus_px, virtual_stylus_py);
+        float ds_x = 0.0f, ds_y = 0.0f;
+        virtual_stylus_to_ds(space, virtual_stylus_screen, virtual_stylus_px,
+                             virtual_stylus_py, &ds_x, &ds_y);
+        virtual_stylus_ds_x = std::clamp(ds_x, 0.0f, kScreenWidth - 1.0f);
+        virtual_stylus_ds_y = std::clamp(ds_y, 0.0f, kScreenHeight - 1.0f);
+
+        const bool tap_held = virtual_stylus_tap_held || virtual_stylus_rt_tap;
+        if (!tap_held && virtual_stylus_press_screen >= 0) {
+            if (virtual_stylus_press_screen == 0)
+                nds_title_set_top_drag(0, 0, false);
+            virtual_stylus_press_screen = -1;
+        }
+        const bool press = tap_held && virtual_stylus_press_screen < 0;
+        if (press) virtual_stylus_press_screen = virtual_stylus_screen;
+        const int screen = virtual_stylus_press_screen >= 0
+            ? virtual_stylus_press_screen : virtual_stylus_screen;
+        // Off the LCD a tap started on, the pointer still counts there.
+        float ex = virtual_stylus_ds_x, ey = virtual_stylus_ds_y;
+        if (screen != virtual_stylus_screen)
+            virtual_stylus_to_ds(space, screen, virtual_stylus_px,
+                                 virtual_stylus_py, &ex, &ey);
+        const int cx = static_cast<int>(
+            std::clamp(ex, 0.0f, kScreenWidth - 1.0f));
+        const int cy = static_cast<int>(
+            std::clamp(ey, 0.0f, kScreenHeight - 1.0f));
+        if (screen == 0) {
+            if (virtual_stylus_touching) {
+                nds_set_touch(0, 0, false);
+                virtual_stylus_touching = false;
+            }
+            nds_title_set_pointer_hover(0, 0, false);
+            nds_title_set_top_pointer(cx, cy,
+                                      screen == virtual_stylus_screen);
+            if (press) nds_title_note_top_click(cx, cy);
+            if (virtual_stylus_press_screen == 0)
+                nds_title_set_top_drag(static_cast<int>(std::floor(ex)),
+                                       static_cast<int>(std::floor(ey)),
+                                       true);
+            return;
+        }
+        nds_title_set_top_pointer(0, 0, false);
+        float ux = static_cast<float>(cx), uy = static_cast<float>(cy);
+        const bool mapped = touch_ui_unscale(&ux, &uy);
+        const uint16_t tx = static_cast<uint16_t>(
+            std::clamp<int>(static_cast<int>(ux), 0, kScreenWidth - 1));
+        const uint16_t ty = static_cast<uint16_t>(
+            std::clamp<int>(static_cast<int>(uy), 0, kScreenHeight - 1));
+        const bool touching = virtual_stylus_press_screen == 1 && mapped;
+        if (touching)
+            nds_set_touch(tx, ty, true);
+        else if (virtual_stylus_touching)
+            nds_set_touch(0, 0, false);
+        virtual_stylus_touching = touching;
+        nds_title_set_pointer_hover(tx, ty,
+                                    virtual_stylus_press_screen < 0 && mapped);
     };
     auto capture_virtual_stylus_mouse = [&]() {
         if (!virtual_stylus_available || virtual_stylus_capture_owned ||
@@ -4644,6 +4905,7 @@ int nds_run_interactive_frontend(const NdsFrontendOptions& initial_options) {
         virtual_stylus_pad_held = down;
         if (!down && !virtual_stylus_pointer_held) {
             virtual_stylus_tap_held = false;
+            virtual_stylus_rt_tap = false;
             nds_set_touch(0, 0, false);
         }
         return true;
@@ -4685,6 +4947,10 @@ int nds_run_interactive_frontend(const NdsFrontendOptions& initial_options) {
         if (virtual_stylus_active() &&
             pad_binding_matches(virtual_stylus_pad_tap, kind, button)) {
             virtual_stylus_tap_held = down;
+            return true;
+        }
+        if (kind == MphPadInputKind::TriggerRight && !virtual_stylus_uses_rt) {
+            virtual_stylus_rt_tap = down && virtual_stylus_active();
             return true;
         }
         return false;
@@ -4910,7 +5176,7 @@ int nds_run_interactive_frontend(const NdsFrontendOptions& initial_options) {
         mouse_down = false;
         touch_release_pending = false;
         nds_set_touch(0, 0, false);
-        right_mouse_button_held = touch_right_held = pad_right_held = false;
+        right_mouse_button_held = touch_right_held = false;
         touch_right_release_pending = false;
         publish_right_mouse();
 #if defined(NDS_HAVE_SDL3)
@@ -5838,6 +6104,7 @@ int nds_run_interactive_frontend(const NdsFrontendOptions& initial_options) {
                 controller_id = -1;
                 controller_pressed = 0;
                 camera_stick_pressed = 0;
+                screen_swap_pad_held = false;
                 // Pad-held Prime actions must not survive the device; the
                 // keyboard/mouse can re-press theirs on the next event.
                 clear_mph_prime_controls();
@@ -5853,6 +6120,9 @@ int nds_run_interactive_frontend(const NdsFrontendOptions& initial_options) {
                 } else if (process_mph_prime_pad(MphPadInputKind::Button, button,
                                           true)) {
                     // Consumed by Prime Controls.
+                } else if (button == SDL_CONTROLLER_BUTTON_LEFTSTICK &&
+                           !gamepad_button_mask(options, button)) {
+                    screen_swap_pad_held = true;
                 } else if (const uint16_t bit =
                         gamepad_button_mask(options, button)) {
                     controller_pressed |= bit;
@@ -5868,6 +6138,9 @@ int nds_run_interactive_frontend(const NdsFrontendOptions& initial_options) {
                 } else if (process_mph_prime_pad(MphPadInputKind::Button, button,
                                           false)) {
                     // Consumed by Prime Controls.
+                } else if (button == SDL_CONTROLLER_BUTTON_LEFTSTICK &&
+                           !gamepad_button_mask(options, button)) {
+                    screen_swap_pad_held = false;
                 } else if (const uint16_t bit =
                         gamepad_button_mask(options, button)) {
                     controller_pressed &= static_cast<uint16_t>(~bit);
@@ -6266,15 +6539,12 @@ int nds_run_interactive_frontend(const NdsFrontendOptions& initial_options) {
                 (event.motion.windowID == presentation.window_ids[0] ||
                  is_presentation_window(event.motion.windowID) ||
                  event.motion.windowID == 0)) {
-                mph_virtual_x +=
+                virtual_stylus_move_x +=
                     static_cast<float>(event.motion.xrel) *
                     options.virtual_stylus.sensitivity * 0.01f;
-                mph_virtual_y +=
+                virtual_stylus_move_y +=
                     static_cast<float>(event.motion.yrel) *
-                    (256.0f / 192.0f) *
                     options.virtual_stylus.sensitivity * 0.01f;
-                mph_virtual_x = std::clamp(mph_virtual_x, 0.0f, 255.0f);
-                mph_virtual_y = std::clamp(mph_virtual_y, 0.0f, 191.0f);
             } else if (event.type == SDL_MOUSEMOTION &&
                 relative_mouse.captured() &&
                 (event.motion.windowID == presentation.window_ids[0] ||
@@ -6396,29 +6666,15 @@ int nds_run_interactive_frontend(const NdsFrontendOptions& initial_options) {
                 }
             }
 
-            // Right trigger held -> fast-forward, as Tab.
-            if (!virtual_stylus_available && !mph_prime_controls_available) {
+            // Right trigger held -> fast-forward, as Tab, unless the virtual
+            // stylus (held: RT taps) or Prime has it.
+            if (!virtual_stylus_uses_rt && !mph_prime_controls_available &&
+                !virtual_stylus_active()) {
                 const int rt = SDL_GameControllerGetAxis(
                     controller, SDL_CONTROLLER_AXIS_TRIGGERRIGHT);
                 turbo_pad_pressed = rt > (turbo_pad_pressed ? 6554 : 9830);
             } else {
                 turbo_pad_pressed = false;
-            }
-
-            // Left trigger held -> the right mouse button, as a two-finger
-            // tap (a title's text skip / advance).
-            {
-                bool lt_held = false;
-                if (!virtual_stylus_available &&
-                    !mph_prime_controls_available) {
-                    const int lt = SDL_GameControllerGetAxis(
-                        controller, SDL_CONTROLLER_AXIS_TRIGGERLEFT);
-                    lt_held = lt > (pad_right_held ? 6554 : 9830);
-                }
-                if (lt_held != pad_right_held) {
-                    pad_right_held = lt_held;
-                    publish_right_mouse();
-                }
             }
 
             // Right stick up/down -> a title's zoom (title_settings.h): up
@@ -6469,17 +6725,17 @@ int nds_run_interactive_frontend(const NdsFrontendOptions& initial_options) {
                     controller, SDL_CONTROLLER_AXIS_TRIGGERRIGHT) > 9830;
                 const bool trigger_left = SDL_GameControllerGetAxis(
                     controller, SDL_CONTROLLER_AXIS_TRIGGERLEFT) > 9830;
-                if (trigger_right != virtual_stylus_pad_trigger_right_held) {
-                    virtual_stylus_pad_trigger_right_held = trigger_right;
-                    process_virtual_stylus_pad(MphPadInputKind::TriggerRight,
-                                              SDL_CONTROLLER_BUTTON_INVALID,
-                                              trigger_right);
-                }
                 if (trigger_left != virtual_stylus_pad_trigger_left_held) {
                     virtual_stylus_pad_trigger_left_held = trigger_left;
                     process_virtual_stylus_pad(MphPadInputKind::TriggerLeft,
                                               SDL_CONTROLLER_BUTTON_INVALID,
                                               trigger_left);
+                }
+                if (trigger_right != virtual_stylus_pad_trigger_right_held) {
+                    virtual_stylus_pad_trigger_right_held = trigger_right;
+                    process_virtual_stylus_pad(MphPadInputKind::TriggerRight,
+                                              SDL_CONTROLLER_BUTTON_INVALID,
+                                              trigger_right);
                 }
                 const float mag = std::sqrt(rx * rx + ry * ry);
                 constexpr float kVirtualStylusDeadzone = 0.25f;
@@ -6490,21 +6746,8 @@ int nds_run_interactive_frontend(const NdsFrontendOptions& initial_options) {
                     const float rate = curved * curved * 5.0f *
                         (options.virtual_stylus.pad_sensitivity / 100.0f) /
                         mag;
-                    virtual_stylus_pad_rem_x += rx * rate;
-                    virtual_stylus_pad_rem_y += ry * rate *
-                        (256.0f / 192.0f);
-                    const int32_t pad_x =
-                        static_cast<int32_t>(virtual_stylus_pad_rem_x);
-                    const int32_t pad_y =
-                        static_cast<int32_t>(virtual_stylus_pad_rem_y);
-                    virtual_stylus_pad_rem_x -= static_cast<float>(pad_x);
-                    virtual_stylus_pad_rem_y -= static_cast<float>(pad_y);
-                    mph_virtual_x = std::clamp(
-                        mph_virtual_x + static_cast<float>(pad_x),
-                        0.0f, 255.0f);
-                    mph_virtual_y = std::clamp(
-                        mph_virtual_y + static_cast<float>(pad_y),
-                        0.0f, 191.0f);
+                    virtual_stylus_move_x += rx * rate;
+                    virtual_stylus_move_y += ry * rate;
                 }
             }
 
@@ -6570,10 +6813,6 @@ int nds_run_interactive_frontend(const NdsFrontendOptions& initial_options) {
             }
         } else {
             turbo_pad_pressed = false;
-            if (pad_right_held) {
-                pad_right_held = false;
-                publish_right_mouse();
-            }
             if (stick_pressed != 0) {
                 stick_pressed = 0;
                 publish_keys();
@@ -6670,15 +6909,14 @@ int nds_run_interactive_frontend(const NdsFrontendOptions& initial_options) {
             relative_delta_y = 0;
         }
         if (generic_virtual_stylus) {
-            // A single-screen peek at the top LCD hides the touchscreen, so
-            // taps do not reach it.
-            const bool stylus_on_touchscreen =
-                !presentation.single || presentation.dual ||
-                presentation.shown_screen == 1;
-            nds_set_touch(static_cast<uint16_t>(std::lround(mph_virtual_x)),
-                          static_cast<uint16_t>(std::lround(mph_virtual_y)),
-                          virtual_stylus_tap_held && stylus_on_touchscreen);
-        } else if (mph_prime_is_active) {
+            update_virtual_stylus(presentation);
+        } else if (virtual_stylus_was_active) {
+            release_virtual_stylus_pointer();
+        }
+        virtual_stylus_was_active = generic_virtual_stylus;
+        g_virtual_stylus_screen =
+            generic_virtual_stylus ? virtual_stylus_screen : 1;
+        if (!generic_virtual_stylus && mph_prime_is_active) {
             if (mph_touch_sequence.active()) {
                 mph_touch_sequence.tick();
             } else if (mph_prime_virtual_stylus) {
@@ -6928,9 +7166,11 @@ int nds_run_interactive_frontend(const NdsFrontendOptions& initial_options) {
                 const int shown = presentation.stacked || presentation.dual
                     ? 0
                     : nds_single_shown_screen(
-                          main_screen.main, screen_toggled,
+                          main_screen.main,
+                          screen_toggled != screen_swap_pad_held,
                           mph_prime_virtual_stylus ||
-                              generic_virtual_stylus);
+                              (generic_virtual_stylus &&
+                               options.second_screen_size == 0));
                 if (shown != presentation.shown_screen) {
                     // A held mouse touch belongs to the LCD it started on.
                     if (mouse_down) {
@@ -6996,7 +7236,8 @@ int nds_run_interactive_frontend(const NdsFrontendOptions& initial_options) {
                 presentation, blend_cache.blended[0].data(), top_width,
                 blend_cache.blended[1].data(), bottom_width,
                 mph_prime_virtual_stylus || generic_virtual_stylus,
-                mph_virtual_x, mph_virtual_y,
+                generic_virtual_stylus ? virtual_stylus_ds_x : mph_virtual_x,
+                generic_virtual_stylus ? virtual_stylus_ds_y : mph_virtual_y,
                 savestate_notice.empty() ? nullptr : savestate_notice.c_str(),
                 options.show_fps ? fps_counter.c_str() : nullptr);
 #if defined(NDS_SECOND_DISPLAY)
@@ -7038,7 +7279,8 @@ int nds_run_interactive_frontend(const NdsFrontendOptions& initial_options) {
             presentation, top_pixels, top_width,
             bottom_pixels, bottom_width,
             mph_prime_virtual_stylus || generic_virtual_stylus,
-            mph_virtual_x, mph_virtual_y,
+            generic_virtual_stylus ? virtual_stylus_ds_x : mph_virtual_x,
+            generic_virtual_stylus ? virtual_stylus_ds_y : mph_virtual_y,
             savestate_notice.empty() ? nullptr : savestate_notice.c_str(),
             options.show_fps ? fps_counter.c_str() : nullptr
 #if defined(NDS_HAVE_COMPUTE_RENDERER)
