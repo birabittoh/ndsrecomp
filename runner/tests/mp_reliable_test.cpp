@@ -40,7 +40,7 @@ bool TestWireRoundTrip() {
     std::vector<uint8_t> bytes;
     mpnet::Encode(in, &bytes);
     Frame out;
-    bool ok = require(bytes.size() == mpnet::kHeaderBytes + 5, "size") &&
+    bool ok = require(bytes.size() <= mpnet::kMaxHeaderBytes + 5, "size") &&
               require(mpnet::Decode(bytes.data(), bytes.size(), &out),
                       "decodes") &&
               require(out.node == in.node && out.type == in.type &&
@@ -52,7 +52,7 @@ bool TestWireRoundTrip() {
                           out.ack_bits == in.ack_bits &&
                           out.flags == in.flags && out.payload == in.payload,
                       "fields round-trip");
-    mpnet::Restamp(bytes.data(), 1234, 5, 6, 0x10);
+    mpnet::Restamp(&bytes, 1234, 5, 6, 0x10);
     ok = ok && require(mpnet::Decode(bytes.data(), bytes.size(), &out) &&
                            out.sent_ns == 1234 && out.ack_node == 5 &&
                            out.ack_next == 6 && out.ack_bits == 0x10 &&
@@ -66,7 +66,7 @@ bool TestWireRoundTrip() {
     ok = ok && require(!mpnet::Decode(bad.data(), bad.size(), &out),
                        "bad magic rejected");
     bad = bytes;
-    std::memset(bad.data() + 4, 0, 4);
+    std::memset(bad.data() + 3, 0, 4);
     ok = ok && require(!mpnet::Decode(bad.data(), bad.size(), &out),
                        "node 0 rejected");
 
@@ -85,8 +85,8 @@ bool TestWireRoundTrip() {
         mpnet::Encode(first, &b1);
         mpnet::Encode(second, &b2);
         mpnet::Encode(in, &dg);
-        ok = ok && require(mpnet::AppendBundled(&dg, b1.data()) &&
-                               mpnet::AppendBundled(&dg, b2.data()),
+        ok = ok && require(mpnet::AppendBundled(&dg, b1) &&
+                               mpnet::AppendBundled(&dg, b2),
                            "bundles appended");
         Frame got;
         ok = ok && require(mpnet::Decode(dg.data(), dg.size(), &got) &&
@@ -116,7 +116,7 @@ bool TestWireRoundTrip() {
         std::vector<uint8_t> bf;
         mpnet::Encode(fat, &bf);
         const size_t before = dg.size();
-        ok = ok && require(!mpnet::AppendBundled(&dg, bf.data()) &&
+        ok = ok && require(!mpnet::AppendBundled(&dg, bf) &&
                                dg.size() == before,
                            "a bundle past the size limit is refused");
     }
@@ -126,7 +126,7 @@ bool TestWireRoundTrip() {
     {
         Frame sparse;
         sparse.node = in.node;
-        sparse.seq = 11;
+        sparse.seq = 4;
         sparse.type = 1;
         sparse.payload.assign(518, 0);
         sparse.payload[0] = 0xB6;
@@ -135,15 +135,14 @@ bool TestWireRoundTrip() {
         std::vector<uint8_t> enc;
         mpnet::Encode(sparse, &enc);
         Frame got;
-        ok = ok && require(enc.size() < mpnet::kHeaderBytes + 40,
+        ok = ok && require(enc.size() < 40,
                            "sparse frame packed") &&
              require(mpnet::Decode(enc.data(), enc.size(), &got) &&
-                         got.payload == sparse.payload &&
-                         (got.flags & mpnet::kFlagPacked) == 0,
+                         got.payload == sparse.payload && got.flags == 0,
                      "packed frame round-trips");
         std::vector<uint8_t> dg;
         mpnet::Encode(in, &dg);
-        ok = ok && require(mpnet::AppendBundled(&dg, enc.data()) &&
+        ok = ok && require(mpnet::AppendBundled(&dg, enc) &&
                                mpnet::Decode(dg.data(), dg.size(), &got) &&
                                got.bundled.size() == 1 &&
                                got.bundled[0].payload == sparse.payload,
@@ -161,6 +160,56 @@ bool TestWireRoundTrip() {
              require(!mpnet::UnpackZeros(zero_run, sizeof(zero_run), 300,
                                          &unpacked),
                      "empty run refused");
+    }
+
+    // An MP cmd's addresses (multicast, host, host) pack to 1 + 1 + 6 bytes;
+    // a frame without a pattern is left alone; a bad code is refused.
+    {
+        Frame cmd;
+        cmd.node = in.node;
+        cmd.seq = 3;
+        cmd.type = 1;
+        cmd.payload.assign(46, 0);
+        const uint8_t mc[6] = {0x03, 0x09, 0xBF, 0x00, 0x00, 0x00};
+        const uint8_t host[6] = {0x00, 0x09, 0xBF, 0xD8, 0xFE, 0xA0};
+        std::memcpy(cmd.payload.data() + 16, mc, 6);
+        std::memcpy(cmd.payload.data() + 22, host, 6);
+        std::memcpy(cmd.payload.data() + 28, host, 6);
+        cmd.payload[8] = 0x14;
+        cmd.payload[12] = 0x28;
+        cmd.payload[13] = 0x02;
+        cmd.payload[36] = 0xB6;
+        cmd.payload[37] = 0x02;
+        std::vector<uint8_t> packed, back;
+        ok = ok && require(mpnet::PackRadio(cmd.payload, &packed) &&
+                               packed.size() == 46u - 18u + 1u + 1u + 6u &&
+                               mpnet::UnpackRadio(packed, 0x948, &back) &&
+                               back == cmd.payload,
+                           "radio addresses pack and round-trip");
+        std::vector<uint8_t> enc;
+        mpnet::Encode(cmd, &enc);
+        Frame got;
+        ok = ok && require(mpnet::Decode(enc.data(), enc.size(), &got) &&
+                               got.payload == cmd.payload,
+                           "radio-packed frame round-trips") &&
+             require(enc.size() < 46u, "a small MP cmd fits under 46 bytes");
+        std::vector<uint8_t> dg;
+        mpnet::Encode(in, &dg);
+        ok = ok && require(mpnet::AppendBundled(&dg, enc) &&
+                               mpnet::Decode(dg.data(), dg.size(), &got) &&
+                               got.bundled.size() == 1 &&
+                               got.bundled[0].payload == cmd.payload &&
+                               got.bundled[0].seq == 3 &&
+                               got.bundled[0].type == 1,
+                           "radio-packed bundled frame round-trips");
+        std::vector<uint8_t> plain(46);
+        for (size_t k = 0; k < plain.size(); ++k)
+            plain[k] = static_cast<uint8_t>(0x40u + k);
+        ok = ok && require(!mpnet::PackRadio(plain, &packed),
+                           "no address pattern, no radio packing");
+        packed[16] = 0x02;  // address 1 "same as address 1"
+        ok = ok && require(!mpnet::UnpackRadio(packed, 0x948, &back),
+                           "bad radio code refused");
     }
 
     uint8_t beacon[12 + 24] = {};
@@ -537,7 +586,7 @@ bool TestRedundancyCost() {
         // 313 frames of 64 bytes, each bundled once on the next frame
         // and at most once more on an ack.
         ok = require(st.redundant_bytes <=
-                         2u * 313u * (mpnet::kBundleHeaderBytes + 64u),
+                         2u * 313u * (18u + 64u),
                      "clean link: each frame bundled at most twice") && ok;
     }
 
@@ -577,7 +626,9 @@ bool TestRedundancyCost() {
     for (int i = 0; i < 4; ++i) {
         Frame big;
         big.type = 1;
-        big.payload.assign(mpnet::kMaxPayloadBytes, 0x5A);
+        big.payload.resize(mpnet::kMaxPayloadBytes);
+        for (size_t k = 0; k < big.payload.size(); ++k)
+            big.payload[k] = static_cast<uint8_t>(1u + k % 250u);
         a.Send(&big, true, t0 + milliseconds(i), send_a);
         Frame small;
         small.type = 1;
@@ -587,7 +638,8 @@ bool TestRedundancyCost() {
         to_b.clear();  // none arrive: all stay unacknowledged
     }
     return ok &&
-           require(largest == mpnet::kMaxDatagramBytes,
+           require(largest > mpnet::kMaxPayloadBytes &&
+                       largest <= mpnet::kMaxPayloadBytes + 40u,
                    "a full-size frame goes out alone, at its own size");
 }
 

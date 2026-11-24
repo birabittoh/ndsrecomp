@@ -2168,7 +2168,7 @@ int main(int argc, char** argv) {
                 config.game_name = std::string(
                     reinterpret_cast<const char*>(rom.data()) + 0x0C, 4);
             // Only the same ROM with the same MP wire format may meet.
-            config.game_version = "nif4-" + rom_sha1.substr(0, 12);
+            config.game_version = "nif5-" + rom_sha1.substr(0, 12);
             config.lobby_name = online.lobby_name;
             // The player's data folder; next to the exe for scripted runs.
             config.secret_path =

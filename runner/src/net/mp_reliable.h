@@ -120,6 +120,10 @@ public:
 
     uint32_t self() const { return self_; }
 
+    // Whether datagrams carry the send time (Frame::sent_ns). Only the
+    // latency lab reads it, and it costs 8 bytes a datagram.
+    void set_stamp_sends(bool on) { stamp_sends_ = on; }
+
     void AddPeer(uint32_t node);
     void RemovePeer(uint32_t node);
     bool HasPeer(uint32_t node) const { return peers_.count(node) != 0; }
@@ -191,6 +195,7 @@ private:
         Time window_start{};
     };
 
+    int64_t StampNs(Time t) const { return stamp_sends_ ? ToNs(t) : 0; }
     static int64_t ToNs(Time t) {
         return std::chrono::duration_cast<std::chrono::nanoseconds>(
                    t.time_since_epoch())
@@ -222,6 +227,7 @@ private:
                                     const Sent& sent) const;
 
     uint32_t self_ = 0;
+    bool stamp_sends_ = true;
     uint32_t next_seq_ = 1;
     std::map<uint32_t, Peer> peers_;
     std::deque<Sent> unacked_;

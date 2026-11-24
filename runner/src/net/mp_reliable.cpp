@@ -51,7 +51,7 @@ uint32_t Reliable::AckBits(const Peer& peer) {
 
 void Reliable::StampFor(uint32_t node, Peer& peer,
                         std::vector<uint8_t>* datagram, Time now) {
-    Restamp(datagram->data(), ToNs(now), peer.rx_synced ? node : 0u,
+    Restamp(datagram, StampNs(now), peer.rx_synced ? node : 0u,
             peer.rx_synced ? peer.rx_expected : 0u,
             peer.rx_synced ? AckBits(peer) : 0u);
     // Whatever goes to the peer carries the acknowledgement.
@@ -71,7 +71,7 @@ size_t Reliable::Send(Frame* frame, bool reliable, Time now,
         frame->seq = 0;
     }
     frame->next_seq = next_seq_;
-    frame->sent_ns = ToNs(now);
+    frame->sent_ns = StampNs(now);
 
     std::vector<uint8_t> datagram;
     Encode(*frame, &datagram);
@@ -100,7 +100,7 @@ void Reliable::SendControl(uint32_t node, uint32_t flags, Time now,
     frame.node = self_;
     frame.flags = flags;
     frame.next_seq = next_seq_;
-    frame.sent_ns = ToNs(now);
+    frame.sent_ns = StampNs(now);
     std::vector<uint8_t> datagram;
     Encode(frame, &datagram);
     if (node != 0) {
@@ -142,8 +142,7 @@ void Reliable::SendWithBundle(uint32_t node, Peer& peer,
     size_t budget = kBundleBudgetBytes;
     uint32_t kept = 0;
     for (uint32_t i = 0; i < picked; ++i) {
-        const size_t bytes =
-            kBundleHeaderBytes + pick[i]->datagram.size() - kHeaderBytes;
+        const size_t bytes = BundleCost(pick[i]->datagram);
         if (bytes > budget) break;
         budget -= bytes;
         ++kept;
@@ -156,7 +155,7 @@ void Reliable::SendWithBundle(uint32_t node, Peer& peer,
     while (kept > 0) {
         const Sent& sent = *pick[--kept];
         const size_t before = scratch_.size();
-        if (!AppendBundled(&scratch_, sent.datagram.data())) continue;
+        if (!AppendBundled(&scratch_, sent.datagram)) continue;
         stats_.redundant_bytes += scratch_.size() - before;
     }
     send(node, scratch_.data(), scratch_.size());

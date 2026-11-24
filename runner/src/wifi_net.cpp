@@ -993,6 +993,7 @@ private:
             node = static_cast<uint32_t>(rng_()) ^
                    (static_cast<uint32_t>(rng_()) << 16u);
         rel_.Reset(node);
+        rel_.set_stamp_sends(tuning_.delay_ms != 0 || tuning_.jitter_ms != 0);
         peers_.clear();
 
         std::fprintf(stderr,
@@ -2285,9 +2286,8 @@ private:
         // Per logical frame, not per peer.
         stats_sent_by_type_[low_type & 3u].fetch_add(
             1, std::memory_order_relaxed);
-        stats_bytes_sent_.fetch_add(
-            mpnet::kHeaderBytes + frame.payload.size(),
-            std::memory_order_relaxed);
+        stats_bytes_sent_.fetch_add(frame.payload.size(),
+                                    std::memory_order_relaxed);
         if (low_type != 2u) MaybeLogStats();
         // The radio transmitted it whether or not anyone is in range.
         return len;
@@ -2521,7 +2521,7 @@ private:
             return;
         }
         stats_frames_received_.fetch_add(1, std::memory_order_relaxed);
-        stats_bytes_received_.fetch_add(mpnet::kHeaderBytes + frame.payload.size(),
+        stats_bytes_received_.fetch_add(frame.payload.size(),
                                         std::memory_order_relaxed);
         const uint32_t low_type = frame.type & 0xFFFFu;
         stats_received_by_type_[low_type & 3u].fetch_add(
