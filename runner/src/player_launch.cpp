@@ -1232,13 +1232,15 @@ std::string build_folder(const std::vector<uint8_t>& rom,
     }
     fs::path unpacked = dest;
     unpacked += ".unpacked";
+    // Left over by a run stopped while converting.
+    std::error_code ec;
+    fs::remove_all(unpacked, ec);
     report(0.1, "Unpacking the ROM");
     if (!nds_rom_folder_unpack(rom, unpacked, &error))
         return "Cannot unpack the ROM: " + error;
     report(0.5, "Rebuilding the game code");
     const bool ok = nds_release_convert_folder(unpacked, dest, recipe->data,
                                                recipe->size, &error);
-    std::error_code ec;
     fs::remove_all(unpacked, ec);
     if (!ok) return "Cannot convert the ROM: " + error;
     return {};

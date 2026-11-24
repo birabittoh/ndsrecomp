@@ -1,10 +1,12 @@
 #include "rom_folder.h"
 
 #include <algorithm>
+#include <chrono>
 #include <cstdio>
 #include <fstream>
 #include <map>
 #include <sstream>
+#include <thread>
 #include <utility>
 
 #include "sha1.h"
@@ -310,11 +312,17 @@ bool nds_rom_folder_unpack(const std::vector<uint8_t>& rom,
         fs::remove_all(tmp, ec);
         return fail(error, "cannot write " + (tmp / kManifest).string());
     }
-    fs::rename(tmp, dir, ec);
+    // A sync client (OneDrive) or a virus scanner can still hold the files
+    // just written, failing the directory rename for a moment.
+    for (int attempt = 0;; ++attempt) {
+        fs::rename(tmp, dir, ec);
+        if (!ec || attempt == 20) break;
+        std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    }
     if (ec) {
+        const std::string reason = ec.message();
         fs::remove_all(tmp, ec);
-        return fail(error, "cannot create " + dir.string() + ": " +
-                               ec.message());
+        return fail(error, "cannot create " + dir.string() + ": " + reason);
     }
     return true;
 }
