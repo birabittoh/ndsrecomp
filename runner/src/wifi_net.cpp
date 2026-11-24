@@ -27,6 +27,7 @@
 #include "net/online_lobby.h"
 #endif
 
+#include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
@@ -1341,14 +1342,7 @@ public:
             if ((aidmask & bit) == 0) continue;
             if ((late_last_mask_ & bit) == 0) late_polled_since_[aid] = now;
             auto& q = late_queue_[aid];
-            // A reply from a previous session (or a client that went
-            // quiet for a second of guest time) is not this exchange's.
-            while (!q.empty() &&
-                   q.front().timestamp + kLateReplyWindowUs < timestamp) {
-                q.pop_front();
-                stats_stale_reply_drops_.fetch_add(
-                    1, std::memory_order_relaxed);
-            }
+            DropStaleDefaultReplies(&q, timestamp);
             // Jitter and every reply answered for (below) leave a standing
             // backlog, and every queued reply is one more cmd of delay.
             // Empty default replies carry no data, so they are the ones to
@@ -1657,7 +1651,8 @@ private:
             diag_reply_age_max_us_ = std::max(
                 diag_reply_age_max_us_,
                 static_cast<int64_t>(timestamp - frame.timestamp));
-            if (frame.timestamp + kLateReplyWindowUs < timestamp) {
+            if (frame.timestamp + kLateReplyWindowUs < timestamp &&
+                IsDefaultReply(frame)) {
                 stats_stale_reply_drops_.fetch_add(
                     1, std::memory_order_relaxed);
                 continue;
@@ -1666,11 +1661,35 @@ private:
             late_node_[aid] = frame.node;
             auto& q = late_queue_[aid];
             if (q.size() >= kLateQueueCapacity) {
-                q.pop_front();
+                // Full: shed an empty reply if there is one, else the oldest.
+                auto victim = std::find_if(q.begin(), q.end(),
+                                           IsDefaultReply);
+                q.erase(victim != q.end() ? victim : q.begin());
                 stats_stale_reply_drops_.fetch_add(
                     1, std::memory_order_relaxed);
             }
             q.push_back(std::move(frame));
+        }
+    }
+
+    // A late reply older than kLateReplyWindowUs is let go only when it is
+    // the client's empty one. One that carries data is the client's share
+    // of a data-sharing step (DQ9): the client has already moved on and
+    // never sends it again, and the host's game waits for it for good, so
+    // a burst of lateness on the link (a 4G stall) would hang the game.
+    // Another session's replies never reach here: the queues are emptied
+    // on reset, on the switch to late mode and when an AID is given out.
+    void DropStaleDefaultReplies(std::deque<LocalMpFrame>* q,
+                                 uint64_t timestamp) {
+        for (auto it = q->begin(); it != q->end();) {
+            if (it->timestamp + kLateReplyWindowUs < timestamp &&
+                IsDefaultReply(*it)) {
+                it = q->erase(it);
+                stats_stale_reply_drops_.fetch_add(
+                    1, std::memory_order_relaxed);
+            } else {
+                ++it;
+            }
         }
     }
 
@@ -1689,6 +1708,7 @@ private:
         late_channel_ = p[9];
         late_known_macs_ |= static_cast<uint16_t>(1u << aid);
         late_reply_seq_[aid] = 0;
+        late_queue_[aid].clear();  // a previous holder's replies
         late_aid_known_ &= static_cast<uint16_t>(~(1u << aid));
         for (const JoinOrigin& o : join_origin_)
             if (o.used && std::memcmp(o.mac, p + 12 + 4, 6) == 0)
