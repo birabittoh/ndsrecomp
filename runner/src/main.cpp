@@ -1122,9 +1122,9 @@ int main(int argc, char** argv) {
         if (!nds_parse_firmware_language(
                 value, &frontend_options.firmware_language)) {
             std::fprintf(stderr,
-                         "invalid NDS_LANGUAGE (expected preserve, japanese, "
-                         "english, french, german, italian, spanish, or "
-                         "chinese)\n");
+                         "invalid NDS_LANGUAGE (expected preserve, system, "
+                         "japanese, english, french, german, italian, "
+                         "spanish, or chinese)\n");
             return 2;
         }
     }
@@ -1132,11 +1132,12 @@ int main(int argc, char** argv) {
         !nds_parse_firmware_language(cli_language,
                                      &frontend_options.firmware_language)) {
         std::fprintf(stderr,
-                     "invalid --language (expected preserve, japanese, "
-                     "english, french, german, italian, spanish, or "
-                     "chinese)\n");
+                     "invalid --language (expected preserve, system, "
+                     "japanese, english, french, german, italian, spanish, "
+                     "or chinese)\n");
         return 2;
     }
+    nds_resolve_system_language(&frontend_options);
     if (const char* value = std::getenv("NDS_PLAYER_NAME")) {
         frontend_options.player_name = value;
     }

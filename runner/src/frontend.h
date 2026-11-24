@@ -39,8 +39,10 @@ enum class NdsStartupMode : uint8_t {
 };
 
 // Firmware user-settings language (user settings +0x64 bits 0-2). Preserve
-// leaves the dump's (or generated image's) language alone; every other value
-// is the firmware's own encoding and overrides the runner's private in-memory
+// leaves the dump's (or generated image's) language alone. System is the OS
+// language, looked up at every launch (nds_resolve_system_language in
+// player_launch.h), or Preserve when it is not a DS one. Every other value is
+// the firmware's own encoding and overrides the runner's private in-memory
 // copy, which games read to pick their text language.
 enum class NdsFirmwareLanguage : uint8_t {
     Japanese = 0,
@@ -50,6 +52,7 @@ enum class NdsFirmwareLanguage : uint8_t {
     Italian = 4,
     Spanish = 5,
     Chinese = 6,
+    System = 0xFE,
     Preserve = 0xFF,
 };
 
@@ -527,8 +530,8 @@ bool nds_apply_fullscreen_overrides(
 bool nds_parse_startup_mode(const std::string& value,
                             NdsStartupMode* out);
 bool nds_parse_boot_mode(const std::string& value, NdsBootMode* out);
-// preserve, or a language name / ISO 639-1 code: japanese|ja, english|en,
-// french|fr, german|de, italian|it, spanish|es, chinese|zh.
+// preserve, system, or a language name / ISO 639-1 code: japanese|ja,
+// english|en, french|fr, german|de, italian|it, spanish|es, chinese|zh.
 bool nds_parse_firmware_language(const std::string& value,
                                  NdsFirmwareLanguage* out);
 // 0..255 (fits the byte-wise MAC perturbation in main.cpp's

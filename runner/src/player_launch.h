@@ -55,6 +55,10 @@ struct NdsPlayerLaunch {
 
 bool nds_player_requested(int argc, char** argv);
 
+// Replaces NdsFirmwareLanguage::System in `options` with the OS language,
+// or Preserve when that is not one of the five a DS title reads.
+void nds_resolve_system_language(NdsFrontendOptions* options);
+
 // The dumps baked in with -DNDS_EMBED_DUMPS_DIR. False when this build has
 // none, in which case the player supplies a folder instead.
 bool nds_player_embedded_dumps(std::vector<uint8_t>* arm9_bios,

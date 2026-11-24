@@ -489,6 +489,7 @@ bool nds_parse_firmware_language(const std::string& value,
         NdsFirmwareLanguage language;
     } kLanguages[] = {
         {"preserve", "firmware", NdsFirmwareLanguage::Preserve},
+        {"system", "os", NdsFirmwareLanguage::System},
         {"japanese", "ja", NdsFirmwareLanguage::Japanese},
         {"english", "en", NdsFirmwareLanguage::English},
         {"french", "fr", NdsFirmwareLanguage::French},
@@ -515,6 +516,7 @@ const char* nds_firmware_language_name(NdsFirmwareLanguage value) {
         case NdsFirmwareLanguage::Italian: return "italian";
         case NdsFirmwareLanguage::Spanish: return "spanish";
         case NdsFirmwareLanguage::Chinese: return "chinese";
+        case NdsFirmwareLanguage::System: return "system";
         default: return "preserve";
     }
 }
@@ -976,8 +978,9 @@ static bool apply_frontend_config(toml::table& root,
                                              &options->firmware_language)) {
                 if (error) {
                     *error =
-                        "system.language must be preserve, japanese, english, "
-                        "french, german, italian, spanish, or chinese";
+                        "system.language must be preserve, system, japanese, "
+                        "english, french, german, italian, spanish, or "
+                        "chinese";
                 }
                 return false;
             }

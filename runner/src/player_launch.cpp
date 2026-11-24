@@ -312,10 +312,6 @@ std::string tr(Text text,
 
 bool write_default_settings(const fs::path& path,
                             const NdsFrontendOptions& options) {
-    const char* language = locale_language();
-    const std::string language_name =
-        language ? language
-                 : nds_firmware_language_name(options.firmware_language);
     std::ofstream out(path);
     out << "# " << nds_game_display_name(options) << " settings.\n"
         << "# Edit this file with the game closed. The in-game menu (Esc)\n"
@@ -353,8 +349,9 @@ bool write_default_settings(const fs::path& path,
         << "discrete_gpu = " << (options.discrete_gpu ? "true" : "false")
         << "\n"
         << "\n[system]\n"
-        << "# Game text: english, french, german, italian or spanish.\n"
-        << "language = " << nds_toml_string(language_name) << "\n"
+        << "# Game text: system (the OS language, checked at every "
+           "launch),\n# english, french, german, italian or spanish.\n"
+        << "language = \"system\"\n"
         << "\n[audio]\n"
         << "volume = " << static_cast<unsigned>(options.audio_volume)
         << "   # 0..100\n"
@@ -1015,6 +1012,15 @@ bool parse_player_args(int argc, char** argv, PlayerArgs* out) {
 
 }  // namespace
 
+void nds_resolve_system_language(NdsFrontendOptions* options) {
+    if (options->firmware_language != NdsFirmwareLanguage::System) return;
+    options->firmware_language = NdsFirmwareLanguage::Preserve;
+    if (const char* name = locale_language()) {
+        nds_parse_firmware_language(name, &options->firmware_language);
+        std::fprintf(stderr, "[player] system language: %s\n", name);
+    }
+}
+
 bool nds_player_requested(int argc, char** argv) {
     if (sizeof(kTitleConfig) <= 1u) return false;
     PlayerArgs args;
@@ -1087,6 +1093,7 @@ bool nds_player_prepare(int argc, char** argv, NdsFrontendOptions* options,
         nds_player_error(settings.string() + ": " + error);
         return false;
     }
+    nds_resolve_system_language(options);
     options->settings_path = settings.string();
     std::fprintf(stderr, "[player] data directory: %s\n",
                  root.string().c_str());
