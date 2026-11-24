@@ -21,6 +21,9 @@ struct NdsRomFolderInfo {
     // another's code). The runner keys everything that names a cartridge on
     // it instead of the packed image's hash. Empty when absent.
     std::string identity;
+    // Optional: the version of the title's step that prepared the folder's
+    // data before its conversion (release_recipe.h). Empty when absent.
+    std::string prepared;
 };
 
 // `dir` holds a rom.toml.

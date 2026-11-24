@@ -374,9 +374,19 @@ bool link_or_copy(const fs::path& from, const fs::path& to) {
 
 NdsReleasePrepare g_prepare = nullptr;
 
+std::string& prepare_version() {
+    static std::string version;
+    return version;
+}
+
 }  // namespace
 
-void nds_release_set_prepare(NdsReleasePrepare prepare) { g_prepare = prepare; }
+void nds_release_set_prepare(NdsReleasePrepare prepare, const char* version) {
+    g_prepare = prepare;
+    prepare_version() = version ? version : "";
+}
+
+const std::string& nds_release_prepare_version() { return prepare_version(); }
 
 bool nds_release_recipe_info(const uint8_t* recipe, size_t size,
                              NdsReleaseRecipeInfo* info, std::string* error) {
@@ -560,11 +570,11 @@ bool nds_release_convert_folder(const fs::path& unpacked, const fs::path& dest,
         }
     } cleanup;
     fs::path source = unpacked;
+    bool prepared = false;
     if (g_prepare) {
         std::error_code ec;
         fs::remove_all(prepared_dir, ec);
         cleanup.dir = prepared_dir;
-        bool prepared = false;
         if (!g_prepare(unpacked, prepared_dir, &prepared, error)) return false;
         if (prepared) source = prepared_dir;
     }
@@ -737,7 +747,10 @@ bool nds_release_convert_folder(const fs::path& unpacked, const fs::path& dest,
       << "game_code = " << toml_string(game_code) << "\n"
       << "revision = " << folder.manifest["rom"]["revision"].value_or(int64_t{0}) << "\n"
       << "sha1 = \"" << recipe.info.applies_to << "\"\n"
-      << "identity = \"" << recipe.info.runs_as << "\"\n"
+      << "identity = \"" << recipe.info.runs_as << "\"\n";
+    if (prepared && !prepare_version().empty())
+        m << "prepared = " << toml_string(prepare_version()) << "\n";
+    m
       << "size = 0x" << hex(folder.manifest["rom"]["size"].value_or(int64_t{0})) << "\n"
       << "fill = 0x" << hex(folder.manifest["rom"]["fill"].value_or(int64_t{0xFF})) << "\n"
       << "fat = 0x" << hex(folder.manifest["rom"]["fat"].value_or(int64_t{0})) << "\n";

@@ -616,13 +616,21 @@ fs::path release_dir(const fs::path& library, const NdsFrontendOptions& options,
 enum class Install { Done, NotThisGame, Failed };
 
 // A folder unpacked from `sha1` and, if `identity` is set, converted to run
-// as it.
+// as it, its data prepared (if at all) by this build's step.
 bool folder_is(const fs::path& dir, const std::string& sha1,
                const std::string& identity) {
     if (!nds_rom_folder_is(dir)) return false;
     NdsRomFolderInfo info;
-    return nds_rom_folder_info(dir, &info, nullptr) && info.sha1 == sha1 &&
-           info.identity == identity;
+    if (!nds_rom_folder_info(dir, &info, nullptr) || info.sha1 != sha1 ||
+        info.identity != identity)
+        return false;
+    if (!info.prepared.empty() &&
+        info.prepared != nds_release_prepare_version()) {
+        std::fprintf(stderr, "[player] %s was prepared by another build, "
+                             "converting it again\n", dir.string().c_str());
+        return false;
+    }
+    return true;
 }
 
 // Unpacks `rom` into the library, or finds it already there. Another release

@@ -43,8 +43,13 @@ bool nds_code_compress(const std::vector<uint8_t>& data, size_t prefix,
 using NdsReleasePrepare = bool (*)(const std::filesystem::path& source,
                                    const std::filesystem::path& out,
                                    bool* prepared, std::string* error);
-// Set from a title's static initializer; one per build.
-void nds_release_set_prepare(NdsReleasePrepare prepare);
+// Set from a title's static initializer; one per build. `version` names
+// what the step writes (e.g. a digest of its data): a folder it prepared
+// records it in rom.toml (`prepared`), and the player converts again a
+// folder prepared by another version.
+void nds_release_set_prepare(NdsReleasePrepare prepare, const char* version);
+// The version set with the title's step, empty without one.
+const std::string& nds_release_prepare_version();
 
 // Writes to `dest` (which must not exist) the unpacked ROM folder `source`
 // with its ARM9 code rebuilt by `recipe`: the ARM9 compressed again where
