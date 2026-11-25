@@ -2668,9 +2668,25 @@ void convert_mouse_event_to_logical_coordinates(
             float tx = 0.0f, ty = 0.0f;
             nds_present_rect_to_content(main_rect, content_w, content_h, px,
                                         py, &tx, &ty);
-            const bool in_inset = cx >= 0.0f && cx < content_w &&
-                                  cy >= 0.0f && cy < content_h;
+            bool in_inset = cx >= 0.0f && cx < content_w &&
+                            cy >= 0.0f && cy < content_h;
+            // A cut-up inset: only its pieces are the touchscreen's.
+            const NdsInsetPieces& pieces = nds_inset_pieces();
+            if (in_inset && pieces.count > 0 &&
+                nds_inset_overlay_flag().load(std::memory_order_relaxed) > 0)
+                in_inset = nds_inset_piece_point(pieces, cx, cy, &cx, &cy);
+            if (!in_inset) {
+                cx = -1.0f;
+                cy = -1.0f;
+            }
             g_top_logical_hit = {!in_inset, tx, ty};
+        } else if (presentation.single && presentation.shown_screen == 1 &&
+                   presentation.inset_percent > 0 &&
+                   nds_inset_overlay_flag().load(
+                       std::memory_order_relaxed) > 0) {
+            // The top LCD drawn over the touchscreen, see-through: a point
+            // there is still a touch.
+            g_top_logical_hit = {};
         } else if (presentation.single && presentation.shown_screen == 1 &&
                    presentation.inset_percent > 0) {
             // The touchscreen is the main rect; the top LCD is the inset,
@@ -2734,7 +2750,14 @@ VirtualStylusSpace virtual_stylus_space(
                 presentation.stacked);
             const int shown = presentation.shown_screen & 1;
             space.rects[shown] = layout.main;
-            if (layout.inset.w > 0 && layout.inset.h > 0) {
+            // Neither is for the stylus: the top LCD drawn over the
+            // touchscreen, nor a touchscreen cut into pieces.
+            const bool over =
+                nds_inset_overlay_flag().load(std::memory_order_relaxed) > 0;
+            const bool top_over_touch = over && shown == 1;
+            const bool cut = over && nds_inset_pieces().count > 0;
+            if (layout.inset.w > 0 && layout.inset.h > 0 && !top_over_touch &&
+                !cut) {
                 space.rects[shown ^ 1] = layout.inset;
                 space.over = shown ^ 1;
             }
@@ -3547,6 +3570,34 @@ PresentationTicks present_single_screen(FrontendPresentation& presentation,
     const int width = shown ? bottom_width : top_width;
     const uint32_t* other_pixels = shown ? top_pixels : bottom_pixels;
     const int other_width = shown ? top_width : bottom_width;
+    // The title may draw the inset over the main screen, see-through, whole
+    // or cut into pieces.
+    int overlay = 0;
+    NdsInsetPieces& pieces = nds_inset_pieces();
+    pieces.count = 0;
+    if (presentation.inset_percent > 0 && !presentation.stacked &&
+        other_pixels && other_width > 0) {
+        static std::vector<uint32_t> overlay_pixels;
+        overlay_pixels.resize(size_t(other_width) * kScreenHeight);
+        overlay = nds_title_inset_overlay(shown ^ 1, other_pixels,
+                                          other_width, overlay_pixels.data(),
+                                          pieces.piece, &pieces.count);
+        if (overlay > 0) other_pixels = overlay_pixels.data();
+    }
+    {
+        // Each change, for the layout flipping (the first ones only).
+        static int last = -1;
+        static int logged = 0;
+        const int state = overlay > 0 ? (pieces.count > 0 ? 2 : 1) : 0;
+        if (state != last && logged < 64) {
+            ++logged;
+            static const char* const kStates[] = {"beside", "over", "cut"};
+            std::fprintf(stderr, "[display] second screen: %s (%d%%, %d pieces)\n",
+                         kStates[state], overlay, pieces.count);
+        }
+        last = state;
+    }
+    nds_inset_overlay_flag().store(overlay, std::memory_order_relaxed);
     const bool stylus =
         virtual_stylus_visible && shown == g_virtual_stylus_screen;
     // On the inset, the cursor is drawn on a copy of its LCD.
@@ -3634,9 +3685,13 @@ PresentationTicks present_single_screen(FrontendPresentation& presentation,
     uint64_t start = SDL_GetPerformanceCounter();
     SDL_UpdateTexture(presentation.textures[shown], nullptr, pixels,
                       width * sizeof(uint32_t));
-    if (presentation.inset_percent > 0)
+    if (presentation.inset_percent > 0) {
         SDL_UpdateTexture(presentation.textures[shown ^ 1], nullptr,
                           other_pixels, other_width * sizeof(uint32_t));
+        SDL_SetTextureBlendMode(presentation.textures[shown ^ 1],
+                                overlay > 0 ? SDL_BLENDMODE_BLEND
+                                            : SDL_BLENDMODE_NONE);
+    }
     ticks.upload += SDL_GetPerformanceCounter() - start;
     SDL_Renderer* renderer = presentation.renderers[0];
     start = SDL_GetPerformanceCounter();
@@ -3651,7 +3706,29 @@ PresentationTicks present_single_screen(FrontendPresentation& presentation,
     const NdsPresentRect& rect = layout.main;
     const SDL_Rect screen_rect{rect.x, rect.y, rect.w, rect.h};
     render_screen(presentation, shown, screen_rect);
-    if (layout.inset.w > 0 && layout.inset.h > 0) {
+    if (layout.inset.w > 0 && layout.inset.h > 0 && pieces.count > 0) {
+        // Each piece straight from the inset's texture, its alpha blended.
+        SDL_Texture* inset = presentation.textures[shown ^ 1];
+        set_texture_scale_linear(inset, true);
+        for (int i = 0; i < pieces.count; ++i) {
+            NdsPresentRect clip{}, view{};
+            const NdsTitleInsetPiece& p = pieces.piece[i];
+            if (!nds_inset_piece_rects(rect, width, kScreenHeight, other_width,
+                                       kScreenHeight, p, &clip, &view))
+                continue;
+#if defined(NDS_HAVE_SDL3)
+            const SDL_FRect src{p.src_x, p.src_y, p.src_w, p.src_h};
+            const SDL_FRect dst{float(clip.x), float(clip.y), float(clip.w),
+                                float(clip.h)};
+            SDL_RenderTexture(renderer, inset, &src, &dst);
+#else
+            const SDL_Rect src{int(p.src_x), int(p.src_y), int(p.src_w),
+                               int(p.src_h)};
+            const SDL_Rect dst{clip.x, clip.y, clip.w, clip.h};
+            SDL_RenderCopy(renderer, inset, &src, &dst);
+#endif
+        }
+    } else if (layout.inset.w > 0 && layout.inset.h > 0) {
         const SDL_Rect inset_rect{layout.inset.x, layout.inset.y,
                                   layout.inset.w, layout.inset.h};
         render_screen(presentation, shown ^ 1, inset_rect);

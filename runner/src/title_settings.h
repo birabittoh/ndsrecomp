@@ -179,6 +179,37 @@ typedef bool (*NdsTitleInsetBelowQuery)();
 void nds_title_set_inset_below_query(NdsTitleInsetBelowQuery query);
 bool nds_title_inset_below_wanted();
 
+// Single-screen layout: a title can draw the second screen over the main one,
+// see-through, in the main screen's bottom-left corner, instead of beside
+// it. The query is handed the second screen's pixels (`screen`: 0 the top
+// LCD, 1 the bottom one; `width` x 192 ARGB, the alpha byte not meaningful)
+// and writes them to `out`, the same size, with the alpha each pixel is drawn
+// at. It returns the inset's size as a percent of the main screen, or 0 for
+// the usual inset beside it (`out` is then unused). Frontend thread, once per
+// presented frame; it may only read settings or guest memory.
+//
+// It may also cut the second screen up instead: each piece draws `src` (in
+// the second screen's pixels) at `dst` (in the main screen's), scaled to fit,
+// and only the pieces are drawn. A point on a piece is a touch at the matching
+// point of its `src`. The query writes up to kNdsTitleMaxInsetPieces of them
+// to `pieces` and their number to `*piece_count` (0, as passed in, for none).
+struct NdsTitleInsetPiece {
+    float src_x, src_y, src_w, src_h;
+    float dst_x, dst_y, dst_w, dst_h;
+};
+enum { kNdsTitleMaxInsetPieces = 16 };
+typedef int (*NdsTitleInsetOverlayQuery)(int screen, const uint32_t* pixels,
+                                         int width, uint32_t* out,
+                                         NdsTitleInsetPiece* pieces,
+                                         int* piece_count);
+void nds_title_set_inset_overlay_query(NdsTitleInsetOverlayQuery query);
+// For the frontend: the query's answer, 0 or 10..100 (0 with none
+// registered; 100 with pieces), and the pieces it cut (*piece_count, 0 for
+// none).
+int nds_title_inset_overlay(int screen, const uint32_t* pixels, int width,
+                            uint32_t* out, NdsTitleInsetPiece* pieces,
+                            int* piece_count);
+
 // Hands 3D motion smoothing (display.smooth_3d) to the title, for a title
 // whose own setting pairs it with its frame rate: while a query is
 // registered the frontend hides its Smooth 3D row, ignores the option and

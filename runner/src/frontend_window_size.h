@@ -5,6 +5,8 @@
 #include <cmath>
 #include <cstdint>
 
+#include "title_settings.h"
+
 // Largest internal-resolution (3D sample) multiplier the accelerated renderer
 // is allowed to build. gpu3d enforces it; the frontend clamps auto scale to it.
 constexpr uint8_t kNdsMaxInternalScale = 16u;
@@ -124,7 +126,9 @@ inline NdsPresentRect nds_present_rect(NdsWindowMode mode,
 // covered, and the window spends its bars on the inset before shrinking the
 // main screen. inset_percent is therefore a minimum: in Letterbox, space left
 // over along that axis goes to the inset too, up to the main screen's size,
-// and the pair is re-centred. inset is empty at zero.
+// and the pair is re-centred. inset is empty at zero. While the title draws
+// the inset over the main screen (nds_inset_overlay_flag) it covers part of
+// it instead.
 struct NdsSingleLayout {
     NdsPresentRect main, inset;
 };
@@ -153,6 +157,77 @@ inline std::atomic<bool>& nds_inset_below_flag() {
     return flag;
 }
 
+// Set while the title draws the second screen over the main one (see
+// title_settings.h, nds_title_inset_overlay): the inset's size as a percent
+// of the main screen, 0 for the inset beside it. The main screen then takes
+// the whole drawable and the inset sits in its bottom-left corner.
+inline std::atomic<int>& nds_inset_overlay_flag() {
+    static std::atomic<int> percent{0};
+    return percent;
+}
+
+// The pieces the title cut the inset into this frame (title_settings.h); 0
+// draws the inset whole. The overlay is then at 100%: the inset rect is the
+// main one, and the pieces' dst are in its content pixels. Set and read on
+// the frontend thread only (presenting and the mouse-to-touch mapping).
+struct NdsInsetPieces {
+    int count = 0;
+    NdsTitleInsetPiece piece[kNdsTitleMaxInsetPieces]{};
+};
+
+inline NdsInsetPieces& nds_inset_pieces() {
+    static NdsInsetPieces pieces;
+    return pieces;
+}
+
+// Where a piece goes in the drawable, given the main screen's rect and the
+// content sizes of the main screen and the inset image: `clip` is the
+// piece's own rect, `view` the rect the whole inset image is drawn into so
+// that the piece's src lands exactly on clip. False for an empty piece.
+inline bool nds_inset_piece_rects(const NdsPresentRect& main, int main_w,
+                                  int main_h, int inset_w, int inset_h,
+                                  const NdsTitleInsetPiece& piece,
+                                  NdsPresentRect* clip,
+                                  NdsPresentRect* view) {
+    if (main.w <= 0 || main.h <= 0 || main_w <= 0 || main_h <= 0 ||
+        piece.src_w <= 0.0f || piece.src_h <= 0.0f || piece.dst_w <= 0.0f ||
+        piece.dst_h <= 0.0f)
+        return false;
+    const double kx = double(main.w) / main_w;
+    const double ky = double(main.h) / main_h;
+    const double x0 = main.x + piece.dst_x * kx;
+    const double y0 = main.y + piece.dst_y * ky;
+    const double w = piece.dst_w * kx, h = piece.dst_h * ky;
+    const auto round = [](double v) { return int(std::lround(v)); };
+    clip->x = round(x0);
+    clip->y = round(y0);
+    clip->w = round(x0 + w) - clip->x;
+    clip->h = round(y0 + h) - clip->y;
+    if (clip->w <= 0 || clip->h <= 0) return false;
+    const double sx = w / piece.src_w, sy = h / piece.src_h;
+    view->x = round(x0 - piece.src_x * sx);
+    view->y = round(y0 - piece.src_y * sy);
+    view->w = std::max(round(inset_w * sx), 1);
+    view->h = std::max(round(inset_h * sy), 1);
+    return true;
+}
+
+// A point in main-screen content pixels to the inset's own, through the
+// piece under it. False when no piece is there.
+inline bool nds_inset_piece_point(const NdsInsetPieces& pieces, float x,
+                                  float y, float* inset_x, float* inset_y) {
+    for (int i = pieces.count - 1; i >= 0; --i) {
+        const NdsTitleInsetPiece& p = pieces.piece[i];
+        if (p.dst_w <= 0.0f || p.dst_h <= 0.0f || x < p.dst_x ||
+            y < p.dst_y || x >= p.dst_x + p.dst_w || y >= p.dst_y + p.dst_h)
+            continue;
+        *inset_x = p.src_x + (x - p.dst_x) * p.src_w / p.dst_w;
+        *inset_y = p.src_y + (y - p.dst_y) * p.src_h / p.dst_h;
+        return true;
+    }
+    return false;
+}
+
 //
 // stack_vertically puts the inset below the main screen (as on the DS: the
 // top screen above the touchscreen) whatever the drawable's shape (what a title forces on some game modes, with
@@ -168,6 +243,20 @@ inline NdsSingleLayout nds_single_layout(NdsWindowMode mode,
     if (inset_percent <= 0 || inset_content_w <= 0) {
         layout.main = nds_present_rect(mode, scaling, drawable_w, drawable_h,
                                        content_w, content_h);
+        return layout;
+    }
+    const int overlay =
+        nds_inset_overlay_flag().load(std::memory_order_relaxed);
+    if (overlay > 0 && !stack_vertically) {
+        layout.main = nds_present_rect(mode, scaling, drawable_w, drawable_h,
+                                       content_w, content_h);
+        const NdsPresentRect& main = layout.main;
+        // Two LCD pixels off the edges.
+        const int margin = overlay < 100 ? main.h * 2 / content_h : 0;
+        layout.inset.w = std::max(main.w * overlay / 100, 1);
+        layout.inset.h = std::max(main.h * overlay / 100, 1);
+        layout.inset.x = main.x + margin;
+        layout.inset.y = main.y + main.h - layout.inset.h - margin;
         return layout;
     }
     if (stack_vertically || drawable_h > drawable_w) {

@@ -728,19 +728,49 @@ bool nds_compute_host_present_top(const unsigned int* fallback_pixels,
         glPixelStorei(GL_UNPACK_ALIGNMENT, 4);
         glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, inset_width, 192, GL_BGRA,
                         GL_UNSIGNED_BYTE, g_inset_pixels);
-        // Point sampling a shrunk inset drops whole rows of text.
+        const NdsInsetPieces& pieces = nds_inset_pieces();
+        const bool over =
+            nds_inset_overlay_flag().load(std::memory_order_relaxed) > 0;
+        const bool cut = over && pieces.count > 0;
+        // Point sampling a shrunk inset drops whole rows of text; the pieces
+        // are scaled each its own way.
         const GLint filter = g_scaling == NdsScalingFilter::Bilinear ||
-                                     inset.w < inset_width
+                                     inset.w < inset_width || cut
             ? GL_LINEAR : GL_NEAREST;
         glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, filter);
         glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, filter);
         glUseProgram(g_blit_program);
         glUniform1ui(0, 1u);
         glUniform1ui(1, 0u);
-        // The source's alpha byte is not meaningful: keep the window opaque.
+        // The source's alpha byte is not meaningful, but over the main
+        // screen (nds_inset_overlay_flag) it is how solid each pixel is.
+        // Either way the window stays opaque.
+        if (over) {
+            glEnable(GL_BLEND);
+            glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+        }
         glColorMask(GL_TRUE, GL_TRUE, GL_TRUE, GL_FALSE);
-        glDrawArrays(GL_TRIANGLES, 0, 3);
+        if (cut) {
+            // Each piece: the whole image placed so that the piece's part
+            // lands on its rect, cut to that rect.
+            glEnable(GL_SCISSOR_TEST);
+            for (int i = 0; i < pieces.count; ++i) {
+                NdsPresentRect clip{}, view{};
+                if (!nds_inset_piece_rects(rect, width, 192, inset_width, 192,
+                                           pieces.piece[i], &clip, &view))
+                    continue;
+                glViewport(view.x, drawable_height - view.y - view.h, view.w,
+                           view.h);
+                glScissor(clip.x, drawable_height - clip.y - clip.h, clip.w,
+                          clip.h);
+                glDrawArrays(GL_TRIANGLES, 0, 3);
+            }
+            glDisable(GL_SCISSOR_TEST);
+        } else {
+            glDrawArrays(GL_TRIANGLES, 0, 3);
+        }
         glColorMask(GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE);
+        if (over) glDisable(GL_BLEND);
     }
     if (g_overlay_pixels) {
         glBindFramebuffer(GL_FRAMEBUFFER, 0);

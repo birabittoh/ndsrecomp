@@ -236,6 +236,34 @@ int main() {
             M::Letterbox, S::Nearest, 1920, 1080, 256, 192, 100, true);
         check(stacked_wide.inset.y == stacked_wide.main.y + stacked_wide.main.h,
               "stacked landscape keeps the inset below the main screen");
+        // The title can draw the inset over the main screen, bottom left.
+        nds_inset_overlay_flag().store(50);
+        const auto over = nds_single_layout(M::Letterbox, S::Nearest, 1920,
+                                            1080, 256, 192, 30);
+        const auto over_stacked = nds_single_layout(
+            M::Letterbox, S::Nearest, 1920, 1080, 256, 192, 100, true);
+        nds_inset_overlay_flag().store(0);
+        check(rect_is(over.main, 240, 0, 1440, 1080) &&
+                  rect_is(over.inset, 251, 529, 720, 540),
+              "overlay inset sits in the main screen's bottom-left corner");
+        check(over_stacked.inset.y == over_stacked.main.y + over_stacked.main.h,
+              "a forced stack ignores the overlay");
+        // A piece: inset (6, 40, 244x40) at half size at main (4, 100).
+        const NdsTitleInsetPiece piece{6, 40, 244, 40, 4, 100, 122, 20};
+        NdsPresentRect clip{}, view{};
+        const bool placed = nds_inset_piece_rects(
+            {0, 0, 1024, 768}, 256, 192, 256, 192, piece, &clip, &view);
+        check(placed && rect_is(clip, 16, 400, 488, 80) &&
+                  rect_is(view, 4, 320, 512, 384),
+              "an inset piece lands its src on its dst");
+        NdsInsetPieces pieces{};
+        pieces.count = 1;
+        pieces.piece[0] = piece;
+        float px = 0.0f, py = 0.0f;
+        check(nds_inset_piece_point(pieces, 65.0f, 110.0f, &px, &py) &&
+                  px == 128.0f && py == 60.0f &&
+                  !nds_inset_piece_point(pieces, 200.0f, 110.0f, &px, &py),
+              "a point on an inset piece maps back to the inset");
     }
 
     // The initial single window counts the inset beside the main screen.

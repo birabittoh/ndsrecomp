@@ -3,6 +3,7 @@
 
 #include "io.h"
 
+#include <algorithm>
 #include <atomic>
 #include <cstring>
 #include <deque>
@@ -164,6 +165,31 @@ bool nds_title_inset_below_wanted() {
     const NdsTitleInsetBelowQuery query =
         g_inset_below_query.load(std::memory_order_relaxed);
     return query && query();
+}
+
+namespace {
+std::atomic<NdsTitleInsetOverlayQuery> g_inset_overlay_query{nullptr};
+}  // namespace
+
+void nds_title_set_inset_overlay_query(NdsTitleInsetOverlayQuery query) {
+    g_inset_overlay_query.store(query, std::memory_order_relaxed);
+}
+
+int nds_title_inset_overlay(int screen, const uint32_t* pixels, int width,
+                            uint32_t* out, NdsTitleInsetPiece* pieces,
+                            int* piece_count) {
+    *piece_count = 0;
+    const NdsTitleInsetOverlayQuery query =
+        g_inset_overlay_query.load(std::memory_order_relaxed);
+    if (!query || !pixels || !out || width <= 0) return 0;
+    const int percent = query(screen, pixels, width, out, pieces, piece_count);
+    if (percent <= 0) {
+        *piece_count = 0;
+        return 0;
+    }
+    *piece_count = std::clamp(*piece_count, 0, int(kNdsTitleMaxInsetPieces));
+    if (*piece_count > 0) return 100;
+    return std::clamp(percent, 10, 100);
 }
 
 namespace {

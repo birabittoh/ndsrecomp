@@ -907,11 +907,22 @@ bool clip_rect(const NdsPresentRect& rect, uint32_t fb_width, uint32_t fb_height
     return true;
 }
 
+// `clip`, when given, cuts the image drawn into `rect` to that rect.
 void record_blit(FrameSlot& slot, RenderDescriptorSet* set, const NdsPresentRect& rect,
                  bool linear, uint32_t flags, uint32_t fb_width,
-                 uint32_t fb_height) {
+                 uint32_t fb_height, const NdsPresentRect* clip = nullptr) {
     RenderRect scissor;
     if (!clip_rect(rect, fb_width, fb_height, &scissor)) return;
+    if (clip) {
+        RenderRect cut;
+        if (!clip_rect(*clip, fb_width, fb_height, &cut)) return;
+        scissor.left = std::max(scissor.left, cut.left);
+        scissor.top = std::max(scissor.top, cut.top);
+        scissor.right = std::min(scissor.right, cut.right);
+        scissor.bottom = std::min(scissor.bottom, cut.bottom);
+        if (scissor.right <= scissor.left || scissor.bottom <= scissor.top)
+            return;
+    }
     RenderCommandList& commands = *slot.commands;
     commands.setGraphicsPipelineLayout(g_backend.layout.get());
     set->setSampler(1, linear ? g_backend.linear.get()
@@ -932,9 +943,9 @@ void record_blit(FrameSlot& slot, RenderDescriptorSet* set, const NdsPresentRect
 
 void record_blit(FrameSlot& slot, Image image, const NdsPresentRect& rect,
                  bool linear, uint32_t flags, uint32_t fb_width,
-                 uint32_t fb_height) {
+                 uint32_t fb_height, const NdsPresentRect* clip = nullptr) {
     record_blit(slot, slot.images[image].set.get(), rect, linear, flags,
-                fb_width, fb_height);
+                fb_width, fb_height, clip);
 }
 
 // Interleaves the two HD layer surfaces into this slot's staging texture.
@@ -1414,7 +1425,25 @@ bool nds_compute_host_present_top(const unsigned int* fallback_pixels,
     if (inset && layout.inset.w > 0 && layout.inset.h > 0) {
         // Point sampling a shrunk inset drops whole rows of text.
         const bool linear = bilinear || layout.inset.w < int(g_inset_width);
-        record_blit(slot, kInset, layout.inset, linear, 0u, fb_width, fb_height);
+        // Over the main screen its alpha is how solid each pixel is.
+        const bool over =
+            nds_inset_overlay_flag().load(std::memory_order_relaxed) > 0;
+        const NdsInsetPieces& pieces = nds_inset_pieces();
+        if (over && pieces.count > 0) {
+            // Each piece: the whole image placed so that the piece's part
+            // lands on its rect, cut to that rect.
+            for (int i = 0; i < pieces.count; ++i) {
+                NdsPresentRect clip{}, view{};
+                if (nds_inset_piece_rects(rect, width, int(kHeight),
+                                          int(g_inset_width), int(kHeight),
+                                          pieces.piece[i], &clip, &view))
+                    record_blit(slot, kInset, view, true, kBlitKeepAlpha,
+                                fb_width, fb_height, &clip);
+            }
+        } else {
+            record_blit(slot, kInset, layout.inset, linear,
+                        over ? kBlitKeepAlpha : 0u, fb_width, fb_height);
+        }
     }
     if (overlay)
         record_blit(slot, kOverlay, rect, bilinear, kBlitKeepAlpha, fb_width,
