@@ -1048,7 +1048,9 @@ std::atomic<float> g_touch_ui_anchor_y{0.0f};
 // DS screen after the mapping, which is where the shrunken UI has nothing.
 bool touch_ui_unscale(float* x, float* y) {
     const float s = g_touch_ui_scale.load(std::memory_order_relaxed);
-    if (s >= 1.0f || s <= 0.0f || nds_title_touch_unscaled()) return true;
+    if (s >= 1.0f || s <= 0.0f || nds_title_touch_unscaled() ||
+        nds_title_touch_stick())
+        return true;
     const float ax = g_touch_ui_anchor_x.load(std::memory_order_relaxed);
     const float ay = g_touch_ui_anchor_y.load(std::memory_order_relaxed);
     // Something the title draws at its native place (DQ9's Menu button) is
@@ -2696,12 +2698,18 @@ struct TopLogicalHit {
     float y = 0.0f;
 };
 TopLogicalHit g_top_logical_hit;
+// Where the last converted mouse event lies on a touchscreen widened past
+// its native 256 x 192 (shown as the main screen), in native DS pixels: the
+// centred columns and middle rows are 0..255 and 0..191, the rest of the
+// view outside them. Not valid off the view or on an inset over it.
+TopLogicalHit g_wide_touch_hit;
 // A left drag that started on the top screen is under way
 // (nds_title_top_drag).
 bool g_top_dragging = false;
 
 void convert_mouse_event_to_logical_coordinates(
     SDL_Event& event, const FrontendPresentation& presentation) {
+    g_wide_touch_hit = {};
     auto screen_for_window = [&](uint32_t window_id) -> int {
         // The second display's touches come converted already.
         if (presentation.dual && window_id == kSecondDisplayWindowId)
@@ -2829,6 +2837,15 @@ void convert_mouse_event_to_logical_coordinates(
         } else {
             g_top_logical_hit = {true, cx, cy};
         }
+        if (presentation.single && presentation.shown_screen == 1 &&
+            (content_w > kScreenWidth || content_h > kScreenHeight) &&
+            cx >= 0.0f && cx < content_w && cy >= 0.0f && cy < content_h)
+            g_wide_touch_hit = {
+                true,
+                cx - static_cast<float>(
+                         std::max(content_w - kScreenWidth, 0) / 2),
+                cy - static_cast<float>(
+                         std::max(content_h - kScreenHeight, 0) / 2)};
         // A widened touchscreen shown as the main screen: its native
         // columns are the centred ones.
         if (presentation.single && presentation.shown_screen == 1 &&
@@ -4850,6 +4867,13 @@ int nds_run_interactive_frontend(const NdsFrontendOptions& initial_options) {
 #endif
     bool compute_failed = false;
     bool mouse_down = false;
+    // The held touch is a title's stick on a widened touchscreen
+    // (nds_title_touch_stick): its points are the pointer's moved by
+    // `touch_stick_dx/dy` (DS pixels), the last one kept while the pointer
+    // is off the view.
+    bool touch_stick = false;
+    float touch_stick_dx = 0.0f, touch_stick_dy = 0.0f;
+    float touch_stick_x = 0.0f, touch_stick_y = 0.0f;
     bool touch_release_pending = false;
     uint32_t touch_frames_held = 0;
     int64_t relative_delta_x = 0;
@@ -6679,10 +6703,13 @@ int nds_run_interactive_frontend(const NdsFrontendOptions& initial_options) {
                     ? (!presentation.single || presentation.dual ||
                        presentation.shown_screen == 1 ||
                        presentation.inset_percent > 0) &&
-                          event.button.x >= bottom_content_left &&
-                          event.button.x < bottom_content_left + kScreenWidth &&
-                          event.button.y >= 0 &&
-                          event.button.y < kScreenHeight
+                          ((event.button.x >= bottom_content_left &&
+                            event.button.x <
+                                bottom_content_left + kScreenWidth &&
+                            event.button.y >= 0 &&
+                            event.button.y < kScreenHeight) ||
+                           (g_wide_touch_hit.valid &&
+                            nds_title_touch_stick()))
                     : stacked_left_route ==
                           NdsStackedRelativeMouseRoute::Touchscreen)) {
                 // A latch button's pick: the touch becomes the keys its
@@ -6709,6 +6736,36 @@ int nds_run_interactive_frontend(const NdsFrontendOptions& initial_options) {
                 }
                 mouse_down = true;
                 ++host_touch_presses;
+                // A stick pressed on a widened view: a press beside the
+                // native screen lands inside it, far enough from its edges
+                // (and below the title's corner buttons) to be dragged any
+                // way, and the drag follows by the same offset.
+                touch_stick = g_wide_touch_hit.valid && nds_title_touch_stick();
+                touch_stick_dx = 0.0f;
+                touch_stick_dy = 0.0f;
+                if (touch_stick) {
+                    constexpr float kStickMargin = 48.0f;
+                    const float nx = g_wide_touch_hit.x;
+                    const float ny = g_wide_touch_hit.y;
+                    if (nx < 0.0f || nx >= kScreenWidth || ny < 0.0f ||
+                        ny >= kScreenHeight) {
+                        touch_stick_dx =
+                            std::clamp(nx, kStickMargin,
+                                       kScreenWidth - kStickMargin) - nx;
+                        touch_stick_dy =
+                            std::clamp(ny, kStickMargin,
+                                       kScreenHeight - kStickMargin) - ny;
+                    }
+                    touch_stick_x = std::clamp(
+                        nx + touch_stick_dx, 0.0f, kScreenWidth - 1.0f);
+                    touch_stick_y = std::clamp(
+                        ny + touch_stick_dy, 0.0f, kScreenHeight - 1.0f);
+                    event.button.x = bottom_content_left + touch_stick_x;
+                    event.button.y = touch_stick_y;
+                }
+                nds_title_set_touch_stick_offset(
+                    static_cast<int>(std::lround(touch_stick_dx)),
+                    static_cast<int>(std::lround(touch_stick_dy)));
                 last_touch_event_x = event.button.x;
                 last_touch_event_y = event.button.y;
                 touch_release_pending = false;
@@ -6723,6 +6780,7 @@ int nds_run_interactive_frontend(const NdsFrontendOptions& initial_options) {
                 event.button.windowID == presentation.window_ids[1] &&
                 mouse_down) {
                 mouse_down = false;
+                touch_stick = false;
                 if (touch_button_latched >= 0 && touch_button_latch_frames < 0)
                     touch_button_latch_frames = 6;
                 // A host click can begin and end while the emulation thread is
@@ -6736,10 +6794,29 @@ int nds_run_interactive_frontend(const NdsFrontendOptions& initial_options) {
                                          bottom_logical_width);
             }
             if (event.type == SDL_MOUSEMOTION && mouse_down &&
-                event.motion.windowID == presentation.window_ids[1])
-                set_touch_from_mouse(event.motion.x, event.motion.y, true,
-                                     options.screen_layout,
-                                     bottom_logical_width);
+                event.motion.windowID == presentation.window_ids[1]) {
+                if (touch_stick) {
+                    // Held at the native screen's edge, never released by
+                    // the drag; off the view (or over an inset) it stays.
+                    if (g_wide_touch_hit.valid) {
+                        touch_stick_x = std::clamp(
+                            g_wide_touch_hit.x + touch_stick_dx, 0.0f,
+                            kScreenWidth - 1.0f);
+                        touch_stick_y = std::clamp(
+                            g_wide_touch_hit.y + touch_stick_dy, 0.0f,
+                            kScreenHeight - 1.0f);
+                    }
+                    last_touch_event_x = bottom_content_left + touch_stick_x;
+                    last_touch_event_y = touch_stick_y;
+                    set_touch_from_mouse(
+                        bottom_content_left + touch_stick_x, touch_stick_y,
+                        true, options.screen_layout, bottom_logical_width);
+                } else {
+                    set_touch_from_mouse(event.motion.x, event.motion.y, true,
+                                         options.screen_layout,
+                                         bottom_logical_width);
+                }
+            }
             // The pointer over the touchscreen with no button held, for
             // titles that highlight the menu entry under it.
             if (event.type == SDL_MOUSEMOTION ||

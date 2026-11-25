@@ -119,6 +119,22 @@ bool nds_title_unscaled_touch_rect(int* x0, int* y0, int* x1, int* y1);
 void nds_title_set_touch_unscaled(bool unscaled);
 bool nds_title_touch_unscaled();
 
+// While set, the touchscreen is a floating stick (DQ9's field walk: held
+// anywhere, it walks the way the stylus is dragged from the press). With the
+// touchscreen widened past its native 256 x 192 (a wide or tall main view),
+// a press anywhere on the view is taken: carried into the native screen,
+// away from its edges, and the drag follows by the same offset, held at the
+// screen's edge rather than released. Off by default. The title thread sets
+// it, the frontend reads it.
+void nds_title_set_touch_stick(bool stick);
+bool nds_title_touch_stick();
+// What the last press was carried by (DS pixels, added to the pointer to
+// get the touch), 0, 0 for one taken where it was: a title draws its stick
+// that much back to show it under the pointer. The frontend sets it on each
+// press, any thread reads it.
+void nds_title_set_touch_stick_offset(int dx, int dy);
+void nds_title_touch_stick_offset(int* dx, int* dy);
+
 // Runs the emulated ARM9 at `multiple` (1, 2 or 4) times its hardware clock
 // from the next scheduler round on, for a title whose own frame pacing is
 // bound by ARM9 time (a setting that lifts the game's frame-rate cap, say).

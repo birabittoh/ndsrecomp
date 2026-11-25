@@ -422,3 +422,32 @@ void nds_title_set_touch_unscaled(bool unscaled) {
 bool nds_title_touch_unscaled() {
     return g_touch_unscaled.load(std::memory_order_relaxed);
 }
+
+namespace {
+std::atomic<bool> g_touch_stick{false};
+}  // namespace
+
+void nds_title_set_touch_stick(bool stick) {
+    g_touch_stick.store(stick, std::memory_order_relaxed);
+}
+
+bool nds_title_touch_stick() {
+    return g_touch_stick.load(std::memory_order_relaxed);
+}
+
+namespace {
+std::atomic<uint32_t> g_touch_stick_offset{0};
+}  // namespace
+
+void nds_title_set_touch_stick_offset(int dx, int dy) {
+    g_touch_stick_offset.store(
+        static_cast<uint32_t>(static_cast<uint16_t>(dy)) << 16 |
+            static_cast<uint16_t>(dx),
+        std::memory_order_relaxed);
+}
+
+void nds_title_touch_stick_offset(int* dx, int* dy) {
+    const uint32_t v = g_touch_stick_offset.load(std::memory_order_relaxed);
+    if (dx) *dx = static_cast<int16_t>(v & 0xFFFF);
+    if (dy) *dy = static_cast<int16_t>(v >> 16);
+}
