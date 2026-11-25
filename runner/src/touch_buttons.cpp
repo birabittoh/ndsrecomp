@@ -116,7 +116,17 @@ int Boxes(int ds_width, Box out[kNdsTouchButtonMax]) {
                 x = ds_width - kNdsTouchButtonMargin - kNdsTouchButtonWidth;
                 break;
             case NdsTouchButtonPlace::TopCenter:
-                x = (ds_width - kNdsTouchButtonWidth) / 2;
+                // Left of the pair it makes with TopCenterNext, which is
+                // centred as a whole whether or not that one shows, so the
+                // two never move.
+                x = (ds_width - 2 * kNdsTouchButtonWidth -
+                     kNdsTouchButtonMargin) / 2;
+                y = kNdsTouchButtonMargin;
+                break;
+            case NdsTouchButtonPlace::TopCenterNext:
+                x = (ds_width - 2 * kNdsTouchButtonWidth -
+                     kNdsTouchButtonMargin) / 2 +
+                    kNdsTouchButtonWidth + kNdsTouchButtonMargin;
                 y = kNdsTouchButtonMargin;
                 break;
             case NdsTouchButtonPlace::BottomCenter:

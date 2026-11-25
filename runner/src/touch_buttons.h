@@ -22,9 +22,13 @@
 // Where a button sits. BottomRight ones make a row from the bottom right
 // corner leftwards, in the order they were registered; LeftMiddle and
 // RightMiddle sit halfway down the left or right edge, TopCenter and
-// BottomCenter halfway along the top or bottom edge.
+// BottomCenter halfway along the top or bottom edge. TopCenterNext sits on
+// the top edge right of the TopCenter button (the fast-forward one), for a
+// button that must stay clear of what a title draws at the bottom; the two
+// are centred together, as a pair, so neither moves when only one shows.
 enum class NdsTouchButtonPlace : uint8_t {
-    BottomRight, LeftMiddle, RightMiddle, TopCenter, BottomCenter
+    BottomRight, LeftMiddle, RightMiddle, TopCenter, BottomCenter,
+    TopCenterNext
 };
 
 // Each button, and the room between buttons and to the screen's edges.

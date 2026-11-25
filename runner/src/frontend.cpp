@@ -5688,22 +5688,28 @@ int nds_run_interactive_frontend(const NdsFrontendOptions& initial_options) {
             event.button.windowID != presentation.window_ids[0] ||
             relative_mouse.captured() || virtual_stylus_active())
             return -1;
+        // The buttons are drawn on a canvas as wide as the screen's 3D lines
+        // (up to 448), centred in a wider view.
         if (presentation.single && presentation.shown_screen == 1) {
-            // Already the touchscreen's coordinates (-1 on the top inset).
-            return nds_touch_buttons_hit(presentation.screen_widths[1],
-                                         float(event.button.x),
-                                         float(event.button.y));
+            // Already the touchscreen's coordinates (-1 on the top inset),
+            // with the 256 native columns centred: back to the canvas's.
+            const int width = presentation.screen_widths[1];
+            return nds_touch_buttons_hit(
+                width, float(event.button.x) + float((width - kScreenWidth) / 2),
+                float(event.button.y));
         }
         if (!g_top_logical_hit.valid) return -1;
         const int left =
             presentation.separate || presentation.single ? 0 : top_content_left;
-        return nds_touch_buttons_hit(
+        const int width = presentation.screen_widths[0];
+        // The view's columns, from its own left edge, to the canvas's.
+        const int canvas_left =
             presentation.single
-                ? std::max(presentation.screen_widths[0],
-                           presentation.main_view_width)
-                : presentation.screen_widths[0],
-            g_top_logical_hit.x - left,
-                                     g_top_logical_hit.y);
+                ? std::max(presentation.main_view_width - width, 0) / 2
+                : 0;
+        return nds_touch_buttons_hit(
+            width, g_top_logical_hit.x - left - canvas_left,
+            g_top_logical_hit.y);
     };
     auto show_savestate_result = [&](const NdsSavestateSlotResult& result) {
         savestate_notice = result.message;
