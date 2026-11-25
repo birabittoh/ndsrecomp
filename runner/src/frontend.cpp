@@ -3709,13 +3709,16 @@ PresentationTicks present_single_screen(FrontendPresentation& presentation,
     if (layout.inset.w > 0 && layout.inset.h > 0 && pieces.count > 0) {
         // Each piece straight from the inset's texture, its alpha blended.
         SDL_Texture* inset = presentation.textures[shown ^ 1];
-        set_texture_scale_linear(inset, true);
         for (int i = 0; i < pieces.count; ++i) {
             NdsPresentRect clip{}, view{};
             const NdsTitleInsetPiece& p = pieces.piece[i];
             if (!nds_inset_piece_rects(rect, width, kScreenHeight, other_width,
                                        kScreenHeight, p, &clip, &view))
                 continue;
+            // The scaling filter, but never point sampling a shrunk piece.
+            set_texture_scale_linear(
+                inset, presentation.scaling == NdsScalingFilter::Bilinear ||
+                           view.w < other_width);
 #if defined(NDS_HAVE_SDL3)
             const SDL_FRect src{p.src_x, p.src_y, p.src_w, p.src_h};
             const SDL_FRect dst{float(clip.x), float(clip.y), float(clip.w),

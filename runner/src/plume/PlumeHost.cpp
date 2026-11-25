@@ -1437,8 +1437,9 @@ bool nds_compute_host_present_top(const unsigned int* fallback_pixels,
                 if (nds_inset_piece_rects(rect, width, int(kHeight),
                                           int(g_inset_width), int(kHeight),
                                           pieces.piece[i], &clip, &view))
-                    record_blit(slot, kInset, view, true, kBlitKeepAlpha,
-                                fb_width, fb_height, &clip);
+                    record_blit(slot, kInset, view,
+                                bilinear || view.w < int(g_inset_width),
+                                kBlitKeepAlpha, fb_width, fb_height, &clip);
             }
         } else {
             record_blit(slot, kInset, layout.inset, linear,

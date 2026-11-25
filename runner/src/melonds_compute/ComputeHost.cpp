@@ -732,10 +732,10 @@ bool nds_compute_host_present_top(const unsigned int* fallback_pixels,
         const bool over =
             nds_inset_overlay_flag().load(std::memory_order_relaxed) > 0;
         const bool cut = over && pieces.count > 0;
-        // Point sampling a shrunk inset drops whole rows of text; the pieces
-        // are scaled each its own way.
-        const GLint filter = g_scaling == NdsScalingFilter::Bilinear ||
-                                     inset.w < inset_width || cut
+        // Point sampling a shrunk inset drops whole rows of text. The pieces
+        // pick theirs each by its own scale.
+        const bool bilinear = g_scaling == NdsScalingFilter::Bilinear;
+        const GLint filter = bilinear || inset.w < inset_width
             ? GL_LINEAR : GL_NEAREST;
         glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, filter);
         glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, filter);
@@ -759,6 +759,12 @@ bool nds_compute_host_present_top(const unsigned int* fallback_pixels,
                 if (!nds_inset_piece_rects(rect, width, 192, inset_width, 192,
                                            pieces.piece[i], &clip, &view))
                     continue;
+                const GLint piece_filter =
+                    bilinear || view.w < inset_width ? GL_LINEAR : GL_NEAREST;
+                glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER,
+                                piece_filter);
+                glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER,
+                                piece_filter);
                 glViewport(view.x, drawable_height - view.y - view.h, view.w,
                            view.h);
                 glScissor(clip.x, drawable_height - clip.y - clip.h, clip.w,
