@@ -203,6 +203,7 @@ private:
     void NextVertexSlot() noexcept;
     void StallPolygonPipeline(s32 delay, s32 nonstalldelay) noexcept;
     void SubmitPolygon() noexcept;
+    void StretchBackdropPolygon(Vertex* verts, int nverts) const noexcept;
     void SubmitVertex() noexcept;
     void CalculateLighting() noexcept;
     void BoxTest(const u32* params) noexcept;

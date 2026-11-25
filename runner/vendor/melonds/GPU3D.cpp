@@ -19,6 +19,7 @@
 #include <stdio.h>
 #include <string.h>
 #include <algorithm>
+#include <cstdlib>
 #include "NDS.h"
 #include "GPU.h"
 #include "FIFO.h"
@@ -1006,6 +1007,49 @@ bool ClipCoordsEqual(Vertex* a, Vertex* b)
            a->Position[3] == b->Position[3];
 }
 
+// The widened view scales clip X (and Y for a taller view) of every
+// full-viewport vertex, so a polygon the guest places exactly on its frustum
+// edges to fill the screen (a sky gradient drawn at one depth) would cover
+// only the native band. Such a polygon -- one W, every vertex on the left or
+// right edge, both edges present -- gets its edge vertices on the widened
+// frustum's edges instead; vertices inside keep the scaled position.
+void GPU3D::StretchBackdropPolygon(Vertex* verts, int nverts) const noexcept
+{
+    const bool wide_x = !GuestWideProjection && RenderWidth > 256 &&
+        Viewport[0] == 0 && Viewport[4] == 256;
+    const bool tall_y = RenderHeight > 192 && Viewport[3] == 0 && Viewport[5] == 192;
+    if ((!wide_x && !tall_y) || nverts < 3) return;
+    const s32 w = verts[0].Position[3];
+    if (w <= 0) return;
+    const s64 tol = (w >> 8) > 2 ? (w >> 8) : 2;
+    // Edge sign (-1/+1) of a coordinate, or 0. A shared strip vertex may
+    // already sit unscaled on the edge; a fresh one is scaled by den/num.
+    auto edge = [&](s32 v, bool scaled, u32 num, u32 den) -> int {
+        for (int sign = -1; sign <= 1; sign += 2) {
+            const s64 target = sign * static_cast<s64>(w);
+            if (std::llabs(v - target) <= tol) return sign;
+            if (scaled && std::llabs(static_cast<s64>(v) * num / den - target) <= tol)
+                return sign;
+        }
+        return 0;
+    };
+    int seen = 0;
+    for (int i = 0; i < nverts; ++i) {
+        if (verts[i].Position[3] != w) return;
+        const int s = edge(verts[i].Position[0], wide_x, RenderWidth, 256);
+        if (!s) return;
+        seen |= s < 0 ? 1 : 2;
+    }
+    if (seen != 3) return;
+    for (int i = 0; i < nverts; ++i) {
+        if (wide_x)
+            verts[i].Position[0] = edge(verts[i].Position[0], true, RenderWidth, 256) * w;
+        if (tall_y)
+            if (const int s = edge(verts[i].Position[1], true, RenderHeight, 192))
+                verts[i].Position[1] = s * w;
+    }
+}
+
 void GPU3D::SubmitPolygon() noexcept
 {
     Vertex clippedvertices[10];
@@ -1118,6 +1162,7 @@ void GPU3D::SubmitPolygon() noexcept
 
     for (int i = clipstart; i < nverts; i++)
         clippedvertices[i] = TempVertexBuffer[i];
+    StretchBackdropPolygon(clippedvertices, nverts);
 
     // detect lines, for the OpenGL renderer
 
