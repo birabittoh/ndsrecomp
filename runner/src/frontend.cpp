@@ -3581,12 +3581,13 @@ struct OwnedPresentationFrame {
 #if defined(NDS_HAVE_COMPUTE_RENDERER)
 // Hands the presenter this frame's fixed-size layers, if gpu2d split them:
 // the layer at its scale about its native anchor, and the image without it.
-// Returns whether it did; the caller clears it after the present.
+// The layer is the native 256 columns; the image without it is `width`
+// wide. Returns whether it did; the caller clears it after the present.
 bool set_fixed_layers(int width) {
     NdsGpu2dFixedLayersFrame fixed{};
-    if (width != 256 || !nds_gpu2d_fixed_layers_frame(&fixed)) return false;
+    if (width < 256 || !nds_gpu2d_fixed_layers_frame(&fixed)) return false;
     const float s = fixed.scale;
-    nds_compute_host_set_layer(fixed.layer, fixed.base, 256u,
+    nds_compute_host_set_layer(fixed.layer, fixed.base, unsigned(width),
                                float(fixed.anchor_x) / 256.0f * (1.0f - s),
                                float(fixed.anchor_y) / 192.0f * (1.0f - s),
                                s, s);

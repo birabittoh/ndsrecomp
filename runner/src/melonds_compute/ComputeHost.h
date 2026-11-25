@@ -81,9 +81,10 @@ unsigned nds_compute_host_overlay_max_scale();
 // room. The pointer is read during that present only; pass nullptr to clear.
 void nds_compute_host_set_inset(const uint32_t* argb, unsigned width,
                                 int percent);
-// Optional layer image for the next present: `layer` is `width` x 192
+// Optional layer image for the next present: `layer` is 256 x 192
 // premultiplied-alpha ARGB, drawn over the image into the sub-rectangle
-// (x, y, w, h) of the image rect, given as fractions of it. `base` replaces
+// (x, y, w, h) of its native 256 x 192 middle, given as fractions of it.
+// `base` (`width` x 192, the presented width) replaces
 // the fallback image for that present (the image without the layer); the
 // HD surfaces, if used, must lack it too. Pointers are read during that
 // present only; pass nullptr to clear. Hosts that return false from

@@ -84,6 +84,7 @@ constexpr RenderFormat kSwapChainFormat = RenderFormat::B8G8R8A8_UNORM;
 constexpr RenderFormat kImageFormat = RenderFormat::B8G8R8A8_UNORM;
 constexpr uint32_t kSwapChainBuffers = 3;
 constexpr uint32_t kFramesInFlight = 2;
+constexpr uint32_t kNativeWidth = 256;
 constexpr uint32_t kMaxWidth = 448;
 constexpr uint32_t kHeight = 192;
 // D3D12 needs placed-footprint rows on 256 bytes; Vulkan accepts that too.
@@ -221,8 +222,9 @@ NdsScalingFilter g_scaling = NdsScalingFilter::Integer;
 const uint32_t* g_overlay_pixels = nullptr;
 unsigned g_overlay_width = 0;
 unsigned g_overlay_height = 0;
-// nds_compute_host_set_layer: the layer, the image without it, and where
-// the layer goes, as fractions of the main rect.
+// nds_compute_host_set_layer: the layer (native 256 wide), the image
+// without it (g_layer_width wide), and where the layer goes, as fractions
+// of the main rect's native middle.
 const uint32_t* g_layer_pixels = nullptr;
 const uint32_t* g_layer_base = nullptr;
 unsigned g_layer_width = 0;
@@ -1320,7 +1322,7 @@ bool nds_compute_host_present_top(const unsigned int* fallback_pixels,
     const uint32_t* main_pixels = layer ? g_layer_base : fallback_pixels;
     bool staged = hd_active || stage_image(slot, staging, kMain, main_pixels, width);
     if (staged && layer)
-        staged = stage_image(slot, staging, kLayer, g_layer_pixels, width);
+        staged = stage_image(slot, staging, kLayer, g_layer_pixels, int(kNativeWidth));
     if (staged && inset)
         staged = stage_image(slot, staging, kInset, g_inset_pixels, int(g_inset_width));
     if (staged && overlay && !fine_overlay)
@@ -1424,11 +1426,16 @@ bool nds_compute_host_present_top(const unsigned int* fallback_pixels,
         const auto pixels = [](int size, float fraction) {
             return int(std::lround(double(size) * fraction));
         };
+        // The layer's native 256 columns, centred in a wider image.
+        const int native_x = int(int64_t(band.w) * ((width - int(kNativeWidth)) / 2) / width);
+        const NdsPresentRect native{band.x + native_x, band.y,
+                                    std::max(int(int64_t(band.w) * kNativeWidth / width), 1),
+                                    band.h};
         const NdsPresentRect layer_rect{
-            band.x + pixels(band.w, g_layer_rect[0]),
-            band.y + pixels(band.h, g_layer_rect[1]),
-            std::max(pixels(band.w, g_layer_rect[2]), 1),
-            std::max(pixels(band.h, g_layer_rect[3]), 1)};
+            native.x + pixels(native.w, g_layer_rect[0]),
+            native.y + pixels(native.h, g_layer_rect[1]),
+            std::max(pixels(native.w, g_layer_rect[2]), 1),
+            std::max(pixels(native.h, g_layer_rect[3]), 1)};
         // The main filter, on a premultiplied image. No box resolve.
         record_blit(slot, kLayer, layer_rect, bilinear,
                     kBlitKeepAlpha | kBlitPremultiplied, fb_width, fb_height);

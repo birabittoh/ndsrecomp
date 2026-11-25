@@ -3431,7 +3431,8 @@ const uint32_t* nds_gpu2d_adaptive_framebuffer(int screen, uint16_t* width) {
     // asked for). Any alpha blend with the rest of the stack splits exactly
     // (fixed_layer_pixel).
     uint8_t fixed_mask = 0;
-    if (fixed_wanted && output_width == 256) {
+    // At any width: the layer is the native 256 columns (hud_x).
+    if (fixed_wanted) {
         for (size_t i = 0; i < hud_bg_count; ++i)
             fixed_mask |= static_cast<uint8_t>(
                 g_fixed_mask & (1u << hud_bgs[i]));
@@ -3528,7 +3529,7 @@ void nds_gpu2d_set_fixed_layers_consumer(bool enabled) {
 
 bool nds_gpu2d_fixed_layers_requested() {
     return g_fixed_consumer && g_fixed_mask != 0 && g_fixed_scale < 1.0f &&
-           !g_adaptive_hud_anchor && nds_gpu3d_output_width() == 256;
+           !g_adaptive_hud_anchor;
 }
 
 bool nds_gpu2d_fixed_layers_frame(NdsGpu2dFixedLayersFrame* out) {
