@@ -437,7 +437,16 @@ bool nds_title_touch_unscaled() {
 
 namespace {
 std::atomic<bool> g_touch_stick{false};
+std::atomic<bool> g_touch_outside{false};
 }  // namespace
+
+void nds_title_set_touch_outside(bool outside) {
+    g_touch_outside.store(outside, std::memory_order_relaxed);
+}
+
+bool nds_title_touch_outside() {
+    return g_touch_outside.load(std::memory_order_relaxed);
+}
 
 void nds_title_set_touch_stick(bool stick) {
     g_touch_stick.store(stick, std::memory_order_relaxed);

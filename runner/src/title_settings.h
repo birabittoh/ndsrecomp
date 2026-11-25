@@ -128,6 +128,13 @@ bool nds_title_touch_unscaled();
 // it, the frontend reads it.
 void nds_title_set_touch_stick(bool stick);
 bool nds_title_touch_stick();
+// While set (and no stick), a press on the widened touchscreen view beyond
+// the native 256 x 192 is a tap at the nearest point of that screen's edge,
+// and the pen follows it there while held: a title's "tap outside the window
+// to close it" works over the whole view. Off by default. The title thread
+// sets it, the frontend reads it.
+void nds_title_set_touch_outside(bool outside);
+bool nds_title_touch_outside();
 // The stick held on a widened view, where the pointer really is (native DS
 // pixels, outside 0..255 x 0..191 beside the DS screen): the press and the
 // pen now. The guest's touch differs: the press carried inside, the drag

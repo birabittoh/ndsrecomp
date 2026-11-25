@@ -4873,6 +4873,9 @@ int nds_run_interactive_frontend(const NdsFrontendOptions& initial_options) {
     // pressed, where the guest's press is (carried inside the screen), and
     // the guest's pen, kept while the pointer is off the view.
     bool touch_stick = false;
+    // Or a tap beyond the native screen (nds_title_touch_outside), held at
+    // its nearest edge point.
+    bool touch_edge = false;
     float touch_stick_press_x = 0.0f, touch_stick_press_y = 0.0f;
     float touch_stick_guest_x = 0.0f, touch_stick_guest_y = 0.0f;
     float touch_stick_x = 0.0f, touch_stick_y = 0.0f;
@@ -6717,7 +6720,8 @@ int nds_run_interactive_frontend(const NdsFrontendOptions& initial_options) {
                             event.button.y >= 0 &&
                             event.button.y < kScreenHeight) ||
                            (g_wide_touch_hit.valid &&
-                            nds_title_touch_stick()))
+                            (nds_title_touch_stick() ||
+                             nds_title_touch_outside())))
                     : stacked_left_route ==
                           NdsStackedRelativeMouseRoute::Touchscreen)) {
                 // A latch button's pick: the touch becomes the keys its
@@ -6774,13 +6778,33 @@ int nds_run_interactive_frontend(const NdsFrontendOptions& initial_options) {
                     static_cast<int>(std::floor(touch_stick_press_y)),
                     static_cast<int>(std::floor(touch_stick_press_x)),
                     static_cast<int>(std::floor(touch_stick_press_y)));
+                // Beyond the native screen with no stick: a tap at its nearest
+                // edge point, in the guest's own (unscaled) coordinates.
+                touch_edge = !touch_stick && g_wide_touch_hit.valid &&
+                             nds_title_touch_outside() &&
+                             (g_wide_touch_hit.x < 0.0f ||
+                              g_wide_touch_hit.x >= kScreenWidth ||
+                              g_wide_touch_hit.y < 0.0f ||
+                              g_wide_touch_hit.y >= kScreenHeight);
+                if (touch_edge) {
+                    touch_stick_x = std::clamp(g_wide_touch_hit.x, 0.0f,
+                                               kScreenWidth - 1.0f);
+                    touch_stick_y = std::clamp(g_wide_touch_hit.y, 0.0f,
+                                               kScreenHeight - 1.0f);
+                    event.button.x = bottom_content_left + touch_stick_x;
+                    event.button.y = touch_stick_y;
+                }
                 last_touch_event_x = event.button.x;
                 last_touch_event_y = event.button.y;
                 touch_release_pending = false;
                 touch_frames_held = 0;
-                set_touch_from_mouse(event.button.x, event.button.y, true,
-                                     options.screen_layout,
-                                     bottom_logical_width);
+                if (touch_edge)
+                    nds_set_touch(static_cast<uint16_t>(touch_stick_x),
+                                  static_cast<uint16_t>(touch_stick_y), true);
+                else
+                    set_touch_from_mouse(event.button.x, event.button.y, true,
+                                         options.screen_layout,
+                                         bottom_logical_width);
             }
             if (!virtual_stylus_mouse_consumed &&
                 event.type == SDL_MOUSEBUTTONUP &&
@@ -6789,6 +6813,7 @@ int nds_run_interactive_frontend(const NdsFrontendOptions& initial_options) {
                 mouse_down) {
                 mouse_down = false;
                 touch_stick = false;
+                touch_edge = false;
                 if (touch_button_latched >= 0 && touch_button_latch_frames < 0)
                     touch_button_latch_frames = 6;
                 // A host click can begin and end while the emulation thread is
@@ -6842,7 +6867,22 @@ int nds_run_interactive_frontend(const NdsFrontendOptions& initial_options) {
                     set_touch_from_mouse(
                         bottom_content_left + touch_stick_x, touch_stick_y,
                         true, options.screen_layout, bottom_logical_width);
+                } else if (touch_edge && g_wide_touch_hit.valid &&
+                           (g_wide_touch_hit.x < 0.0f ||
+                            g_wide_touch_hit.x >= kScreenWidth ||
+                            g_wide_touch_hit.y < 0.0f ||
+                            g_wide_touch_hit.y >= kScreenHeight)) {
+                    // Still beyond the screen: the pen slides along its edge.
+                    touch_stick_x = std::clamp(g_wide_touch_hit.x, 0.0f,
+                                               kScreenWidth - 1.0f);
+                    touch_stick_y = std::clamp(g_wide_touch_hit.y, 0.0f,
+                                               kScreenHeight - 1.0f);
+                    last_touch_event_x = bottom_content_left + touch_stick_x;
+                    last_touch_event_y = touch_stick_y;
+                    nds_set_touch(static_cast<uint16_t>(touch_stick_x),
+                                  static_cast<uint16_t>(touch_stick_y), true);
                 } else {
+                    touch_edge = false;
                     set_touch_from_mouse(event.motion.x, event.motion.y, true,
                                          options.screen_layout,
                                          bottom_logical_width);
