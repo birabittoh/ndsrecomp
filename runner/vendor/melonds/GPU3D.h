@@ -137,6 +137,8 @@ public:
     // The widest view the 1/16 pixel positions of 448 lines still resolve
     // column by column (448 * 16).
     static constexpr u32 MaxViewWidth = MaxLineWidth * 16;
+    // The same down a taller view's 192 lines (192 * 16).
+    static constexpr u32 MaxViewHeight = 192 * 16;
     [[nodiscard]] static constexpr u32 LineWidth(u32 view) noexcept
     { return view < MaxLineWidth ? view : MaxLineWidth; }
     [[nodiscard]] u32 GetRenderWidth() const noexcept { return LineWidth(RenderWidth); }

@@ -2794,7 +2794,7 @@ void GPU3D::SetRenderWidth(u32 width) noexcept
 void GPU3D::SetRenderHeight(u32 height) noexcept
 {
     if (height < 192) height = 192;
-    if (height > 512) height = 512;
+    if (height > MaxViewHeight) height = MaxViewHeight;
     height &= ~1u;
     RenderHeight = height;
     RenderBatchHeight = height;
@@ -2807,7 +2807,7 @@ void GPU3D::RequestRenderHeight(u32 height) noexcept
     if (height)
     {
         if (height < 192) height = 192;
-        if (height > 512) height = 512;
+        if (height > MaxViewHeight) height = MaxViewHeight;
         height &= ~1u;
     }
     RenderRequestedHeight = height;

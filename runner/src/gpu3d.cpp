@@ -1836,7 +1836,8 @@ uint16_t nds_gpu3d_output_view_width() {
 bool nds_gpu3d_request_output_height(uint16_t height) {
     if (g_nds.GPU.GPU3D.IsRendererAccelerated()) return false;
     if (height < 192u) height = 192u;
-    if (height > 512u) height = 512u;
+    static_assert(kNdsGpu3dMaxViewHeight == melonDS::GPU3D::MaxViewHeight);
+    if (height > kNdsGpu3dMaxViewHeight) height = kNdsGpu3dMaxViewHeight;
     g_requested_output_height.store(static_cast<uint16_t>(height & ~1u),
                                     std::memory_order_relaxed);
     return true;

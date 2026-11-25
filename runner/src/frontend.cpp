@@ -2553,8 +2553,12 @@ struct WideSize {
     uint16_t height = kScreenHeight;
 };
 
+// `assume_hd`: the view the window would get with the HD raster on, whatever
+// the internal scale now (choosing that scale).
 WideSize dynamic_wide_size(const FrontendPresentation& presentation,
-                           const NdsFrontendOptions& options) {
+                           const NdsFrontendOptions& options,
+                           bool assume_hd = false) {
+    const bool hd = assume_hd || nds_gpu3d_internal_scale() > 1u;
     WideSize size;
     if (!options.adaptive_dynamic || !presentation.single ||
         presentation.stacked || presentation.dual || !presentation.gl_top ||
@@ -2577,7 +2581,7 @@ WideSize dynamic_wide_size(const FrontendPresentation& presentation,
             options.adaptive_max_width[shown], kScreenWidth);
 #if defined(NDS_USE_PLUME)
         // Past the 3D lines' width only the HD raster can show the view.
-        if (nds_gpu3d_internal_scale() > 1u)
+        if (hd)
             max_width = std::max<long long>(max_width,
                                             kNdsGpu3dMaxViewWidth);
 #endif
@@ -2585,11 +2589,12 @@ WideSize dynamic_wide_size(const FrontendPresentation& presentation,
         size.width = static_cast<uint16_t>(width & ~1ll);
         return size;
     }
-    if (nds_gpu3d_internal_scale() <= 1u) return size;
+    if (!hd) return size;
     long long height = integer
         ? h / std::max<long long>(1, w / kScreenWidth)
         : h * kScreenWidth / w;
-    height = std::clamp<long long>(height, kScreenHeight, 512);
+    height = std::clamp<long long>(height, kScreenHeight,
+                                   kNdsGpu3dMaxViewHeight);
     size.height = static_cast<uint16_t>(height & ~1ll);
     return size;
 }
@@ -2606,6 +2611,20 @@ uint8_t requested_internal_scale_for(const FrontendPresentation& presentation,
     window_drawable_size(presentation, 0, &drawable_w, &drawable_h);
     int content_w = 0, content_h = 0;
     window_content_size(presentation, 0, &content_w, &content_h);
+    // A widescreen view is sized by the window, not by the scale: the rect
+    // it gets with the HD raster on. Its 3D lines (448 columns and 192 rows
+    // at most) are stretched over that rect, so the scale is measured per
+    // line along the axis they are stretched most.
+    int lines_w = content_w, lines_h = content_h;
+    if (presentation.single) {
+        const WideSize view = dynamic_wide_size(presentation, options, true);
+        if (view.width != kScreenWidth || view.height != kScreenHeight) {
+            content_w = view.width;
+            content_h = view.height;
+            lines_w = std::min<int>(view.width, 448);
+            lines_h = kScreenHeight;
+        }
+    }
     const NdsPresentRect rect = nds_single_layout(
         options.window_mode, options.scaling, drawable_w, drawable_h,
         content_w, content_h,
@@ -2614,7 +2633,11 @@ uint8_t requested_internal_scale_for(const FrontendPresentation& presentation,
             : 0,
         presentation.stacked).main;
     if (rect_out) *rect_out = rect;
-    return nds_auto_internal_scale(rect.h, content_h, options.scaling,
+    const bool across = lines_w < content_w &&
+                        static_cast<long long>(rect.w) * lines_h >
+                        static_cast<long long>(rect.h) * lines_w;
+    return nds_auto_internal_scale(across ? rect.w : rect.h,
+                                   across ? lines_w : lines_h, options.scaling,
                                    options.resolution_scale,
                                    kNdsMaxInternalScale);
 }

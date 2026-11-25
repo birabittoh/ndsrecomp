@@ -214,13 +214,15 @@ uint16_t nds_gpu3d_output_width();
 uint16_t nds_gpu3d_output_view_width();
 // The widest view (melonDS GPU3D::MaxViewWidth).
 constexpr uint16_t kNdsGpu3dMaxViewWidth = 448 * 16;
+// The tallest (melonDS GPU3D::MaxViewHeight).
+constexpr uint16_t kNdsGpu3dMaxViewHeight = 192 * 16;
 // A view width for the frames to come (256 to GPU3D::MaxViewWidth), from any
 // thread: taken at a VBlank, with the next render list, so every frame is
 // projected and drawn at one width.
 // False (and ignored) where the width is fixed: an accelerated renderer
 // sized at startup.
 bool nds_gpu3d_request_output_width(uint16_t width);
-// Ver+: a taller view, 192 (native) to 512 lines, requested and taken the
+// Ver+: a taller view, 192 (native) to kNdsGpu3dMaxViewHeight lines, requested and taken the
 // same way. The 192 native lines then hold the whole taller view squeezed:
 // only a presenter that draws its own 3D raster (the HD path) can show it,
 // stretched back over a rect that tall. Same thread rules; false where the

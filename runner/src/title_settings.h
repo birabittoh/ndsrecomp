@@ -215,7 +215,7 @@ int nds_title_inset_overlay(int screen, const uint32_t* pixels, int width,
 // gains columns (Hor+, up to 448x192, or any width up to
 // kNdsGpu3dMaxViewWidth with the HD renderer: the guest's projection keeps
 // its vertical field of view); taller, with the HD renderer, it gains lines
-// (Ver+, up to 256x512, keeping the horizontal one). The extra columns or
+// (Ver+, up to kNdsGpu3dMaxViewHeight lines, keeping the horizontal one). The extra columns or
 // lines show 3D only; the 2D keeps its native size and proportions in the
 // centred 256x192, and the second screen stays native. With a query registered the title needs no ROM-hash
 // capability entry. The title is responsible for its own frustum culling at
@@ -232,7 +232,7 @@ bool nds_title_wide_wanted();
 // of the frame being drawn (256 while not wide). Inset pieces are in a main
 // screen this wide. Any thread.
 int nds_title_wide_width();
-// Its height, 192 to 512 (192 while not taller than 4:3). Inset pieces
+// Its height, 192 to kNdsGpu3dMaxViewHeight (192 while not taller than 4:3). Inset pieces
 // (nds_title_set_inset_overlay_query) are in a main screen this tall.
 int nds_title_wide_height();
 
