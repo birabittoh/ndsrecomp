@@ -226,6 +226,43 @@ def read_manifest(folder: Path):
     return tomllib.loads(text)
 
 
+def free_spans(files, grown, entries, fat_off):
+    """Where the files that outgrew their slots can go, sorted: the slots
+    they leave and the ends of slots whose file shrank, less every byte a
+    file that stays, a fixed part or the FAT holds."""
+    moving = set(grown)
+    spans = []
+    for i, (_, off, slot, data) in enumerate(files):
+        start = off if i in moving else (off + len(data) + 0x1FF) & ~0x1FF
+        if off + slot > start:
+            spans.append([start, off + slot])
+    spans.sort()
+    merged = []
+    for s, e in spans:
+        if merged and s <= merged[-1][1]:
+            merged[-1][1] = max(merged[-1][1], e)
+        else:
+            merged.append([s, e])
+    used = sorted([(off, off + len(data)) for _, off, data in entries] +
+                  [(fat_off, fat_off + 8 * len(files))] +
+                  [(off, off + len(data)) for i, (_, off, _, data) in enumerate(files)
+                   if i not in moving and data])
+    out = []
+    u = 0
+    for s, e in merged:
+        while u < len(used) and used[u][1] <= s:
+            u += 1
+        k = u
+        while s < e and k < len(used) and used[k][0] < e:
+            if used[k][0] > s:
+                out.append((s, used[k][0]))
+            s = max(s, used[k][1])
+            k += 1
+        if s < e:
+            out.append((s, e))
+    return out
+
+
 def pack(folder: Path) -> bytes:
     folder = Path(folder)
     manifest = read_manifest(folder)
@@ -257,13 +294,33 @@ def pack(folder: Path) -> bytes:
     used = u32(header, 0x80)
     end = max([used] + [off + len(data) for _, off, data in entries] +
               [off + slot for _, off, slot, _ in files])
-    placed = []
-    for name, off, slot, data in files:
-        if len(data) > slot:
-            off = (end + 0x1FF) & ~0x1FF
-            end = off + len(data)
-        placed.append((off, data))
-    moved = any(len(data) > slot for _, _, slot, data in files)
+    fat_off = info["fat"]
+    placed = [off for _, off, _, _ in files]
+    grown = [i for i, (_, _, slot, data) in enumerate(files) if len(data) > slot]
+    free = free_spans(files, grown, entries, fat_off)
+    # The largest first, each into the smallest free span it fits, else
+    # after the end.
+    for i in sorted(grown, key=lambda i: (-len(files[i][3]), i)):
+        size = len(files[i][3])
+        best = None
+        for k, (s, e) in enumerate(free):
+            a = (s + 0x1FF) & ~0x1FF
+            if a + size <= e and (best is None or
+                                  e - s < free[best][1] - free[best][0]):
+                best = k
+        if best is None:
+            placed[i] = (end + 0x1FF) & ~0x1FF
+            end = placed[i] + size
+            continue
+        s, e = free[best]
+        placed[i] = (s + 0x1FF) & ~0x1FF
+        rest = (placed[i] + size + 0x1FF) & ~0x1FF
+        if rest < e:
+            free[best] = (rest, e)
+        else:
+            del free[best]
+    placed = [(off, data) for off, (_, _, _, data) in zip(placed, files)]
+    moved = bool(grown)
 
     if end > size:
         while size < end:
@@ -271,7 +328,6 @@ def pack(folder: Path) -> bytes:
     image = bytearray(bytes([fill]) * size)
     for _, off, data in entries:
         image[off:off + len(data)] = data
-    fat_off = info["fat"]
     for i, (off, data) in enumerate(placed):
         image[off:off + len(data)] = data
         struct.pack_into("<II", image, fat_off + 8 * i, off, off + len(data))

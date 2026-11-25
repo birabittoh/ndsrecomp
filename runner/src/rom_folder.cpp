@@ -403,19 +403,81 @@ bool nds_rom_folder_pack(const fs::path& dir, std::vector<uint8_t>* rom,
         slots.push_back(static_cast<uint32_t>(*slot));
         files.push_back(std::move(file));
     }
-    bool moved = false;
-    for (size_t i = 0; i < files.size(); ++i) {
-        if (files[i].data.size() <= slots[i]) continue;
-        files[i].offset = static_cast<uint32_t>((end + 0x1FF) & ~uint64_t{0x1FF});
-        end = uint64_t{files[i].offset} + files[i].data.size();
-        moved = true;
+    const uint32_t fat_off = static_cast<uint32_t>(*fat_value);
+    std::vector<size_t> grown;
+    for (size_t i = 0; i < files.size(); ++i)
+        if (files[i].data.size() > slots[i]) grown.push_back(i);
+    const bool moved = !grown.empty();
+    auto align = [](uint64_t a) { return (a + 0x1FF) & ~uint64_t{0x1FF}; };
+    // Where they can go: the slots they leave and the ends of slots whose
+    // file shrank, less every byte a file that stays, a fixed part or the
+    // FAT holds (as tools/nds_folder.py free_spans).
+    std::vector<std::pair<uint64_t, uint64_t>> free;
+    if (moved) {
+        std::vector<bool> moving(files.size(), false);
+        for (size_t i : grown) moving[i] = true;
+        std::vector<std::pair<uint64_t, uint64_t>> spans, used;
+        for (size_t i = 0; i < files.size(); ++i) {
+            const uint64_t off = files[i].offset, slot_end = off + slots[i];
+            const uint64_t start =
+                moving[i] ? off : align(off + files[i].data.size());
+            if (slot_end > start) spans.push_back({start, slot_end});
+            if (!moving[i] && !files[i].data.empty())
+                used.push_back({off, off + files[i].data.size()});
+        }
+        for (const Placed& p : fixed)
+            used.push_back({p.offset, uint64_t{p.offset} + p.data.size()});
+        used.push_back({fat_off, uint64_t{fat_off} + 8 * files.size()});
+        std::sort(spans.begin(), spans.end());
+        std::sort(used.begin(), used.end());
+        std::vector<std::pair<uint64_t, uint64_t>> merged;
+        for (const auto& s : spans) {
+            if (!merged.empty() && s.first <= merged.back().second)
+                merged.back().second = std::max(merged.back().second, s.second);
+            else
+                merged.push_back(s);
+        }
+        size_t u = 0;
+        for (auto [s, e] : merged) {
+            while (u < used.size() && used[u].second <= s) ++u;
+            for (size_t k = u; s < e && k < used.size() && used[k].first < e; ++k) {
+                if (used[k].first > s) free.push_back({s, used[k].first});
+                s = std::max(s, used[k].second);
+            }
+            if (s < e) free.push_back({s, e});
+        }
+    }
+    // The largest first, each into the smallest free span it fits, else
+    // after the end.
+    std::stable_sort(grown.begin(), grown.end(), [&](size_t a, size_t b) {
+        return files[a].data.size() > files[b].data.size();
+    });
+    for (size_t i : grown) {
+        const uint64_t size = files[i].data.size();
+        size_t best = free.size();
+        for (size_t k = 0; k < free.size(); ++k) {
+            if (align(free[k].first) + size > free[k].second) continue;
+            if (best == free.size() ||
+                free[k].second - free[k].first < free[best].second - free[best].first)
+                best = k;
+        }
+        if (best == free.size()) {
+            files[i].offset = static_cast<uint32_t>(align(end));
+            end = uint64_t{files[i].offset} + size;
+            continue;
+        }
+        files[i].offset = static_cast<uint32_t>(align(free[best].first));
+        const uint64_t rest = align(files[i].offset + size);
+        if (rest < free[best].second)
+            free[best].first = rest;
+        else
+            free.erase(free.begin() + static_cast<ptrdiff_t>(best));
     }
     uint64_t size = static_cast<uint64_t>(*size_value);
     while (size < end) size *= 2;
     if (size > 0x80000000ull)
         return fail(error, dir.string() + " packs into more than 2 GiB");
 
-    const uint32_t fat_off = static_cast<uint32_t>(*fat_value);
     if (uint64_t{fat_off} + 8 * files.size() > size)
         return fail(error, (dir / kManifest).string() + ": bad FAT offset");
     rom->assign(static_cast<size_t>(size),
