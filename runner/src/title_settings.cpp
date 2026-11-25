@@ -169,6 +169,18 @@ bool nds_title_inset_below_wanted() {
 }
 
 namespace {
+std::atomic<int> g_second_screen_size{30};
+}  // namespace
+
+void nds_title_set_second_screen_size(int percent) {
+    g_second_screen_size.store(percent, std::memory_order_relaxed);
+}
+
+int nds_title_second_screen_size() {
+    return g_second_screen_size.load(std::memory_order_relaxed);
+}
+
+namespace {
 std::atomic<NdsTitleInsetOverlayQuery> g_inset_overlay_query{nullptr};
 }  // namespace
 

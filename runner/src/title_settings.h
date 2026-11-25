@@ -189,6 +189,13 @@ typedef int (*NdsTitleStackedGapQuery)();
 void nds_title_set_stacked_gap_query(NdsTitleStackedGapQuery query);
 int nds_title_stacked_gap();
 
+// display.second_screen_size (10..100, the inset beside the main screen as
+// a percent of it), for a title that sizes its own inset over the main
+// screen by it. The frontend sets it as the option changes, any thread reads
+// it.
+void nds_title_set_second_screen_size(int percent);
+int nds_title_second_screen_size();
+
 // A game mode that wants the second screen below the main one in a portrait
 // window (the default puts it above), at the usual second_screen_size.
 typedef bool (*NdsTitleInsetBelowQuery)();

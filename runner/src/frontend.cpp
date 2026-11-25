@@ -3398,6 +3398,7 @@ bool create_presentation(const NdsFrontendOptions& options,
     presentation.internal_resolution = options.internal_resolution;
     presentation.inset_percent =
         presentation.single ? options.second_screen_size : 0;
+    nds_title_set_second_screen_size(options.second_screen_size);
     const int aa_scale = presentation.gl_top ? 1 : options.antialiasing >= 8 ? 4 :
                          options.antialiasing >= 4 ? 3 :
                          options.antialiasing >= 2 ? 2 : 1;
@@ -7678,6 +7679,7 @@ int nds_run_interactive_frontend(const NdsFrontendOptions& initial_options) {
         presentation.inset_percent =
             !presentation.single || presentation.dual ? 0
             : presentation.stacked ? 100 : options.second_screen_size;
+        nds_title_set_second_screen_size(options.second_screen_size);
         const PresentationTicks presentation_ticks = present_screens(
             presentation, top_pixels, top_width,
             bottom_pixels, bottom_width,
