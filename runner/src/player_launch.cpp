@@ -577,6 +577,37 @@ bool read_bytes(const fs::path& path, std::vector<uint8_t>* bytes) {
     return true;
 }
 
+// A folder converted from another release keeps that release's image here
+// (rom.toml does not list it, so it is not packed): a later build whose
+// step prepares the data differently converts it again from this copy,
+// without asking for the ROM.
+constexpr const char* kOriginalRom = "original.nds";
+
+bool write_bytes(const fs::path& path, const std::vector<uint8_t>& bytes) {
+    std::ofstream out(path, std::ios::binary | std::ios::trunc);
+    out.write(reinterpret_cast<const char*>(bytes.data()),
+              static_cast<std::streamsize>(bytes.size()));
+    return static_cast<bool>(out);
+}
+
+// Keeps `rom` in the converted folder `dir`; a failure only costs asking
+// for the ROM again later.
+void keep_original(const fs::path& dir, const std::vector<uint8_t>& rom) {
+    if (!write_bytes(dir / kOriginalRom, rom)) {
+        std::error_code ec;
+        fs::remove(dir / kOriginalRom, ec);
+        std::fprintf(stderr, "[player] could not keep the ROM in %s\n",
+                     dir.string().c_str());
+    }
+}
+
+// A converted folder whose data this build's step would prepare otherwise.
+bool prepared_by_another_build(const fs::path& dir) {
+    NdsRomFolderInfo info;
+    return nds_rom_folder_info(dir, &info, nullptr) && !info.prepared.empty() &&
+           info.prepared != nds_release_prepare_version();
+}
+
 // An unpacked ROM folder made from the image this build runs, or converted
 // to run as it (rom.toml identity).
 bool folder_matches(const fs::path& dir, const std::string& expected_sha1) {
@@ -645,8 +676,13 @@ Install install_rom(const fs::path& library, const NdsFrontendOptions& options,
     if (!expected.empty() && sha1 != expected && !recipe)
         return Install::NotThisGame;
     *dir = release_dir(library, options, rom, sha1);
-    if (recipe ? folder_is(*dir, sha1, expected) : folder_matches(*dir, sha1))
+    if (recipe ? folder_is(*dir, sha1, expected) : folder_matches(*dir, sha1)) {
+        // Converted before folders kept their ROM.
+        std::error_code ec;
+        if (recipe && !fs::is_regular_file(*dir / kOriginalRom, ec))
+            keep_original(*dir, rom);
         return Install::Done;
+    }
     std::error_code ec;
     fs::create_directories(library, ec);
     std::string error;
@@ -684,6 +720,7 @@ Install install_rom(const fs::path& library, const NdsFrontendOptions& options,
         nds_player_error(tr(Text::CannotConvert, {{"error", error}}));
         return Install::Failed;
     }
+    keep_original(converted, rom);
     fs::remove_all(source, ec);
     fs::remove_all(*dir, ec);
     fs::rename(converted, *dir, ec);
@@ -692,6 +729,28 @@ Install install_rom(const fs::path& library, const NdsFrontendOptions& options,
         return Install::Failed;
     }
     return Install::Done;
+}
+
+// The folder `dir` found for this build: used as it is, or, when its data
+// was prepared by another build, converted again from the ROM it keeps.
+// False when that cannot be done (no ROM kept: the player is asked for it).
+bool use_folder(const fs::path& library, const NdsFrontendOptions& options,
+                const fs::path& dir, fs::path* rom) {
+    if (!prepared_by_another_build(dir)) {
+        *rom = dir;
+        return true;
+    }
+    std::vector<uint8_t> bytes;
+    if (!read_bytes(dir / kOriginalRom, &bytes)) {
+        std::fprintf(stderr, "[player] %s was prepared by another build and "
+                             "keeps no ROM to convert it again from\n",
+                     dir.string().c_str());
+        return false;
+    }
+    std::fprintf(stderr, "[player] %s was prepared by another build, "
+                         "converting it again from %s\n",
+                 dir.string().c_str(), kOriginalRom);
+    return install_rom(library, options, bytes, rom) == Install::Done;
 }
 
 // Which dumps the folder has to hold. system.freebios replaces the two BIOS
@@ -751,8 +810,9 @@ bool resolve_rom(const fs::path& root, const fs::path& settings,
     const fs::path old_copy = root / (options.app_name + ".nds");
     if (!argument && !options.paths.rom.empty()) {
         const fs::path stored = resolve_stored(root, options.paths.rom);
-        if (folder_matches(stored, expected)) {
-            *rom = stored;
+        if (folder_matches(stored, expected) &&
+            use_folder(library, options, stored, rom)) {
+            if (*rom != stored) remember(settings, "rom", to_stored(root, *rom));
             return true;
         }
         std::vector<uint8_t> bytes;
@@ -777,11 +837,15 @@ bool resolve_rom(const fs::path& root, const fs::path& settings,
     if (!argument && !expected.empty()) {
         // A folder unpacked earlier, or next to the executable (a build).
         for (const fs::path& dir : {library, executable_dir() / "assets"}) {
+            // Listed first: converting one again changes the directory.
             std::error_code ec;
+            std::vector<fs::path> found;
             for (const fs::directory_entry& entry :
-                 fs::directory_iterator(dir, ec)) {
-                if (!folder_matches(entry.path(), expected)) continue;
-                *rom = entry.path();
+                 fs::directory_iterator(dir, ec))
+                if (folder_matches(entry.path(), expected))
+                    found.push_back(entry.path());
+            for (const fs::path& path : found) {
+                if (!use_folder(library, options, path, rom)) continue;
                 remember(settings, "rom", to_stored(root, *rom));
                 return true;
             }
@@ -1216,6 +1280,10 @@ std::string read_source(const fs::path& source, std::vector<uint8_t>* rom) {
         if (!nds_rom_folder_is(source))
             return "The folder is not an unpacked ROM (it has no rom.toml).";
         if (!nds_rom_folder_info(source, &info, &error)) return error;
+        // A converted folder that keeps the image it was made from.
+        if (!info.identity.empty() && read_bytes(source / kOriginalRom, rom) &&
+            gba::sha1(rom->data(), rom->size()).hex() == info.sha1)
+            return {};
         if (!info.identity.empty())
             return "This folder was converted from another release. Select "
                    "the original ROM instead.";
@@ -1251,6 +1319,7 @@ std::string build_folder(const std::vector<uint8_t>& rom,
                                                recipe->size, &error);
     fs::remove_all(unpacked, ec);
     if (!ok) return "Cannot convert the ROM: " + error;
+    keep_original(dest, rom);
     return {};
 }
 
