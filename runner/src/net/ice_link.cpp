@@ -7,6 +7,7 @@
 #include <algorithm>
 #include <atomic>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <mutex>
 #include <random>
@@ -83,9 +84,14 @@ int SeatOf(const PeerAddr& addr) {
     return seat < kMaxSeats ? seat : -1;
 }
 
-// STUN server for direct connections (public, no account).
-constexpr const char* kDirectStunHost = "stun.l.google.com";
-constexpr int kDirectStunPort = 19302;
+// STUN server for direct connections (public, no account); SetDirectStunServer
+// replaces it.
+constexpr const char* kDefaultStunHost = "stun.l.google.com";
+constexpr int kDefaultStunPort = 19302;
+
+std::mutex g_stun_mutex;
+std::string g_stun_host = kDefaultStunHost;
+int g_stun_port = kDefaultStunPort;
 
 bool IsRelayCandidate(const std::string& line) {
     return CandidateType(line.c_str()) == "relay";
@@ -182,6 +188,26 @@ void IceLink::SetDirect(bool direct) {
 }
 
 bool IceLink::Direct() const { return direct_.load(); }
+
+void SetDirectStunServer(const std::string& hostport) {
+    std::string host = hostport;
+    int port = kDefaultStunPort;
+    const size_t colon = host.rfind(':');
+    if (colon != std::string::npos) {
+        const int parsed = std::atoi(host.c_str() + colon + 1);
+        if (parsed > 0 && parsed < 65536) port = parsed;
+        host.resize(colon);
+    }
+    if (host.empty()) {
+        host = kDefaultStunHost;
+        port = kDefaultStunPort;
+    }
+    std::lock_guard<std::mutex> lock(g_stun_mutex);
+    g_stun_host = host;
+    g_stun_port = port;
+    std::fprintf(stderr, "[online] link: STUN server %s:%d\n", host.c_str(),
+                 port);
+}
 
 std::string IceLink::FilterSdp(const std::string& sdp) const {
     return Direct() ? sdp : FilterRelayOnly(sdp);
@@ -299,9 +325,16 @@ std::shared_ptr<IceLink::Peer> IceLink::CreateAgent(int seat, int gen,
     // Relay only, unless the player chose direct connections (SetDirect):
     // then a STUN server gives the agent its public address, and a direct
     // pair is used when one works, the relay otherwise.
+    std::string stun_host;
     if (Direct()) {
-        config.stun_server_host = kDirectStunHost;
-        config.stun_server_port = kDirectStunPort;
+        int stun_port;
+        {
+            std::lock_guard<std::mutex> lock(g_stun_mutex);
+            stun_host = g_stun_host;
+            stun_port = g_stun_port;
+        }
+        config.stun_server_host = stun_host.c_str();
+        config.stun_server_port = static_cast<uint16_t>(stun_port);
     } else {
         config.stun_server_host = nullptr;  // no server-reflexive candidates
     }

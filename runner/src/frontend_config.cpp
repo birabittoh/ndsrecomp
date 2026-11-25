@@ -570,7 +570,7 @@ bool nds_is_local_wireless_tuning_flag(const std::string& flag) {
            flag == "--local-wireless-peer" ||
            flag == "--netplay" || flag == "--netplay-sign-in" ||
            flag == "--netplay-join" || flag == "--netplay-direct" || flag == "--netplay-lobby-name" ||
-           flag == "--netplay-lobby-url";
+           flag == "--netplay-lobby-url" || flag == "--netplay-stun";
 }
 
 bool nds_parse_local_wireless_tuning(const std::string& flag,
@@ -632,6 +632,10 @@ bool nds_parse_local_wireless_tuning(const std::string& flag,
     if (flag == "--netplay-lobby-url") {
         if (value.rfind("ws://", 0) != 0) return fail("a ws:// URL");
         out->online.lobby_url = value;
+        return true;
+    }
+    if (flag == "--netplay-stun") {
+        out->online.stun_server = value;
         return true;
     }
     if (error) *error = "unknown flag " + flag;
@@ -1442,6 +1446,8 @@ static bool apply_frontend_config(toml::table& root,
             }
             o.lobby_url = *value;
         }
+        if (const auto value = (*online)["stun_server"].value<std::string>())
+            o.stun_server = *value;
         if (const auto value = (*online)["game_name"].value<std::string>())
             o.game_name = *value;
         if (const auto value = (*online)["lobby_name"].value<std::string>())

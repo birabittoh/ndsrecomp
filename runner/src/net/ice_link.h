@@ -184,4 +184,8 @@ private:
 // keeps the agents: closing the view only stops delivery.
 std::unique_ptr<MpLink> MakeLinkView(std::shared_ptr<IceLink> link);
 
+// STUN server used by direct connections, "host[:port]"; empty restores the
+// default (stun.l.google.com:19302). Read when an agent is created.
+void SetDirectStunServer(const std::string& hostport);
+
 }  // namespace mpnet

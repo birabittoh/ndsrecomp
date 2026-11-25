@@ -73,6 +73,7 @@
 #include "release_recipe.h"
 #include "title_patches.h"
 #if NDS_ONLINE
+#include "net/ice_link.h"
 #include "net/online_lobby.h"
 #endif
 #if defined(NDS_HAVE_COMPUTE_RENDERER)
@@ -2181,6 +2182,8 @@ int main(int argc, char** argv) {
                     .string();
             config.enabled = online.enabled;
             config.direct = online.direct;
+            if (!online.stun_server.empty())
+                mpnet::SetDirectStunServer(online.stun_server);
             config.sign_in = online.sign_in;
             config.join = online.join;
             nds_online_start(config);
