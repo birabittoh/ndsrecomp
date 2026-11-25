@@ -130,13 +130,24 @@ public:
     void SetRenderXPos(u16 xpos) noexcept;
     [[nodiscard]] u16 GetRenderXPos() const noexcept { return RenderXPos; }
     void SetRenderWidth(u32 width) noexcept;
-    [[nodiscard]] u32 GetRenderWidth() const noexcept { return RenderWidth; }
+    // The view's width in LCD columns, up to MaxViewWidth; the lines the
+    // renderers draw are at most MaxLineWidth wide, a wider view squeezed
+    // into them (as a taller one is into 192 lines).
+    static constexpr u32 MaxLineWidth = 448;
+    // The widest view the 1/16 pixel positions of 448 lines still resolve
+    // column by column (448 * 16).
+    static constexpr u32 MaxViewWidth = MaxLineWidth * 16;
+    [[nodiscard]] static constexpr u32 LineWidth(u32 view) noexcept
+    { return view < MaxLineWidth ? view : MaxLineWidth; }
+    [[nodiscard]] u32 GetRenderWidth() const noexcept { return LineWidth(RenderWidth); }
+    [[nodiscard]] u32 GetRenderViewWidth() const noexcept { return RenderWidth; }
     // A new width for the frames to come, taken at the next buffer swap so a
     // render list is always projected and drawn at one width (0 = none).
     void RequestRenderWidth(u32 width) noexcept;
     // The width the renderer draws the current frame at: the one the shown
     // render list was projected at, latched at VCount215.
-    [[nodiscard]] u32 GetShownWidth() const noexcept { return ShownWidth; }
+    [[nodiscard]] u32 GetShownWidth() const noexcept { return LineWidth(ShownWidth); }
+    [[nodiscard]] u32 GetShownViewWidth() const noexcept { return ShownWidth; }
     void LatchShownWidth() noexcept;
     // The same for a taller view (Ver+): above 192, full-screen viewports
     // take a taller vertical field of view, squeezed into the 192 lines;

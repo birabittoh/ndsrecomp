@@ -35,7 +35,7 @@ void CaptureReference::Latch(GPU& source) {
     PaletteVersion = source.TexPalViewVersion;
     SnapshotValid = true;
     out.SetEnabled(true, true);
-    out.SetRenderWidth(in.GetRenderWidth());
+    out.SetRenderWidth(in.GetRenderViewWidth());
     out.RenderDispCnt = in.RenderDispCnt;
     out.RenderAlphaRef = in.RenderAlphaRef;
     out.RenderClearAttr1 = in.RenderClearAttr1;

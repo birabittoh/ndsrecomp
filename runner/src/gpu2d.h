@@ -85,6 +85,10 @@ int nds_gpu2d_presented_main_screen();
 // The 3D view height (gpu3d.h, nds_gpu3d_request_output_height) of that
 // frame on `screen`: above 192 only on engine A's LCD of a Ver+ frame.
 int nds_gpu2d_presented_view_height(int screen);
+// The 3D view width of that frame on `screen`, given its image's `width`:
+// wider than the image only on engine A's LCD when the view is wider than
+// the 3D lines (nds_gpu3d_output_view_width).
+int nds_gpu2d_presented_view_width(int screen, int width);
 // True when neither LCD showed an image in that frame (each engine powered
 // off, force-blanked, or in display mode 0) -- a fade or transition frame.
 bool nds_gpu2d_presented_both_blank();
@@ -169,6 +173,9 @@ struct NdsGpu2dHdFrame {
     // backdrop (`backdrop`, an RGB6 colour as [0]; `backdrop_meta` as [1])
     // with the 3D in front.
     uint16_t height;
+    // The same across: a view wider than `width` has the surfaces in its
+    // middle `width` columns and the backdrop on either side.
+    uint16_t view_width;
     uint32_t backdrop;
     uint32_t backdrop_meta;
 };

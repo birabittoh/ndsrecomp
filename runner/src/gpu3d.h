@@ -205,10 +205,18 @@ void nds_gpu3d_draw_deferred_frame(bool for_capture);
 // returns the centered 256-pixel hardware viewport for the faithful 2D
 // compositor; wide_line exposes the complete enhanced surface.
 bool nds_gpu3d_set_output_width(uint16_t width);
-// The width of the frame being drawn (and of its lines).
+// The width of the frame being drawn (and of its lines), at most 448.
 uint16_t nds_gpu3d_output_width();
-// A width for the frames to come, from any thread: taken at a VBlank, with
-// the next render list, so every frame is projected and drawn at one width.
+// The width of that frame's view: its line width, or more when the view is
+// wider than 448 lines can hold. Those lines then hold the whole view
+// squeezed, as a taller view's 192 lines do (see the height below): only a
+// presenter that draws its own 3D raster can stretch it back.
+uint16_t nds_gpu3d_output_view_width();
+// The widest view (melonDS GPU3D::MaxViewWidth).
+constexpr uint16_t kNdsGpu3dMaxViewWidth = 448 * 16;
+// A view width for the frames to come (256 to GPU3D::MaxViewWidth), from any
+// thread: taken at a VBlank, with the next render list, so every frame is
+// projected and drawn at one width.
 // False (and ignored) where the width is fixed: an accelerated renderer
 // sized at startup.
 bool nds_gpu3d_request_output_width(uint16_t width);

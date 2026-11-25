@@ -209,6 +209,7 @@ std::array<bool, 2> g_frame_3d_skipped{};
 // at the width its 3D has.
 std::array<uint16_t, 2> g_frame_3d_width{256, 256};
 std::array<uint16_t, 2> g_frame_3d_height{192, 192};
+std::array<uint16_t, 2> g_frame_3d_view_width{256, 256};
 // The frame being latched has a line that reads the CPU 3D raster (see
 // nds_gpu2d_expects_cpu_3d).
 bool g_frame_reads_cpu_3d = false;
@@ -1787,6 +1788,7 @@ void latch_line(int y, LineJob& job) {
         g_frame_3d_skipped[job.buffer] = false;
         g_frame_3d_width[job.buffer] = nds_gpu3d_output_width();
         g_frame_3d_height[job.buffer] = nds_gpu3d_output_height();
+        g_frame_3d_view_width[job.buffer] = nds_gpu3d_output_view_width();
     }
     const bool capture_uses_3d = job.cap &&
         ((job.unit[0].capture >> 29) & 3u) != 1u &&
@@ -2298,6 +2300,7 @@ void nds_gpu2d_reset(){
     g_wide_3d_width.fill(0u);
     g_frame_3d_width.fill(nds_gpu3d_output_width());
     g_frame_3d_height.fill(nds_gpu3d_output_height());
+    g_frame_3d_view_width.fill(nds_gpu3d_output_view_width());
     for (auto& frame : g_direct_object_frame) frame.fill(0u);
 }
 void nds_gpu2d_stop(){
@@ -2434,6 +2437,7 @@ bool gpu2d_savestate_import(const NdsGpu2dSaveState& in,
     g_wide_3d_width.fill(0u);
     g_frame_3d_width.fill(nds_gpu3d_output_width());
     g_frame_3d_height.fill(nds_gpu3d_output_height());
+    g_frame_3d_view_width.fill(nds_gpu3d_output_view_width());
     for (auto& frame : g_direct_object_frame) frame.fill(0u);
     return true;
 }
@@ -2652,6 +2656,12 @@ int nds_gpu2d_presented_view_height(int screen){
     if (g_route_main_screen[g_front] != static_cast<uint8_t>(screen & 1))
         return 192;
     return g_frame_3d_height[g_front];
+}
+int nds_gpu2d_presented_view_width(int screen, int width){
+    drain_pool(NDS_GPU2D_FENCE_PRESENT);
+    if (g_route_main_screen[g_front] != static_cast<uint8_t>(screen & 1))
+        return width;
+    return std::max<int>(width, g_frame_3d_view_width[g_front]);
 }
 bool nds_gpu2d_presented_both_blank(){
     drain_pool(NDS_GPU2D_FENCE_PRESENT);
@@ -3492,6 +3502,8 @@ const uint32_t* nds_gpu2d_adaptive_framebuffer(int screen, uint16_t* width) {
         g_hd_frame.evy = static_cast<uint8_t>(u.evy);
         g_hd_frame.render_xpos = nds_gpu3d_render_xpos();
         g_hd_frame.height = g_frame_3d_height[g_front];
+        g_hd_frame.view_width = std::max<uint16_t>(
+            static_cast<uint16_t>(output_width), g_frame_3d_view_width[g_front]);
         g_hd_frame.backdrop = backdrop.color;
         g_hd_frame.backdrop_meta = hd_meta(backdrop, 0x3Fu);
         g_hd_frame_valid = true;

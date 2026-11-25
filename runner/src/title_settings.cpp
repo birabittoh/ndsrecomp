@@ -212,7 +212,7 @@ bool nds_title_wide_wanted() {
 }
 
 int nds_title_wide_width() {
-    return nds_gpu3d_output_width();
+    return nds_gpu3d_output_view_width();
 }
 
 int nds_title_wide_height() {

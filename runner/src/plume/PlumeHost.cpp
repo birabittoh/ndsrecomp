@@ -119,6 +119,7 @@ struct ComposeConstants {
     uint32_t output_height;
     uint32_t backdrop;
     uint32_t backdrop_meta;
+    uint32_t output_view_width;
 };
 
 // The HD surfaces (NdsGpu2dHdFrame), both in one RGBA32UI texture: top
@@ -1045,6 +1046,7 @@ void record_compose(FrameSlot& slot, RenderTexture* raster, const NdsGpu2dHdFram
     constants.priority_3d = hd.priority_3d;
     constants.order_3d = hd.order_3d;
     constants.output_height = hd.height;
+    constants.output_view_width = hd.view_width;
     constants.backdrop = hd.backdrop;
     constants.backdrop_meta = hd.backdrop_meta;
     commands.setGraphicsPushConstants(0, &constants, 0, sizeof(constants));
@@ -1283,14 +1285,18 @@ bool nds_compute_host_present_top(const unsigned int* fallback_pixels,
     // A taller view (Ver+) is that many lines; its 2D the middle 192.
     const int view_h = std::max(int(kHeight),
         nds_main_view_height_flag().load(std::memory_order_relaxed));
+    // A view wider than the image (its 3D lines full) is that many columns,
+    // the image its middle ones.
+    const int view_w = std::max(width,
+        nds_main_view_width_flag().load(std::memory_order_relaxed));
     const NdsSingleLayout layout = nds_single_layout(
-        g_window_mode, g_scaling, int(fb_width), int(fb_height), width,
+        g_window_mode, g_scaling, int(fb_width), int(fb_height), view_w,
         view_h, g_inset_percent, nds_stack_vertically_flag().load());
     const NdsPresentRect& rect = layout.main;
-    const NdsPresentRect band = nds_view_band(rect, view_h);
+    const NdsPresentRect band = nds_view_band(rect, view_w, width, view_h);
     // Size the next 3D frame by this rect: from here on 3D follows the
     // window pixel for pixel, whatever its size.
-    request_raster(rect, width, view_h);
+    request_raster(rect, view_w, view_h);
 
     // HD: the compositor's layer surfaces for this frame plus a Plume raster.
     NdsGpu2dHdFrame hd{};
@@ -1452,7 +1458,7 @@ bool nds_compute_host_present_top(const unsigned int* fallback_pixels,
             // lands on its rect, cut to that rect.
             for (int i = 0; i < pieces.count; ++i) {
                 NdsPresentRect clip{}, view{};
-                if (nds_inset_piece_rects(rect, width, view_h,
+                if (nds_inset_piece_rects(rect, view_w, view_h,
                                           int(g_inset_width), int(kHeight),
                                           pieces.piece[i], &clip, &view))
                     record_blit(slot, kInset, view,

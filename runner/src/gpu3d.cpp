@@ -1829,6 +1829,10 @@ uint16_t nds_gpu3d_output_width() {
     return static_cast<uint16_t>(g_nds.GPU.GPU3D.GetShownWidth());
 }
 
+uint16_t nds_gpu3d_output_view_width() {
+    return static_cast<uint16_t>(g_nds.GPU.GPU3D.GetShownViewWidth());
+}
+
 bool nds_gpu3d_request_output_height(uint16_t height) {
     if (g_nds.GPU.GPU3D.IsRendererAccelerated()) return false;
     if (height < 192u) height = 192u;
@@ -1845,7 +1849,8 @@ uint16_t nds_gpu3d_output_height() {
 bool nds_gpu3d_request_output_width(uint16_t width) {
     if (g_nds.GPU.GPU3D.IsRendererAccelerated()) return false;
     if (width < 256u) width = 256u;
-    if (width > 448u) width = 448u;
+    static_assert(kNdsGpu3dMaxViewWidth == melonDS::GPU3D::MaxViewWidth);
+    if (width > kNdsGpu3dMaxViewWidth) width = kNdsGpu3dMaxViewWidth;
     g_requested_output_width.store(static_cast<uint16_t>(width & ~1u),
                                    std::memory_order_relaxed);
     return true;

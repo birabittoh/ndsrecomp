@@ -13,7 +13,9 @@
 //
 // A view taller than 192 lines (Ver+, outputHeight) has the 2D surfaces in
 // its middle 192 rows and only the backdrop, with the 3D in front, above and
-// below; the raster covers the whole view.
+// below; the raster covers the whole view. A view wider than the surfaces
+// (outputViewWidth, its 3D lines squeezed) has them in its middle columns
+// the same way.
 
 struct VSOutput {
     float4 position : SV_POSITION;
@@ -39,6 +41,7 @@ struct Constants {
     uint outputHeight;   // the view's native lines; 0 or 192 = the surfaces'
     uint backdrop;       // the backdrop as a surface texel, for the rows
     uint backdropMeta;   // above and below them
+    uint outputViewWidth; // the view's columns; 0 or the surfaces' = theirs
 } constants;
 
 uint3 Blend16(uint3 a, uint3 b, uint ca, uint cb) {
@@ -120,10 +123,12 @@ float4 PSMain(VSOutput input) : SV_TARGET {
     const float2 nativeSize = float2(nativeW, nativeH);
     const float2 hiSize = float2(hiW, hiH);
     const float viewH = float(max(constants.outputHeight, nativeH));
+    const float viewW = float(max(constants.outputViewWidth, nativeW));
     const float bandY = input.uv.y * viewH - (viewH - float(nativeH)) * 0.5;
-    const bool inBand = bandY >= 0.0 && bandY < float(nativeH);
-    const int2 dst = int2(clamp(float2(input.uv.x * nativeSize.x, bandY), 0.0,
-                                nativeSize - 1.0));
+    const float bandX = input.uv.x * viewW - (viewW - float(nativeW)) * 0.5;
+    const bool inBand = bandY >= 0.0 && bandY < float(nativeH) &&
+                        bandX >= 0.0 && bandX < float(nativeW);
+    const int2 dst = int2(clamp(float2(bandX, bandY), 0.0, nativeSize - 1.0));
     const int2 dstHi = int2(clamp(input.uv * hiSize, 0.0, hiSize - 1.0));
 
     // Raster pixels per native pixel, horizontally.

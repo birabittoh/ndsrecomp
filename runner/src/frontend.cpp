@@ -2236,6 +2236,9 @@ struct FrontendPresentation {
     // The shown screen's view height in the single layout: 192, or more for
     // a taller widescreen view (Ver+), whose 2D is its middle 192 lines.
     int main_view_height = kScreenHeight;
+    // Its view width: the screen's own, or more when the view is wider than
+    // the 3D lines (gpu3d.h), the image being its middle columns.
+    int main_view_width = kScreenWidth;
     int canvas_width = kScreenWidth;
     int configured_sample_scale = 1;
     int sample_scale = 1;
@@ -2486,7 +2489,9 @@ void window_content_size(const FrontendPresentation& presentation,
         *width = presentation.screen_widths[screen];
         *height = kScreenHeight;
     } else if (presentation.single) {
-        *width = presentation.screen_widths[presentation.shown_screen & 1];
+        *width = std::max(
+            presentation.screen_widths[presentation.shown_screen & 1],
+            presentation.main_view_width);
         *height = presentation.main_view_height;
     } else {
         *width = presentation.canvas_width;
@@ -2568,8 +2573,14 @@ WideSize dynamic_wide_size(const FrontendPresentation& presentation,
             ? w / std::max<long long>(1, h / kScreenHeight)
             : w * kScreenHeight / h;
         const int shown = presentation.shown_screen & 1;
-        const long long max_width = std::max<long long>(
+        long long max_width = std::max<long long>(
             options.adaptive_max_width[shown], kScreenWidth);
+#if defined(NDS_USE_PLUME)
+        // Past the 3D lines' width only the HD raster can show the view.
+        if (nds_gpu3d_internal_scale() > 1u)
+            max_width = std::max<long long>(max_width,
+                                            kNdsGpu3dMaxViewWidth);
+#endif
         width = std::clamp<long long>(width, kScreenWidth, max_width);
         size.width = static_cast<uint16_t>(width & ~1ll);
         return size;
@@ -5637,8 +5648,12 @@ int nds_run_interactive_frontend(const NdsFrontendOptions& initial_options) {
         if (!g_top_logical_hit.valid) return -1;
         const int left =
             presentation.separate || presentation.single ? 0 : top_content_left;
-        return nds_touch_buttons_hit(presentation.screen_widths[0],
-                                     g_top_logical_hit.x - left,
+        return nds_touch_buttons_hit(
+            presentation.single
+                ? std::max(presentation.screen_widths[0],
+                           presentation.main_view_width)
+                : presentation.screen_widths[0],
+            g_top_logical_hit.x - left,
                                      g_top_logical_hit.y);
     };
     auto show_savestate_result = [&](const NdsSavestateSlotResult& result) {
@@ -6746,8 +6761,15 @@ int nds_run_interactive_frontend(const NdsFrontendOptions& initial_options) {
                       (presentation.shown_screen == 0 ||
                        presentation.inset_percent > 0)));
                 int top_x = 0, top_y = 0;
+                // The top LCD shown as the main screen: its content is the
+                // view, which can be wider than the image.
+                const int top_content_w =
+                    presentation.single && presentation.shown_screen == 0
+                        ? std::max(presentation.screen_widths[0],
+                                   presentation.main_view_width)
+                        : presentation.screen_widths[0];
                 const int top_left =
-                    (presentation.screen_widths[0] - kScreenWidth) / 2 +
+                    (top_content_w - kScreenWidth) / 2 +
                     (presentation.separate || presentation.single
                          ? 0 : top_content_left);
                 const bool over = top_shown &&
@@ -7463,6 +7485,14 @@ int nds_run_interactive_frontend(const NdsFrontendOptions& initial_options) {
                 : kScreenHeight;
             nds_main_view_height_flag().store(presentation.main_view_height,
                                               std::memory_order_relaxed);
+            const int shown = presentation.shown_screen & 1;
+            presentation.main_view_width = presentation.single
+                ? nds_gpu2d_presented_view_width(
+                      shown, presentation.screen_widths[shown])
+                : kScreenWidth;
+            nds_main_view_width_flag().store(
+                presentation.single ? presentation.main_view_width : 0,
+                std::memory_order_relaxed);
             const WideSize wanted = dynamic_wide_size(presentation, options);
             static uint32_t last_wanted = 0;
             static int logged_sizes = 0;

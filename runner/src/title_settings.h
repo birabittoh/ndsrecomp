@@ -212,8 +212,9 @@ int nds_title_inset_overlay(int screen, const uint32_t* pixels, int width,
 
 // Widescreen owned by the title, in the single-screen layout: while the query
 // returns true the main screen takes the window's shape. Wider than 4:3 it
-// gains columns (Hor+, up to 448x192: the guest's projection keeps its
-// vertical field of view); taller, with the HD renderer, it gains lines
+// gains columns (Hor+, up to 448x192, or any width up to
+// kNdsGpu3dMaxViewWidth with the HD renderer: the guest's projection keeps
+// its vertical field of view); taller, with the HD renderer, it gains lines
 // (Ver+, up to 256x512, keeping the horizontal one). The extra columns or
 // lines show 3D only; the 2D keeps its native size and proportions in the
 // centred 256x192, and the second screen stays native. With a query registered the title needs no ROM-hash
@@ -227,8 +228,9 @@ void nds_title_set_wide_query(NdsTitleWideQuery query);
 // For the frontend: whether a query is registered, and its answer.
 bool nds_title_wide_owned();
 bool nds_title_wide_wanted();
-// The main screen's width in LCD pixels, 256 to 448, of the frame being
-// drawn (256 while not wide). Any thread.
+// The main screen's view width in LCD pixels, 256 to kNdsGpu3dMaxViewWidth,
+// of the frame being drawn (256 while not wide). Inset pieces are in a main
+// screen this wide. Any thread.
 int nds_title_wide_width();
 // Its height, 192 to 512 (192 while not taller than 4:3). Inset pieces
 // (nds_title_set_inset_overlay_query) are in a main screen this tall.

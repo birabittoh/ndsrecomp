@@ -164,7 +164,7 @@ void Vertex::DoSavestate(Savestate* file) noexcept
 void GPU3D::SetCurrentRenderer(std::unique_ptr<Renderer3D>&& renderer) noexcept
 {
     CurrentRenderer = std::move(renderer);
-    CurrentRenderer->SetRenderWidth(ShownWidth);
+    CurrentRenderer->SetRenderWidth(LineWidth(ShownWidth));
     CurrentRenderer->Reset(NDS.GPU);
 }
 
@@ -1333,7 +1333,7 @@ void GPU3D::SubmitPolygon() noexcept
 
     u32 vtop = 0, vbot = 0;
     s32 ytop = 192, ybot = 0;
-    s32 xtop = static_cast<s32>(RenderWidth), xbot = 0;
+    s32 xtop = static_cast<s32>(LineWidth(RenderWidth)), xbot = 0;
     u32 wsize = 0;
 
     for (int i = 0; i < nverts; i++)
@@ -1446,8 +1446,9 @@ void GPU3D::ProjectVertex(Vertex* vtx) noexcept
         // so every viewport maps linearly onto it. The end is derived from
         // the sum, not from a scaled width, so viewports the guest emits
         // back to back still tile without a seam.
-        const u32 x_start = (Viewport[0] * RenderWidth) / 256;
-        const u32 x_end = ((Viewport[0] + Viewport[4]) * RenderWidth) / 256;
+        const u32 line_width = LineWidth(RenderWidth);
+        const u32 x_start = (Viewport[0] * line_width) / 256;
+        const u32 x_end = ((Viewport[0] + Viewport[4]) * line_width) / 256;
         viewport_x = x_start;
         viewport_width = x_end - x_start;
     }
@@ -1455,9 +1456,12 @@ void GPU3D::ProjectVertex(Vertex* vtx) noexcept
     {
         const bool enhanced_full_viewport =
             RenderWidth > 256 && Viewport[0] == 0 && Viewport[4] == 256;
-        viewport_width = enhanced_full_viewport ? RenderWidth : Viewport[4];
+        // A view wider than the lines is squeezed into them (clip X is
+        // scaled by the view's width), for a presenter to stretch back.
+        const u32 line_width = LineWidth(RenderWidth);
+        viewport_width = enhanced_full_viewport ? line_width : Viewport[4];
         viewport_x = enhanced_full_viewport
-            ? 0 : Viewport[0] + (RenderWidth - 256) / 2;
+            ? 0 : Viewport[0] + (line_width - 256) / 2;
     }
     u32 posX, posY;
     u32 w = vtx->Position[3];
@@ -2759,7 +2763,7 @@ void GPU3D::LatchShownWidth() noexcept
     ShownHeight = RenderBatchHeight;
     if (ShownWidth == RenderBatchWidth) return;
     ShownWidth = RenderBatchWidth;
-    if (CurrentRenderer) CurrentRenderer->SetRenderWidth(ShownWidth);
+    if (CurrentRenderer) CurrentRenderer->SetRenderWidth(LineWidth(ShownWidth));
 }
 
 void GPU3D::VCount215(GPU& gpu) noexcept
@@ -2778,13 +2782,13 @@ void GPU3D::SetRenderXPos(u16 xpos) noexcept
 void GPU3D::SetRenderWidth(u32 width) noexcept
 {
     if (width < 256) width = 256;
-    if (width > 448) width = 448;
+    if (width > MaxViewWidth) width = MaxViewWidth;
     if (width & 1) width--;
     RenderWidth = width;
     RenderBatchWidth = width;
     ShownWidth = width;
     RenderRequestedWidth = 0;
-    if (CurrentRenderer) CurrentRenderer->SetRenderWidth(width);
+    if (CurrentRenderer) CurrentRenderer->SetRenderWidth(LineWidth(width));
 }
 
 void GPU3D::SetRenderHeight(u32 height) noexcept
@@ -2814,7 +2818,7 @@ void GPU3D::RequestRenderWidth(u32 width) noexcept
     if (width)
     {
         if (width < 256) width = 256;
-        if (width > 448) width = 448;
+        if (width > MaxViewWidth) width = MaxViewWidth;
         width &= ~1u;
     }
     RenderRequestedWidth = width;
@@ -2837,6 +2841,7 @@ bool GPU3D::RenderFrameHasPerspectiveProjection() const noexcept
 
 u32* GPU3D::GetLine(int line) noexcept
 {
+    const int shown = static_cast<int>(LineWidth(ShownWidth));
     if (!AbortFrame)
     {
         u32* rawline = CurrentRenderer->GetLine(line);
@@ -2849,25 +2854,25 @@ u32* GPU3D::GetLine(int line) noexcept
         {
             int i = 0;
             int shift = 512 - RenderXPos;
-            if (shift > static_cast<int>(ShownWidth))
-                shift = static_cast<int>(ShownWidth);
+            if (shift > shown)
+                shift = shown;
             for (; i < shift; i++)
                 ScrolledLine[i] = 0;
-            for (int j = 0; i < static_cast<int>(ShownWidth); i++, j++)
+            for (int j = 0; i < shown; i++, j++)
                 ScrolledLine[i] = rawline[j];
         }
         else
         {
             int i = 0, j = RenderXPos;
-            for (; j < static_cast<int>(ShownWidth); i++, j++)
+            for (; j < shown; i++, j++)
                 ScrolledLine[i] = rawline[j];
-            for (; i < static_cast<int>(ShownWidth); i++)
+            for (; i < shown; i++)
                 ScrolledLine[i] = 0;
         }
     }
     else
     {
-        memset(ScrolledLine, 0, ShownWidth*4);
+        memset(ScrolledLine, 0, shown*4);
     }
 
     return ScrolledLine;
@@ -2875,9 +2880,10 @@ u32* GPU3D::GetLine(int line) noexcept
 
 const u32* GPU3D::GetAttrLine(int line) noexcept
 {
+    const int shown = static_cast<int>(LineWidth(ShownWidth));
     if (AbortFrame)
     {
-        memset(ScrolledAttrLine, 0, ShownWidth * sizeof(u32));
+        memset(ScrolledAttrLine, 0, shown * sizeof(u32));
         return ScrolledAttrLine;
     }
 
@@ -2889,19 +2895,19 @@ const u32* GPU3D::GetAttrLine(int line) noexcept
     {
         int i = 0;
         int shift = 512 - RenderXPos;
-        if (shift > static_cast<int>(ShownWidth))
-            shift = static_cast<int>(ShownWidth);
+        if (shift > shown)
+            shift = shown;
         for (; i < shift; i++)
             ScrolledAttrLine[i] = 0;
-        for (int j = 0; i < static_cast<int>(ShownWidth); i++, j++)
+        for (int j = 0; i < shown; i++, j++)
             ScrolledAttrLine[i] = rawline[j];
     }
     else
     {
         int i = 0, j = RenderXPos;
-        for (; j < static_cast<int>(ShownWidth); i++, j++)
+        for (; j < shown; i++, j++)
             ScrolledAttrLine[i] = rawline[j];
-        for (; i < static_cast<int>(ShownWidth); i++)
+        for (; i < shown; i++)
             ScrolledAttrLine[i] = 0;
     }
     return ScrolledAttrLine;

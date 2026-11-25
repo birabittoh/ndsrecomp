@@ -174,6 +174,15 @@ inline std::atomic<int>& nds_main_view_height_flag() {
     return height;
 }
 
+// The same across: the main screen's view width in LCD columns, 0 when it
+// is the width of the main screen's image. Wider only when the view is
+// wider than the 3D lines can hold (gpu3d.h, nds_gpu3d_output_view_width):
+// the image is then its middle columns. Same thread rules.
+inline std::atomic<int>& nds_main_view_width_flag() {
+    static std::atomic<int> width{0};
+    return width;
+}
+
 // The middle 192 lines of a rect showing a view `view_h` lines tall: where
 // the 2D goes.
 inline NdsPresentRect nds_view_band(const NdsPresentRect& rect, int view_h) {
@@ -184,6 +193,20 @@ inline NdsPresentRect nds_view_band(const NdsPresentRect& rect, int view_h) {
     NdsPresentRect band = rect;
     band.y = rect.y + top;
     band.h = std::max(bottom - top, 1);
+    return band;
+}
+
+// Both ways: the middle `width` x 192 of a rect showing a view `view_w` x
+// `view_h`, where an image `width` columns wide goes.
+inline NdsPresentRect nds_view_band(const NdsPresentRect& rect, int view_w,
+                                    int width, int view_h) {
+    NdsPresentRect band = nds_view_band(rect, view_h);
+    if (view_w <= width || width <= 0 || rect.w <= 0) return band;
+    const long long extra = (view_w - width) / 2;
+    const int left = static_cast<int>(rect.w * extra / view_w);
+    const int right = static_cast<int>(rect.w * (extra + width) / view_w);
+    band.x = rect.x + left;
+    band.w = std::max(right - left, 1);
     return band;
 }
 
