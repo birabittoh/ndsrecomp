@@ -1121,7 +1121,7 @@ void nds_plume3d_render(const melonDS::GPU& gpu, melonDS::Polygon* const* polygo
     Slot& slot = r.slots[r.slot];
     wait_slot(slot);
     const Targets& t = r.targets;
-    const uint32_t render_width = g3.GetRenderWidth();
+    const uint32_t render_width = g3.GetShownWidth();
 
     // Render list.
     r.num_polys = 0;

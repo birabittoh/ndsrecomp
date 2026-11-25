@@ -2233,6 +2233,9 @@ struct FrontendPresentation {
     SDL_Texture* sample_targets[2]{};
     uint32_t window_ids[2]{};
     int screen_widths[2]{kScreenWidth, kScreenWidth};
+    // The shown screen's view height in the single layout: 192, or more for
+    // a taller widescreen view (Ver+), whose 2D is its middle 192 lines.
+    int main_view_height = kScreenHeight;
     int canvas_width = kScreenWidth;
     int configured_sample_scale = 1;
     int sample_scale = 1;
@@ -2484,7 +2487,7 @@ void window_content_size(const FrontendPresentation& presentation,
         *height = kScreenHeight;
     } else if (presentation.single) {
         *width = presentation.screen_widths[presentation.shown_screen & 1];
-        *height = kScreenHeight;
+        *height = presentation.main_view_height;
     } else {
         *width = presentation.canvas_width;
         *height = kScreenHeight * 2;
@@ -2532,6 +2535,52 @@ int presented_screen_points(const FrontendPresentation& presentation) {
 #endif
     return static_cast<int>(std::lround(
         static_cast<double>(rect.h) * kScreenHeight / content_h / density));
+}
+
+// The main screen's view while the title owns widescreen
+// (options.adaptive_dynamic): the window's shape, so the letterboxed rect
+// fills it. Wider than 4:3 adds columns (Hor+, up to the configured maximum
+// width), taller adds lines (Ver+, which only the HD raster can show); native
+// when the title does not want it now, or for a layout or presenter it is
+// not for.
+struct WideSize {
+    uint16_t width = kScreenWidth;
+    uint16_t height = kScreenHeight;
+};
+
+WideSize dynamic_wide_size(const FrontendPresentation& presentation,
+                           const NdsFrontendOptions& options) {
+    WideSize size;
+    if (!options.adaptive_dynamic || !presentation.single ||
+        presentation.stacked || presentation.dual || !presentation.gl_top ||
+        !presentation.windows[0] || !nds_title_wide_wanted())
+        return size;
+    int drawable_w = 0, drawable_h = 0;
+    window_drawable_size(presentation, 0, &drawable_w, &drawable_h);
+    if (drawable_w <= 0 || drawable_h <= 0) return size;
+    // Integer scaling: whole multiples along the short side, and as many
+    // pixels along the other as fit.
+    const bool integer = options.scaling == NdsScalingFilter::Integer &&
+                         options.window_mode == NdsWindowMode::Letterbox;
+    const long long w = drawable_w, h = drawable_h;
+    if (w * kScreenHeight >= h * kScreenWidth) {
+        long long width = integer
+            ? w / std::max<long long>(1, h / kScreenHeight)
+            : w * kScreenHeight / h;
+        const int shown = presentation.shown_screen & 1;
+        const long long max_width = std::max<long long>(
+            options.adaptive_max_width[shown], kScreenWidth);
+        width = std::clamp<long long>(width, kScreenWidth, max_width);
+        size.width = static_cast<uint16_t>(width & ~1ll);
+        return size;
+    }
+    if (nds_gpu3d_internal_scale() <= 1u) return size;
+    long long height = integer
+        ? h / std::max<long long>(1, w / kScreenWidth)
+        : h * kScreenWidth / w;
+    height = std::clamp<long long>(height, kScreenHeight, 512);
+    size.height = static_cast<uint16_t>(height & ~1ll);
+    return size;
 }
 
 // The 3D multiplier the options ask for: with resolution_scale, that percent
@@ -2644,8 +2693,15 @@ void convert_mouse_event_to_logical_coordinates(
         const float py = static_cast<float>(y) * drawable_h / window_h;
         int content_w = 0, content_h = 0;
         window_content_size(presentation, screen, &content_w, &content_h);
+        // The other LCD's own width, for the inset (it can differ from the
+        // shown one's in widescreen).
+        const int inset_content_w = presentation.single
+            ? presentation.screen_widths[(presentation.shown_screen & 1) ^ 1]
+            : content_w;
         NdsPresentRect rect = window_present_rect(
             presentation, screen, drawable_w, drawable_h);
+        int rect_content_w = content_w;
+        bool inset_is_rect = false;
         // With the top LCD shown, the touchscreen is the inset. Either way
         // the result is bottom-LCD coordinates.
         if (presentation.single && presentation.shown_screen == 0 &&
@@ -2655,10 +2711,13 @@ void convert_mouse_event_to_logical_coordinates(
                                      drawable_h, content_w, content_h,
                                      presentation.inset_percent,
                                      presentation.stacked).inset;
+            rect_content_w = inset_content_w;
+            inset_is_rect = true;
         }
         float cx = 0.0f, cy = 0.0f;
-        nds_present_rect_to_content(rect, content_w, content_h, px, py,
-                                    &cx, &cy);
+        const int rect_content_h = inset_is_rect ? kScreenHeight : content_h;
+        nds_present_rect_to_content(rect, rect_content_w, rect_content_h, px,
+                                    py, &cx, &cy);
         g_top_logical_hit = {};
         if (presentation.single && presentation.shown_screen == 0 &&
             presentation.inset_percent > 0) {
@@ -2668,18 +2727,22 @@ void convert_mouse_event_to_logical_coordinates(
             float tx = 0.0f, ty = 0.0f;
             nds_present_rect_to_content(main_rect, content_w, content_h, px,
                                         py, &tx, &ty);
-            bool in_inset = cx >= 0.0f && cx < content_w &&
-                            cy >= 0.0f && cy < content_h;
-            // A cut-up inset: only its pieces are the touchscreen's.
+            bool in_inset = cx >= 0.0f && cx < rect_content_w &&
+                            cy >= 0.0f && cy < rect_content_h;
+            // A cut-up inset: only its pieces are the touchscreen's. Their
+            // dst is in the main screen's pixels.
             const NdsInsetPieces& pieces = nds_inset_pieces();
-            if (in_inset && pieces.count > 0 &&
+            if (pieces.count > 0 &&
                 nds_inset_overlay_flag().load(std::memory_order_relaxed) > 0)
-                in_inset = nds_inset_piece_point(pieces, cx, cy, &cx, &cy);
+                in_inset = tx >= 0.0f && tx < content_w && ty >= 0.0f &&
+                           ty < content_h &&
+                           nds_inset_piece_point(pieces, tx, ty, &cx, &cy);
             if (!in_inset) {
                 cx = -1.0f;
                 cy = -1.0f;
             }
-            g_top_logical_hit = {!in_inset, tx, ty};
+            g_top_logical_hit = {!in_inset, tx,
+                                 ty - float((content_h - kScreenHeight) / 2)};
         } else if (presentation.single && presentation.shown_screen == 1 &&
                    presentation.inset_percent > 0 &&
                    nds_inset_overlay_flag().load(
@@ -2697,10 +2760,10 @@ void convert_mouse_event_to_logical_coordinates(
                 drawable_h, content_w, content_h,
                 presentation.inset_percent, presentation.stacked).inset;
             float tx = 0.0f, ty = 0.0f;
-            nds_present_rect_to_content(inset_rect, content_w, content_h, px,
-                                        py, &tx, &ty);
-            const bool in_inset = tx >= 0.0f && tx < content_w &&
-                                  ty >= 0.0f && ty < content_h;
+            nds_present_rect_to_content(inset_rect, inset_content_w,
+                                        kScreenHeight, px, py, &tx, &ty);
+            const bool in_inset = tx >= 0.0f && tx < inset_content_w &&
+                                  ty >= 0.0f && ty < kScreenHeight;
             g_top_logical_hit = {in_inset, tx, ty};
             if (in_inset) {
                 cx = -1.0f;
@@ -2709,6 +2772,15 @@ void convert_mouse_event_to_logical_coordinates(
         } else {
             g_top_logical_hit = {true, cx, cy};
         }
+        // A widened touchscreen shown as the main screen: its native
+        // columns are the centred ones.
+        if (presentation.single && presentation.shown_screen == 1 &&
+            content_w > kScreenWidth && cx >= 0.0f)
+            cx -= static_cast<float>((content_w - kScreenWidth) / 2);
+        // A taller one: its 2D band is the middle 192 lines.
+        if (presentation.single && presentation.shown_screen == 1 &&
+            content_h > kScreenHeight && cy >= 0.0f)
+            cy -= static_cast<float>((content_h - kScreenHeight) / 2);
         using Coordinate = std::remove_reference_t<decltype(x)>;
         x = static_cast<Coordinate>(std::floor(cx));
         y = static_cast<Coordinate>(std::floor(cy));
@@ -3200,7 +3272,8 @@ bool create_presentation(const NdsFrontendOptions& options,
     presentation.sample_scale = presentation.configured_sample_scale;
     for (int screen = 0; screen < 2; ++screen) {
         const uint8_t bit = static_cast<uint8_t>(1u << screen);
-        if ((options.adaptive_screens & bit) &&
+        // A width that follows the window starts native.
+        if (!options.adaptive_dynamic && (options.adaptive_screens & bit) &&
             (options.adaptive_supported & bit)) {
             presentation.screen_widths[screen] =
                 options.adaptive_max_width[screen];
@@ -7283,6 +7356,31 @@ int nds_run_interactive_frontend(const NdsFrontendOptions& initial_options) {
                 bottom_pixels=nds_gpu2d_adaptive_framebuffer(1,&bottom_width);
             phase_adaptive_ticks+=SDL_GetPerformanceCounter()-adaptive_start;
             observe_top_black_bands(native_top,shown_frames);
+        }
+        if (options.adaptive_dynamic) {
+            // The layout and the touch mapping follow the frame's own
+            // widths; the next frames take the window's.
+            presentation.screen_widths[0] = top_width;
+            presentation.screen_widths[1] = bottom_width;
+            presentation.canvas_width = std::max<int>(top_width, bottom_width);
+            presentation.main_view_height = presentation.single
+                ? nds_gpu2d_presented_view_height(presentation.shown_screen)
+                : kScreenHeight;
+            nds_main_view_height_flag().store(presentation.main_view_height,
+                                              std::memory_order_relaxed);
+            const WideSize wanted = dynamic_wide_size(presentation, options);
+            static uint32_t last_wanted = 0;
+            static int logged_sizes = 0;
+            const uint32_t key = uint32_t(wanted.width) << 16 | wanted.height;
+            if (key != last_wanted && logged_sizes < 200) {
+                ++logged_sizes;
+                last_wanted = key;
+                std::fprintf(stderr, "[display] main screen view -> %ux%u\n",
+                             static_cast<unsigned>(wanted.width),
+                             static_cast<unsigned>(wanted.height));
+            }
+            nds_gpu3d_request_output_width(wanted.width);
+            nds_gpu3d_request_output_height(wanted.height);
         }
         // At most ONE synthetic frame, presented ahead of the real one, so
         // the visible order stays real(N-1), blend(N-1,N), real(N). No

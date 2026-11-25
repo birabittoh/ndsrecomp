@@ -131,6 +131,21 @@ public:
     [[nodiscard]] u16 GetRenderXPos() const noexcept { return RenderXPos; }
     void SetRenderWidth(u32 width) noexcept;
     [[nodiscard]] u32 GetRenderWidth() const noexcept { return RenderWidth; }
+    // A new width for the frames to come, taken at the next buffer swap so a
+    // render list is always projected and drawn at one width (0 = none).
+    void RequestRenderWidth(u32 width) noexcept;
+    // The width the renderer draws the current frame at: the one the shown
+    // render list was projected at, latched at VCount215.
+    [[nodiscard]] u32 GetShownWidth() const noexcept { return ShownWidth; }
+    void LatchShownWidth() noexcept;
+    // The same for a taller view (Ver+): above 192, full-screen viewports
+    // take a taller vertical field of view, squeezed into the 192 lines;
+    // a presenter with a raster of its own stretches it back. 192 is native.
+    void RequestRenderHeight(u32 height) noexcept;
+    [[nodiscard]] u32 GetRenderHeight() const noexcept { return RenderHeight; }
+    [[nodiscard]] u32 GetShownHeight() const noexcept { return ShownHeight; }
+    // At once, as SetRenderWidth (a replayed image's height).
+    void SetRenderHeight(u32 height) noexcept;
     void SetGuestWideProjection(bool enable) noexcept;
     [[nodiscard]] bool GetGuestWideProjection() const noexcept { return GuestWideProjection; }
     [[nodiscard]] bool RenderFrameHasPerspectiveProjection() const noexcept;
@@ -236,6 +251,16 @@ private:
     // Host-only enhanced output width. The hardware-visible viewport and
     // registers remain untouched; 256 is the exact native path.
     u32 RenderWidth = 256;
+    // RenderRequestedWidth waits for a swap; RenderBatchWidth is what the
+    // latched render list was projected at; ShownWidth what the renderer
+    // draws at (see RequestRenderWidth).
+    u32 RenderRequestedWidth = 0;
+    u32 RenderBatchWidth = 256;
+    u32 ShownWidth = 256;
+    u32 RenderHeight = 192;
+    u32 RenderRequestedHeight = 0;
+    u32 RenderBatchHeight = 192;
+    u32 ShownHeight = 192;
     // Asserted per frame by the title-patch layer while the guest itself has
     // been patched to build band-wide frusta. Guest screen X 0..256 then
     // already spans RenderWidth, so the host must not rescale clip X on top of

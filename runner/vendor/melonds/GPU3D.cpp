@@ -163,7 +163,7 @@ void Vertex::DoSavestate(Savestate* file) noexcept
 void GPU3D::SetCurrentRenderer(std::unique_ptr<Renderer3D>&& renderer) noexcept
 {
     CurrentRenderer = std::move(renderer);
-    CurrentRenderer->SetRenderWidth(RenderWidth);
+    CurrentRenderer->SetRenderWidth(ShownWidth);
     CurrentRenderer->Reset(NDS.GPU);
 }
 
@@ -1478,6 +1478,11 @@ void GPU3D::SubmitVertex() noexcept
         vertextrans->Position[0] = static_cast<s32>(
             (static_cast<s64>(vertextrans->Position[0]) * 256) /
             RenderWidth);
+    // Ver+: the same for clip Y, the full-screen viewport being 192 lines.
+    if (RenderHeight > 192 && Viewport[3] == 0 && Viewport[5] == 192)
+        vertextrans->Position[1] = static_cast<s32>(
+            (static_cast<s64>(vertextrans->Position[1]) * 192) /
+            RenderHeight);
 
     // this probably shouldn't be.
     // the way color is handled during clipping needs investigation. TODO
@@ -1708,6 +1713,9 @@ void GPU3D::BoxTest(const u32* params) noexcept
             RenderWidth > 256 && Viewport[0] == 0 && Viewport[4] == 256)
             cube[i].Position[0] = static_cast<s32>(
                 (static_cast<s64>(cube[i].Position[0]) * 256) / RenderWidth);
+        if (RenderHeight > 192 && Viewport[3] == 0 && Viewport[5] == 192)
+            cube[i].Position[1] = static_cast<s32>(
+                (static_cast<s64>(cube[i].Position[1]) * 192) / RenderHeight);
     }
 
     // front face (-Z)
@@ -2672,6 +2680,8 @@ void GPU3D::VBlank() noexcept
 
         if (FlushRequest)
         {
+            RenderBatchWidth = RenderWidth;
+            RenderBatchHeight = RenderHeight;
             CurRAMBank = CurRAMBank?0:1;
             CurVertexRAM = &VertexRAM[CurRAMBank ? 6144 : 0];
             CurPolygonRAM = &PolygonRAM[CurRAMBank ? 2048 : 0];
@@ -2683,10 +2693,33 @@ void GPU3D::VBlank() noexcept
             FlushRequest = 0;
         }
     }
+
+    // A requested width starts with the next list: right after a swap, or
+    // whenever nothing has been projected at the old one yet.
+    if (RenderRequestedWidth && RenderRequestedWidth != RenderWidth &&
+        (!GeometryEnabled || NumPolygons == 0))
+        RenderWidth = RenderRequestedWidth;
+    if (RenderRequestedHeight && RenderRequestedHeight != RenderHeight &&
+        (!GeometryEnabled || NumPolygons == 0))
+        RenderHeight = RenderRequestedHeight;
+    if (!GeometryEnabled || RenderNumPolygons == 0)
+    {
+        RenderBatchWidth = RenderWidth;
+        RenderBatchHeight = RenderHeight;
+    }
+}
+
+void GPU3D::LatchShownWidth() noexcept
+{
+    ShownHeight = RenderBatchHeight;
+    if (ShownWidth == RenderBatchWidth) return;
+    ShownWidth = RenderBatchWidth;
+    if (CurrentRenderer) CurrentRenderer->SetRenderWidth(ShownWidth);
 }
 
 void GPU3D::VCount215(GPU& gpu) noexcept
 {
+    LatchShownWidth();
     CurrentRenderer->RenderFrame(gpu);
 }
 
@@ -2703,7 +2736,43 @@ void GPU3D::SetRenderWidth(u32 width) noexcept
     if (width > 448) width = 448;
     if (width & 1) width--;
     RenderWidth = width;
+    RenderBatchWidth = width;
+    ShownWidth = width;
+    RenderRequestedWidth = 0;
     if (CurrentRenderer) CurrentRenderer->SetRenderWidth(width);
+}
+
+void GPU3D::SetRenderHeight(u32 height) noexcept
+{
+    if (height < 192) height = 192;
+    if (height > 512) height = 512;
+    height &= ~1u;
+    RenderHeight = height;
+    RenderBatchHeight = height;
+    ShownHeight = height;
+    RenderRequestedHeight = 0;
+}
+
+void GPU3D::RequestRenderHeight(u32 height) noexcept
+{
+    if (height)
+    {
+        if (height < 192) height = 192;
+        if (height > 512) height = 512;
+        height &= ~1u;
+    }
+    RenderRequestedHeight = height;
+}
+
+void GPU3D::RequestRenderWidth(u32 width) noexcept
+{
+    if (width)
+    {
+        if (width < 256) width = 256;
+        if (width > 448) width = 448;
+        width &= ~1u;
+    }
+    RenderRequestedWidth = width;
 }
 
 void GPU3D::SetGuestWideProjection(bool enable) noexcept
@@ -2735,25 +2804,25 @@ u32* GPU3D::GetLine(int line) noexcept
         {
             int i = 0;
             int shift = 512 - RenderXPos;
-            if (shift > static_cast<int>(RenderWidth))
-                shift = static_cast<int>(RenderWidth);
+            if (shift > static_cast<int>(ShownWidth))
+                shift = static_cast<int>(ShownWidth);
             for (; i < shift; i++)
                 ScrolledLine[i] = 0;
-            for (int j = 0; i < static_cast<int>(RenderWidth); i++, j++)
+            for (int j = 0; i < static_cast<int>(ShownWidth); i++, j++)
                 ScrolledLine[i] = rawline[j];
         }
         else
         {
             int i = 0, j = RenderXPos;
-            for (; j < static_cast<int>(RenderWidth); i++, j++)
+            for (; j < static_cast<int>(ShownWidth); i++, j++)
                 ScrolledLine[i] = rawline[j];
-            for (; i < static_cast<int>(RenderWidth); i++)
+            for (; i < static_cast<int>(ShownWidth); i++)
                 ScrolledLine[i] = 0;
         }
     }
     else
     {
-        memset(ScrolledLine, 0, RenderWidth*4);
+        memset(ScrolledLine, 0, ShownWidth*4);
     }
 
     return ScrolledLine;
@@ -2763,7 +2832,7 @@ const u32* GPU3D::GetAttrLine(int line) noexcept
 {
     if (AbortFrame)
     {
-        memset(ScrolledAttrLine, 0, RenderWidth * sizeof(u32));
+        memset(ScrolledAttrLine, 0, ShownWidth * sizeof(u32));
         return ScrolledAttrLine;
     }
 
@@ -2775,19 +2844,19 @@ const u32* GPU3D::GetAttrLine(int line) noexcept
     {
         int i = 0;
         int shift = 512 - RenderXPos;
-        if (shift > static_cast<int>(RenderWidth))
-            shift = static_cast<int>(RenderWidth);
+        if (shift > static_cast<int>(ShownWidth))
+            shift = static_cast<int>(ShownWidth);
         for (; i < shift; i++)
             ScrolledAttrLine[i] = 0;
-        for (int j = 0; i < static_cast<int>(RenderWidth); i++, j++)
+        for (int j = 0; i < static_cast<int>(ShownWidth); i++, j++)
             ScrolledAttrLine[i] = rawline[j];
     }
     else
     {
         int i = 0, j = RenderXPos;
-        for (; j < static_cast<int>(RenderWidth); i++, j++)
+        for (; j < static_cast<int>(ShownWidth); i++, j++)
             ScrolledAttrLine[i] = rawline[j];
-        for (; i < static_cast<int>(RenderWidth); i++)
+        for (; i < static_cast<int>(ShownWidth); i++)
             ScrolledAttrLine[i] = 0;
     }
     return ScrolledAttrLine;

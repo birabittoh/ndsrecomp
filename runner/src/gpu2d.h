@@ -82,6 +82,9 @@ void nds_gpu2d_hold_screen(int screen, uint32_t frames);
 // scanlines latched it (POWCNT1 bit 15 of the last line), never the live
 // register: 0 when engine A ("main") drew the top LCD, 1 for the bottom.
 int nds_gpu2d_presented_main_screen();
+// The 3D view height (gpu3d.h, nds_gpu3d_request_output_height) of that
+// frame on `screen`: above 192 only on engine A's LCD of a Ver+ frame.
+int nds_gpu2d_presented_view_height(int screen);
 // True when neither LCD showed an image in that frame (each engine powered
 // off, force-blanked, or in display mode 0) -- a fade or transition frame.
 bool nds_gpu2d_presented_both_blank();
@@ -98,6 +101,10 @@ void nds_gpu2d_set_adaptive_hud_anchor(bool enabled,
 // not been audited yet. The presenter still uses the adaptive window width,
 // but the source pixels remain a centered native-width composite.
 void nds_gpu2d_set_adaptive_center_native(bool enabled);
+// Keeps every 2D layer, OBJs included, inside the centred native columns of
+// a widened frame (the margins show only 3D), and engine B's screen at its
+// native width. For titles whose 2D is authored for 4:3 only.
+void nds_gpu2d_set_adaptive_native_2d(bool enabled);
 void nds_gpu2d_set_adaptive_center_max_polygons(uint32_t max_polygons);
 
 // Narrow host-only seam used by the accelerated separate-window presenter.
@@ -157,6 +164,13 @@ struct NdsGpu2dHdFrame {
     // The hi-res 3D surface is unscrolled, unlike the CPU wide line which has
     // RenderXPos already applied, so the presenter applies it itself.
     uint16_t render_xpos;
+    // The view's height in native lines: above 192 (Ver+) the surfaces are
+    // its middle 192 rows, and the rows above and below show only the
+    // backdrop (`backdrop`, an RGB6 colour as [0]; `backdrop_meta` as [1])
+    // with the 3D in front.
+    uint16_t height;
+    uint32_t backdrop;
+    uint32_t backdrop_meta;
 };
 // Enabled only while internal resolution > 1. Emission costs an extra pair of
 // stores per pixel in the adaptive loop, so it stays off at 1x.

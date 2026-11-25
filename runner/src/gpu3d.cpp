@@ -62,6 +62,9 @@ using NdsAcceleratedRenderer = melonDS::ComputeRenderer;
 #endif
 
 namespace {
+// nds_gpu3d_request_output_width: 0 for none.
+std::atomic<uint16_t> g_requested_output_width{0};
+std::atomic<uint16_t> g_requested_output_height{0};
 
 melonDS::NDS g_nds;
 #if defined(NDS_USE_NATIVE_GL)
@@ -523,6 +526,7 @@ melonDS::SoftRenderer* deferred_soft_renderer() {
 // that has to match the hardware turns up: see nds_gpu3d_cpu_frame_deferred.
 void plume_vcount215() {
     auto& g3 = g_nds.GPU.GPU3D;
+    g3.LatchShownWidth();
     auto* soft = dynamic_cast<melonDS::SoftRenderer*>(&g3.GetCurrentRenderer());
     g_cpu_frame_deferred = false;
     // A frame drawn on demand starts at line 0 and holds the 2D latch up
@@ -1658,6 +1662,12 @@ void nds_gpu3d_vblank() {
 #if defined(NDS_USE_PLUME)
     plume_drop_deferred_frame();
 #endif
+    if (const uint16_t width =
+            g_requested_output_width.load(std::memory_order_relaxed))
+        g3.RequestRenderWidth(width);
+    if (const uint16_t height =
+            g_requested_output_height.load(std::memory_order_relaxed))
+        g3.RequestRenderHeight(height);
     g3.VBlank();
 #if defined(NDS_USE_PLUME)
     // The soft renderer stays faithful; only the Plume raster shows the
@@ -1797,13 +1807,13 @@ const uint32_t* nds_gpu3d_line(int line) {
 #endif
     if (!profiling()) {
         const uint32_t* result = g_nds.GPU.GPU3D.GetLine(line);
-        return result + (g_nds.GPU.GPU3D.GetRenderWidth() - 256u) / 2u;
+        return result + (g_nds.GPU.GPU3D.GetShownWidth() - 256u) / 2u;
     }
     const auto start = ProfileClock::now();
     const uint32_t* result = g_nds.GPU.GPU3D.GetLine(line);
     profile_add(g_gpu3d_profile.getline_ns, start);
     ++g_gpu3d_profile.getline_calls;
-    return result + (g_nds.GPU.GPU3D.GetRenderWidth() - 256u) / 2u;
+    return result + (g_nds.GPU.GPU3D.GetShownWidth() - 256u) / 2u;
 }
 
 bool nds_gpu3d_set_output_width(uint16_t width) {
@@ -1816,7 +1826,29 @@ bool nds_gpu3d_set_output_width(uint16_t width) {
 }
 
 uint16_t nds_gpu3d_output_width() {
-    return static_cast<uint16_t>(g_nds.GPU.GPU3D.GetRenderWidth());
+    return static_cast<uint16_t>(g_nds.GPU.GPU3D.GetShownWidth());
+}
+
+bool nds_gpu3d_request_output_height(uint16_t height) {
+    if (g_nds.GPU.GPU3D.IsRendererAccelerated()) return false;
+    if (height < 192u) height = 192u;
+    if (height > 512u) height = 512u;
+    g_requested_output_height.store(static_cast<uint16_t>(height & ~1u),
+                                    std::memory_order_relaxed);
+    return true;
+}
+
+uint16_t nds_gpu3d_output_height() {
+    return static_cast<uint16_t>(g_nds.GPU.GPU3D.GetShownHeight());
+}
+
+bool nds_gpu3d_request_output_width(uint16_t width) {
+    if (g_nds.GPU.GPU3D.IsRendererAccelerated()) return false;
+    if (width < 256u) width = 256u;
+    if (width > 448u) width = 448u;
+    g_requested_output_width.store(static_cast<uint16_t>(width & ~1u),
+                                   std::memory_order_relaxed);
+    return true;
 }
 
 void nds_gpu3d_set_guest_wide_projection(bool enabled) {

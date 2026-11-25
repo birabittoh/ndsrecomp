@@ -205,7 +205,21 @@ void nds_gpu3d_draw_deferred_frame(bool for_capture);
 // returns the centered 256-pixel hardware viewport for the faithful 2D
 // compositor; wide_line exposes the complete enhanced surface.
 bool nds_gpu3d_set_output_width(uint16_t width);
+// The width of the frame being drawn (and of its lines).
 uint16_t nds_gpu3d_output_width();
+// A width for the frames to come, from any thread: taken at a VBlank, with
+// the next render list, so every frame is projected and drawn at one width.
+// False (and ignored) where the width is fixed: an accelerated renderer
+// sized at startup.
+bool nds_gpu3d_request_output_width(uint16_t width);
+// Ver+: a taller view, 192 (native) to 512 lines, requested and taken the
+// same way. The 192 native lines then hold the whole taller view squeezed:
+// only a presenter that draws its own 3D raster (the HD path) can show it,
+// stretched back over a rect that tall. Same thread rules; false where the
+// width is fixed too.
+bool nds_gpu3d_request_output_height(uint16_t height);
+// The view height of the frame being drawn.
+uint16_t nds_gpu3d_output_height();
 // Asserted every frame by the title-patch layer (title_patches.cpp) once it
 // has verified its guest-side wide-frustum words are resident. While set, the
 // engine stops rescaling clip X and maps every guest viewport linearly across

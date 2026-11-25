@@ -393,6 +393,7 @@ void nds_gx_capture_state(const GPU3D& g, NdsGxGeometryState* s) {
     s->num_consecutive_polygons = g.NumConsecutivePolygons;
     s->render_width = g.GetRenderWidth();
     s->guest_wide = g.GetGuestWideProjection() ? 1 : 0;
+    s->render_height = g.GetRenderHeight();
     std::memcpy(s->temp_vertices, g.TempVertexBuffer, sizeof(s->temp_vertices));
 }
 
@@ -441,6 +442,7 @@ void nds_gx_apply_state(const NdsGxGeometryState& s, GPU3D* out) {
     std::memcpy(g.TempVertexBuffer, s.temp_vertices, sizeof(s.temp_vertices));
     if (g.GetRenderWidth() != s.render_width) g.SetRenderWidth(s.render_width);
     g.SetGuestWideProjection(s.guest_wide != 0);
+    if (g.GetRenderHeight() != s.render_height) g.SetRenderHeight(s.render_height);
 }
 
 void NdsGxRecorder::attach(GPU3D& gpu3d) {

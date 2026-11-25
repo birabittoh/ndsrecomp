@@ -10,6 +10,10 @@
 // size the host chose, with no whole-multiple relation between the two: both
 // are addressed from the same uv, so a 5.625x raster composes exactly like a
 // 6x one. RenderXPos is a native-pixel scroll, applied here in raster pixels.
+//
+// A view taller than 192 lines (Ver+, outputHeight) has the 2D surfaces in
+// its middle 192 rows and only the backdrop, with the 3D in front, above and
+// below; the raster covers the whole view.
 
 struct VSOutput {
     float4 position : SV_POSITION;
@@ -32,9 +36,9 @@ struct Constants {
     uint evy;
     uint priority3d;
     uint order3d;
-    uint pad0;
-    uint pad1;
-    uint pad2;
+    uint outputHeight;   // the view's native lines; 0 or 192 = the surfaces'
+    uint backdrop;       // the backdrop as a surface texel, for the rows
+    uint backdropMeta;   // above and below them
 } constants;
 
 uint3 Blend16(uint3 a, uint3 b, uint ca, uint cb) {
@@ -115,7 +119,11 @@ float4 PSMain(VSOutput input) : SV_TARGET {
     tex3d.GetDimensions(hiW, hiH);
     const float2 nativeSize = float2(nativeW, nativeH);
     const float2 hiSize = float2(hiW, hiH);
-    const int2 dst = int2(clamp(input.uv * nativeSize, 0.0, nativeSize - 1.0));
+    const float viewH = float(max(constants.outputHeight, nativeH));
+    const float bandY = input.uv.y * viewH - (viewH - float(nativeH)) * 0.5;
+    const bool inBand = bandY >= 0.0 && bandY < float(nativeH);
+    const int2 dst = int2(clamp(float2(input.uv.x * nativeSize.x, bandY), 0.0,
+                                nativeSize - 1.0));
     const int2 dstHi = int2(clamp(input.uv * hiSize, 0.0, hiSize - 1.0));
 
     // Raster pixels per native pixel, horizontally.
@@ -134,7 +142,10 @@ float4 PSMain(VSOutput input) : SV_TARGET {
         }
     }
 
-    const uint4 layers = texLayers.Load(int3(dst, 0));
+    const uint4 layers = inBand
+        ? texLayers.Load(int3(dst, 0))
+        : uint4(constants.backdrop, constants.backdropMeta,
+                constants.backdrop, constants.backdropMeta);
     const uint2 topTexel = layers.xy;
     Layer top = UnpackLayer(topTexel);
     Layer below = UnpackLayer(layers.zw);

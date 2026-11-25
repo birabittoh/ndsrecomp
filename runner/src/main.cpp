@@ -53,6 +53,7 @@
 #include "frontend.h"
 #include "gpu2d.h"
 #include "gpu3d.h"
+#include "title_settings.h"
 #include "live_overlay.h"
 #include "live_overlay_platform.h"
 #include "melonds_compute/TextureUpscale.h"
@@ -2401,6 +2402,18 @@ int main(int argc, char** argv) {
         sm64ds_wide_policy = true;
     }
 #endif
+    // A title that owns its widescreen (title_settings.h) widens the main
+    // screen on its own terms: whichever LCD engine A is on, the width from
+    // the window, the 2D kept native.
+    const bool title_wide = interactive && nds_title_wide_owned();
+    if (title_wide) {
+        frontend_options.adaptive_supported = NDS_ADAPTIVE_BOTH;
+        frontend_options.adaptive_screens = NDS_ADAPTIVE_BOTH;
+        frontend_options.adaptive_max_width[0] = 448;
+        frontend_options.adaptive_max_width[1] = 448;
+        frontend_options.adaptive_dynamic = true;
+    }
+    nds_gpu2d_set_adaptive_native_2d(title_wide);
     if (interactive &&
         (frontend_options.adaptive_screens &
          ~frontend_options.adaptive_supported) != 0u) {

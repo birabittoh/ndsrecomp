@@ -115,7 +115,9 @@ struct ComposeConstants {
     uint32_t evy;
     uint32_t priority_3d;
     uint32_t order_3d;
-    uint32_t pad[3];
+    uint32_t output_height;
+    uint32_t backdrop;
+    uint32_t backdrop_meta;
 };
 
 // The HD surfaces (NdsGpu2dHdFrame), both in one RGBA32UI texture: top
@@ -1040,20 +1042,23 @@ void record_compose(FrameSlot& slot, RenderTexture* raster, const NdsGpu2dHdFram
     constants.evy = hd.evy;
     constants.priority_3d = hd.priority_3d;
     constants.order_3d = hd.order_3d;
+    constants.output_height = hd.height;
+    constants.backdrop = hd.backdrop;
+    constants.backdrop_meta = hd.backdrop_meta;
     commands.setGraphicsPushConstants(0, &constants, 0, sizeof(constants));
     commands.drawInstanced(3, 1, 0, 0);
 }
 
 // The 3D raster for a presented rect: resolution_scale percent of the rect
 // itself, any size, or the fixed internal_resolution multiple of native.
-void request_raster(const NdsPresentRect& rect, int width) {
+void request_raster(const NdsPresentRect& rect, int width, int height) {
     uint32_t raster_w, raster_h;
     if (g_raster_percent > 0) {
         raster_w = uint32_t((uint64_t(std::max(rect.w, 1)) * g_raster_percent + 50) / 100);
         raster_h = uint32_t((uint64_t(std::max(rect.h, 1)) * g_raster_percent + 50) / 100);
     } else {
         raster_w = uint32_t(width) * g_raster_fixed;
-        raster_h = kHeight * g_raster_fixed;
+        raster_h = uint32_t(height) * g_raster_fixed;
     }
     // Outlines are one presented pixel wide: as many raster pixels as the
     // raster has per pixel of the rect. A DS pixel scaled up with the 3D is
@@ -1273,13 +1278,17 @@ bool nds_compute_host_present_top(const unsigned int* fallback_pixels,
     if (chain.isEmpty() || g_backend.framebuffers.empty()) return true;
     const uint32_t fb_width = chain.getWidth();
     const uint32_t fb_height = chain.getHeight();
+    // A taller view (Ver+) is that many lines; its 2D the middle 192.
+    const int view_h = std::max(int(kHeight),
+        nds_main_view_height_flag().load(std::memory_order_relaxed));
     const NdsSingleLayout layout = nds_single_layout(
         g_window_mode, g_scaling, int(fb_width), int(fb_height), width,
-        int(kHeight), g_inset_percent, nds_stack_vertically_flag().load());
+        view_h, g_inset_percent, nds_stack_vertically_flag().load());
     const NdsPresentRect& rect = layout.main;
+    const NdsPresentRect band = nds_view_band(rect, view_h);
     // Size the next 3D frame by this rect: from here on 3D follows the
     // window pixel for pixel, whatever its size.
-    request_raster(rect, width);
+    request_raster(rect, width, view_h);
 
     // HD: the compositor's layer surfaces for this frame plus a Plume raster.
     NdsGpu2dHdFrame hd{};
@@ -1398,12 +1407,14 @@ bool nds_compute_host_present_top(const unsigned int* fallback_pixels,
         // density: nearest at the exact rect, bilinear resampled, and a box
         // resolve where integer (or nearest at 2x and up) would otherwise
         // skip source texels.
-        const bool supersampled = width > rect.w || int(kHeight) > rect.h;
+        // A taller view's CPU frame is its 2D band only (its 3D is the
+        // squeezed one): drawn there, the rows around it left black.
+        const bool supersampled = width > band.w || int(kHeight) > band.h;
         const bool box_resolve =
             (g_scaling == NdsScalingFilter::Integer && supersampled) ||
-            (g_scaling == NdsScalingFilter::Nearest && width >= 2 * rect.w &&
-             int(kHeight) >= 2 * rect.h);
-        record_blit(slot, kMain, rect, bilinear && !box_resolve,
+            (g_scaling == NdsScalingFilter::Nearest && width >= 2 * band.w &&
+             int(kHeight) >= 2 * band.h);
+        record_blit(slot, kMain, band, bilinear && !box_resolve,
                     box_resolve ? kBlitBoxResolve : 0u, fb_width, fb_height);
     }
     if (layer) {
@@ -1414,10 +1425,10 @@ bool nds_compute_host_present_top(const unsigned int* fallback_pixels,
             return int(std::lround(double(size) * fraction));
         };
         const NdsPresentRect layer_rect{
-            rect.x + pixels(rect.w, g_layer_rect[0]),
-            rect.y + pixels(rect.h, g_layer_rect[1]),
-            std::max(pixels(rect.w, g_layer_rect[2]), 1),
-            std::max(pixels(rect.h, g_layer_rect[3]), 1)};
+            band.x + pixels(band.w, g_layer_rect[0]),
+            band.y + pixels(band.h, g_layer_rect[1]),
+            std::max(pixels(band.w, g_layer_rect[2]), 1),
+            std::max(pixels(band.h, g_layer_rect[3]), 1)};
         // The main filter, on a premultiplied image. No box resolve.
         record_blit(slot, kLayer, layer_rect, bilinear,
                     kBlitKeepAlpha | kBlitPremultiplied, fb_width, fb_height);
@@ -1434,7 +1445,7 @@ bool nds_compute_host_present_top(const unsigned int* fallback_pixels,
             // lands on its rect, cut to that rect.
             for (int i = 0; i < pieces.count; ++i) {
                 NdsPresentRect clip{}, view{};
-                if (nds_inset_piece_rects(rect, width, int(kHeight),
+                if (nds_inset_piece_rects(rect, width, view_h,
                                           int(g_inset_width), int(kHeight),
                                           pieces.piece[i], &clip, &view))
                     record_blit(slot, kInset, view,
@@ -1447,7 +1458,7 @@ bool nds_compute_host_present_top(const unsigned int* fallback_pixels,
         }
     }
     if (overlay)
-        record_blit(slot, kOverlay, rect, bilinear, kBlitKeepAlpha, fb_width,
+        record_blit(slot, kOverlay, band, bilinear, kBlitKeepAlpha, fb_width,
                     fb_height);
     commands.barriers(RenderBarrierStage::NONE,
                       RenderTextureBarrier(backbuffer, RenderTextureLayout::PRESENT));

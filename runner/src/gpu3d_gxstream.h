@@ -62,6 +62,7 @@ struct NdsGxGeometryState {
     uint32_t num_consecutive_polygons = 0;
     uint32_t render_width = 256;
     uint32_t guest_wide = 0;
+    uint32_t render_height = 192;
     melonDS::Vertex temp_vertices[4] = {};
 };
 

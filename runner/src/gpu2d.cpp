@@ -135,6 +135,7 @@ std::array<AdaptiveFrame, 2> g_wide_3d_attr_frame{};
 std::array<uint16_t, 2> g_wide_3d_width{};
 bool g_adaptive_skybox_fill = false;
 bool g_adaptive_center_native = false;
+bool g_adaptive_native_2d = false;
 uint32_t g_adaptive_center_max_polygons = 0;
 std::array<AdaptiveFrame, 2> g_direct_object_frame{};
 NdsGpu2dDirectFrame g_direct_current_frame{};
@@ -203,6 +204,11 @@ uint32_t g_frames_since_hd_present = ~0u;
 // Per back buffer: engine A lines of this frame went without their 3D line
 // because the presenter was expected to show the HD raster instead.
 std::array<bool, 2> g_frame_3d_skipped{};
+// The 3D width each buffer's lines were drawn with: the width can change
+// between frames (nds_gpu3d_request_output_width), and a frame is composed
+// at the width its 3D has.
+std::array<uint16_t, 2> g_frame_3d_width{256, 256};
+std::array<uint16_t, 2> g_frame_3d_height{192, 192};
 // The frame being latched has a line that reads the CPU 3D raster (see
 // nds_gpu2d_expects_cpu_3d).
 bool g_frame_reads_cpu_3d = false;
@@ -1777,7 +1783,11 @@ void latch_line(int y, LineJob& job) {
     // scanline-semaphore tokens, so no other thread may call it.
     const bool engine_a_renders =
         job.engine_active[0] && !line_forceblank(job, 0);
-    if (y == 0) g_frame_3d_skipped[job.buffer] = false;
+    if (y == 0) {
+        g_frame_3d_skipped[job.buffer] = false;
+        g_frame_3d_width[job.buffer] = nds_gpu3d_output_width();
+        g_frame_3d_height[job.buffer] = nds_gpu3d_output_height();
+    }
     const bool capture_uses_3d = job.cap &&
         ((job.unit[0].capture >> 29) & 3u) != 1u &&
         ((job.unit[0].capture & (1u << 24)) || job.bg0_3d);
@@ -1814,7 +1824,7 @@ void latch_line(int y, LineJob& job) {
             job.line3d = job.line3d_storage.data();
         }
         if (job.bg0_3d) {
-            const uint16_t wide_width = nds_gpu3d_output_width();
+            const uint16_t wide_width = g_frame_3d_width[job.buffer];
             if (wide_width > 256u &&
                 wide_width <= static_cast<uint16_t>(kMaxAdaptiveWidth)) {
                 const size_t offset = static_cast<size_t>(y) * wide_width;
@@ -2286,6 +2296,8 @@ void nds_gpu2d_reset(){
     for (auto& frame : g_wide_3d_frame) frame.fill(0u);
     for (auto& frame : g_wide_3d_attr_frame) frame.fill(0u);
     g_wide_3d_width.fill(0u);
+    g_frame_3d_width.fill(nds_gpu3d_output_width());
+    g_frame_3d_height.fill(nds_gpu3d_output_height());
     for (auto& frame : g_direct_object_frame) frame.fill(0u);
 }
 void nds_gpu2d_stop(){
@@ -2420,6 +2432,8 @@ bool gpu2d_savestate_import(const NdsGpu2dSaveState& in,
     for (auto& frame : g_wide_3d_frame) frame.fill(0u);
     for (auto& frame : g_wide_3d_attr_frame) frame.fill(0u);
     g_wide_3d_width.fill(0u);
+    g_frame_3d_width.fill(nds_gpu3d_output_width());
+    g_frame_3d_height.fill(nds_gpu3d_output_height());
     for (auto& frame : g_direct_object_frame) frame.fill(0u);
     return true;
 }
@@ -2633,6 +2647,12 @@ int nds_gpu2d_presented_main_screen(){
     drain_pool(NDS_GPU2D_FENCE_PRESENT);
     return g_route_main_screen[g_front];
 }
+int nds_gpu2d_presented_view_height(int screen){
+    drain_pool(NDS_GPU2D_FENCE_PRESENT);
+    if (g_route_main_screen[g_front] != static_cast<uint8_t>(screen & 1))
+        return 192;
+    return g_frame_3d_height[g_front];
+}
 bool nds_gpu2d_presented_both_blank(){
     drain_pool(NDS_GPU2D_FENCE_PRESENT);
     return g_route_both_blank[g_front] != 0u;
@@ -2701,6 +2721,10 @@ void nds_gpu2d_set_adaptive_hud_anchor(bool enabled,
     g_adaptive_hud_anchor = enabled;
     g_adaptive_hud_center_width =
         std::clamp<int>(center_width, 8, 256);
+}
+
+void nds_gpu2d_set_adaptive_native_2d(bool enabled) {
+    g_adaptive_native_2d = enabled;
 }
 
 void nds_gpu2d_set_adaptive_center_native(bool enabled) {
@@ -3005,7 +3029,8 @@ void composite_adaptive_line(const AdaptiveCtx& c, int y,
                 push(pixel);
             }
         }
-        if (obj[x].valid && (window_mask & 0x10u)) {
+        if (obj[x].valid && (window_mask & 0x10u) &&
+            (!g_adaptive_native_2d || hud_x >= 0)) {
             const int hx = hud_x, hy = y;
             const bool keep = hx >= c.obj_keep[0] && hx < c.obj_keep[2] &&
                               hy >= c.obj_keep[1] && hy < c.obj_keep[3];
@@ -3251,12 +3276,13 @@ const uint32_t* nds_gpu2d_adaptive_framebuffer(int screen, uint16_t* width) {
         if (width) *width = 256;
         return native;
     }
-    const int output_width = nds_gpu3d_output_width();
+    const int output_width = g_frame_3d_width[g_front];
     const bool fixed_wanted =
         engine == 0 && screen == g_hd_screen &&
         nds_gpu2d_fixed_layers_requested();
     if (output_width < 256 ||
-        (output_width == 256 && !g_hd_emit_enabled && !fixed_wanted)) {
+        (output_width == 256 &&
+         ((!g_hd_emit_enabled && !fixed_wanted) || screen != g_hd_screen))) {
         if (width) *width = 256;
         return native;
     }
@@ -3290,7 +3316,16 @@ const uint32_t* nds_gpu2d_adaptive_framebuffer(int screen, uint16_t* width) {
                         adaptive.data() + y * output_width + extra);
         return adaptive.data();
     };
-    if (engine != 0) return center_native(NDS_GPU2D_ADAPTIVE_ENGINE_B);
+    if (engine != 0) {
+        // With the 2D kept native, engine B's screen is never widened: it is
+        // handed over as it is (the second screen of a single-screen layout).
+        if (g_adaptive_native_2d) {
+            ++g_adaptive_fallback_frames[NDS_GPU2D_ADAPTIVE_ENGINE_B];
+            if (width) *width = 256;
+            return native;
+        }
+        return center_native(NDS_GPU2D_ADAPTIVE_ENGINE_B);
+    }
     if (g_adaptive_center_native)
         return center_native(NDS_GPU2D_ADAPTIVE_CENTER_NATIVE);
     if (g_adaptive_center_max_polygons != 0u &&
@@ -3344,6 +3379,17 @@ const uint32_t* nds_gpu2d_adaptive_framebuffer(int screen, uint16_t* width) {
         reject = NDS_GPU2D_ADAPTIVE_CAPTURE;
     else if (nds_title_patches_mph_adaptive_centered_native())
         reject = NDS_GPU2D_ADAPTIVE_TITLE_CENTERED;
+    {
+        static int logged_reason = -1;
+        static uint32_t logged = 0;
+        if (static_cast<int>(reject) != logged_reason && logged < 64u) {
+            ++logged;
+            logged_reason = static_cast<int>(reject);
+            std::fprintf(stderr, "[gpu2d] adaptive %d wide: %s\n",
+                         output_width,
+                         nds_gpu2d_adaptive_fallback_name(reject));
+        }
+    }
     if (reject != NDS_GPU2D_ADAPTIVE_WIDE) return center_native(reject);
     ++g_adaptive_fallback_frames[NDS_GPU2D_ADAPTIVE_WIDE];
 
@@ -3444,6 +3490,9 @@ const uint32_t* nds_gpu2d_adaptive_framebuffer(int screen, uint16_t* width) {
         g_hd_frame.evb = static_cast<uint8_t>(u.evb);
         g_hd_frame.evy = static_cast<uint8_t>(u.evy);
         g_hd_frame.render_xpos = nds_gpu3d_render_xpos();
+        g_hd_frame.height = g_frame_3d_height[g_front];
+        g_hd_frame.backdrop = backdrop.color;
+        g_hd_frame.backdrop_meta = hd_meta(backdrop, 0x3Fu);
         g_hd_frame_valid = true;
         ++g_hd_frames;
     }

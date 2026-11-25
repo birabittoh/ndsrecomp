@@ -166,6 +166,27 @@ inline std::atomic<int>& nds_inset_overlay_flag() {
     return percent;
 }
 
+// The main screen's view height in LCD lines for this frame: 192, or more
+// for a taller widescreen view (Ver+, gpu3d.h). Its 2D is the middle 192
+// lines. Set and read on the frontend thread.
+inline std::atomic<int>& nds_main_view_height_flag() {
+    static std::atomic<int> height{192};
+    return height;
+}
+
+// The middle 192 lines of a rect showing a view `view_h` lines tall: where
+// the 2D goes.
+inline NdsPresentRect nds_view_band(const NdsPresentRect& rect, int view_h) {
+    if (view_h <= 192 || rect.h <= 0) return rect;
+    const long long extra = (view_h - 192) / 2;
+    const int top = static_cast<int>(rect.h * extra / view_h);
+    const int bottom = static_cast<int>(rect.h * (extra + 192) / view_h);
+    NdsPresentRect band = rect;
+    band.y = rect.y + top;
+    band.h = std::max(bottom - top, 1);
+    return band;
+}
+
 // The pieces the title cut the inset into this frame (title_settings.h); 0
 // draws the inset whole. The overlay is then at 100%: the inset rect is the
 // main one, and the pieces' dst are in its content pixels. Set and read on
@@ -251,10 +272,16 @@ inline NdsSingleLayout nds_single_layout(NdsWindowMode mode,
         layout.main = nds_present_rect(mode, scaling, drawable_w, drawable_h,
                                        content_w, content_h);
         const NdsPresentRect& main = layout.main;
-        // Two LCD pixels off the edges.
+        // Two LCD pixels off the edges. The inset is a native 256-wide LCD
+        // at the main screen's scale, which may be wider (widescreen).
         const int margin = overlay < 100 ? main.h * 2 / content_h : 0;
-        layout.inset.w = std::max(main.w * overlay / 100, 1);
-        layout.inset.h = std::max(main.h * overlay / 100, 1);
+        // (main.h / content_h: the scale of one LCD pixel.)
+        layout.inset.w = std::max(static_cast<int>(
+            static_cast<long long>(main.w) * 256 * overlay /
+            (100LL * content_w)), 1);
+        layout.inset.h = std::max(static_cast<int>(
+            static_cast<long long>(main.h) * 192 * overlay /
+            (100LL * content_h)), 1);
         layout.inset.x = main.x + margin;
         layout.inset.y = main.y + main.h - layout.inset.h - margin;
         return layout;

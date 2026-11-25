@@ -1,4 +1,5 @@
 #include "title_settings.h"
+#include "gpu3d.h"
 #include "scheduler.h"
 
 #include "io.h"
@@ -190,6 +191,32 @@ int nds_title_inset_overlay(int screen, const uint32_t* pixels, int width,
     *piece_count = std::clamp(*piece_count, 0, int(kNdsTitleMaxInsetPieces));
     if (*piece_count > 0) return 100;
     return std::clamp(percent, 10, 100);
+}
+
+namespace {
+std::atomic<NdsTitleWideQuery> g_wide_query{nullptr};
+}  // namespace
+
+void nds_title_set_wide_query(NdsTitleWideQuery query) {
+    g_wide_query.store(query, std::memory_order_relaxed);
+}
+
+bool nds_title_wide_owned() {
+    return g_wide_query.load(std::memory_order_relaxed) != nullptr;
+}
+
+bool nds_title_wide_wanted() {
+    const NdsTitleWideQuery query =
+        g_wide_query.load(std::memory_order_relaxed);
+    return query && query();
+}
+
+int nds_title_wide_width() {
+    return nds_gpu3d_output_width();
+}
+
+int nds_title_wide_height() {
+    return nds_gpu3d_output_height();
 }
 
 namespace {

@@ -358,6 +358,10 @@ struct NdsFrontendOptions {
     // unsupported adaptive output fails closed instead of stretching pixels.
     uint8_t adaptive_supported = NDS_ADAPTIVE_NONE;
     uint16_t adaptive_max_width[2] = {256, 256};
+    // The width follows the window's aspect each frame, up to
+    // adaptive_max_width, while the title wants it (title_settings.h,
+    // nds_title_set_wide_query); 256 otherwise.
+    bool adaptive_dynamic = false;
     // Optional title-owned compositor repair for cylindrical sky geometry.
     // This is deliberately separate from generic adaptive output: most games
     // should leave the heuristic off.
