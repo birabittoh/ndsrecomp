@@ -970,6 +970,10 @@ static bool apply_frontend_config(toml::table& root,
         if (const auto value = (*system)["freebios"].value<bool>()) {
             options->freebios = *value;
         }
+        if (const auto value =
+                (*system)["check_for_updates"].value<bool>()) {
+            options->check_for_updates = *value;
+        }
         // beads-yjp.16: the firmware console nickname. Stored raw here and
         // validated once in main.cpp, together with NDS_PLAYER_NAME and
         // --player-name, so one rule set covers all three sources and the

@@ -2092,11 +2092,12 @@ void runtime_menu_serve_title(RuntimeMenuState* state,
 }
 
 // The self-updater for title hooks (title_update.h): checks once at
-// startup, takes the hooks' install request, and applies a staged update
-// at once. Returns the notice to show ("" for none); *quit is set when the
+// startup (unless `enabled` is false: then it stays Off and never contacts
+// the release host), takes the hooks' install request, and applies a
+// staged update at once. Returns the notice to show ("" for none); *quit is set when the
 // update helper has been started and the frontend has to exit so it can
 // swap the files.
-std::string serve_title_update(bool* quit) {
+std::string serve_title_update(bool enabled, bool* quit) {
     using nds::update::SelfUpdater;
     static SelfUpdater updater(nds::update::BuildConfig());
     static const std::filesystem::path install_root = SelfUpdater::InstallRoot();
@@ -2108,7 +2109,9 @@ std::string serve_title_update(bool* quit) {
 
     if (!started) {
         started = true;
-        if (updater.Enabled() && !install_root.empty()) {
+        if (!enabled) {
+            std::fprintf(stderr, "[update] update check disabled\n");
+        } else if (updater.Enabled() && !install_root.empty()) {
             // Also drops a stale staged APK on Android.
             SelfUpdater::HasPendingSelfUpdate(install_root, config.current_version);
             updater.CheckAsync();
@@ -2185,7 +2188,7 @@ std::string serve_title_update(bool* quit) {
     if (info) status.available_version = info->version;
     status.downloaded_bytes = install.downloaded_bytes;
     status.total_bytes = install.total_bytes;
-    if (!updater.Enabled() || install_root.empty()) {
+    if (!enabled || !updater.Enabled() || install_root.empty()) {
         status.state = NdsTitleUpdateState::Off;
     } else if (applied) {
         status.state = NdsTitleUpdateState::Applying;
@@ -6056,7 +6059,7 @@ int nds_run_interactive_frontend(const NdsFrontendOptions& initial_options) {
         }
         {
             bool quit_for_update = false;
-            const std::string notice = serve_title_update(&quit_for_update);
+            const std::string notice = serve_title_update(options.check_for_updates, &quit_for_update);
             if (!notice.empty()) {
                 savestate_notice = notice;
                 savestate_notice_until =

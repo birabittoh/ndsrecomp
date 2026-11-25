@@ -573,6 +573,7 @@ int main(int argc, char** argv) {
     bool discover_static_misses = false;
     bool force_tier3 = false;
     bool save_disabled = false;
+    bool cli_no_update_check = false;
     // One-shot batch-mode diagnostic: dump the (Wiimmfi M0) network event
     // ring to stderr at the end of a plain (non-serve, non-interactive) run,
     // same convention as the existing nds_dump_irq()/runtime_trace_dump_recent
@@ -648,6 +649,8 @@ int main(int argc, char** argv) {
             coverage_manifest_disabled = true;
         } else if (a == "--no-save") {
             save_disabled = true;
+        } else if (a == "--no-update-check") {
+            cli_no_update_check = true;
         } else if (a == "--firmware-path" && i + 1 < argc) {
             cli_firmware_path = argv[++i];
         } else if (a == "--firmware-state-path" && i + 1 < argc) {
@@ -877,7 +880,7 @@ int main(int argc, char** argv) {
                 "italian|spanish|chinese] "
                 "[--freebios] "
                 "[--instance-index 0..255] "
-                "[--discover-static-misses] [--rtc-host] "
+                "[--discover-static-misses] [--rtc-host] [--no-update-check] "
                 "[--net-ring-dump] [--net-ring-last N] "
                 "[--net-ring-filter <class>|all] "
                 "[--network on|off] [--network-backend slirp|replay|pcap] "
@@ -1467,6 +1470,7 @@ int main(int argc, char** argv) {
                      "invalid --local-wireless-port (expected 1024..65520)\n");
         return 2;
     }
+    if (cli_no_update_check) frontend_options.check_for_updates = false;
     for (const auto& [flag, value] : cli_local_wireless_tuning) {
         std::string tuning_error;
         if (!nds_parse_local_wireless_tuning(

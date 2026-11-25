@@ -1042,11 +1042,12 @@ bool nds_player_embedded_dumps(std::vector<uint8_t>* arm9_bios,
 namespace {
 
 // Player-mode command line: an optional .nds path (or unpacked ROM
-// folder) and an optional
-// `--instance N`, in any order. `instance` stays -1 without the flag.
+// folder), an optional `--instance N` and `--no-update-check`, in any
+// order. `instance` stays -1 without the flag.
 struct PlayerArgs {
     const char* rom = nullptr;
     int instance = -1;
+    bool no_update_check = false;
     // Latency-lab flags (nds_is_local_wireless_tuning_flag), applied after
     // the settings file so the command line wins.
     std::vector<std::pair<std::string, std::string>> local_wireless_tuning;
@@ -1070,6 +1071,8 @@ bool parse_player_args(int argc, char** argv, PlayerArgs* out) {
             if (end == argv[i] || *end != '\0' || value < 0 || value > 15)
                 return false;
             out->instance = static_cast<int>(value);
+        } else if (arg == "--no-update-check") {
+            out->no_update_check = true;
         } else if (nds_is_local_wireless_tuning_flag(arg) && i + 1 < argc) {
             out->local_wireless_tuning.emplace_back(arg, argv[++i]);
         } else if (arg[0] != '-' && !out->rom &&
@@ -1191,6 +1194,7 @@ bool nds_player_prepare(int argc, char** argv, NdsFrontendOptions* options,
 #endif
     PlayerArgs args;
     parse_player_args(argc, argv, &args);
+    if (args.no_update_check) options->check_for_updates = false;
     for (const auto& [flag, value] : args.local_wireless_tuning) {
         if (!nds_parse_local_wireless_tuning(flag, value,
                                              &options->local_wireless,

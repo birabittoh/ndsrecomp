@@ -421,6 +421,9 @@ struct NdsFrontendOptions {
     std::string discord_application_id;
     std::string discord_large_image;
     bool discord_activity = true;
+    // [system] check_for_updates (--no-update-check): false keeps the
+    // self-updater (title_update.h) from contacting the release host.
+    bool check_for_updates = true;
     // Texture upscaling factor, 1 (off), 2, or 4. Filters each decoded DS
     // texture once on a cache miss; independent of internal_resolution, but
     // only worth enabling alongside it.
