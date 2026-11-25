@@ -4693,6 +4693,8 @@ int nds_run_interactive_frontend(const NdsFrontendOptions& initial_options) {
     // and the DS keys it holds.
     int touch_button_held = -1;
     uint16_t touch_button_pressed = 0;
+    // Whether the press is a mouse right click (NdsTouchButtonSpec::right_keys).
+    bool touch_button_right = false;
     // A latch button's (NdsTouchButtonSpec::latch) keys, held from its tap
     // until the next touchscreen press ends, -1 / 0 for none; the frames
     // left before they go, once that press has ended (the guest sees the
@@ -4735,6 +4737,7 @@ int nds_run_interactive_frontend(const NdsFrontendOptions& initial_options) {
     auto release_touch_button = [&]() {
         touch_button_held = -1;
         touch_button_pressed = 0;
+        touch_button_right = false;
         publish_keys();
     };
     publish_keys();
@@ -5687,19 +5690,27 @@ int nds_run_interactive_frontend(const NdsFrontendOptions& initial_options) {
     // one in the single layout.
     auto touch_button_at = [&](const SDL_Event& event) {
         if (event.type != SDL_MOUSEBUTTONDOWN ||
-            event.button.button != SDL_BUTTON_LEFT ||
+            (event.button.button != SDL_BUTTON_LEFT &&
+             event.button.button != SDL_BUTTON_RIGHT) ||
             event.button.windowID != presentation.window_ids[0] ||
             relative_mouse.captured() || virtual_stylus_active())
             return -1;
+        const bool right_click = event.button.button == SDL_BUTTON_RIGHT;
+        // A right click counts only on a button that has keys for it.
+        auto right_ok = [&](int hit) {
+            if (!right_click) return hit;
+            const NdsTouchButtonSpec* spec = nds_touch_button_spec(hit);
+            return spec && spec->right_keys ? hit : -1;
+        };
         // The buttons are drawn on a canvas as wide as the screen's 3D lines
         // (up to 448), centred in a wider view.
         if (presentation.single && presentation.shown_screen == 1) {
             // Already the touchscreen's coordinates (-1 on the top inset),
             // with the 256 native columns centred: back to the canvas's.
             const int width = presentation.screen_widths[1];
-            return nds_touch_buttons_hit(
+            return right_ok(nds_touch_buttons_hit(
                 width, float(event.button.x) + float((width - kScreenWidth) / 2),
-                float(event.button.y));
+                float(event.button.y)));
         }
         if (!g_top_logical_hit.valid) return -1;
         const int left =
@@ -5710,9 +5721,9 @@ int nds_run_interactive_frontend(const NdsFrontendOptions& initial_options) {
             presentation.single
                 ? std::max(presentation.main_view_width - width, 0) / 2
                 : 0;
-        return nds_touch_buttons_hit(
+        return right_ok(nds_touch_buttons_hit(
             width, g_top_logical_hit.x - left - canvas_left,
-            g_top_logical_hit.y);
+            g_top_logical_hit.y));
     };
     auto show_savestate_result = [&](const NdsSavestateSlotResult& result) {
         savestate_notice = result.message;
@@ -6273,21 +6284,28 @@ int nds_run_interactive_frontend(const NdsFrontendOptions& initial_options) {
                         turbo_toggled = !turbo_toggled;
                         nds_touch_button_set_active(button, turbo_toggled);
                     }
+                    const bool right =
+                        event.button.button == SDL_BUTTON_RIGHT;
                     const bool was_latched = button == touch_button_latched;
                     release_touch_latch();
-                    if (spec->latch && !was_latched) {
+                    if (!right && spec->latch && !was_latched) {
                         touch_button_latched = button;
                         touch_button_latched_pressed = spec->keys;
                         nds_touch_button_set_active(button, true);
                     }
                     touch_button_held = button;
-                    touch_button_pressed = spec->latch ? 0 : spec->keys;
+                    touch_button_right = right;
+                    touch_button_pressed =
+                        right ? spec->right_keys
+                              : (spec->latch ? 0 : spec->keys);
                     publish_keys();
                 }
                 continue;
             } else if (touch_button_held >= 0 &&
                        event.type == SDL_MOUSEBUTTONUP &&
-                       event.button.button == SDL_BUTTON_LEFT) {
+                       event.button.button ==
+                           (touch_button_right ? SDL_BUTTON_RIGHT
+                                               : SDL_BUTTON_LEFT)) {
                 // The press on a button ends: so does its keys' hold, and
                 // the release goes nowhere else, like the press.
                 release_touch_button();

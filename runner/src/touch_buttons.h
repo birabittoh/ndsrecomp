@@ -56,6 +56,9 @@ struct NdsTouchButtonSpec {
     // to its own, instead of the touch, for a pick made with keys (a pad
     // direction); 0, or nullptr, lets the touch through as a touch.
     uint16_t (*touch_keys)(int x, int y) = nullptr;
+    // DS keys held while a mouse right click is held on it, instead of its
+    // own (never a latch); 0 for a button that ignores right clicks.
+    uint16_t right_keys = 0;
 };
 
 constexpr int kNdsTouchButtonMax = 8;
