@@ -2748,8 +2748,31 @@ void convert_mouse_event_to_logical_coordinates(
                    nds_inset_overlay_flag().load(
                        std::memory_order_relaxed) > 0) {
             // The top LCD drawn over the touchscreen, see-through: a point
-            // there is still a touch.
-            g_top_logical_hit = {};
+            // on it (or on one of its pieces) is the top screen's, never a touch.
+            float tx = -1.0f, ty = -1.0f;
+            bool in_inset = false;
+            const NdsInsetPieces& pieces = nds_inset_pieces();
+            if (pieces.count > 0) {
+                // A cut-up inset: its pieces' dst is in the main screen's
+                // pixels, cx and cy here.
+                in_inset = cx >= 0.0f && cx < content_w && cy >= 0.0f &&
+                           cy < content_h &&
+                           nds_inset_piece_point(pieces, cx, cy, &tx, &ty);
+            } else {
+                const NdsPresentRect inset_rect = nds_single_layout(
+                    presentation.window_mode, presentation.scaling,
+                    drawable_w, drawable_h, content_w, content_h,
+                    presentation.inset_percent, presentation.stacked).inset;
+                nds_present_rect_to_content(inset_rect, inset_content_w,
+                                            kScreenHeight, px, py, &tx, &ty);
+                in_inset = tx >= 0.0f && tx < inset_content_w &&
+                           ty >= 0.0f && ty < kScreenHeight;
+            }
+            g_top_logical_hit = {in_inset, tx, ty};
+            if (in_inset) {
+                cx = -1.0f;
+                cy = -1.0f;
+            }
         } else if (presentation.single && presentation.shown_screen == 1 &&
                    presentation.inset_percent > 0) {
             // The touchscreen is the main rect; the top LCD is the inset,
