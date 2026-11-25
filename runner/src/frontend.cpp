@@ -4869,11 +4869,12 @@ int nds_run_interactive_frontend(const NdsFrontendOptions& initial_options) {
     bool compute_failed = false;
     bool mouse_down = false;
     // The held touch is a title's stick on a widened touchscreen
-    // (nds_title_touch_stick): its points are the pointer's moved by
-    // `touch_stick_dx/dy` (DS pixels), the last one kept while the pointer
-    // is off the view.
+    // (nds_title_touch_stick), in native DS pixels: where the pointer was
+    // pressed, where the guest's press is (carried inside the screen), and
+    // the guest's pen, kept while the pointer is off the view.
     bool touch_stick = false;
-    float touch_stick_dx = 0.0f, touch_stick_dy = 0.0f;
+    float touch_stick_press_x = 0.0f, touch_stick_press_y = 0.0f;
+    float touch_stick_guest_x = 0.0f, touch_stick_guest_y = 0.0f;
     float touch_stick_x = 0.0f, touch_stick_y = 0.0f;
     bool touch_release_pending = false;
     uint32_t touch_frames_held = 0;
@@ -6742,31 +6743,31 @@ int nds_run_interactive_frontend(const NdsFrontendOptions& initial_options) {
                 // (and below the title's corner buttons) to be dragged any
                 // way, and the drag follows by the same offset.
                 touch_stick = g_wide_touch_hit.valid && nds_title_touch_stick();
-                touch_stick_dx = 0.0f;
-                touch_stick_dy = 0.0f;
                 if (touch_stick) {
                     constexpr float kStickMargin = 48.0f;
                     const float nx = g_wide_touch_hit.x;
                     const float ny = g_wide_touch_hit.y;
+                    touch_stick_press_x = nx;
+                    touch_stick_press_y = ny;
+                    touch_stick_guest_x = nx;
+                    touch_stick_guest_y = ny;
                     if (nx < 0.0f || nx >= kScreenWidth || ny < 0.0f ||
                         ny >= kScreenHeight) {
-                        touch_stick_dx =
-                            std::clamp(nx, kStickMargin,
-                                       kScreenWidth - kStickMargin) - nx;
-                        touch_stick_dy =
-                            std::clamp(ny, kStickMargin,
-                                       kScreenHeight - kStickMargin) - ny;
+                        touch_stick_guest_x = std::clamp(
+                            nx, kStickMargin, kScreenWidth - kStickMargin);
+                        touch_stick_guest_y = std::clamp(
+                            ny, kStickMargin, kScreenHeight - kStickMargin);
                     }
-                    touch_stick_x = std::clamp(
-                        nx + touch_stick_dx, 0.0f, kScreenWidth - 1.0f);
-                    touch_stick_y = std::clamp(
-                        ny + touch_stick_dy, 0.0f, kScreenHeight - 1.0f);
+                    touch_stick_x = touch_stick_guest_x;
+                    touch_stick_y = touch_stick_guest_y;
                     event.button.x = bottom_content_left + touch_stick_x;
                     event.button.y = touch_stick_y;
                 }
-                nds_title_set_touch_stick_offset(
-                    static_cast<int>(std::lround(touch_stick_dx)),
-                    static_cast<int>(std::lround(touch_stick_dy)));
+                nds_title_set_touch_stick_points(
+                    touch_stick, static_cast<int>(std::floor(touch_stick_press_x)),
+                    static_cast<int>(std::floor(touch_stick_press_y)),
+                    static_cast<int>(std::floor(touch_stick_press_x)),
+                    static_cast<int>(std::floor(touch_stick_press_y)));
                 last_touch_event_x = event.button.x;
                 last_touch_event_y = event.button.y;
                 touch_release_pending = false;
@@ -6797,15 +6798,38 @@ int nds_run_interactive_frontend(const NdsFrontendOptions& initial_options) {
             if (event.type == SDL_MOUSEMOTION && mouse_down &&
                 event.motion.windowID == presentation.window_ids[1]) {
                 if (touch_stick) {
-                    // Held at the native screen's edge, never released by
-                    // the drag; off the view (or over an inset) it stays.
+                    // The drag from the guest's press, the way the pointer
+                    // went from its own, shortened only as far as it must
+                    // to stay on the screen: never released by the drag,
+                    // whichever side of the screen's edge it starts or ends.
+                    // Off the view (or over an inset) it stays.
                     if (g_wide_touch_hit.valid) {
+                        const float vx =
+                            g_wide_touch_hit.x - touch_stick_press_x;
+                        const float vy =
+                            g_wide_touch_hit.y - touch_stick_press_y;
+                        float s = 1.0f;
+                        auto fit = [&s](float from, float v, float limit) {
+                            if (v > 0.0f && from + v * s > limit)
+                                s = (limit - from) / v;
+                            else if (v < 0.0f && from + v * s < 0.0f)
+                                s = -from / v;
+                        };
+                        fit(touch_stick_guest_x, vx, kScreenWidth - 1.0f);
+                        fit(touch_stick_guest_y, vy, kScreenHeight - 1.0f);
+                        s = std::max(s, 0.0f);
                         touch_stick_x = std::clamp(
-                            g_wide_touch_hit.x + touch_stick_dx, 0.0f,
+                            touch_stick_guest_x + vx * s, 0.0f,
                             kScreenWidth - 1.0f);
                         touch_stick_y = std::clamp(
-                            g_wide_touch_hit.y + touch_stick_dy, 0.0f,
+                            touch_stick_guest_y + vy * s, 0.0f,
                             kScreenHeight - 1.0f);
+                        nds_title_set_touch_stick_points(
+                            true,
+                            static_cast<int>(std::floor(touch_stick_press_x)),
+                            static_cast<int>(std::floor(touch_stick_press_y)),
+                            static_cast<int>(std::floor(g_wide_touch_hit.x)),
+                            static_cast<int>(std::floor(g_wide_touch_hit.y)));
                     }
                     last_touch_event_x = bottom_content_left + touch_stick_x;
                     last_touch_event_y = touch_stick_y;

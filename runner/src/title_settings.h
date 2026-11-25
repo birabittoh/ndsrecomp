@@ -128,12 +128,16 @@ bool nds_title_touch_unscaled();
 // it, the frontend reads it.
 void nds_title_set_touch_stick(bool stick);
 bool nds_title_touch_stick();
-// What the last press was carried by (DS pixels, added to the pointer to
-// get the touch), 0, 0 for one taken where it was: a title draws its stick
-// that much back to show it under the pointer. The frontend sets it on each
-// press, any thread reads it.
-void nds_title_set_touch_stick_offset(int dx, int dy);
-void nds_title_touch_stick_offset(int* dx, int* dy);
+// The stick held on a widened view, where the pointer really is (native DS
+// pixels, outside 0..255 x 0..191 beside the DS screen): the press and the
+// pen now. The guest's touch differs: the press carried inside, the drag
+// from it in the same direction, shortened to stay on the screen. A title
+// draws its stick from these to show it under the pointer. False when the
+// last press was not such a stick. The frontend sets it, any thread reads it.
+void nds_title_set_touch_stick_points(bool active, int press_x, int press_y,
+                                      int pen_x, int pen_y);
+bool nds_title_touch_stick_points(int* press_x, int* press_y, int* pen_x,
+                                  int* pen_y);
 
 // Runs the emulated ARM9 at `multiple` (1, 2 or 4) times its hardware clock
 // from the next scheduler round on, for a title whose own frame pacing is

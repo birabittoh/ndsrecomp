@@ -448,18 +448,32 @@ bool nds_title_touch_stick() {
 }
 
 namespace {
-std::atomic<uint32_t> g_touch_stick_offset{0};
+// Four int16 (press x, y, pen x, y); every one -32768 when not active (the
+// setter clamps the points to +-32767).
+constexpr uint64_t kNoStickPoints = 0x8000800080008000ull;
+std::atomic<uint64_t> g_touch_stick_points{kNoStickPoints};
 }  // namespace
 
-void nds_title_set_touch_stick_offset(int dx, int dy) {
-    g_touch_stick_offset.store(
-        static_cast<uint32_t>(static_cast<uint16_t>(dy)) << 16 |
-            static_cast<uint16_t>(dx),
+void nds_title_set_touch_stick_points(bool active, int press_x, int press_y,
+                                      int pen_x, int pen_y) {
+    auto axis = [](int v) {
+        return static_cast<uint64_t>(static_cast<uint16_t>(
+            static_cast<int16_t>(std::clamp(v, -32767, 32767))));
+    };
+    g_touch_stick_points.store(
+        active ? axis(pen_y) << 48 | axis(pen_x) << 32 | axis(press_y) << 16 |
+                     axis(press_x)
+               : kNoStickPoints,
         std::memory_order_relaxed);
 }
 
-void nds_title_touch_stick_offset(int* dx, int* dy) {
-    const uint32_t v = g_touch_stick_offset.load(std::memory_order_relaxed);
-    if (dx) *dx = static_cast<int16_t>(v & 0xFFFF);
-    if (dy) *dy = static_cast<int16_t>(v >> 16);
+bool nds_title_touch_stick_points(int* press_x, int* press_y, int* pen_x,
+                                  int* pen_y) {
+    const uint64_t v = g_touch_stick_points.load(std::memory_order_relaxed);
+    if (v == kNoStickPoints) return false;
+    if (press_x) *press_x = static_cast<int16_t>(v & 0xFFFF);
+    if (press_y) *press_y = static_cast<int16_t>(v >> 16 & 0xFFFF);
+    if (pen_x) *pen_x = static_cast<int16_t>(v >> 32 & 0xFFFF);
+    if (pen_y) *pen_y = static_cast<int16_t>(v >> 48 & 0xFFFF);
+    return true;
 }
