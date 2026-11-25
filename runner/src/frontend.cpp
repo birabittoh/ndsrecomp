@@ -2820,11 +2820,17 @@ void convert_mouse_event_to_logical_coordinates(
 // layout: window 0's drawable pixels, holding the shown LCD's rect and the
 // inset's (when there is one), so the cursor goes from one to the other as
 // the mouse does. Otherwise the two LCDs stacked, top over bottom, in DS
-// pixels. A rect with w == 0 is an LCD not shown.
+// pixels. A rect with w == 0 is an LCD not shown, unless it is `cut`: an
+// inset cut into pieces over the main LCD, where only those pieces are it.
 struct VirtualStylusSpace {
     NdsPresentRect rects[2]{};
-    int content_w = kScreenWidth;
+    // Each rect's content (a widescreen LCD is wider, a Ver+ one taller);
+    // its native 256 x 192 are the centred pixels.
+    int content_w[2]{kScreenWidth, kScreenWidth};
+    int content_h[2]{kScreenHeight, kScreenHeight};
     int over = -1;       // the LCD drawn over the other where they overlap
+    int cut = -1;        // the LCD shown only as the pieces over the main one
+    int main = 0;        // with `cut`: the LCD under the pieces
     float scale = 1.0f;  // plane units per DS pixel of the main LCD
 };
 
@@ -2845,18 +2851,19 @@ VirtualStylusSpace virtual_stylus_space(
                 presentation.stacked);
             const int shown = presentation.shown_screen & 1;
             space.rects[shown] = layout.main;
-            // Neither is for the stylus: the top LCD drawn over the
-            // touchscreen, nor a touchscreen cut into pieces.
+            space.content_w[shown] = content_w;
+            space.content_h[shown] = content_h;
+            space.content_w[shown ^ 1] = std::max<int>(
+                presentation.screen_widths[shown ^ 1], kScreenWidth);
+            space.main = shown;
             const bool over =
                 nds_inset_overlay_flag().load(std::memory_order_relaxed) > 0;
-            const bool top_over_touch = over && shown == 1;
-            const bool cut = over && nds_inset_pieces().count > 0;
-            if (layout.inset.w > 0 && layout.inset.h > 0 && !top_over_touch &&
-                !cut) {
+            if (over && nds_inset_pieces().count > 0) {
+                space.cut = shown ^ 1;
+            } else if (layout.inset.w > 0 && layout.inset.h > 0) {
                 space.rects[shown ^ 1] = layout.inset;
                 space.over = shown ^ 1;
             }
-            space.content_w = content_w;
             space.scale = static_cast<float>(layout.main.w) / content_w;
             return space;
         }
@@ -2866,24 +2873,64 @@ VirtualStylusSpace virtual_stylus_space(
     return space;
 }
 
+// A plane point as the main LCD's content pixels (cut layouts).
+void virtual_stylus_main_content(const VirtualStylusSpace& space, float px,
+                                 float py, float* cx, float* cy) {
+    nds_present_rect_to_content(space.rects[space.main],
+                                space.content_w[space.main],
+                                space.content_h[space.main], px, py, cx, cy);
+}
+
 // A plane point as DS pixels of `screen` (as displayed, not clamped).
 void virtual_stylus_to_ds(const VirtualStylusSpace& space, int screen,
                           float px, float py, float* ds_x, float* ds_y) {
     float cx = 0.0f, cy = 0.0f;
-    nds_present_rect_to_content(space.rects[screen], space.content_w,
-                                kScreenHeight, px, py, &cx, &cy);
-    *ds_x = cx - static_cast<float>((space.content_w - kScreenWidth) / 2);
-    *ds_y = cy;
+    if (screen == space.cut) {
+        // Through the piece under the point; off them, nowhere on it.
+        float mx = 0.0f, my = 0.0f;
+        virtual_stylus_main_content(space, px, py, &mx, &my);
+        if (!nds_inset_piece_point(nds_inset_pieces(), mx, my, &cx, &cy)) {
+            cx = cy = -1.0f;
+        }
+    } else {
+        nds_present_rect_to_content(space.rects[screen],
+                                    space.content_w[screen],
+                                    space.content_h[screen], px, py, &cx,
+                                    &cy);
+    }
+    *ds_x = cx - static_cast<float>((space.content_w[screen] - kScreenWidth) / 2);
+    *ds_y = cy - static_cast<float>((space.content_h[screen] - kScreenHeight) / 2);
 }
 
-// DS pixels of `screen` as a plane point.
-void virtual_stylus_from_ds(const VirtualStylusSpace& space, int screen,
+// DS pixels of `screen` as a plane point. False for a point of a cut LCD
+// that no piece shows.
+bool virtual_stylus_from_ds(const VirtualStylusSpace& space, int screen,
                             float ds_x, float ds_y, float* px, float* py) {
+    const float cx = ds_x +
+        static_cast<float>((space.content_w[screen] - kScreenWidth) / 2);
+    const float cy = ds_y +
+        static_cast<float>((space.content_h[screen] - kScreenHeight) / 2);
+    if (screen == space.cut) {
+        const NdsInsetPieces& pieces = nds_inset_pieces();
+        for (int i = pieces.count - 1; i >= 0; --i) {
+            const NdsTitleInsetPiece& p = pieces.piece[i];
+            if (p.src_w <= 0.0f || p.src_h <= 0.0f || cx < p.src_x ||
+                cy < p.src_y || cx >= p.src_x + p.src_w ||
+                cy >= p.src_y + p.src_h)
+                continue;
+            const float mx = p.dst_x + (cx - p.src_x) * p.dst_w / p.src_w;
+            const float my = p.dst_y + (cy - p.src_y) * p.dst_h / p.src_h;
+            const NdsPresentRect& r = space.rects[space.main];
+            *px = r.x + mx * r.w / static_cast<float>(space.content_w[space.main]);
+            *py = r.y + my * r.h / static_cast<float>(space.content_h[space.main]);
+            return true;
+        }
+        return false;
+    }
     const NdsPresentRect& r = space.rects[screen];
-    const float cx =
-        ds_x + static_cast<float>((space.content_w - kScreenWidth) / 2);
-    *px = r.x + cx * r.w / static_cast<float>(space.content_w);
-    *py = r.y + ds_y * r.h / static_cast<float>(kScreenHeight);
+    *px = r.x + cx * r.w / static_cast<float>(space.content_w[screen]);
+    *py = r.y + cy * r.h / static_cast<float>(space.content_h[screen]);
+    return true;
 }
 
 // The LCD under a plane point: the one it is in (the one drawn over the
@@ -2895,6 +2942,12 @@ int virtual_stylus_screen_at(const VirtualStylusSpace& space, float px,
         return r.w > 0 && px >= r.x && px < r.x + r.w && py >= r.y &&
                py < r.y + r.h;
     };
+    if (space.cut >= 0 && inside(space.main)) {
+        float mx = 0.0f, my = 0.0f, ix = 0.0f, iy = 0.0f;
+        virtual_stylus_main_content(space, px, py, &mx, &my);
+        return nds_inset_piece_point(nds_inset_pieces(), mx, my, &ix, &iy)
+            ? space.cut : space.main;
+    }
     if (space.over >= 0 && inside(space.over)) return space.over;
     if (inside(0)) return 0;
     if (inside(1)) return 1;
@@ -3237,6 +3290,13 @@ void draw_fps_counter(DsTarget target, const char* text) {
 
 // The stylus lives in the 256x192 touch space spread over the screen's rect.
 void draw_virtual_stylus(DsTarget target, float stylus_x, float stylus_y) {
+    // Native DS pixels: a widened canvas's centred 256 columns.
+    if (target.canvas.width > 256) {
+        const int full = target.canvas.dest.w;
+        target.canvas.dest.x +=
+            full * ((target.canvas.width - 256) / 2) / target.canvas.width;
+        target.canvas.dest.w = full * 256 / target.canvas.width;
+    }
     target.canvas.width = 256;
     target.canvas.height = 192;
     const int x = static_cast<int>(std::lround(stylus_x));
@@ -4958,16 +5018,27 @@ int nds_run_interactive_frontend(const NdsFrontendOptions& initial_options) {
         // the same DS pixel.
         if (!virtual_stylus_placed ||
             !same_rect(space.rects[0], virtual_stylus_plane.rects[0]) ||
-            !same_rect(space.rects[1], virtual_stylus_plane.rects[1])) {
+            !same_rect(space.rects[1], virtual_stylus_plane.rects[1]) ||
+            space.cut != virtual_stylus_plane.cut) {
             int screen = virtual_stylus_screen;
-            if (space.rects[screen].w <= 0) {
+            if (space.rects[screen].w <= 0 && screen != space.cut) {
                 screen ^= 1;
                 virtual_stylus_ds_x = kScreenWidth / 2.0f;
                 virtual_stylus_ds_y = kScreenHeight / 2.0f;
             }
-            virtual_stylus_from_ds(space, screen, virtual_stylus_ds_x,
-                                   virtual_stylus_ds_y, &virtual_stylus_px,
-                                   &virtual_stylus_py);
+            // A point of a cut LCD no piece shows: the main one's centre.
+            if (!virtual_stylus_from_ds(space, screen, virtual_stylus_ds_x,
+                                        virtual_stylus_ds_y,
+                                        &virtual_stylus_px,
+                                        &virtual_stylus_py)) {
+                screen = space.main;
+                virtual_stylus_ds_x = kScreenWidth / 2.0f;
+                virtual_stylus_ds_y = kScreenHeight / 2.0f;
+                virtual_stylus_from_ds(space, screen, virtual_stylus_ds_x,
+                                       virtual_stylus_ds_y,
+                                       &virtual_stylus_px,
+                                       &virtual_stylus_py);
+            }
             virtual_stylus_placed = true;
         }
         virtual_stylus_plane = space;
