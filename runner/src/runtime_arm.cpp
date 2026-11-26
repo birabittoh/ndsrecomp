@@ -304,6 +304,9 @@ struct alignas(64) CachedStaticLookup {
     uint8_t page_count = 0u;
     uint8_t thumb = 0u;
     uint8_t occupied = 0u;
+    // Read only in a set's first way: which of its two ways hit or was
+    // filled last (dispatch_cache_set).
+    uint8_t mru_way = 0u;
     uint32_t live_bank_serial = 0u;
     void (*fn)(void) = nullptr;
     uint32_t generation[4]{};
@@ -324,6 +327,39 @@ std::array<std::array<CachedStaticLookup, kDispatchCacheSize>, 2>
 inline uint32_t dispatch_cache_index(uint32_t pc, bool thumb) {
     return ((pc >> 1u) ^ (pc >> 13u) ^ uint32_t{thumb}) &
         (kDispatchCacheSize - 1u);
+}
+
+// The cache is two-way set associative: a set is two adjacent slots (one
+// 256-byte block). Direct-mapped, two hot entry points sharing a slot evicted
+// each other on every dispatch, and each refill is a full lookup (binary
+// search plus the byte-identity proof, ~3.4 us on a Cortex-A720 against
+// ~60 ns for a hit): in a DQ9 town ~130 such misses a frame cost as much as
+// the ~6,300 hits. Returns the way holding (pc, thumb), else the way to
+// refill: an empty one, else the one that was not used last.
+inline CachedStaticLookup& dispatch_cache_set(
+    std::array<CachedStaticLookup, kDispatchCacheSize>& cache, uint32_t pc,
+    bool thumb, unsigned* way_out) {
+    CachedStaticLookup* const set =
+        &cache[dispatch_cache_index(pc, thumb) & ~1u];
+    const auto holds = [&](const CachedStaticLookup& s) {
+        return s.occupied && s.pc == pc && s.thumb == uint8_t{thumb};
+    };
+    unsigned way;
+    if (holds(set[0])) way = 0u;
+    else if (holds(set[1])) way = 1u;
+    else if (!set[0].occupied) way = 0u;
+    else if (!set[1].occupied) way = 1u;
+    else way = set[0].mru_way ^ 1u;
+    *way_out = way;
+    return set[way];
+}
+
+inline void dispatch_cache_touch(
+    std::array<CachedStaticLookup, kDispatchCacheSize>& cache, uint32_t pc,
+    bool thumb, unsigned way) {
+    CachedStaticLookup& first =
+        cache[dispatch_cache_index(pc, thumb) & ~1u];
+    if (first.mru_way != way) first.mru_way = static_cast<uint8_t>(way);
 }
 
 void clear_dispatch_cache_cpu(unsigned cpu) {
@@ -658,10 +694,12 @@ struct SlowLookupScope {
 const CachedStaticLookup* lookup_static_cached_impl(const CpuCtx& c,
                                                     uint32_t pc, bool thumb) {
     auto& cache = g_dispatch_cache[g_nds_active];
-    CachedStaticLookup& slot = cache[dispatch_cache_index(pc, thumb)];
+    unsigned way = 0u;
+    CachedStaticLookup& slot = dispatch_cache_set(cache, pc, thumb, &way);
     if (slot.occupied && slot.dispatch_epoch == c.dispatch_epoch &&
         slot.pc == pc && slot.thumb == uint8_t{thumb} &&
         cached_lookup_live(slot)) {
+        dispatch_cache_touch(cache, pc, thumb, way);
         auto& stats = g_nds_dispatch_stats[g_nds_active];
         if (slot.fn) {
             ++stats.cache_hit;
@@ -713,6 +751,7 @@ const CachedStaticLookup* lookup_static_cached_impl(const CpuCtx& c,
                     ? *slot.generation_ptr[i]
                     : bus_exec_page_generation(slot.page_addr[i]);
             }
+            dispatch_cache_touch(cache, pc, thumb, way);
             return &slot;
         }
     }
@@ -853,6 +892,7 @@ const CachedStaticLookup* lookup_static_cached_impl(const CpuCtx& c,
         }
     }
 #endif
+    dispatch_cache_touch(cache, pc, thumb, way);
     if (hit && slot.page_count) watch_candidate_run(c, pc, thumb, slot);
     return slot.fn ? &slot : nullptr;
 }
