@@ -6,6 +6,7 @@
 #include "frontend_screen_route.h"
 #include "arm9_native.h"
 #include "cpu_render_handoff.h"
+#include "audio_stretch.h"
 
 #include <algorithm>
 #include <array>
@@ -766,22 +767,33 @@ constexpr uint32_t kAudioQueueFrames = 2048;
 // screen needs interactive input.
 constexpr uint32_t kAudioStartFrames = 57344;
 constexpr uint32_t kAudioFrameBytes = 2u * sizeof(int16_t);
-constexpr uint32_t kAudioCapacityFrames = 65536;
-
 struct AudioQueue {
     // Host output only. Consumption, guest mixing and pacing remain active.
     bool output_muted = false;
 #if !defined(NDS_HAVE_SDL3)
     // Read by the audio callback; SDL3 applies it as the stream gain instead.
     std::atomic<float> gain{1.0f};
-    std::array<int16_t, kAudioCapacityFrames * 2> samples{};
-    uint32_t read = 0;
-    uint32_t write = 0;
-    uint32_t count = 0;
 #endif
+    // Guest samples, played by the device thread through a time stretcher so
+    // a slow stretch of emulation never runs the device dry.
+    NdsAudioStretchQueue ring;
     std::atomic<uint64_t> underruns{0};
     std::atomic<bool> started{false};
 };
+
+// Device thread: renders `frames` from the queue. An underrun is counted
+// when the stretcher had to fade to silence, the only audible gap left.
+void audio_render(AudioQueue& queue, int16_t* out, uint32_t frames) {
+    bool gap_started = false;
+    const uint32_t silent = queue.ring.render(out, frames, &gap_started);
+    if (queue.started.load(std::memory_order_relaxed) &&
+        (gap_started || silent)) {
+        queue.underruns.fetch_add(1, std::memory_order_relaxed);
+        nds_frontend_latency::shortage(
+            static_cast<int>((silent ? silent : frames) * kAudioFrameBytes),
+            static_cast<int>(frames * kAudioFrameBytes));
+    }
+}
 
 #if defined(NDS_HAVE_SDL3)
 struct NdsAudioDevice {
@@ -789,25 +801,28 @@ struct NdsAudioDevice {
     explicit operator bool() const { return stream != nullptr; }
 };
 
-// SDL3 has no mixer callback that can observe a short read the way the SDL2
-// ring-buffer callback below does, but the stream "get" callback carries the
-// same fact: additional_amount is how many more bytes the device needs beyond
-// what is already queued to satisfy this pull. A nonzero value while playback
-// is running is exactly the SDL2 path's `take < requested` condition — the
-// device ran dry. Without this the underrun counter would be permanently zero
-// under SDL3 and NDS_FRONTEND_REQUIRE_AUDIO would assert nothing.
-// Runs on the audio thread; `underruns` is atomic for that reason.
-void SDLCALL audio_stream_underrun_callback(void* userdata,
-                                            SDL_AudioStream* /*stream*/,
-                                            int additional_amount,
-                                            int total_amount) {
+// The stream's "get" callback asks for additional_amount more bytes (in our
+// input format) than it holds; the device thread renders exactly that from
+// the queue, so the SDL stream itself never runs dry.
+void SDLCALL audio_stream_get_callback(void* userdata,
+                                       SDL_AudioStream* stream,
+                                       int additional_amount,
+                                       int /*total_amount*/) {
     if (additional_amount <= 0) return;
-    auto* queue = static_cast<AudioQueue*>(userdata);
-    if (queue && queue->started.load(std::memory_order_relaxed))
-    {
-        queue->underruns.fetch_add(1, std::memory_order_relaxed);
-        nds_frontend_latency::shortage(additional_amount, total_amount);
+    static thread_local bool hostprof_registered = false;
+    if (!hostprof_registered) {
+        hostprof_registered = true;
+        nds_hostprof_register_current_thread(NDS_HOSTPROF_ROLE_AUDIO);
     }
+    auto* queue = static_cast<AudioQueue*>(userdata);
+    if (!queue) return;
+    static thread_local std::vector<int16_t> buffer;
+    const uint32_t frames = (static_cast<uint32_t>(additional_amount) +
+                             kAudioFrameBytes - 1) / kAudioFrameBytes;
+    buffer.resize(size_t(frames) * 2u);
+    audio_render(*queue, buffer.data(), frames);
+    SDL_PutAudioStreamData(stream, buffer.data(),
+                           static_cast<int>(frames * kAudioFrameBytes));
 }
 #else
 using NdsAudioDevice = SDL_AudioDeviceID;
@@ -825,28 +840,15 @@ void SDLCALL audio_callback(void* userdata, Uint8* stream, int len) {
     auto* queue = static_cast<AudioQueue*>(userdata);
     std::memset(stream, 0, static_cast<size_t>(len));
     if (!queue || len <= 0) return;
-    const uint32_t requested = static_cast<uint32_t>(len) / kAudioFrameBytes;
-    const uint32_t take = std::min(requested, queue->count);
+    const uint32_t take = static_cast<uint32_t>(len) / kAudioFrameBytes;
     auto* output = reinterpret_cast<int16_t*>(stream);
-    const uint32_t first = std::min(take, kAudioCapacityFrames - queue->read);
-    std::memcpy(output, queue->samples.data() + queue->read * 2u,
-                first * kAudioFrameBytes);
-    if (first < take)
-        std::memcpy(output + first * 2u, queue->samples.data(),
-                    (take - first) * kAudioFrameBytes);
-    queue->read = (queue->read + take) % kAudioCapacityFrames;
-    queue->count -= take;
+    audio_render(*queue, output, take);
     if (queue->output_muted) {
         std::memset(stream, 0, static_cast<size_t>(len));
     } else if (const float gain = queue->gain.load(std::memory_order_relaxed);
                gain < 1.0f) {
         for (uint32_t i = 0; i < take * 2u; ++i)
             output[i] = static_cast<int16_t>(output[i] * gain);
-    }
-    if (take < requested && queue->started.load(std::memory_order_relaxed)) {
-        queue->underruns.fetch_add(1, std::memory_order_relaxed);
-        nds_frontend_latency::shortage(
-            static_cast<int>((requested - take) * kAudioFrameBytes), len);
     }
 }
 #endif
@@ -1147,17 +1149,13 @@ bool top_screen_point(float x, float y, int left, int* ds_x, int* ds_y) {
 
 uint32_t audio_queue_count(const NdsAudioDevice& device, AudioQueue& queue) {
     if (!device) return 0;
+    uint32_t count = queue.ring.queued();
 #if defined(NDS_HAVE_SDL3)
-    (void)queue;
     const int queued_bytes = SDL_GetAudioStreamQueued(device.stream);
-    return queued_bytes > 0
-        ? static_cast<uint32_t>(queued_bytes) / kAudioFrameBytes : 0;
-#else
-    SDL_LockAudioDevice(device);
-    const uint32_t count = queue.count;
-    SDL_UnlockAudioDevice(device);
-    return count;
+    if (queued_bytes > 0)
+        count += static_cast<uint32_t>(queued_bytes) / kAudioFrameBytes;
 #endif
+    return count;
 }
 
 uint32_t drain_audio(const NdsAudioDevice& device, AudioQueue& queue,
@@ -1184,35 +1182,7 @@ uint32_t drain_audio(const NdsAudioDevice& device, AudioQueue& queue,
             continue;
         bool pushed = false;
         while (!pushed) {
-#if defined(NDS_HAVE_SDL3)
-            const uint32_t queued = audio_queue_count(device, queue);
-            if (kAudioCapacityFrames - queued >= frames) {
-                if (SDL_PutAudioStreamData(device.stream, samples.data(),
-                                           static_cast<int>(
-                                               frames * kAudioFrameBytes))) {
-                    pushed = true;
-                } else {
-                    queue_error = true;
-                    return audio_queue_count(device, queue);
-                }
-            }
-#else
-            SDL_LockAudioDevice(device);
-            if (kAudioCapacityFrames - queue.count >= frames) {
-                const uint32_t first = std::min(
-                    frames, kAudioCapacityFrames - queue.write);
-                std::memcpy(queue.samples.data() + queue.write * 2u,
-                            samples.data(), first * kAudioFrameBytes);
-                if (first < frames)
-                    std::memcpy(queue.samples.data(),
-                                samples.data() + first * 2u,
-                                (frames - first) * kAudioFrameBytes);
-                queue.write = (queue.write + frames) % kAudioCapacityFrames;
-                queue.count += frames;
-                pushed = true;
-            }
-            SDL_UnlockAudioDevice(device);
-#endif
+            pushed = queue.ring.push(samples.data(), frames);
             if (!pushed) {
                 if (!throttle) {
                     queue_error = true;
@@ -1242,15 +1212,9 @@ uint32_t drain_audio(const NdsAudioDevice& device, AudioQueue& queue,
 
 void clear_audio_queue(const NdsAudioDevice& device, AudioQueue& queue) {
     if (!device) return;
+    queue.ring.clear();
 #if defined(NDS_HAVE_SDL3)
     SDL_ClearAudioStream(device.stream);
-    (void)queue;
-#else
-    SDL_LockAudioDevice(device);
-    queue.read = 0;
-    queue.write = 0;
-    queue.count = 0;
-    SDL_UnlockAudioDevice(device);
 #endif
 }
 
@@ -1290,11 +1254,10 @@ NdsAudioDevice open_audio_device(AudioQueue& queue,
     }
     if (device.stream &&
         !SDL_SetAudioStreamGetCallback(
-            device.stream, audio_stream_underrun_callback, &queue)) {
-        // Refuse a device that cannot report underruns rather than silently
-        // shipping a frontend whose audio gate asserts nothing.
+            device.stream, audio_stream_get_callback, &queue)) {
+        // The callback is what feeds the device: without it nothing plays.
         std::fprintf(stderr,
-            "[sdl] audio underrun callback unavailable: %s\n", SDL_GetError());
+            "[sdl] audio get callback unavailable: %s\n", SDL_GetError());
         close_audio(device);
     }
     return device;
