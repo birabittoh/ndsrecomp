@@ -4,6 +4,7 @@
 #include <dlfcn.h>
 #include <unistd.h>
 
+#include <atomic>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -51,22 +52,36 @@ Api g_api;
 Session* g_session = nullptr;
 bool g_tried = false;
 int64_t g_target_ns = 0;
+// A second thread for the session (0: none), and the one it was made with.
+std::atomic<int32_t> g_extra_tid{0};
+int32_t g_session_extra_tid = 0;
 
 }  // namespace
 
 void nds_android_perf_hint_frame(uint64_t work_ns, uint64_t target_ns) {
+    const int32_t extra = g_extra_tid.load(std::memory_order_acquire);
+    if (g_session && extra != g_session_extra_tid) {
+        // A session cannot gain a thread before API 34: made again with it.
+        g_api.close(g_session);
+        g_session = nullptr;
+        g_tried = false;
+    }
     if (!g_tried) {
+        const bool loaded = g_api.manager != nullptr;
         g_tried = true;
         // NDS_ANDROID_PERF_HINT=0 (debug.ndsrecomp.env) leaves it off.
         const char* env = std::getenv("NDS_ANDROID_PERF_HINT");
-        if (!env || std::strcmp(env, "0") != 0) g_api = load();
+        if (!loaded && (!env || std::strcmp(env, "0") != 0)) g_api = load();
         if (g_api.manager) {
-            const int32_t tid = static_cast<int32_t>(gettid());
+            const int32_t tids[2] = {static_cast<int32_t>(gettid()), extra};
             g_target_ns = static_cast<int64_t>(target_ns);
-            g_session = g_api.create(g_api.manager, &tid, 1, g_target_ns);
+            g_session = g_api.create(g_api.manager, tids, extra ? 2u : 1u,
+                                     g_target_ns);
+            g_session_extra_tid = extra;
         }
-        std::fprintf(stderr, "[android] performance hint session: %s\n",
-                     g_session ? "on" : "unavailable");
+        std::fprintf(stderr, "[android] performance hint session: %s%s\n",
+                     g_session ? "on" : "unavailable",
+                     g_session && extra ? " (with the CPU producer)" : "");
     }
     if (!g_session || work_ns == 0) return;
     if (static_cast<int64_t>(target_ns) != g_target_ns) {
@@ -74,6 +89,11 @@ void nds_android_perf_hint_frame(uint64_t work_ns, uint64_t target_ns) {
         g_api.update(g_session, g_target_ns);
     }
     g_api.report(g_session, static_cast<int64_t>(work_ns));
+}
+
+void nds_android_perf_hint_add_current_thread() {
+    g_extra_tid.store(static_cast<int32_t>(gettid()),
+                      std::memory_order_release);
 }
 
 void nds_android_perf_hint_close() {

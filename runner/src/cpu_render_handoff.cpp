@@ -1,5 +1,6 @@
 #include "cpu_render_handoff.h"
 #include "host_profile.h"
+#include <chrono>
 #include <stdexcept>
 #if defined(_WIN32)
 #ifndef NOMINMAX
@@ -73,6 +74,28 @@ void NdsCpuRenderHandoff::Join() {
     auto error = frame_error;
     lock.unlock();
     if (error) std::rethrow_exception(error);
+}
+void NdsCpuRenderHandoff::ServiceFor(uint32_t ms) {
+    if (std::this_thread::get_id() != main_id)
+        throw std::logic_error("CPU frame service is not on the main owner");
+    std::unique_lock lock(mutex);
+    if (!changed.wait_for(lock, std::chrono::milliseconds(ms),
+                          [&] { return bool(request) || stopping; }) ||
+        !request)
+        return;
+    auto action = std::move(request);
+    request = nullptr;
+    lock.unlock();
+    std::exception_ptr error;
+    try { if (before_request) before_request(); action(); }
+    catch (...) { error = std::current_exception(); }
+    lock.lock();
+    request_error = error; request_done = true;
+    changed.notify_all();
+}
+bool NdsCpuRenderHandoff::FrameDone() {
+    std::lock_guard lock(mutex);
+    return !active || done;
 }
 void NdsCpuRenderHandoff::Main(std::function<void()> action) {
     const auto begin = clock();

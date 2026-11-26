@@ -24,6 +24,12 @@ public:
     NdsCpuRenderHandoff& operator=(const NdsCpuRenderHandoff&) = delete;
     void Start(std::function<void()> frame);
     void Join();
+    // Main only: waits up to `ms` for a request of the running frame and
+    // services it. For the main thread's own waits (audio pacing) while the
+    // producer runs, so the producer is never left waiting on a sleep.
+    void ServiceFor(uint32_t ms);
+    // Main only: whether the running frame has finished (Join would not wait).
+    bool FrameDone();
     const Timing& LastTiming() const { return timing; } // only after Join
     void Main(std::function<void()> request);
 private:

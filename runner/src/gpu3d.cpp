@@ -489,6 +489,11 @@ bool profiling() {
 // the flat texture views coherent. At 1x the CPU composite is presented and
 // nothing is drawn here.
 void plume_render_frame() {
+    // The draw records and submits on the host's device, which the presenter
+    // uses too: the CPU producer has the main thread do it.
+    if (nds_cpu_render_on_worker()) {
+        nds_cpu_render_main([] { plume_render_frame(); }); return;
+    }
     if (!nds_plume3d_ready()) return;
     const auto& g3 = g_nds.GPU.GPU3D;
     if (g_internal_scale <= 1u || g3.AbortFrame) {
@@ -1450,9 +1455,12 @@ const char* nds_gpu3d_command_batch_json() {
 }
 
 void nds_gpu3d_set_power(uint16_t powcnt1) {
+    // Plume: only plume_render_frame needs the main thread.
+#if !defined(NDS_USE_PLUME)
     if (nds_cpu_render_on_worker()) {
         nds_cpu_render_main([=] { nds_gpu3d_set_power(powcnt1); }); return;
     }
+#endif
     g_nds.GPU.GPU3D.SetEnabled((powcnt1 & (1u << 3)) != 0,
                                (powcnt1 & (1u << 2)) != 0);
 }
@@ -1510,9 +1518,12 @@ void nds_gpu3d_check_fifo_irq() {
 }
 
 void nds_gpu3d_vcount144() {
+    // Plume: only plume_render_frame needs the main thread.
+#if !defined(NDS_USE_PLUME)
     if (nds_cpu_render_on_worker()) {
         nds_cpu_render_main([] { nds_gpu3d_vcount144(); }); return;
     }
+#endif
     // 3D frame boundary reached from the display tick. EXACT: three calls a
     // frame, each potentially a full renderer barrier, so sampling them at
     // 1-in-N would be a lottery ticket on a ~1 ms cost.
@@ -1688,9 +1699,12 @@ void nds_gpu3d_vblank() {
 }
 
 void nds_gpu3d_vcount215() {
+    // Plume: only plume_render_frame needs the main thread.
+#if !defined(NDS_USE_PLUME)
     if (nds_cpu_render_on_worker()) {
         nds_cpu_render_main([] { nds_gpu3d_vcount215(); }); return;
     }
+#endif
     // See nds_gpu3d_vcount144. The compute submit/sync/map buckets in
     // NdsGpu3dProfile are a breakdown of this region, not an addend to it.
     NdsEmuScope emu_region(NDS_EMU_GPU3D_FRAME);

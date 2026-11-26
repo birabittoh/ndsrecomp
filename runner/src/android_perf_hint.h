@@ -9,8 +9,12 @@
 #if defined(__ANDROID__)
 // Opens the session for the calling thread on the first call.
 void nds_android_perf_hint_frame(uint64_t work_ns, uint64_t target_ns);
+// Adds the calling thread (the CPU producer of the render handoff) to the
+// session; the reported work is then the two threads' frame together.
+void nds_android_perf_hint_add_current_thread();
 void nds_android_perf_hint_close();
 #else
 inline void nds_android_perf_hint_frame(uint64_t, uint64_t) {}
+inline void nds_android_perf_hint_add_current_thread() {}
 inline void nds_android_perf_hint_close() {}
 #endif

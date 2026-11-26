@@ -1170,7 +1170,19 @@ uint32_t audio_queue_count(const NdsAudioDevice& device, AudioQueue& queue) {
 uint32_t drain_audio(const NdsAudioDevice& device, AudioQueue& queue,
                      bool throttle, uint32_t pace_floor, bool& queue_error,
                      const std::vector<int16_t>* owned_pcm = nullptr,
-                     uint32_t drop_above = 0) {
+                     uint32_t drop_above = 0, bool guest_stopped = true,
+                     uint64_t* slept_ticks = nullptr,
+                     NdsCpuRenderHandoff* producer = nullptr) {
+    // A wait of about a millisecond; with a CPU producer running, it serves
+    // the producer's requests meanwhile. slept_ticks gets the waits that
+    // hold the loop up: with a producer, only those after its frame is done.
+    const auto wait = [producer, slept_ticks] {
+        const bool gating = !producer || producer->FrameDone();
+        const uint64_t start = slept_ticks && gating ? SDL_GetPerformanceCounter() : 0;
+        if (producer) producer->ServiceFor(1);
+        else SDL_Delay(1);
+        if (start) *slept_ticks += SDL_GetPerformanceCounter() - start;
+    };
     if (!device) return 0;
     queue.stalled = false;
     std::array<int16_t, 2048> samples{};
@@ -1203,7 +1215,7 @@ uint32_t drain_audio(const NdsAudioDevice& device, AudioQueue& queue,
                     queue.stalled = true;
                     return audio_queue_count(device, queue);
                 }
-                SDL_Delay(1);
+                wait();
             }
         }
     }
@@ -1224,9 +1236,10 @@ uint32_t drain_audio(const NdsAudioDevice& device, AudioQueue& queue,
     uint32_t lowest = queued;
     uint64_t progress_ticks = SDL_GetTicks();
     while (throttle && queued > pace_floor) {
-        // Spend existing audio pacing slack preparing qualified native code.
-        // Guest CPUs remain paused; under load/no slack demand execution wins.
-        if (!nds_arm9_native_prepare_idle(1000)) SDL_Delay(1);
+        // Spend existing audio pacing slack preparing qualified native code,
+        // while the guest CPUs are paused (not while a CPU producer runs);
+        // under load/no slack demand execution wins.
+        if (!guest_stopped || !nds_arm9_native_prepare_idle(1000)) wait();
         queued = audio_queue_count(device, queue);
         if (queued < lowest) {
             lowest = queued;
@@ -3646,16 +3659,23 @@ bool apply_performance_governor_stage(
 // slot or touching live simulation. No CPU images grow with internal scale.
 struct OwnedPresentationFrame {
     std::vector<uint32_t> pixels[2], native_top, hd_top, hd_below, objects, raster;
+    std::vector<uint32_t> fixed_base, fixed_layer;
     std::vector<int16_t> pcm;
     NdsComputePresentationFrame gl{};
+    NdsGpu2dFixedLayersFrame fixed{};
     uint16_t widths[2]{256,256};
+    // gpu2d's presented view of each LCD, for the dynamic layout.
+    int view_heights[2]{192,192}, view_widths[2]{256,256};
+    int hd_screen{};  // the LCD the HD surfaces and fixed layers are for
     uint64_t system_timestamp{}, audio_epoch{}, digest_epoch{}, job{}, adaptive_ticks{};
     uint64_t catchup_frames{};  // nds_spu_catchup_frames() when pcm was taken
     uint64_t emu_begin{}, emu_end{}, cycles_begin{}, cycles_end{};
-    bool direct{}, valid{}, powered_off{};
+    bool direct{}, valid{}, powered_off{}, has_fixed{};
 
-    void Capture(const NdsFrontendOptions& options, bool gl_top) {
-        valid=false; gl={}; pcm.clear();
+    // hd_screen: the one nds_gpu2d_set_hd_screen last set, which the
+    // presenter set while the producer was joined.
+    void Capture(const NdsFrontendOptions& options, bool gl_top, int screen) {
+        valid=false; gl={}; pcm.clear(); has_fixed=false; hd_screen=screen;
         powered_off=nds_powered_off();
         if (powered_off || nds_gpu3d_compute_runtime_failed()) return;
         const auto* native=nds_gpu2d_framebuffer(0);
@@ -3668,14 +3688,28 @@ struct OwnedPresentationFrame {
         const auto start=SDL_GetPerformanceCounter();
         const bool native_hd=gl_top && nds_gpu3d_internal_scale()>1u &&
                              nds_gpu3d_output_width()==256u;
-        if (((options.adaptive_screens & NDS_ADAPTIVE_TOP) || native_hd) && !direct)
+        const bool fixed_layers=nds_gpu2d_fixed_layers_requested();
+        if (((options.adaptive_screens & NDS_ADAPTIVE_TOP) ||
+             ((native_hd || fixed_layers) && screen == 0)) && !direct)
             top=nds_gpu2d_adaptive_framebuffer(0,&widths[0]);
         else if (direct) widths[0]=nds_gpu3d_output_width();
-        if (options.adaptive_screens & NDS_ADAPTIVE_BOTTOM)
+        if ((options.adaptive_screens & NDS_ADAPTIVE_BOTTOM) ||
+            ((native_hd || fixed_layers) && screen == 1))
             bottom=nds_gpu2d_adaptive_framebuffer(1,&widths[1]);
         adaptive_ticks=SDL_GetPerformanceCounter()-start;
         pixels[0].assign(top,top+(direct ? 256u : widths[0])*192u);
         pixels[1].assign(bottom,bottom+widths[1]*192u);
+        for (int s=0; s<2; ++s) {
+            view_heights[s]=nds_gpu2d_presented_view_height(s);
+            view_widths[s]=nds_gpu2d_presented_view_width(s,widths[s]);
+        }
+        has_fixed=!direct && nds_gpu2d_fixed_layers_frame(&fixed);
+        if (has_fixed) {
+            const size_t base_count=size_t(widths[screen & 1])*192u;
+            fixed_base.assign(fixed.base,fixed.base+base_count);
+            fixed_layer.assign(fixed.layer,fixed.layer+256u*192u);
+            fixed.base=fixed_base.data(); fixed.layer=fixed_layer.data();
+        }
         gl.has_direct=nds_gpu2d_direct_frame(&gl.direct);
         if (gl.has_direct) {
             objects.assign(gl.direct.object_pixels,
@@ -3715,9 +3749,13 @@ struct OwnedPresentationFrame {
 // the layer at its scale about its native anchor, and the image without it.
 // The layer is the native 256 columns; the image without it is `width`
 // wide. Returns whether it did; the caller clears it after the present.
-bool set_fixed_layers(int width) {
+// `owned` is the frame's copy when the CPU producer runs ahead; else gpu2d's.
+bool set_fixed_layers(int width,
+                      const NdsGpu2dFixedLayersFrame* owned = nullptr) {
     NdsGpu2dFixedLayersFrame fixed{};
-    if (width < 256 || !nds_gpu2d_fixed_layers_frame(&fixed)) return false;
+    if (owned) fixed = *owned;
+    if (width < 256 || (!owned && !nds_gpu2d_fixed_layers_frame(&fixed)))
+        return false;
     const float s = fixed.scale;
     nds_compute_host_set_layer(fixed.layer, fixed.base, unsigned(width),
                                float(fixed.anchor_x) / 256.0f * (1.0f - s),
@@ -3769,7 +3807,11 @@ PresentationTicks present_single_screen(FrontendPresentation& presentation,
                                         float virtual_stylus_x,
                                         float virtual_stylus_y,
                                         const char* savestate_notice,
-                                        const char* fps_counter) {
+                                        const char* fps_counter
+#if defined(NDS_HAVE_COMPUTE_RENDERER)
+                                        ,const OwnedPresentationFrame* packet = nullptr
+#endif
+                                        ) {
     PresentationTicks ticks{};
     const int shown = presentation.shown_screen & 1;
     const uint32_t* pixels = shown ? bottom_pixels : top_pixels;
@@ -3825,7 +3867,17 @@ PresentationTicks present_single_screen(FrontendPresentation& presentation,
 #if defined(NDS_HAVE_COMPUTE_RENDERER)
         // The OBJ-only direct path draws engine A on the top LCD only.
         NdsGpu2dDirectFrame direct_frame{};
-        const bool direct = shown == 0 && nds_gpu2d_direct_frame(&direct_frame);
+        const bool direct = shown == 0 &&
+            (packet ? (direct_frame = packet->gl.direct, packet->gl.has_direct)
+                    : nds_gpu2d_direct_frame(&direct_frame));
+        // A packet made for the other LCD (the shown one just changed) has
+        // no HD surfaces or fixed layers for this one.
+        const bool packet_screen = packet && packet->hd_screen == shown;
+        NdsComputePresentationFrame owned{};
+        if (packet) {
+            owned = packet->gl;
+            owned.has_hd = packet_screen && owned.has_hd;
+        }
         static std::vector<uint32_t> overlay;
         static ChatFrame chat;
         bool want_chat = false;
@@ -3858,10 +3910,14 @@ PresentationTicks present_single_screen(FrontendPresentation& presentation,
         nds_compute_host_set_inset(other_pixels,
                                    static_cast<unsigned>(other_width),
                                    presentation.inset_percent);
-        const bool layer_set = !direct && set_fixed_layers(width);
+        const bool layer_set = !direct &&
+            (packet ? packet_screen && packet->has_fixed &&
+                          set_fixed_layers(width, &packet->fixed)
+                    : set_fixed_layers(width));
         NdsGpu2dFixedLayersFrame fixed_shown{};
         if (layer_set && shown == 1 &&
-            nds_gpu2d_fixed_layers_frame(&fixed_shown)) {
+            (packet ? (fixed_shown = packet->fixed, true)
+                    : nds_gpu2d_fixed_layers_frame(&fixed_shown))) {
             g_touch_ui_anchor_x.store(float(fixed_shown.anchor_x));
             g_touch_ui_anchor_y.store(float(fixed_shown.anchor_y));
             g_touch_ui_scale.store(fixed_shown.scale);
@@ -3871,7 +3927,7 @@ PresentationTicks present_single_screen(FrontendPresentation& presentation,
         const bool ok = nds_compute_host_present_top(
             pixels, static_cast<uint16_t>(width),
             direct ? &direct_frame : nullptr, &gl_ticks,
-            presentation.antialiasing);
+            presentation.antialiasing, packet ? &owned : nullptr);
         nds_compute_host_set_overlay(nullptr, 0);
         nds_compute_host_set_inset(nullptr, 0, 0);
         nds_compute_host_set_layer(nullptr, nullptr, 0, 0, 0, 0, 0);
@@ -3972,13 +4028,14 @@ PresentationTicks present_dual(FrontendPresentation& presentation,
                                bool virtual_stylus_visible,
                                float virtual_stylus_x, float virtual_stylus_y,
                                const char* savestate_notice,
-                               const char* fps_counter) {
+                               const char* fps_counter,
+                               const OwnedPresentationFrame* packet) {
     presentation.shown_screen = 0;
     presentation.inset_percent = 0;
     PresentationTicks ticks = present_single_screen(
         presentation, top_pixels, top_width, bottom_pixels, bottom_width,
         virtual_stylus_visible && g_virtual_stylus_screen == 0,
-        virtual_stylus_x, virtual_stylus_y, nullptr, nullptr);
+        virtual_stylus_x, virtual_stylus_y, nullptr, nullptr, packet);
     if (!ticks.ok || g_present_synthetic) return ticks;
     virtual_stylus_visible =
         virtual_stylus_visible && g_virtual_stylus_screen == 1;
@@ -4077,7 +4134,7 @@ PresentationTicks present_screens(FrontendPresentation& presentation,
                                   const char* savestate_notice,
                                   const char* fps_counter
 #if defined(NDS_HAVE_COMPUTE_RENDERER)
-                                  ,const NdsComputePresentationFrame* owned = nullptr
+                                  ,const OwnedPresentationFrame* packet = nullptr
 #endif
                                   ) {
     PresentationTicks ticks{};
@@ -4086,15 +4143,20 @@ PresentationTicks present_screens(FrontendPresentation& presentation,
         return present_dual(presentation, top_pixels, top_width, bottom_pixels,
                             bottom_width, virtual_stylus_visible,
                             virtual_stylus_x, virtual_stylus_y,
-                            savestate_notice, fps_counter);
+                            savestate_notice, fps_counter, packet);
 #endif
     if (presentation.single)
         return present_single_screen(
             presentation, top_pixels, top_width, bottom_pixels, bottom_width,
             virtual_stylus_visible, virtual_stylus_x,
-            virtual_stylus_y, savestate_notice, fps_counter);
+            virtual_stylus_y, savestate_notice, fps_counter
+#if defined(NDS_HAVE_COMPUTE_RENDERER)
+            ,packet
+#endif
+            );
     if (presentation.gl_top) {
 #if defined(NDS_HAVE_COMPUTE_RENDERER)
+        const NdsComputePresentationFrame* owned = packet ? &packet->gl : nullptr;
         NdsGpu2dDirectFrame direct_frame{};
         const bool latency = nds_frontend_latency::enabled.load(std::memory_order_relaxed);
         const auto pool_begin = latency ? SDL_GetPerformanceCounter() : 0;
@@ -4108,7 +4170,11 @@ PresentationTicks present_screens(FrontendPresentation& presentation,
         nds_compute_host_set_raster_request(presentation.resolution_scale,
                                             presentation.internal_resolution);
         g_touch_ui_scale.store(1.0f);  // the touchscreen has its own window
-        if (!owned && !direct) set_fixed_layers(top_width);
+        if (!direct) {
+            if (!packet) set_fixed_layers(top_width);
+            else if (packet->has_fixed && packet->hd_screen == 0)
+                set_fixed_layers(top_width, &packet->fixed);
+        }
         // The top window's overlays: the chat and the on-screen buttons.
         static std::vector<uint32_t> top_overlay;
         static ChatFrame chat;
@@ -5751,19 +5817,32 @@ int nds_run_interactive_frontend(const NdsFrontendOptions& initial_options) {
     bool producer_priority_initialized=false;
 #endif
     std::unique_ptr<NdsCpuRenderHandoff> cpu_handoff;
+    // The handoff loop's period and its pacing sleep, for frame_behind.
+    uint64_t handoff_period=0, handoff_last_phase0=0, handoff_last_slept=0;
 #if defined(NDS_HAVE_COMPUTE_RENDERER)
     int completed_slot=-1;
+    // The LCD the next packet's HD surfaces are for: set while joined.
+    int handoff_hd_screen=0;
     uint64_t produced_jobs=0;
     const char* handoff_setting=std::getenv("NDS_CPU_RENDER_HANDOFF");
-    const bool handoff_requested=handoff_setting && std::strcmp(handoff_setting,"1")==0;
+    // On by default with Plume (=0 turns it off); the compute renderer's
+    // MKDS profile only with =1.
+    const bool handoff_forced=handoff_setting && std::strcmp(handoff_setting,"1")==0;
+    const bool handoff_requested=!handoff_setting || std::strcmp(handoff_setting,"0")!=0;
     bool handoff_title_supported=false;
 #if defined(NDS_MKDS_PERFORMANCE)
     handoff_title_supported=options.savestate_rom_sha1=="691e00d9a5dd80b04f80cc7559503e8b06848785";
 #endif
     const std::string backend=nds_gpu3d_compiled_accelerated_backend();
-    if (handoff_requested && handoff_title_supported && presentation.gl_top &&
-        !presentation.single && backend=="compute" &&
-        !interpolation_active && options.perf_governor_mode==NdsPerfGovernorMode::Off &&
+    // Plume: its 3D draw (VCount215) and every present stay on main, in that
+    // order, so the raster a present reads is the presented frame's. The
+    // governor and the auto scale apply their stages while joined.
+    const bool handoff_backend=backend=="plume" ||
+        (backend=="compute" && handoff_forced && handoff_title_supported &&
+         !presentation.single &&
+         options.perf_governor_mode==NdsPerfGovernorMode::Off);
+    if (handoff_requested && handoff_backend && presentation.gl_top &&
+        !interpolation_active &&
         !selftest_menu && !selftest_relative_mouse &&
         !std::getenv("NDS_GUEST_JOB_PROFILE_OUTPUT")) {
         nds_hostprof_unregister_current_thread();
@@ -5772,8 +5851,8 @@ int nds_run_interactive_frontend(const NdsFrontendOptions& initial_options) {
             if (!nds_compute_host_make_current())
                 throw std::runtime_error("main GL context unavailable during native borrow");
         });
-        std::fprintf(stderr,"[sdl] CPU/render handoff: elective MKDS profile; worker simulation+PCM, main SDL/GL; one completed-frame presentation/PCM latency\n");
-    } else if (handoff_requested) {
+        std::fprintf(stderr,"[sdl] CPU/render handoff (%s): worker simulation+PCM, main presentation; one completed-frame presentation/PCM latency\n",backend.c_str());
+    } else if (handoff_forced) {
         std::fprintf(stderr,"[sdl] CPU/render handoff unavailable for selected title/renderer/features; serial fallback\n");
     }
 #endif
@@ -7426,6 +7505,117 @@ int nds_run_interactive_frontend(const NdsFrontendOptions& initial_options) {
         }
         publish_input_debug();
 
+        // The single layout's screen: which LCD shows, stacked or not. Reads
+        // the live emulation (with the CPU handoff, right after the join,
+        // for the frame presented next). Returns the LCD that takes HD.
+        const auto choose_single_layout = [&]() -> int {
+            int hd_screen = 0;
+            if (presentation.single) {
+                if (nds_main_screen_update(
+                        main_screen, nds_gpu2d_presented_main_screen(),
+                        nds_gpu2d_presented_both_blank())) {
+                    std::fprintf(stderr,
+                                 "[display] main screen -> %s (frame %llu)\n",
+                                 main_screen.main ? "bottom" : "top",
+                                 static_cast<unsigned long long>(shown_frames));
+                    screen_toggled = false;
+                }
+                // With the second display each LCD has a panel of its own.
+                presentation.stacked =
+                    !presentation.dual && nds_title_stacked_layout_wanted();
+                nds_stack_vertically_flag().store(
+                    presentation.stacked, std::memory_order_relaxed);
+                nds_stack_gap_flag().store(
+                    presentation.stacked ? nds_title_stacked_gap() : 0,
+                    std::memory_order_relaxed);
+                nds_inset_below_flag().store(nds_title_inset_below_wanted(),
+                                             std::memory_order_relaxed);
+                const int shown = presentation.stacked || presentation.dual
+                    ? 0
+                    : nds_single_shown_screen(
+                          main_screen.main,
+                          screen_toggled != screen_swap_pad_held,
+                          mph_prime_virtual_stylus ||
+                              (generic_virtual_stylus &&
+                               options.second_screen_size == 0));
+                if (shown != presentation.shown_screen) {
+                    // A held mouse touch belongs to the LCD it started on.
+                    if (mouse_down) {
+                        mouse_down = false;
+                        touch_release_pending = false;
+                        nds_set_touch(0, 0, false);
+                    }
+                    presentation.shown_screen = shown;
+                }
+                hd_screen = shown;
+            }
+            return hd_screen;
+        };
+#if defined(NDS_SECOND_DISPLAY)
+        const auto update_second_display = [&] {
+            // The second display's surface, picked up or let go of between
+            // frames: the layout switches with it, the windows stay as they are.
+            {
+                uint64_t generation = 0;
+                ANativeWindow* const surface =
+                    nds_second_display_surface(&generation);
+                if (generation != second_display_generation) {
+                    nds_compute_host_set_bottom_window(nullptr);
+                    nds_second_display_release(generation);
+                    second_display_generation = generation;
+                    if (surface && presentation.single && presentation.gl_top)
+                        nds_compute_host_set_bottom_window(surface);
+                    const bool dual = nds_compute_host_has_bottom_window();
+                    if (dual != presentation.dual) {
+                        // A held touch belongs to the panel it started on.
+                        if (mouse_down) {
+                            mouse_down = false;
+                            touch_release_pending = false;
+                            nds_set_touch(0, 0, false);
+                        }
+                        second_display_touch_held = false;
+                        presentation.dual = dual;
+                        presentation.window_ids[1] =
+                            dual ? kSecondDisplayWindowId
+                                 : presentation.window_ids[0];
+                        if (dual) {
+                            presentation.shown_screen = 0;
+                            presentation.stacked = false;
+                        }
+                        std::fprintf(stderr, "[second-display] bottom screen %s\n",
+                                     dual ? "on the second display"
+                                          : "back in the main window");
+                    }
+                }
+            }
+        };
+#endif
+        // 3D motion smoothing for the frame emulated next. Fast-forward
+        // shows the game's own 3D images only: building and drawing the
+        // halfway image costs host time that turbo would rather spend running
+        // more DS frames, and at turbo speed it is not seen. A title that
+        // owns smoothing replaces display.smooth_3d.
+        const auto update_smooth_3d = [&] {
+            const bool smooth_3d = nds_title_smooth_3d_owned()
+                                       ? nds_title_smooth_3d_wanted()
+                                       : options.smooth_3d;
+            nds_gpu3d_set_interpolation(smooth_3d && !turbo_active);
+        };
+#if defined(NDS_HAVE_COMPUTE_RENDERER)
+        // With the CPU handoff, what the serial loop does before its present
+        // from the live emulation is done here, joined, after each frame:
+        // it takes effect from the next frame the producer captures.
+        const auto handoff_joined = [&] {
+#if defined(NDS_SECOND_DISPLAY)
+            update_second_display();
+#endif
+            handoff_hd_screen = choose_single_layout();
+            nds_gpu2d_set_hd_screen(handoff_hd_screen);
+            nds_gpu2d_set_fixed_layers_consumer(
+                presentation.gl_top && nds_compute_host_supports_layer());
+            update_smooth_3d();
+        };
+#endif
         // Quit/control requests are resolved while the producer is joined.
         // Never start another guest transaction after SDL_QUIT/window close.
         if (!running) break;
@@ -7446,12 +7636,14 @@ int nds_run_interactive_frontend(const NdsFrontendOptions& initial_options) {
             building_slot=completed_slot<0 ? 0 : 1-completed_slot;
             auto& packet=owned_frames[building_slot];
             packet.job=++produced_jobs; packet.digest_epoch=g_frame_digest_epoch;
-            cpu_handoff->Start([&,building_slot] {
+            cpu_handoff->Start([&,building_slot,gl_top=presentation.gl_top,
+                                hd_screen=handoff_hd_screen] {
                 // SDL changes the CALLING thread's priority. Do not assume the
                 // main thread's existing HIGH setting is inherited by pthreads.
                 if (!producer_priority_initialized) {
                     if (!sdl_set_thread_priority_high())
                         std::fprintf(stderr,"[sdl] CPU producer priority unchanged: %s\n",SDL_GetError());
+                    nds_android_perf_hint_add_current_thread();
                     producer_priority_initialized=true;
                 }
                 auto& output=owned_frames[building_slot];
@@ -7464,7 +7656,7 @@ int nds_run_interactive_frontend(const NdsFrontendOptions& initial_options) {
                     scheduler_run_round();
                 output.cycles_end=latency_trace ? nds_frontend_latency::cycles() : 0;
                 output.emu_end=SDL_GetPerformanceCounter();
-                output.Capture(options,presentation.gl_top);
+                output.Capture(options,gl_top,hd_screen);
             });
             producer_pending=true;
             if (completed_slot<0) {
@@ -7474,6 +7666,7 @@ int nds_run_interactive_frontend(const NdsFrontendOptions& initial_options) {
                     compute_failed=true; running=false; break;
                 }
                 producer_pending=false; completed_slot=building_slot;
+                handoff_joined();
                 // Prime one completed packet without displaying it twice. The
                 // next loop samples controls for the next CPU frame, then
                 // presents this completed job while that producer runs.
@@ -7545,41 +7738,7 @@ int nds_run_interactive_frontend(const NdsFrontendOptions& initial_options) {
         }
 
 #if defined(NDS_SECOND_DISPLAY)
-        // The second display's surface, picked up or let go of between
-        // frames: the layout switches with it, the windows stay as they are.
-        {
-            uint64_t generation = 0;
-            ANativeWindow* const surface =
-                nds_second_display_surface(&generation);
-            if (generation != second_display_generation) {
-                nds_compute_host_set_bottom_window(nullptr);
-                nds_second_display_release(generation);
-                second_display_generation = generation;
-                if (surface && presentation.single && presentation.gl_top)
-                    nds_compute_host_set_bottom_window(surface);
-                const bool dual = nds_compute_host_has_bottom_window();
-                if (dual != presentation.dual) {
-                    // A held touch belongs to the panel it started on.
-                    if (mouse_down) {
-                        mouse_down = false;
-                        touch_release_pending = false;
-                        nds_set_touch(0, 0, false);
-                    }
-                    second_display_touch_held = false;
-                    presentation.dual = dual;
-                    presentation.window_ids[1] =
-                        dual ? kSecondDisplayWindowId
-                             : presentation.window_ids[0];
-                    if (dual) {
-                        presentation.shown_screen = 0;
-                        presentation.stacked = false;
-                    }
-                    std::fprintf(stderr, "[second-display] bottom screen %s\n",
-                                 dual ? "on the second display"
-                                      : "back in the main window");
-                }
-            }
-        }
+        if (!cpu_handoff) update_second_display();
 #endif
         const uint64_t phase1 = SDL_GetPerformanceCounter();
         uint64_t latency_cycles_present = latency_trace ? nds_frontend_latency::cycles() : 0;
@@ -7606,46 +7765,7 @@ int nds_run_interactive_frontend(const NdsFrontendOptions& initial_options) {
             // The window that consumes HD surfaces: the top one, or in the
             // single-screen layout whichever LCD it shows. gpu2d emits them
             // only while engine A drew that LCD.
-            int hd_screen = 0;
-            if (presentation.single) {
-                if (nds_main_screen_update(
-                        main_screen, nds_gpu2d_presented_main_screen(),
-                        nds_gpu2d_presented_both_blank())) {
-                    std::fprintf(stderr,
-                                 "[display] main screen -> %s (frame %llu)\n",
-                                 main_screen.main ? "bottom" : "top",
-                                 static_cast<unsigned long long>(shown_frames));
-                    screen_toggled = false;
-                }
-                // With the second display each LCD has a panel of its own.
-                presentation.stacked =
-                    !presentation.dual && nds_title_stacked_layout_wanted();
-                nds_stack_vertically_flag().store(
-                    presentation.stacked, std::memory_order_relaxed);
-                nds_stack_gap_flag().store(
-                    presentation.stacked ? nds_title_stacked_gap() : 0,
-                    std::memory_order_relaxed);
-                nds_inset_below_flag().store(nds_title_inset_below_wanted(),
-                                             std::memory_order_relaxed);
-                const int shown = presentation.stacked || presentation.dual
-                    ? 0
-                    : nds_single_shown_screen(
-                          main_screen.main,
-                          screen_toggled != screen_swap_pad_held,
-                          mph_prime_virtual_stylus ||
-                              (generic_virtual_stylus &&
-                               options.second_screen_size == 0));
-                if (shown != presentation.shown_screen) {
-                    // A held mouse touch belongs to the LCD it started on.
-                    if (mouse_down) {
-                        mouse_down = false;
-                        touch_release_pending = false;
-                        nds_set_touch(0, 0, false);
-                    }
-                    presentation.shown_screen = shown;
-                }
-                hd_screen = shown;
-            }
+            const int hd_screen = choose_single_layout();
             nds_gpu2d_set_hd_screen(hd_screen);
             const bool native_hd=presentation.gl_top && nds_gpu3d_internal_scale()>1u &&
                                  nds_gpu3d_output_width()==256u;
@@ -7674,15 +7794,26 @@ int nds_run_interactive_frontend(const NdsFrontendOptions& initial_options) {
             presentation.screen_widths[0] = top_width;
             presentation.screen_widths[1] = bottom_width;
             presentation.canvas_width = std::max<int>(top_width, bottom_width);
+            const auto view_height = [&](int screen) {
+#if defined(NDS_HAVE_COMPUTE_RENDERER)
+                if (cpu_handoff) return presented->view_heights[screen & 1];
+#endif
+                return nds_gpu2d_presented_view_height(screen);
+            };
+            const auto view_width = [&](int screen, int width) {
+#if defined(NDS_HAVE_COMPUTE_RENDERER)
+                if (cpu_handoff) return presented->view_widths[screen & 1];
+#endif
+                return nds_gpu2d_presented_view_width(screen, width);
+            };
             presentation.main_view_height = presentation.single
-                ? nds_gpu2d_presented_view_height(presentation.shown_screen)
+                ? view_height(presentation.shown_screen)
                 : kScreenHeight;
             nds_main_view_height_flag().store(presentation.main_view_height,
                                               std::memory_order_relaxed);
             const int shown = presentation.shown_screen & 1;
             presentation.main_view_width = presentation.single
-                ? nds_gpu2d_presented_view_width(
-                      shown, presentation.screen_widths[shown])
+                ? view_width(shown, presentation.screen_widths[shown])
                 : kScreenWidth;
             nds_main_view_width_flag().store(
                 presentation.single ? presentation.main_view_width : 0,
@@ -7757,14 +7888,7 @@ int nds_run_interactive_frontend(const NdsFrontendOptions& initial_options) {
             // extra present.
             SDL_PumpEvents();
         }
-        // Fast-forward shows the game's own 3D images only: building and
-        // drawing the halfway image costs host time that turbo would rather
-        // spend running more DS frames, and at turbo speed it is not seen.
-        // A title that owns smoothing replaces display.smooth_3d.
-        const bool smooth_3d = nds_title_smooth_3d_owned()
-                                   ? nds_title_smooth_3d_wanted()
-                                   : options.smooth_3d;
-        nds_gpu3d_set_interpolation(smooth_3d && !turbo_active);
+        if (!cpu_handoff) update_smooth_3d();
         presentation.window_mode = options.window_mode;
         presentation.scaling = options.scaling;
         presentation.resolution_scale = options.resolution_scale;
@@ -7782,51 +7906,23 @@ int nds_run_interactive_frontend(const NdsFrontendOptions& initial_options) {
             savestate_notice.empty() ? nullptr : savestate_notice.c_str(),
             options.show_fps ? fps_counter.c_str() : nullptr
 #if defined(NDS_HAVE_COMPUTE_RENDERER)
-            ,cpu_handoff ? &presented->gl : nullptr
+            ,cpu_handoff ? presented : nullptr
 #endif
             );
         const uint64_t presentation_end=SDL_GetPerformanceCounter();
+        bool early_audio_stalled=false;
+        uint64_t frame_slept=0;  // the audio pacing's sleep this frame
 #if defined(NDS_HAVE_COMPUTE_RENDERER)
-        if (cpu_handoff) {
-            if (producer_pending) {
-                try { cpu_handoff->Join(); }
-                catch (const std::exception& e) {
-                    std::fprintf(stderr,"[sdl] CPU producer failed: %s\n",e.what());
-                    compute_failed=true; running=false; break;
-                }
-                producer_pending=false; completed_slot=building_slot;
-            }
-            const auto& produced=owned_frames[building_slot];
-            const auto& handoff_timing=cpu_handoff->LastTiming();
-            frame_work_ticks=std::max(presentation_end,handoff_timing.end)-phase0;
-            const auto overlap_begin=std::max(phase1,handoff_timing.begin);
-            const auto prefix_end=handoff_timing.first_request
-                ? handoff_timing.first_request : handoff_timing.end;
-            const auto overlap_end=std::min(presentation_end,prefix_end);
-            const auto overlap=overlap_end>overlap_begin ? overlap_end-overlap_begin : 0;
-            g_live_stats.cpu_render_handoff=1;
-            g_live_stats.cpu_frames_produced=produced.job;
-            g_live_stats.presented_job=presented->job;
-            g_live_stats.presented_system_timestamp=presented->system_timestamp;
-            g_live_stats.cpu_worker_cycles+=handoff_timing.cycles_end-handoff_timing.cycles_begin;
-            g_live_stats.cpu_main_requests+=handoff_timing.main_requests;
-            g_live_stats.cpu_overlap_ticks+=overlap;
-            if (overlap) ++g_live_stats.cpu_overlap_frames;
-            g_live_stats.cpu_prefix_cycles+=(handoff_timing.first_request
-                ? handoff_timing.cycles_first_request : handoff_timing.cycles_end)
-                -handoff_timing.cycles_begin;
-            worker_emu_begin=produced.emu_begin; worker_emu_end=produced.emu_end;
-            latency_cycles_emu=produced.cycles_begin; latency_cycles_present=produced.cycles_end;
-            frame_emu_ticks=worker_emu_end-worker_emu_begin;
-            phase_emu_ticks+=frame_emu_ticks;
-            if (frame_emu_ticks>max_emu_ticks) { max_emu_ticks=frame_emu_ticks; max_emu_frame=shown_frames; }
-            if (frame_emu_ticks*1000u>frequency*32u) ++slow_frames_32ms;
-            if (!produced.valid || nds_gpu3d_compute_runtime_failed()) {
-                compute_failed=!produced.powered_off; running=false; break;
-            }
-            if (touch_release_pending && touch_frames_held>=2) {
-                nds_set_touch(0,0,false); touch_release_pending=false;
-            }
+        // The presented frame's sound goes to the device while the producer
+        // still runs, and the whole audio step below with it: the producer
+        // is joined after it.
+        if (cpu_handoff && !turbo_active && audio) {
+            drain_audio(audio, audio_queue, audio_started,
+                        std::numeric_limits<uint32_t>::max(),
+                        audio_queue_error, &presented->pcm, 0, false,
+                        nullptr, cpu_handoff.get());
+            early_audio_stalled=audio_queue.stalled;
+            presented->pcm.clear();
         }
 #endif
         if (!presentation_ticks.ok) {
@@ -7856,18 +7952,26 @@ int nds_run_interactive_frontend(const NdsFrontendOptions& initial_options) {
             blend_cache.valid = false;
         }
         phase_present_ticks += presentation_end - phase1;
-        {
+        const auto report_frame_work = [&] {
             // The frame's own work, without the swap's wait for the display.
+            // With the CPU handoff the producer's frame and the present
+            // overlap: the work is from the producer's start until both are
+            // done (the hint session has both threads).
             const uint64_t present = presentation_end - phase1;
-            const uint64_t work = frame_emu_ticks +
-                (present > presentation_ticks.swap
-                     ? present - presentation_ticks.swap : 0u);
+            const uint64_t work = cpu_handoff ? frame_work_ticks
+                : frame_emu_ticks + (present > presentation_ticks.swap
+                                         ? present - presentation_ticks.swap : 0u);
             nds_android_perf_hint_frame(
                 static_cast<uint64_t>(work * 1e9 / double(frequency)),
                 1'000'000'000ull / 60u);
-            frame_work_average += (double(work) - frame_work_average) / 8.0;
+            // Behind real time with the handoff: the loop's own period
+            // without its pacing sleep (the threads' work overlaps, so no
+            // per-thread sum says it), the last frame's.
+            const uint64_t behind_work = cpu_handoff ? handoff_period : work;
+            frame_work_average += (double(behind_work) - frame_work_average) / 8.0;
             frame_behind = frame_work_average * 60.0 > double(frequency);
-        }
+        };
+        if (!cpu_handoff) report_frame_work();
         if (audio && audio_started) {
             const uint32_t queued = audio_queue_count(audio, audio_queue);
             audio_min_queue = std::min(audio_min_queue, queued);
@@ -7936,10 +8040,13 @@ int nds_run_interactive_frontend(const NdsFrontendOptions& initial_options) {
                 audio_queue_error
 #if defined(NDS_HAVE_COMPUTE_RENDERER)
                 ,cpu_handoff ? &presented->pcm : nullptr
+#else
+                ,nullptr
 #endif
-                );
+                ,0, !cpu_handoff, &frame_slept,
+                producer_pending ? cpu_handoff.get() : nullptr);
         }
-        if (audio && audio_queue.stalled) {
+        if (audio && (audio_queue.stalled || early_audio_stalled)) {
             // The device stopped consuming: a fresh one, prebuffered like
             // after a state load. On Android this is what a long stay in
             // the background leaves behind.
@@ -8001,6 +8108,59 @@ int nds_run_interactive_frontend(const NdsFrontendOptions& initial_options) {
             audio_pace_floor = audio_start_threshold;
         }
 
+#if defined(NDS_HAVE_COMPUTE_RENDERER)
+        if (cpu_handoff) {
+            if (producer_pending) {
+                try { cpu_handoff->Join(); }
+                catch (const std::exception& e) {
+                    std::fprintf(stderr,"[sdl] CPU producer failed: %s\n",e.what());
+                    compute_failed=true; running=false; break;
+                }
+                producer_pending=false; completed_slot=building_slot;
+            }
+            handoff_joined();
+            const auto& produced=owned_frames[building_slot];
+            const auto& handoff_timing=cpu_handoff->LastTiming();
+            frame_work_ticks=std::max(presentation_end,handoff_timing.end)-phase0;
+            const auto overlap_begin=std::max(phase1,handoff_timing.begin);
+            const auto prefix_end=handoff_timing.first_request
+                ? handoff_timing.first_request : handoff_timing.end;
+            const auto overlap_end=std::min(presentation_end,prefix_end);
+            const auto overlap=overlap_end>overlap_begin ? overlap_end-overlap_begin : 0;
+            g_live_stats.cpu_render_handoff=1;
+            g_live_stats.cpu_frames_produced=produced.job;
+            g_live_stats.presented_job=presented->job;
+            g_live_stats.presented_system_timestamp=presented->system_timestamp;
+            g_live_stats.cpu_worker_cycles+=handoff_timing.cycles_end-handoff_timing.cycles_begin;
+            g_live_stats.cpu_main_requests+=handoff_timing.main_requests;
+            g_live_stats.cpu_overlap_ticks+=overlap;
+            if (overlap) ++g_live_stats.cpu_overlap_frames;
+            g_live_stats.cpu_prefix_cycles+=(handoff_timing.first_request
+                ? handoff_timing.cycles_first_request : handoff_timing.cycles_end)
+                -handoff_timing.cycles_begin;
+            worker_emu_begin=produced.emu_begin; worker_emu_end=produced.emu_end;
+            latency_cycles_emu=produced.cycles_begin; latency_cycles_present=produced.cycles_end;
+            frame_emu_ticks=worker_emu_end-worker_emu_begin;
+            phase_emu_ticks+=frame_emu_ticks;
+            if (frame_emu_ticks>max_emu_ticks) { max_emu_ticks=frame_emu_ticks; max_emu_frame=shown_frames; }
+            if (frame_emu_ticks*1000u>frequency*32u) ++slow_frames_32ms;
+            if (!produced.valid || nds_gpu3d_compute_runtime_failed()) {
+                compute_failed=!produced.powered_off; running=false; break;
+            }
+            if (touch_release_pending && touch_frames_held>=2) {
+                nds_set_touch(0,0,false); touch_release_pending=false;
+            }
+        }
+        if (cpu_handoff) {
+            handoff_period = handoff_last_phase0 && phase0 > handoff_last_phase0
+                ? phase0 - handoff_last_phase0 - std::min(phase0 - handoff_last_phase0,
+                                                          handoff_last_slept)
+                : 0;
+            handoff_last_phase0 = phase0;
+            handoff_last_slept = frame_slept;
+            report_frame_work();
+        }
+#endif
         const uint64_t current_underruns =
             audio_queue.underruns.load(std::memory_order_relaxed);
         NdsGpu3dProfile current_gpu3d_profile{};
