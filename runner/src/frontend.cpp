@@ -250,6 +250,7 @@ void observe_top_black_bands(const uint32_t* pixels, uint64_t frame,
 #endif
 
 #include "frontend_latency.h"
+#include "android_perf_hint.h"
 
 namespace {
 
@@ -7847,6 +7848,16 @@ int nds_run_interactive_frontend(const NdsFrontendOptions& initial_options) {
             blend_cache.valid = false;
         }
         phase_present_ticks += presentation_end - phase1;
+        {
+            // The frame's own work, without the swap's wait for the display.
+            const uint64_t present = presentation_end - phase1;
+            const uint64_t work = frame_emu_ticks +
+                (present > presentation_ticks.swap
+                     ? present - presentation_ticks.swap : 0u);
+            nds_android_perf_hint_frame(
+                static_cast<uint64_t>(work * 1e9 / double(frequency)),
+                1'000'000'000ull / 60u);
+        }
         if (audio && audio_started) {
             const uint32_t queued = audio_queue_count(audio, audio_queue);
             audio_min_queue = std::min(audio_min_queue, queued);
@@ -8222,6 +8233,7 @@ int nds_run_interactive_frontend(const NdsFrontendOptions& initial_options) {
         nds_hostprof_unregister_current_thread();
         nds_hostprof_register_current_thread(NDS_HOSTPROF_ROLE_EMU);
     }
+    nds_android_perf_hint_close();
     if (audio) pause_audio(audio, true);
     finish_pending_save(true);
     release_relative_mouse();
