@@ -5350,6 +5350,14 @@ int nds_run_interactive_frontend(const NdsFrontendOptions& initial_options) {
     // window cannot leave it latched.
     auto clear_tab_turbo = [&]() { turbo_pressed = false; };
     uint32_t audio_pace_floor = kAudioQueueFrames;
+    // Whether the frames' own work (emulation + presentation, without the
+    // swap's wait) averages more than a DS frame: the game is then behind
+    // real time, and an audio pacing sleep would only slow it further.
+    // Averaged (1/8 per frame) because a title drawing 3D every other
+    // VBlank alternates a heavy frame with a light one, and pacing the light
+    // one sleeps away the time the heavy one needs.
+    bool frame_behind = false;
+    double frame_work_average = 0.0;
     // The steady-state queue target. kAudioQueueFrames (~63 ms) leaves about
     // one late frame of runway once a frame's emulation and the device's own
     // pull are taken out, so a host that drops a frame now and then hears a
@@ -7857,6 +7865,8 @@ int nds_run_interactive_frontend(const NdsFrontendOptions& initial_options) {
             nds_android_perf_hint_frame(
                 static_cast<uint64_t>(work * 1e9 / double(frequency)),
                 1'000'000'000ull / 60u);
+            frame_work_average += (double(work) - frame_work_average) / 8.0;
+            frame_behind = frame_work_average * 60.0 > double(frequency);
         }
         if (audio && audio_started) {
             const uint32_t queued = audio_queue_count(audio, audio_queue);
@@ -7914,8 +7924,15 @@ int nds_run_interactive_frontend(const NdsFrontendOptions& initial_options) {
 #endif
                 ,kAudioQueueFrames * 2u);
         } else {
+            // Behind real time the real-time catch-up (below) keeps the queue
+            // near the floor, so the queue no longer says the game is ahead:
+            // pacing on it slept ~1 ms almost every frame (5-7% of the emu
+            // thread on Android at 50 VBlanks/s). The catch-up stops owing
+            // once the queue reaches the floor, so it stays bounded.
             queued = drain_audio(
-                audio, audio_queue, audio_started, audio_pace_floor,
+                audio, audio_queue, audio_started,
+                frame_behind ? std::numeric_limits<uint32_t>::max()
+                             : audio_pace_floor,
                 audio_queue_error
 #if defined(NDS_HAVE_COMPUTE_RENDERER)
                 ,cpu_handoff ? &presented->pcm : nullptr
