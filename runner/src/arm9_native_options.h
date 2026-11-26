@@ -33,6 +33,7 @@ inline bool nds_native_gx_command(uint32_t addr,unsigned width) {
 }
 inline unsigned nds_native_block_limit(bool longer) {return longer?64u:16u;}
 inline uint64_t nds_native_event_quantum(bool enabled,bool peer_sleeping,
-                                        bool peer_wake,bool dma,bool gx_stall) {
-    return enabled&&peer_sleeping&&!peer_wake&&!dma&&!gx_stall?256u:64u;
+                                        bool peer_wake,bool dma,bool gx_stall,
+                                        uint64_t window=1024u) {
+    return enabled&&peer_sleeping&&!peer_wake&&!dma&&!gx_stall?window:64u;
 }

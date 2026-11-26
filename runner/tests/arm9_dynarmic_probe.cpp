@@ -597,7 +597,7 @@ int main() {
         !nds_native_plain_video(0x04000240u,1)&&!nds_native_plain_video(0x08000000u,1),"data coalescing excludes mapping/status/MMIO and slot devices");
     require(nds_native_gx_command(0x04000400u,4)&&nds_native_gx_command(0x040005c8u,4)&&
         !nds_native_gx_command(0x04000600u,4)&&!nds_native_gx_command(0x04000400u,2),"GX batching excludes readbacks/control and partial writes");
-    require(nds_native_event_quantum(true,true,false,false,false)==256&&
+    require(nds_native_event_quantum(true,true,false,false,false)==1024&&
         nds_native_event_quantum(true,false,false,false,false)==64&&
         nds_native_event_quantum(true,true,true,false,false)==64&&
         nds_native_event_quantum(true,true,false,true,false)==64&&

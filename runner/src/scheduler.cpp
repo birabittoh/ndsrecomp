@@ -10,6 +10,9 @@
 #include <cstdlib>
 #include <cstring>
 #include <thread>
+#if defined(__ANDROID__)
+#include <sys/system_properties.h>
+#endif
 
 #include "state.h"
 #include "savestate.h"
@@ -85,6 +88,32 @@ uint64_t           g_sys_timestamp = 0;
 bool performance_window_active=false;
 uint64_t performance_windows=0,performance_fences=0;
 constexpr uint64_t kIterCap        = 64;   // system cycles per outer iteration
+// Length of an event window (system cycles) while the ARM7 sleeps, 1024 by
+// default (longer ones measured no shorter: events, timers and fences end
+// them first):
+// NDS_EVENT_WINDOW at startup, and on Android also the live
+// debug.ndsrecomp.event_window property, re-read every 2^18 rounds.
+static uint64_t event_window_quantum() {
+    static uint64_t window = [] {
+        const char* v = std::getenv("NDS_EVENT_WINDOW");
+        const unsigned long long n = v ? std::strtoull(v, nullptr, 10) : 0ull;
+        return n >= kIterCap ? uint64_t(n) : uint64_t(1024u);
+    }();
+#if defined(__ANDROID__)
+    static uint32_t polls = 0;
+    if ((polls++ & ((1u << 18) - 1u)) == 0u) {
+        char buf[PROP_VALUE_MAX] = {};
+        if (__system_property_get("debug.ndsrecomp.event_window", buf) > 0) {
+            const unsigned long long n = std::strtoull(buf, nullptr, 10);
+            if (n >= kIterCap && n != window) {
+                window = n;
+                std::fprintf(stderr, "[sched] event window: %llu\n", n);
+            }
+        }
+    }
+#endif
+    return window;
+}
 // Power-on periodic scheduler events in SYSTEM cycles. NextTarget scans RTC,
 // SPU and LCD even before their IRQs are enabled. They phase the 64-cycle CPU
 // rendezvous grid, so omitting a deadline can move an IPCSYNC write across the
@@ -421,7 +450,8 @@ void scheduler_run_round() {
         ((nds_performance_execution()&&nds_native_options().events)||
          nds_event_windows_requested())&&g_slot[0].started&&g_slot[1].started,
         nds_cpu_halted(1),nds_halt_wake_pending(1),
-        nds_dma_cpu_stalled(0)||nds_dma_cpu_stalled(1),nds_gxfifo_stalled());
+        nds_dma_cpu_stalled(0)||nds_dma_cpu_stalled(1),nds_gxfifo_stalled(),
+        event_window_quantum());
     performance_window_active=quantum>kIterCap;
     if(performance_window_active)++performance_windows;
     struct WindowEnd {~WindowEnd(){performance_window_active=false;}} window_end;
