@@ -767,6 +767,9 @@ constexpr uint32_t kAudioQueueFrames = 2048;
 // screen needs interactive input.
 constexpr uint32_t kAudioStartFrames = 57344;
 constexpr uint32_t kAudioFrameBytes = 2u * sizeof(int16_t);
+// How long the pacing wait lets the device go without consuming anything
+// before it counts as dead. Normal pacing waits at most about a frame.
+constexpr uint64_t kAudioStallMs = 500;
 struct AudioQueue {
     // Host output only. Consumption, guest mixing and pacing remain active.
     bool output_muted = false;
@@ -779,6 +782,9 @@ struct AudioQueue {
     NdsAudioStretchQueue ring;
     // Emulation thread: the last drain slept to pace (the game is ahead).
     bool paced = false;
+    // Emulation thread: the last drain gave up because the device stopped
+    // consuming (kAudioStallMs); the caller reopens the device.
+    bool stalled = false;
     std::atomic<uint64_t> underruns{0};
     std::atomic<bool> started{false};
 };
@@ -1165,6 +1171,7 @@ uint32_t drain_audio(const NdsAudioDevice& device, AudioQueue& queue,
                      const std::vector<int16_t>* owned_pcm = nullptr,
                      uint32_t drop_above = 0) {
     if (!device) return 0;
+    queue.stalled = false;
     std::array<int16_t, 2048> samples{};
     size_t pcm_offset=0;
     for (;;) {
@@ -1183,11 +1190,16 @@ uint32_t drain_audio(const NdsAudioDevice& device, AudioQueue& queue,
             audio_queue_count(device, queue) + frames > drop_above)
             continue;
         bool pushed = false;
+        const uint64_t push_start = SDL_GetTicks();
         while (!pushed) {
             pushed = queue.ring.push(samples.data(), frames);
             if (!pushed) {
                 if (!throttle) {
                     queue_error = true;
+                    return audio_queue_count(device, queue);
+                }
+                if (SDL_GetTicks() - push_start >= kAudioStallMs) {
+                    queue.stalled = true;
                     return audio_queue_count(device, queue);
                 }
                 SDL_Delay(1);
@@ -1204,11 +1216,24 @@ uint32_t drain_audio(const NdsAudioDevice& device, AudioQueue& queue,
     // buffered runway instead of having it slept away.
     uint32_t queued = audio_queue_count(device, queue);
     queue.paced = throttle && queued > pace_floor;
+    // A device that stops pulling (Android's AAudio stream left dead by a
+    // long stay in the background, a lost headset) would hold the queue up
+    // forever and freeze the game here: give up once it has not gone down
+    // for kAudioStallMs.
+    uint32_t lowest = queued;
+    uint64_t progress_ticks = SDL_GetTicks();
     while (throttle && queued > pace_floor) {
         // Spend existing audio pacing slack preparing qualified native code.
         // Guest CPUs remain paused; under load/no slack demand execution wins.
         if (!nds_arm9_native_prepare_idle(1000)) SDL_Delay(1);
         queued = audio_queue_count(device, queue);
+        if (queued < lowest) {
+            lowest = queued;
+            progress_ticks = SDL_GetTicks();
+        } else if (SDL_GetTicks() - progress_ticks >= kAudioStallMs) {
+            queue.stalled = true;
+            break;
+        }
     }
     return queued;
 }
@@ -7885,6 +7910,30 @@ int nds_run_interactive_frontend(const NdsFrontendOptions& initial_options) {
                 ,cpu_handoff ? &presented->pcm : nullptr
 #endif
                 );
+        }
+        if (audio && audio_queue.stalled) {
+            // The device stopped consuming: a fresh one, prebuffered like
+            // after a state load. On Android this is what a long stay in
+            // the background leaves behind.
+            std::fprintf(stderr, "[sdl] audio device stopped playing; "
+                                 "reopening it\n");
+            close_audio(audio);
+            audio_queue.ring.clear();
+            audio_queue.started.store(false, std::memory_order_relaxed);
+            audio_queue.stalled = false;
+            audio = open_audio_device(audio_queue, want);
+            if (!audio)
+                std::fprintf(stderr, "[sdl] audio unavailable: %s\n",
+                             SDL_GetError());
+            else
+                apply_audio_output_level(audio, audio_queue,
+                                         options.audio_volume,
+                                         options.audio_muted);
+            audio_started = false;
+            audio_start_threshold = kAudioQueueFrames;
+            audio_pace_floor = kAudioQueueFrames;
+            audio_min_queue = std::numeric_limits<uint32_t>::max();
+            queued = 0;
         }
         // Real-time audio: while the game runs behind (the drain did not
         // have to wait), the guest's sound driver makes up what the device
