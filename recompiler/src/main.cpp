@@ -1156,11 +1156,61 @@ void emit_function_body(std::FILE* f, const Function& fn,
         have_prev_scan_ins = true;
     }
 
+    // The fall-through tick of the instruction at `at` may jump straight to
+    // the next instruction's LC_ label only when the loop below emits that
+    // instruction next with nothing in between: no after-hook here, no
+    // before-hook there, and a normal next instruction (undefined and
+    // condition-NV ones have their own entry text and no LC_ label).
+    auto fast_after = [&](uint32_t at) -> bool {
+        const uint32_t next_pc = at + step;
+        std::size_t next_off = 0;
+        if (!(next_pc < fn.end_addr &&
+              source_offset_for(next_pc, step, &next_off)))
+            return false;
+        if (hooks) {
+            auto here = hooks->find(function_key(at, fn.mode));
+            if (here != hooks->end() && here->second.after) return false;
+            auto there = hooks->find(function_key(next_pc, fn.mode));
+            if (there != hooks->end() && there->second.before) return false;
+        }
+        const armv4t::Instr next = decode_at(next_pc, next_off);
+        return !(next.is_undefined || next.cond == armv4t::Cond::NV);
+    };
+    // ALU runs (codegen version 5): a run starts at the first eligible
+    // instruction past the previous run, and again at each backward branch
+    // target inside one (loop heads), so those entries get the fast block
+    // too.
+    constexpr std::size_t kMaxAluRun = 32;
+    std::vector<armv4t::Instr> alu_run;
+    uint32_t alu_run_end = fn.addr;
+
     uint32_t pc = fn.addr;
     while (pc < fn.end_addr) {
         std::size_t off = 0;
         if (!source_offset_for(pc, step, &off)) break;
         armv4t::Instr ins = decode_at(pc, off);
+
+        alu_run.clear();
+        if (armv4t::ArmCodegen::alu_run_eligible(ins) &&
+            (pc >= alu_run_end || backward_targets.count(pc) != 0)) {
+            for (uint32_t at = pc;
+                 at < fn.end_addr && alu_run.size() < kMaxAluRun;
+                 at += step) {
+                std::size_t at_off = 0;
+                if (!source_offset_for(at, step, &at_off)) break;
+                const armv4t::Instr cand =
+                    at == pc ? ins : decode_at(at, at_off);
+                if (!armv4t::ArmCodegen::alu_run_eligible(cand) ||
+                    !fast_after(at))
+                    break;
+                alu_run.push_back(cand);
+            }
+            if (alu_run.size() >= 2u)
+                alu_run_end =
+                    pc + static_cast<uint32_t>(alu_run.size()) * step;
+            else
+                alu_run.clear();
+        }
 
         std::fprintf(f, "L_%08X:\n", pc);
 
@@ -1183,29 +1233,12 @@ void emit_function_body(std::FILE* f, const Function& fn,
         // label only when the loop emits that instruction next with nothing
         // in between: no after-hook here, no before-hook there.
         ctx.fast_entry_labels = true;
-        {
-            const uint32_t next_pc = pc + step;
-            std::size_t next_off = 0;
-            bool fast = next_pc < fn.end_addr &&
-                        source_offset_for(next_pc, step, &next_off) &&
-                        !(site && site->after);
-            if (fast) {
-                // Undefined and condition-NV instructions have their own
-                // entry text and no LC_ label.
-                const armv4t::Instr next = decode_at(next_pc, next_off);
-                if (next.is_undefined || next.cond == armv4t::Cond::NV)
-                    fast = false;
-            }
-            if (fast && hooks) {
-                auto next_site = hooks->find(function_key(next_pc, fn.mode));
-                if (next_site != hooks->end() && next_site->second.before)
-                    fast = false;
-            }
-            ctx.fast_fallthrough = fast;
-        }
+        ctx.fast_fallthrough = fast_after(pc);
+        ctx.alu_run = alu_run.empty() ? nullptr : &alu_run;
         std::fputs(armv4t::ArmCodegen::emit_instr(ins, ctx, &ni).c_str(), f);
         ctx.fast_entry_labels = false;
         ctx.fast_fallthrough = false;
+        ctx.alu_run = nullptr;
         (void)ni;  // abort path is in the emit; tracked at audit time
         if (site && site->after) {
             emit_hook_site(f, *site->after, pc, ctx);

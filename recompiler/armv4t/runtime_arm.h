@@ -636,6 +636,24 @@ NDS_HOT_INLINE uint32_t nds_code_numc_entered(uint32_t pc, uint32_t k) {
     const uint32_t region = (k >> g_arm9_code_class_shift) & 0xFFu;
     return pc < g_arm9_itcm_code_limit ? 1u : region;
 }
+// Sum of nds_code_numc_entered() over a straight-line ARM9 run of
+// instructions at [first_pc, last_pc], entered below g_nds_fast_limit (codegen
+// version 5 ALU runs). n_line counts the run's instructions whose K has the
+// 0x0100 field (NDS_ARM9_CODE_K(0, 0)), n_edge those with 0x0300
+// (NDS_ARM9_CODE_K(24, 0)); Thumb odd halfwords (K = 0) are not counted.
+// Returns false, leaving *out unset, when the ITCM limit falls inside the run
+// (the caller then takes the per-instruction path).
+NDS_HOT_INLINE bool nds_code_numc_run(uint32_t first_pc, uint32_t last_pc,
+                                      uint32_t n_line, uint32_t n_edge,
+                                      uint32_t* out) {
+    const uint32_t lim = g_arm9_itcm_code_limit;
+    if (last_pc < lim) { *out = n_line + n_edge; return true; }
+    if (first_pc < lim) return false;
+    const uint32_t s = g_arm9_code_class_shift;
+    *out = n_line * ((NDS_ARM9_CODE_K(0u, 0) >> s) & 0xFFu) +
+           n_edge * ((NDS_ARM9_CODE_K(24u, 0) >> s) & 0xFFu);
+    return true;
+}
 
 // ── Inline condition evaluation (beads-yjp.70 phase 2A) ─────────────────
 // arm_cond_passes() is a pure function of four CPSR bits, but it was a

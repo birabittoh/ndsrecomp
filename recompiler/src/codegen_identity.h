@@ -64,7 +64,13 @@ namespace ndsrecomp {
 //     stays under the limit enters the next instruction past that compare
 //     (runtime_tick_fast, LC_ labels). Ticks, cycle counts and IRQ
 //     boundaries are unchanged.
-inline constexpr unsigned kCodegenVersion = 4;
+// 5 — ALU runs: a straight-line run of register-only instructions also
+//     carries an ARM9 fast block after its first LC_ label that checks the
+//     whole run's cost against g_nds_fast_limit once, runs the bodies back
+//     to back and applies the summed tick, count and R15 once
+//     (nds_code_numc_run); otherwise the per-instruction code runs. Ticks,
+//     cycle counts and IRQ boundaries are unchanged.
+inline constexpr unsigned kCodegenVersion = 5;
 
 // The string `--codegen-identity` prints and the shard provider identity
 // folds. Tagged so that a hash of it can never collide with a bare integer

@@ -126,6 +126,33 @@ void run_class(const ClassCase& c, bool thumb) {
                      (unsigned long long)sum_ref);
         ++g_failures;
     }
+    // nds_code_numc_run over every window of the corpus must equal the sum
+    // of the out-of-line costs, or decline when the ITCM limit splits it.
+    for (uint32_t i = 0; i < 40u; ++i) {
+        uint32_t n_line = 0, n_edge = 0, ref = 0;
+        for (uint32_t j = i; j < 40u; ++j) {
+            const uint32_t pc = c.base + j * step;
+            if (!(thumb && (pc & 2u))) {
+                if (((pc + (thumb ? 4u : 8u)) & 0x1Fu) != 0u) ++n_line;
+                else ++n_edge;
+            }
+            ref += runtime_code_cycles(pc);
+            uint32_t got = 0xFFFFFFFFu;
+            const bool ok = nds_code_numc_run(c.base + i * step, pc, n_line,
+                                              n_edge, &got);
+            if (!ok) fail("run-declined", pc, thumb, c.name, 0u, ref);
+            else if (got != ref) fail("run", pc, thumb, c.name, got, ref);
+        }
+    }
+    {
+        // A run straddling the ITCM limit is declined.
+        const uint32_t saved = g_arm9_itcm_code_limit;
+        g_arm9_itcm_code_limit = c.base + 8u * step;
+        uint32_t got = 0u;
+        expect(!nds_code_numc_run(c.base, c.base + 8u * step, 4u, 4u, &got),
+               "run straddling the ITCM limit was not declined");
+        g_arm9_itcm_code_limit = saved;
+    }
     if (!c.expect_numc)
         expect(saw_one && saw_three,
                "cached corpus did not cover both line-boundary phases");
