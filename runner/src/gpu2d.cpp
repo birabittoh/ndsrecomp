@@ -2214,11 +2214,22 @@ void submit_line(int y) {
     // Publish under the mutex: a worker that has already evaluated its
     // predicate and is between that check and its wait would otherwise miss
     // the notification and sleep with work queued.
+    // A worker renders a line in a few microseconds and parks again long
+    // before the next one is latched, so waking one per line was still a
+    // futex wake on nearly every scanline (~5% of the emu thread on
+    // Android). Parked workers are woken once kWakeBatch lines wait, and at
+    // the last visible line; every fence drains (and helps with) whatever is
+    // still queued, so a held-back line is only ever rendered later, never
+    // lost or reordered.
+    constexpr uint64_t kWakeBatch = 16;
     bool wake = false;
     {
         std::lock_guard<std::mutex> lock(pool->m);
         pool->head.store(head + 1, std::memory_order_release);
-        wake = pool->sleepers > 0;
+        wake = pool->sleepers > 0 &&
+               (head + 1 - pool->claim.load(std::memory_order_acquire) >=
+                    kWakeBatch ||
+                y >= 191);
     }
     nds_gpu2d_jobs_outstanding.store(1u, std::memory_order_relaxed);
     if (job.cap)
