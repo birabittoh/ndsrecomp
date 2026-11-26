@@ -174,6 +174,15 @@ void nds_title_set_event_windows(bool enabled);
 // not guest time: the CPU still waits as long as the engine takes.
 void nds_title_wait_gx_test();
 
+// For a title hook placed where the guest sound driver waits for its next
+// periodic tick (in the NITRO SDK's SndThread, the OS_ReceiveMessage call).
+// True when the host audio device is short of sound because the emulation
+// runs below real time: `tick_system_cycles` of SPU output (one driver tick,
+// 2728 * 64 for the SDK's 5.2 ms interval) has just been mixed, and the hook
+// should skip the wait and run the tick at once. False at full speed, in
+// fast-forward and without audio. See spu.h nds_spu_catchup. ARM7 only.
+bool nds_title_audio_catchup(uint32_t tick_system_cycles);
+
 // The language the title shows the game in, as a firmware language code
 // (0 Japanese .. 5 Spanish), for what the frontend shows of its own, such as
 // the window title (the game's name from the ROM banner in that language).

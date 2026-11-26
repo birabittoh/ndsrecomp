@@ -777,6 +777,8 @@ struct AudioQueue {
     // Guest samples, played by the device thread through a time stretcher so
     // a slow stretch of emulation never runs the device dry.
     NdsAudioStretchQueue ring;
+    // Emulation thread: the last drain slept to pace (the game is ahead).
+    bool paced = false;
     std::atomic<uint64_t> underruns{0};
     std::atomic<bool> started{false};
 };
@@ -1201,6 +1203,7 @@ uint32_t drain_audio(const NdsAudioDevice& device, AudioQueue& queue,
     // down while the emulator is running behind, so a slow stretch spends the
     // buffered runway instead of having it slept away.
     uint32_t queued = audio_queue_count(device, queue);
+    queue.paced = throttle && queued > pace_floor;
     while (throttle && queued > pace_floor) {
         // Spend existing audio pacing slack preparing qualified native code.
         // Guest CPUs remain paused; under load/no slack demand execution wins.
@@ -3621,6 +3624,7 @@ struct OwnedPresentationFrame {
     NdsComputePresentationFrame gl{};
     uint16_t widths[2]{256,256};
     uint64_t system_timestamp{}, audio_epoch{}, digest_epoch{}, job{}, adaptive_ticks{};
+    uint64_t catchup_frames{};  // nds_spu_catchup_frames() when pcm was taken
     uint64_t emu_begin{}, emu_end{}, cycles_begin{}, cycles_end{};
     bool direct{}, valid{}, powered_off{};
 
@@ -3674,6 +3678,7 @@ struct OwnedPresentationFrame {
         }
         system_timestamp=scheduler_system_timestamp();
         audio_epoch=nds_spu_presentation_epoch();
+        catchup_frames=nds_spu_catchup_frames();
         valid=true;
     }
 };
@@ -7828,15 +7833,18 @@ int nds_run_interactive_frontend(const NdsFrontendOptions& initial_options) {
         // 63 ms target, shedding the extra startup latency over a couple of
         // seconds without ever forcing the queue down during a slow stretch.
         constexpr uint32_t kGlideStepFrames = 300;
+        // A grain the stretcher had to slow down counts as an underrun here:
+        // the queue ran close to dry, so the target rises the same way.
         if (audio_started && !turbo_active) {
             const uint64_t underruns =
-                audio_queue.underruns.load(std::memory_order_relaxed);
+                audio_queue.underruns.load(std::memory_order_relaxed) +
+                audio_queue.ring.slowed_hops();
             if (underruns != audio_steady_underruns) {
                 audio_steady_quiet_frames = 0;
                 if (audio_steady_floor < kAudioSteadyMaxFrames) {
                     audio_steady_floor += kAudioSteadyStepFrames;
                     std::fprintf(stderr,
-                                 "[sdl] audio underrun: queue target raised "
+                                 "[sdl] audio queue ran low: target raised "
                                  "to %u frames (%u ms)\n",
                                  audio_steady_floor,
                                  audio_steady_floor * 1000u / kAudioFrequency);
@@ -7849,7 +7857,8 @@ int nds_run_interactive_frontend(const NdsFrontendOptions& initial_options) {
             audio_steady_underruns = underruns;
         } else {
             audio_steady_underruns =
-                audio_queue.underruns.load(std::memory_order_relaxed);
+                audio_queue.underruns.load(std::memory_order_relaxed) +
+                audio_queue.ring.slowed_hops();
         }
         if (audio_pace_floor > audio_steady_floor + kGlideStepFrames)
             audio_pace_floor -= kGlideStepFrames;
@@ -7876,6 +7885,29 @@ int nds_run_interactive_frontend(const NdsFrontendOptions& initial_options) {
                 ,cpu_handoff ? &presented->pcm : nullptr
 #endif
                 );
+        }
+        // Real-time audio: while the game runs behind (the drain did not
+        // have to wait), the guest's sound driver makes up what the device
+        // is short of the steady target during the next frame (spu.h
+        // nds_spu_catchup), so music keeps its tempo. Capped at three frames
+        // of sound per frame, enough down to a quarter of full speed.
+        {
+            // With the CPU handoff the worker is already emulating the
+            // next frame, and catch-up it mixed since this frame's sound was
+            // taken is on its way: count it as queued.
+            constexpr uint32_t kCatchUpMaxFrames = 3u * 546u;
+            uint64_t in_flight = 0;
+#if defined(NDS_HAVE_COMPUTE_RENDERER)
+            if (cpu_handoff)
+                in_flight = nds_spu_catchup_frames() - presented->catchup_frames;
+#endif
+            const uint64_t expected = queued + in_flight;
+            uint32_t owed = 0;
+            if (audio && audio_started && !turbo_active &&
+                !audio_queue.paced && expected < audio_steady_floor)
+                owed = static_cast<uint32_t>(std::min<uint64_t>(
+                    audio_steady_floor - expected, kCatchUpMaxFrames));
+            nds_spu_set_catchup_owed(owed);
         }
         const uint64_t frame_drain_ticks =
             SDL_GetPerformanceCounter() - phase2;

@@ -31,7 +31,7 @@ public:
     static constexpr uint32_t kW = 1024;          // grain (~31 ms)
     static constexpr uint32_t kH = kW / 2;        // output hop
     static constexpr uint32_t kSeek = 256;        // +- seek window (~8 ms)
-    static constexpr uint32_t kLowFrames = kW + 512;
+    static constexpr uint32_t kLowFrames = kW + 256;
     static constexpr double kMinTempo = 0.25;
     static constexpr uint32_t kDroneFrames = 4096;   // ~125 ms
     static constexpr float kFadeOutStep = 1.0f / 1600.0f;
@@ -72,6 +72,12 @@ public:
     void clear() {
         std::lock_guard<std::mutex> lock(mutex_);
         reset_locked();
+    }
+
+    // Grains played below tempo 1 so far (monotonic): the queue ran low.
+    uint64_t slowed_hops() {
+        std::lock_guard<std::mutex> lock(mutex_);
+        return slowed_hops_;
     }
 
     // Consumer. Fills `frames` stereo frames; returns how many of them were
@@ -207,11 +213,14 @@ private:
                 acc_[i * 2u + c] = window_[kH + i] * sample(s + kH + i, c);
             }
         }
+        if (tempo < 1.0) ++slowed_hops_;
         out_count_ = kH;
         prev_end_ = s + kH;
         have_prev_ = true;
         playing_ = true;
-        pos_ += kH * tempo;
+        // At tempo 1 the nominal position follows the played grains again,
+        // so drift left by a slow stretch cannot force a later seek.
+        pos_ = tempo < 1.0 ? pos_ + kH * tempo : double(prev_end_);
         const double max_pos = double(avail_end - kW);
         if (pos_ > max_pos) pos_ = max_pos;
         if (pos_ < double(trim_)) pos_ = double(trim_);
@@ -222,6 +231,7 @@ private:
         return true;
     }
 
+    uint64_t slowed_hops_ = 0;
     std::mutex mutex_;
     std::vector<int16_t> ring_;
     std::vector<float> window_;

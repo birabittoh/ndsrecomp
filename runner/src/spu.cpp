@@ -518,6 +518,36 @@ void nds_tick_spu(uint64_t system_cycles) {
     while (g_mix_count < due) { mix(); ++g_mix_count; }
 }
 
+namespace {
+std::atomic<uint64_t> g_catchup_owed_cycles{0};
+std::atomic<uint64_t> g_catchup_frames{0};
+uint64_t g_catchup_carry_cycles = 0;
+}  // namespace
+
+void nds_spu_set_catchup_owed(uint32_t frames) {
+    g_catchup_owed_cycles.store(uint64_t(frames) * 1024u,
+                                std::memory_order_relaxed);
+}
+
+bool nds_spu_catchup(uint32_t system_cycles) {
+    uint64_t owed = g_catchup_owed_cycles.load(std::memory_order_relaxed);
+    do {
+        if (owed < system_cycles) return false;
+    } while (!g_catchup_owed_cycles.compare_exchange_weak(
+        owed, owed - system_cycles, std::memory_order_relaxed));
+    NdsEmuScope emu_region(NDS_EMU_SPU);
+    g_catchup_carry_cycles += system_cycles;
+    for (; g_catchup_carry_cycles >= 1024u; g_catchup_carry_cycles -= 1024u) {
+        mix();
+        g_catchup_frames.fetch_add(1, std::memory_order_relaxed);
+    }
+    return true;
+}
+
+uint64_t nds_spu_catchup_frames() {
+    return g_catchup_frames.load(std::memory_order_relaxed);
+}
+
 uint32_t nds_spu_read_output(int16_t* stereo, uint32_t frames) {
     if (!stereo) return 0;
     const uint32_t take = std::min(frames, g_output_count);

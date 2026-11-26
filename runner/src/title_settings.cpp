@@ -1,6 +1,7 @@
 #include "title_settings.h"
 #include "gpu3d.h"
 #include "scheduler.h"
+#include "spu.h"
 
 #include "io.h"
 
@@ -421,6 +422,10 @@ void nds_title_set_card_speedup(int factor) {
 
 void nds_title_set_event_windows(bool enabled) {
     nds_request_event_windows(enabled);
+}
+
+bool nds_title_audio_catchup(uint32_t tick_system_cycles) {
+    return nds_spu_catchup(tick_system_cycles);
 }
 
 void nds_title_wait_gx_test() {
