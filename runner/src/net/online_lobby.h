@@ -39,7 +39,7 @@ class IceLink;
 }
 
 struct NdsOnlineConfig {
-    std::string lobby_url = "ws://netplay.retcomm.net:8765";
+    std::string lobby_url;  // required: no lobby server is built in
     // Lobby list filter and join check. Empty game_name: Netplay unusable.
     std::string game_name;
     std::string game_version;

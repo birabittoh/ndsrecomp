@@ -182,6 +182,11 @@ public:
     void Start(const NdsOnlineConfig& config) {
         std::lock_guard<std::mutex> lock(mu_);
         if (thread_.joinable()) return;
+        if (config.lobby_url.empty()) {
+            std::fprintf(stderr, "[online] no online.lobby_url set: Netplay "
+                                 "is not available\n");
+            return;
+        }
         config_ = config;
         enabled_ = config.enabled;
         direct_ = config.direct;

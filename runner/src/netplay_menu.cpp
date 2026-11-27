@@ -2,6 +2,7 @@
 
 #include "netplay_menu.h"
 
+#include "net/ice_link.h"
 #include "net/online_lobby.h"
 
 #include <array>
@@ -15,9 +16,12 @@ using Clock = std::chrono::steady_clock;
 
 constexpr const char* kSection = "Netplay";
 constexpr const char* kEnabledKey = "netplay.enabled";
-// Local, Online (direct connections through a public STUN server), Online
-// (unsafe) (shown "Online (alt)": the relay).
-constexpr const char* kModeChoices[] = {"Local", "Online", "Online (alt)"};
+// Local, Online (direct connections through the configured STUN server, only
+// offered when online.stun_server is set) and Online (relay).
+constexpr const char* kModeChoices[] = {"Local", "Online", "Online (relay)"};
+constexpr const char* kRelayOnlyChoices[] = {"Local", "Online (relay)"};
+constexpr int kModeValues[] = {0, 1, 2};
+constexpr int kRelayOnlyValues[] = {0, 2};
 constexpr const char* kAccountKey = "netplay.account";
 // Signing out takes a second press within this time.
 constexpr auto kConfirmTime = std::chrono::seconds(3);
@@ -99,8 +103,15 @@ void nds_netplay_menu_append_items(std::vector<NdsMenuItem>* items) {
     enabled.minimum = 0;
     enabled.maximum = 2;
     enabled.step = 1;
-    enabled.choices = kModeChoices;
-    enabled.choice_count = 3;
+    if (mpnet::DirectStunConfigured()) {
+        enabled.choices = kModeChoices;
+        enabled.choice_count = 3;
+        enabled.choice_values = kModeValues;
+    } else {
+        enabled.choices = kRelayOnlyChoices;
+        enabled.choice_count = 2;
+        enabled.choice_values = kRelayOnlyValues;
+    }
     items->push_back(enabled);
     NdsMenuItem account{};
     account.key = kAccountKey;
@@ -123,6 +134,7 @@ int nds_netplay_menu_get_value(const NdsMenuItem* item, int* value) {
 
 int nds_netplay_menu_set_value(const NdsMenuItem* item, int value) {
     if (!is(item, kEnabledKey) || value < 0 || value > 2) return 0;
+    if (value == 1 && !mpnet::DirectStunConfigured()) return 0;
     nds_online_set_direct(value == 1);
     nds_online_set_enabled(value != 0);
     state().dirty = true;

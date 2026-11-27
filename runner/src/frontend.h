@@ -169,9 +169,9 @@ struct NdsNetworkOptions {
 // NDS_ONLINE ignore it.
 struct NdsOnlineOptions {
     bool enabled = false;
-    bool direct = true;      // Online: direct connections; false: Online (alt), the relay
-    std::string lobby_url;   // empty = the public lobby server
-    std::string stun_server; // host[:port] for Online (alt); empty = default
+    bool direct = true;      // Online: direct connections; false: Online (relay)
+    std::string lobby_url;   // empty = no online netplay at all
+    std::string stun_server; // host[:port] for Online (direct); empty = direct is not offered
     std::string game_name;   // lobby list filter; empty = the ROM game code
     std::string lobby_name;  // empty = "<host's name>'s lobby"
     bool sign_in = false;    // --netplay-sign-in on: sign in at startup

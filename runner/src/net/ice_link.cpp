@@ -84,13 +84,12 @@ int SeatOf(const PeerAddr& addr) {
     return seat < kMaxSeats ? seat : -1;
 }
 
-// STUN server for direct connections (public, no account); SetDirectStunServer
-// replaces it.
-constexpr const char* kDefaultStunHost = "stun.l.google.com";
-constexpr int kDefaultStunPort = 19302;
+// STUN server for direct connections: none until SetDirectStunServer names one
+// (online.stun_server); without it Online (direct) is not offered.
+constexpr int kDefaultStunPort = 3478;
 
 std::mutex g_stun_mutex;
-std::string g_stun_host = kDefaultStunHost;
+std::string g_stun_host;
 int g_stun_port = kDefaultStunPort;
 
 bool IsRelayCandidate(const std::string& line) {
@@ -198,15 +197,17 @@ void SetDirectStunServer(const std::string& hostport) {
         if (parsed > 0 && parsed < 65536) port = parsed;
         host.resize(colon);
     }
-    if (host.empty()) {
-        host = kDefaultStunHost;
-        port = kDefaultStunPort;
-    }
+    if (host.empty()) return;
     std::lock_guard<std::mutex> lock(g_stun_mutex);
     g_stun_host = host;
     g_stun_port = port;
     std::fprintf(stderr, "[online] link: STUN server %s:%d\n", host.c_str(),
                  port);
+}
+
+bool DirectStunConfigured() {
+    std::lock_guard<std::mutex> lock(g_stun_mutex);
+    return !g_stun_host.empty();
 }
 
 std::string IceLink::FilterSdp(const std::string& sdp) const {
@@ -326,7 +327,7 @@ std::shared_ptr<IceLink::Peer> IceLink::CreateAgent(int seat, int gen,
     // then a STUN server gives the agent its public address, and a direct
     // pair is used when one works, the relay otherwise.
     std::string stun_host;
-    if (Direct()) {
+    if (Direct() && DirectStunConfigured()) {
         int stun_port;
         {
             std::lock_guard<std::mutex> lock(g_stun_mutex);

@@ -2185,9 +2185,10 @@ int main(int argc, char** argv) {
                  "netplay_secret")
                     .string();
             config.enabled = online.enabled;
-            config.direct = online.direct;
             if (!online.stun_server.empty())
                 mpnet::SetDirectStunServer(online.stun_server);
+            // No STUN server named: only the relay is offered.
+            config.direct = online.direct && mpnet::DirectStunConfigured();
             config.sign_in = online.sign_in;
             config.join = online.join;
             nds_online_start(config);

@@ -187,5 +187,7 @@ std::unique_ptr<MpLink> MakeLinkView(std::shared_ptr<IceLink> link);
 // STUN server used by direct connections, "host[:port]"; empty restores the
 // default (stun.l.google.com:19302). Read when an agent is created.
 void SetDirectStunServer(const std::string& hostport);
+// True once an explicit STUN server is set: Online (direct) needs one.
+bool DirectStunConfigured();
 
 }  // namespace mpnet
