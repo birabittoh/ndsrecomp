@@ -82,10 +82,19 @@ constexpr RenderFormat kDepthFormat = RenderFormat::D32_FLOAT_S8_UINT;
 constexpr RenderFormat kOutputFormat = RenderFormat::R8G8B8A8_UNORM;
 constexpr uint32_t kSlots = 2;
 // Ten vertices plus the centre per polygon, and a triangle per edge.
-constexpr uint32_t kMaxVertices = 2048u * 11u;
-constexpr uint32_t kMaxIndices = 2048u * 10u * 3u;
+constexpr uint32_t kMaxVertices = melonDS::kMaxPolygons * 11u;
+constexpr uint32_t kMaxIndices = melonDS::kMaxPolygons * 10u * 3u;
 constexpr uint64_t kTexMemBytes = 1024u * 512u;
 constexpr uint64_t kTexPalBytes = 1024u * 64u * 2u;
+// Texture pages (melonDS::kTexPages) sit below the texture and palette
+// memory in the same textures: page p's texture bytes from row
+// 512 + p * kPageTexRows of tex_mem, its palette from row 64 + p *
+// kPagePalRows of tex_pal. The staging buffer holds them after the two.
+constexpr uint32_t kPageTexRows = melonDS::kTexPageTexBytes / 1024u;
+constexpr uint32_t kPagePalRows = melonDS::kTexPagePalBytes / 2048u;
+constexpr uint64_t kPageTexBytes = uint64_t(melonDS::kTexPages) * melonDS::kTexPageTexBytes;
+constexpr uint64_t kPagePalBytes = uint64_t(melonDS::kTexPages) * melonDS::kTexPagePalBytes;
+constexpr uint64_t kStagingBytes = kTexMemBytes + kTexPalBytes + kPageTexBytes + kPagePalBytes;
 // 16x the widest adaptive surface; the GL renderers' own cap.
 constexpr uint32_t kMaxRasterWidth = 448u * 16u;
 constexpr uint32_t kMaxRasterHeight = 192u * 16u;
@@ -129,10 +138,13 @@ struct GxConfig {
     uint32_t clear_poly_id;
     uint32_t clear_depth;
     uint32_t pad[2];
+    // Per texture page: texture byte range (lo, size), palette entry range.
+    uint32_t tex_pages[melonDS::kTexPages][4];
 };
-static_assert(sizeof(GxConfig) == 352);
+static_assert(sizeof(GxConfig) == 352 + 16 * melonDS::kTexPages);
 // D3D12 constant buffer views come in 256 byte units.
-constexpr uint64_t kConfigBytes = 512;
+constexpr uint64_t kConfigBytes = 1024;
+static_assert(sizeof(GxConfig) <= kConfigBytes);
 
 enum Program : uint8_t { kOpaque, kTrans, kShadow, kNull, kProgramCount };
 
@@ -226,10 +238,11 @@ struct Renderer {
     uint32_t slot = 0;
     uint32_t want_width = 0, want_height = 0;
     uint64_t uploaded_generation = ~0ull;
+    uint32_t uploaded_pages = ~0u;
     bool valid = false;
     uint64_t frames = 0;
 
-    RendererPolygon polygons[2048];
+    RendererPolygon polygons[melonDS::kMaxPolygons];
     GxVertex vertex_data[kMaxVertices];
     uint32_t index_data[kMaxIndices];
     uint32_t num_vertices = 0, num_indices = 0;
@@ -420,7 +433,7 @@ bool create_slots(Renderer& r) {
         slot.config = device().createBuffer(
             RenderBufferDesc::UploadBuffer(kConfigBytes, RenderBufferFlag::CONSTANT));
         slot.staging = device().createBuffer(
-            RenderBufferDesc::UploadBuffer(kTexMemBytes + kTexPalBytes));
+            RenderBufferDesc::UploadBuffer(kStagingBytes));
         slot.render_set = device().createDescriptorSet(render_set_desc());
         slot.final_set = device().createDescriptorSet(final_set_desc());
         if (!slot.commands || !slot.fence || !slot.vertices || !slot.indices ||
@@ -909,6 +922,15 @@ void fill_config(GxConfig& c, const melonDS::GPU3D& g, const Targets& t, uint32_
     c.edge_distance = std::max(edge_pixels, 1u);
     c.clear_poly_id = (g.RenderClearAttr1 >> 24) & 0x3F;
     c.clear_depth = ((g.RenderClearAttr2 & 0x7FFF) * 0x200) + 0x1FF;
+    if (g.TexPageData) {
+        for (uint32_t p = 1; p < melonDS::kTexPages; ++p) {
+            const melonDS::GPU3D::TexPage& page = g.TexPages[p];
+            c.tex_pages[p][0] = page.TexLo;
+            c.tex_pages[p][1] = page.TexSize;
+            c.tex_pages[p][2] = page.PalLo / 2u;
+            c.tex_pages[p][3] = page.PalSize / 2u;
+        }
+    }
 }
 
 // Every pipeline the passes can bind, found by running them dry over
@@ -1023,9 +1045,11 @@ bool nds_plume3d_start(const std::string& pipeline_cache_path) {
     if (!create_shaders(*r)) return fail("shader creation");
     if (!create_layouts(*r)) return fail("pipeline layout creation");
     r->tex_mem = device().createTexture(
-        RenderTextureDesc::Texture2D(1024, 512, 1, RenderFormat::R8_UINT));
+        RenderTextureDesc::Texture2D(1024, 512 + melonDS::kTexPages * kPageTexRows, 1,
+                                     RenderFormat::R8_UINT));
     r->tex_pal = device().createTexture(
-        RenderTextureDesc::Texture2D(1024, 64, 1, RenderFormat::R16_UINT));
+        RenderTextureDesc::Texture2D(1024, 64 + melonDS::kTexPages * kPagePalRows, 1,
+                                     RenderFormat::R16_UINT));
     if (!r->tex_mem || !r->tex_pal) return fail("texture memory creation");
     if (!create_slots(*r)) return fail("frame slot creation");
     r->ready = true;
@@ -1126,7 +1150,7 @@ void nds_plume3d_render(const melonDS::GPU& gpu, melonDS::Polygon* const* polygo
     // Render list.
     r.num_polys = 0;
     r.num_opaque_polys = -1;
-    for (uint32_t i = 0; i < count && i < 2048; ++i) {
+    for (uint32_t i = 0; i < count && i < melonDS::kMaxPolygons; ++i) {
         const melonDS::Polygon* poly = polygons[i];
         if (poly->Degenerate) continue;
         setup_polygon(&r.polygons[r.num_polys], poly);
@@ -1160,10 +1184,25 @@ void nds_plume3d_render(const melonDS::GPU& gpu, melonDS::Polygon* const* polygo
         }
         r.uploaded_generation = texture_generation;
     }
+    const bool upload_pages = g3.TexPageData && g3.TexPageGeneration != r.uploaded_pages;
+    if (upload_pages) {
+        if (auto* p = static_cast<uint8_t*>(slot.staging->map())) {
+            uint8_t* tex = p + kTexMemBytes + kTexPalBytes;
+            uint8_t* pal = tex + kPageTexBytes;
+            for (uint32_t i = 0; i < melonDS::kTexPages; ++i) {
+                std::memcpy(tex + i * uint64_t(melonDS::kTexPageTexBytes),
+                            g3.TexPageTexture(i), melonDS::kTexPageTexBytes);
+                std::memcpy(pal + i * uint64_t(melonDS::kTexPagePalBytes),
+                            g3.TexPagePalette(i), melonDS::kTexPagePalBytes);
+            }
+            slot.staging->unmap();
+        }
+        r.uploaded_pages = g3.TexPageGeneration;
+    }
 
     RenderCommandList& commands = *slot.commands;
     commands.begin();
-    if (upload) {
+    if (upload || upload_pages) {
         const RenderTextureBarrier to_copy[] = {
             RenderTextureBarrier(r.tex_mem.get(), RenderTextureLayout::COPY_DEST),
             RenderTextureBarrier(r.tex_pal.get(), RenderTextureLayout::COPY_DEST),
@@ -1177,6 +1216,21 @@ void nds_plume3d_render(const melonDS::GPU& gpu, melonDS::Polygon* const* polygo
             RenderTextureCopyLocation::Subresource(r.tex_pal.get()),
             RenderTextureCopyLocation::PlacedFootprint(
                 slot.staging.get(), RenderFormat::R16_UINT, 1024, 64, 1, 1024, kTexMemBytes));
+    }
+    if (upload_pages) {
+        commands.copyTextureRegion(
+            RenderTextureCopyLocation::Subresource(r.tex_mem.get()),
+            RenderTextureCopyLocation::PlacedFootprint(
+                slot.staging.get(), RenderFormat::R8_UINT, 1024,
+                melonDS::kTexPages * kPageTexRows, 1, 1024, kTexMemBytes + kTexPalBytes),
+            0, 512);
+        commands.copyTextureRegion(
+            RenderTextureCopyLocation::Subresource(r.tex_pal.get()),
+            RenderTextureCopyLocation::PlacedFootprint(
+                slot.staging.get(), RenderFormat::R16_UINT, 1024,
+                melonDS::kTexPages * kPagePalRows, 1, 1024,
+                kTexMemBytes + kTexPalBytes + kPageTexBytes),
+            0, 64);
     }
     const RenderTextureBarrier to_draw[] = {
         RenderTextureBarrier(r.tex_mem.get(), RenderTextureLayout::SHADER_READ),

@@ -28,6 +28,30 @@
 
 namespace melonDS
 {
+
+// Polygon and vertex RAM, per bank. The DS holds 2048 polygons and 6144
+// vertices a frame and drops what does not fit; this engine keeps
+// kMaxPolygons / kMaxVertices, so a title that draws more models than the
+// DS could (inn guests as live models) still gets all of them. The RAM_COUNT
+// register still reports at most the DS's numbers.
+constexpr u32 kHwPolygons = 2048;
+constexpr u32 kHwVertices = 6144;
+constexpr u32 kMaxPolygons = kHwPolygons * 4;
+constexpr u32 kMaxVertices = kHwVertices * 4;
+
+// Texture pages: a title's own copy of one model's texture and palette
+// bytes, for models that share the same texture VRAM (several inn guests
+// built into the same slots). Page n (1..kTexPages-1) holds a texture range
+// and a palette range; a polygon whose POLYGON_ATTR carries n in bits 21-23
+// and 30-31 (bits the DS ignores) reads those ranges from the page and the
+// rest from VRAM. Page 0 is none.
+constexpr u32 kTexPages = 32;
+constexpr u32 kTexPageTexBytes = 128 * 1024;
+constexpr u32 kTexPagePalBytes = 32 * 1024;
+constexpr u32 kTexPageBytes = kTexPageTexBytes + kTexPagePalBytes;
+constexpr u32 TexPageOfAttr(u32 attr) { return ((attr >> 21) & 7) | ((attr >> 27) & 0x18); }
+constexpr u32 TexPageAttrBits(u32 page) { return ((page & 7) << 21) | ((page & 0x18) << 27); }
+constexpr u32 kTexPageAttrMask = TexPageAttrBits(kTexPages - 1);
 class GPU;
 
 struct Vertex
@@ -402,8 +426,8 @@ public:
     Polygon* LastStripPolygon = nullptr;
     u32 NumOpaquePolygons = 0;
 
-    Vertex VertexRAM[6144 * 2] {};
-    Polygon PolygonRAM[2048 * 2] {};
+    Vertex VertexRAM[kMaxVertices * 2] {};
+    Polygon PolygonRAM[kMaxPolygons * 2] {};
 
     Vertex* CurVertexRAM = nullptr;
     Polygon* CurPolygonRAM = nullptr;
@@ -411,7 +435,24 @@ public:
     u32 NumPolygons = 0;
     u32 CurRAMBank = 0;
 
-    std::array<Polygon*,2048> RenderPolygonRAM {};
+    std::array<Polygon*,kMaxPolygons> RenderPolygonRAM {};
+    // Texture pages (see kTexPages). Ranges in bytes of the flat texture /
+    // palette memory; TexSize = PalSize = 0 is an unused page. The renderer
+    // thread reads them: SetTexPage fills the bytes before the sizes.
+    struct TexPage { u32 TexLo = 0, TexSize = 0, PalLo = 0, PalSize = 0; };
+    TexPage TexPages[kTexPages] {};
+    std::unique_ptr<u8[]> TexPageData;
+    u32 TexPageGeneration = 0;
+    const u8* TexPageTexture(u32 page) const noexcept { return TexPageData.get() + page * kTexPageBytes; }
+    const u8* TexPagePalette(u32 page) const noexcept { return TexPageTexture(page) + kTexPageTexBytes; }
+    // Copies the ranges out of `texture` (512 KiB flat) and `palette`
+    // (128 KiB flat) into page `page`. False when they do not fit.
+    bool SetTexPage(u32 page, u32 texLo, u32 texSize, u32 palLo, u32 palSize,
+                    const u8* texture, const u8* palette) noexcept;
+    void ClearTexPages() noexcept;
+    u32 PolygonFromFile(u32 index, bool sized) noexcept;
+    u32 VertexFromFile(u32 index, bool sized) noexcept;
+    void UsedRAM(u32 vertices[2], u32 polygons[2]) const noexcept;
     // Host-side diagnostics only (not in savestates).
     u32 RamFullRejects = 0, RamPeakPolygons = 0, RamPeakVertices = 0, RamReportFrames = 0;
     u32 RenderNumPolygons = 0;

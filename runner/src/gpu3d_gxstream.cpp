@@ -699,7 +699,7 @@ bool nds_gx_trace_read(FILE* file, NdsGxTraceImage* out) {
     }
     if (at != params) return false;
     s.complete = commands > 0 && s.ops.back() == 0x50;
-    if (!get(file, &polygons) || polygons > 2048) return false;
+    if (!get(file, &polygons) || polygons > melonDS::kMaxPolygons) return false;
     out->polygons.resize(polygons);
     for (NdsGxTracePolygon& p : out->polygons) {
         if (!get(file, &p.attr) || !get(file, &p.tex_param) || !get(file, &p.tex_palette) ||

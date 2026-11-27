@@ -187,9 +187,38 @@ void GPU3D::ResetRenderingState() noexcept
     RenderClearAttr2 = 0x00007FFF;
 }
 
+bool GPU3D::SetTexPage(u32 page, u32 texLo, u32 texSize, u32 palLo, u32 palSize,
+                       const u8* texture, const u8* palette) noexcept
+{
+    if (page == 0 || page >= kTexPages || texSize > kTexPageTexBytes ||
+        palSize > kTexPagePalBytes || texLo > 512 * 1024 - texSize ||
+        palLo > 128 * 1024 - palSize)
+        return false;
+    if (!TexPageData)
+        TexPageData = std::make_unique<u8[]>(kTexPages * kTexPageBytes);
+    TexPages[page].TexSize = TexPages[page].PalSize = 0;
+    u8* data = TexPageData.get() + page * kTexPageBytes;
+    memcpy(data, texture + texLo, texSize);
+    memcpy(data + kTexPageTexBytes, palette + palLo, palSize);
+    TexPages[page].TexLo = texLo;
+    TexPages[page].PalLo = palLo;
+    TexPages[page].TexSize = texSize;
+    TexPages[page].PalSize = palSize;
+    ++TexPageGeneration;
+    return true;
+}
+
+void GPU3D::ClearTexPages() noexcept
+{
+    for (TexPage& page : TexPages)
+        page = {};
+    ++TexPageGeneration;
+}
+
 void GPU3D::Reset() noexcept
 {
     NativeProjectionCache.clear();
+    ClearTexPages();
     CmdFIFO.Clear();
     CmdPIPE.Clear();
 
@@ -312,6 +341,51 @@ void GPU3D::Reset() noexcept
         CurrentRenderer->Reset(NDS.GPU);
 }
 
+u32 GPU3D::PolygonFromFile(u32 index, bool sized) noexcept
+{
+    // A file index in the file's layout -> PolygonRAM index, or UINT32_MAX.
+    const u32 stride = sized ? kMaxPolygons : kHwPolygons;
+    if (index >= 2 * stride) return UINT32_MAX;
+    return (index / stride) * kMaxPolygons + index % stride;
+}
+
+u32 GPU3D::VertexFromFile(u32 index, bool sized) noexcept
+{
+    const u32 stride = sized ? kMaxVertices : kHwVertices;
+    if (index >= 2 * stride) return UINT32_MAX;
+    return (index / stride) * kMaxVertices + index % stride;
+}
+
+void GPU3D::UsedRAM(u32 vertices[2], u32 polygons[2]) const noexcept
+{
+    // Per bank, one past the last vertex / polygon anything points at, and
+    // at least what the current bank holds.
+    vertices[0] = vertices[1] = 0;
+    polygons[0] = polygons[1] = 0;
+    vertices[CurRAMBank] = NumVertices;
+    polygons[CurRAMBank] = NumPolygons;
+    auto notePolygon = [&](const Polygon* p) {
+        if (!p) return;
+        const u32 k = (u32)(p - &PolygonRAM[0]);
+        polygons[k / kMaxPolygons] = std::max(polygons[k / kMaxPolygons], k % kMaxPolygons + 1);
+    };
+    notePolygon(LastStripPolygon);
+    for (u32 i = 0; i < RenderNumPolygons && i < RenderPolygonRAM.size(); i++)
+        notePolygon(RenderPolygonRAM[i]);
+    for (u32 b = 0; b < 2; b++)
+    {
+        for (u32 i = 0; i < polygons[b]; i++)
+        {
+            for (const Vertex* v : PolygonRAM[b * kMaxPolygons + i].Vertices)
+            {
+                if (!v) continue;
+                const u32 k = (u32)(v - &VertexRAM[0]);
+                vertices[k / kMaxVertices] = std::max(vertices[k / kMaxVertices], k % kMaxVertices + 1);
+            }
+        }
+    }
+}
+
 void GPU3D::DoSavestate(Savestate* file) noexcept
 {
     if (!file->Saving) NativeProjectionCache.clear();
@@ -413,6 +487,8 @@ void GPU3D::DoSavestate(Savestate* file) noexcept
     file->VarArray(PosTestResult, 4*4);
     file->VarArray(VecTestResult, 2*3);
 
+    const bool sized = file->Saving || file->IsAtLeastVersion(12, 3);
+
     file->Var32(&VertexNum);
     file->Var32(&VertexNumInPoly);
     file->Var32(&NumConsecutivePolygons);
@@ -431,10 +507,14 @@ void GPU3D::DoSavestate(Savestate* file) noexcept
     {
         u32 index = UINT32_MAX;
         file->Var32(&index);
-        if (index != UINT32_MAX && index >= 4096)
+        if (index != UINT32_MAX)
         {
-            file->Error = true;
-            return;
+            index = PolygonFromFile(index, sized);
+            if (index == UINT32_MAX)
+            {
+                file->Error = true;
+                return;
+            }
         }
         LastStripPolygon = (index == UINT32_MAX) ? nullptr : &PolygonRAM[index];
     }
@@ -447,14 +527,53 @@ void GPU3D::DoSavestate(Savestate* file) noexcept
     file->Var32(&FlushRequest);
     file->Var32(&FlushAttributes);
 
-    for (Vertex& vtx : VertexRAM)
+    // Version 12.3 stores, per bank, only the vertices and polygons in use
+    // (the RAM is kMaxVertices / kMaxPolygons per bank); 12.2 and older
+    // store the DS's 6144 / 2048 per bank whole. Indices in the file follow
+    // the file's own layout.
+    u32 savedVertices[2] = {kHwVertices, kHwVertices};
+    u32 savedPolygons[2] = {kHwPolygons, kHwPolygons};
+    if (sized)
     {
-        vtx.DoSavestate(file);
+        if (file->Saving)
+        {
+            UsedRAM(savedVertices, savedPolygons);
+        }
+        for (int b = 0; b < 2; b++)
+        {
+            file->Var32(&savedVertices[b]);
+            file->Var32(&savedPolygons[b]);
+            if (!file->Saving &&
+                (savedVertices[b] > kMaxVertices || savedPolygons[b] > kMaxPolygons))
+            {
+                file->Error = true;
+                return;
+            }
+        }
     }
 
-    for(int i = 0; i < 2048*2; i++)
+    for (int b = 0; b < 2; b++)
     {
-        Polygon* poly = &PolygonRAM[i];
+        for (u32 i = 0; i < kMaxVertices; i++)
+        {
+            Vertex& vtx = VertexRAM[b * kMaxVertices + i];
+            if (i < savedVertices[b])
+                vtx.DoSavestate(file);
+            else if (!file->Saving)
+                vtx = {};
+        }
+    }
+
+    for (u32 k = 0; k < 2 * kMaxPolygons; k++)
+    {
+        const u32 b = k / kMaxPolygons;
+        Polygon* poly = &PolygonRAM[k];
+        if (k % kMaxPolygons >= savedPolygons[b])
+        {
+            if (!file->Saving)
+                *poly = {};
+            continue;
+        }
 
         // this is a bit ugly, but eh
         // we can't save the pointers as-is, that's a bad idea
@@ -473,10 +592,14 @@ void GPU3D::DoSavestate(Savestate* file) noexcept
             {
                 u32 index = UINT32_MAX;
                 file->Var32(&index);
-                if (index != UINT32_MAX && index >= 12288)
+                if (index != UINT32_MAX)
                 {
-                    file->Error = true;
-                    return;
+                    index = VertexFromFile(index, sized);
+                    if (index == UINT32_MAX)
+                    {
+                        file->Error = true;
+                        return;
+                    }
                 }
                 poly->Vertices[j] = index == UINT32_MAX ? nullptr : &VertexRAM[index];
             }
@@ -553,8 +676,14 @@ void GPU3D::DoSavestate(Savestate* file) noexcept
         ClipMatrixDirty = true;
         UpdateClipMatrix();
 
-        CurVertexRAM = &VertexRAM[CurRAMBank ? 6144 : 0];
-        CurPolygonRAM = &PolygonRAM[CurRAMBank ? 2048 : 0];
+        CurVertexRAM = &VertexRAM[CurRAMBank ? kMaxVertices : 0];
+        CurPolygonRAM = &PolygonRAM[CurRAMBank ? kMaxPolygons : 0];
+        if (NumVertices > kMaxVertices || NumPolygons > kMaxPolygons ||
+            (!sized && (NumVertices > kHwVertices || NumPolygons > kHwPolygons)))
+        {
+            file->Error = true;
+            return;
+        }
     }
 
     file->Var32(&RenderNumPolygons);
@@ -563,10 +692,23 @@ void GPU3D::DoSavestate(Savestate* file) noexcept
         file->Error = true;
         return;
     }
+    // 12.3 stores the render list's used part, 12.2 the DS's 2048 entries.
+    u32 renderSaved = kHwPolygons;
+    if (sized)
+    {
+        renderSaved = RenderNumPolygons;
+        file->Var32(&renderSaved);
+    }
+    if (!file->Saving && renderSaved > RenderPolygonRAM.size())
+    {
+        file->Error = true;
+        return;
+    }
     if (file->Saving)
     {
-        for (const Polygon* p : RenderPolygonRAM)
+        for (u32 i = 0; i < renderSaved; ++i)
         {
+            const Polygon* p = RenderPolygonRAM[i];
             u32 index = p ? (p - &PolygonRAM[0]) : UINT32_MAX;
 
             file->Var32(&index);
@@ -574,18 +716,72 @@ void GPU3D::DoSavestate(Savestate* file) noexcept
     }
     else
     {
-        for (int i = 0; i < RenderPolygonRAM.size(); ++i)
+        for (u32 i = 0; i < RenderPolygonRAM.size(); ++i)
         {
             u32 index = UINT32_MAX;
-            file->Var32(&index);
-            if (index != UINT32_MAX && index >= 4096)
+            if (i < renderSaved)
+                file->Var32(&index);
+            if (index != UINT32_MAX)
             {
-                file->Error = true;
-                return;
+                index = PolygonFromFile(index, sized);
+                if (index == UINT32_MAX)
+                {
+                    file->Error = true;
+                    return;
+                }
             }
 
             RenderPolygonRAM[i] = index == UINT32_MAX ? nullptr : &PolygonRAM[index];
         }
+    }
+
+    // 12.3: the texture pages in use.
+    if (sized)
+    {
+        u32 used = 0;
+        if (file->Saving)
+        {
+            for (u32 p = 1; p < kTexPages; p++)
+                if (TexPages[p].TexSize || TexPages[p].PalSize)
+                    used |= 1u << p;
+        }
+        file->Var32(&used);
+        if (!file->Saving)
+        {
+            ClearTexPages();
+            if (used & 1)
+            {
+                file->Error = true;
+                return;
+            }
+        }
+        for (u32 p = 1; p < kTexPages; p++)
+        {
+            if (!(used & (1u << p))) continue;
+            TexPage page = TexPages[p];
+            file->Var32(&page.TexLo);
+            file->Var32(&page.TexSize);
+            file->Var32(&page.PalLo);
+            file->Var32(&page.PalSize);
+            if (!file->Saving &&
+                (page.TexSize > kTexPageTexBytes || page.PalSize > kTexPagePalBytes ||
+                 page.TexLo > 512 * 1024 - page.TexSize ||
+                 page.PalLo > 128 * 1024 - page.PalSize))
+            {
+                file->Error = true;
+                return;
+            }
+            if (!TexPageData)
+                TexPageData = std::make_unique<u8[]>(kTexPages * kTexPageBytes);
+            u8* data = TexPageData.get() + p * kTexPageBytes;
+            file->VarArray(data, page.TexSize);
+            file->VarArray(data + kTexPageTexBytes, page.PalSize);
+            TexPages[p] = page;
+        }
+    }
+    else if (!file->Saving)
+    {
+        ClearTexPages();
     }
 
     file->VarArray(CurVertex, sizeof(s16)*3);
@@ -1192,7 +1388,7 @@ void GPU3D::SubmitPolygon() noexcept
 
     // reject the polygon if it's not going to fit in polygon/vertex RAM
 
-    if (NumPolygons >= 2048 || NumVertices+nverts > 6144)
+    if (NumPolygons >= kMaxPolygons || NumVertices+nverts > kMaxVertices)
     {
         ++RamFullRejects;
         LastStripPolygon = NULL;
@@ -2736,7 +2932,7 @@ void GPU3D::VBlank() noexcept
             RamPeakVertices = std::max<u32>(RamPeakVertices, NumVertices);
             if (++RamReportFrames >= 300)
             {
-                if (RamFullRejects || RamPeakPolygons > 1800 || RamPeakVertices > 5400)
+                if (RamFullRejects || RamPeakPolygons > kHwPolygons || RamPeakVertices > kHwVertices)
                     fprintf(stderr, "[gpu3d] last %u frames: peak %u polygons, %u vertices, %u rejected\n",
                             RamReportFrames, RamPeakPolygons, RamPeakVertices, RamFullRejects);
                 RamReportFrames = RamPeakPolygons = RamPeakVertices = RamFullRejects = 0;
@@ -2744,8 +2940,8 @@ void GPU3D::VBlank() noexcept
             RenderBatchWidth = RenderWidth;
             RenderBatchHeight = RenderHeight;
             CurRAMBank = CurRAMBank?0:1;
-            CurVertexRAM = &VertexRAM[CurRAMBank ? 6144 : 0];
-            CurPolygonRAM = &PolygonRAM[CurRAMBank ? 2048 : 0];
+            CurVertexRAM = &VertexRAM[CurRAMBank ? kMaxVertices : 0];
+            CurPolygonRAM = &PolygonRAM[CurRAMBank ? kMaxPolygons : 0];
 
             NumVertices = 0;
             NumPolygons = 0;
@@ -3046,9 +3242,9 @@ u16 GPU3D::Read16(u32 addr) noexcept
         }
 
     case 0x04000604:
-        return NumPolygons;
+        return std::min(NumPolygons, kHwPolygons);
     case 0x04000606:
-        return NumVertices;
+        return std::min(NumVertices, kHwVertices);
 
     case 0x04000630: return VecTestResult[0];
     case 0x04000632: return VecTestResult[1];
@@ -3084,7 +3280,7 @@ u32 GPU3D::Read32(u32 addr) noexcept
         }
 
     case 0x04000604:
-        return NumPolygons | (NumVertices << 16);
+        return std::min(NumPolygons, kHwPolygons) | (std::min(NumVertices, kHwVertices) << 16);
 
     case 0x04000620: return PosTestResult[0];
     case 0x04000624: return PosTestResult[1];

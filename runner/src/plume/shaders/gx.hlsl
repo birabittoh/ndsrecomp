@@ -32,6 +32,9 @@ struct GxConfig {
     uint clearPolyId;    // the clear plane's, for the screen border
     uint clearDepth;     // 24 bit
     uint2 pad;
+    // Texture pages (Plume3D.cpp kPageTexRows): per page, the texture byte
+    // range (x lo, y size) and palette entry range (z lo, w size) it holds.
+    uint4 texPages[32];
 };
 
 [[vk::binding(2, 0)]] ConstantBuffer<GxConfig> config : register(b2);
@@ -99,11 +102,25 @@ VSOutput RenderVertex(VSInput input, bool wbuffer) {
 VSOutput VSMainZ(VSInput input) { return RenderVertex(input, false); }
 VSOutput VSMainW(VSInput input) { return RenderVertex(input, true); }
 
+// The texture page of the polygon being shaded (0: none): the page's
+// ranges come from its rows below the texture / palette memory.
+static uint gTexPage = 0;
+
 uint TexByte(int addr) {
+    if (gTexPage != 0u) {
+        const uint4 page = config.texPages[gTexPage];
+        const uint off = uint(addr) - page.x;
+        if (off < page.y) addr = int(0x80000u + gTexPage * 0x20000u + off);
+    }
     return texMem.Load(int3(addr & 0x3FF, addr >> 10, 0));
 }
 
 float4 PalColor(int addr) {
+    if (gTexPage != 0u) {
+        const uint4 page = config.texPages[gTexPage];
+        const uint off = uint(addr) - page.z;
+        if (off < page.w) addr = int(0x10000u + gTexPage * 0x4000u + off);
+    }
     const uint c = texPal.Load(int3(addr & 0x3FF, addr >> 10, 0));
     return float4(Bgr555(c), float(c >> 15));
 }
@@ -199,6 +216,7 @@ float4 FetchDirect(int2 addr, int4 st, int wrapmode) {
 }
 
 float4 TextureLookup(float2 st, uint3 attr) {
+    gTexPage = ((attr.x >> 21) & 7u) | ((attr.x >> 27) & 0x18u);
     const int texparam = int(attr.y);
     const int paladdr = int(attr.z);
     const float alpha0 = (texparam & (1 << 29)) != 0 ? 0.0 : 1.0;

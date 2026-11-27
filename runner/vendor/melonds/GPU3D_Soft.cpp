@@ -154,7 +154,43 @@ void SoftRenderer::SetRenderWidth(u32 width)
     FrameIdentical = false;
 }
 
-void SoftRenderer::TextureLookup(const GPU& gpu, u32 texparam, u32 texpal, s16 s, s16 t, u16* color, u8* alpha) const
+// Texture and palette reads for a polygon on texture page `page` (see
+// kTexPages): the page's ranges from the page, the rest from flat VRAM.
+template <typename T>
+static inline T PagedTexture(const GPU& gpu, u32 page, u32 addr)
+{
+    if (page)
+    {
+        const GPU3D::TexPage& p = gpu.GPU3D.TexPages[page];
+        const u32 off = (addr & 0x7FFFF) - p.TexLo;
+        if (off + sizeof(T) <= p.TexSize)
+        {
+            T v;
+            memcpy(&v, gpu.GPU3D.TexPageTexture(page) + off, sizeof(T));
+            return v;
+        }
+    }
+    return gpu.ReadVRAMFlat_Texture<T>(addr);
+}
+
+template <typename T>
+static inline T PagedPalette(const GPU& gpu, u32 page, u32 addr)
+{
+    if (page)
+    {
+        const GPU3D::TexPage& p = gpu.GPU3D.TexPages[page];
+        const u32 off = (addr & 0x1FFFF) - p.PalLo;
+        if (off + sizeof(T) <= p.PalSize)
+        {
+            T v;
+            memcpy(&v, gpu.GPU3D.TexPagePalette(page) + off, sizeof(T));
+            return v;
+        }
+    }
+    return gpu.ReadVRAMFlat_TexPal<T>(addr);
+}
+
+void SoftRenderer::TextureLookup(const GPU& gpu, u32 page, u32 texparam, u32 texpal, s16 s, s16 t, u16* color, u8* alpha) const
 {
     u32 vramaddr = (texparam & 0xFFFF) << 3;
 
@@ -209,10 +245,10 @@ void SoftRenderer::TextureLookup(const GPU& gpu, u32 texparam, u32 texpal, s16 s
     case 1: // A3I5
         {
             vramaddr += ((t * width) + s);
-            u8 pixel = gpu.ReadVRAMFlat_Texture<u8>(vramaddr);
+            u8 pixel = PagedTexture<u8>(gpu, page, vramaddr);
 
             texpal <<= 4;
-            *color = gpu.ReadVRAMFlat_TexPal<u16>(texpal + ((pixel&0x1F)<<1));
+            *color = PagedPalette<u16>(gpu, page, texpal + ((pixel&0x1F)<<1));
             *alpha = ((pixel >> 3) & 0x1C) + (pixel >> 6);
         }
         break;
@@ -220,12 +256,12 @@ void SoftRenderer::TextureLookup(const GPU& gpu, u32 texparam, u32 texpal, s16 s
     case 2: // 4-color
         {
             vramaddr += (((t * width) + s) >> 2);
-            u8 pixel = gpu.ReadVRAMFlat_Texture<u8>(vramaddr);
+            u8 pixel = PagedTexture<u8>(gpu, page, vramaddr);
             pixel >>= ((s & 0x3) << 1);
             pixel &= 0x3;
 
             texpal <<= 3;
-            *color = gpu.ReadVRAMFlat_TexPal<u16>(texpal + (pixel<<1));
+            *color = PagedPalette<u16>(gpu, page, texpal + (pixel<<1));
             *alpha = (pixel==0) ? alpha0 : 31;
         }
         break;
@@ -233,12 +269,12 @@ void SoftRenderer::TextureLookup(const GPU& gpu, u32 texparam, u32 texpal, s16 s
     case 3: // 16-color
         {
             vramaddr += (((t * width) + s) >> 1);
-            u8 pixel = gpu.ReadVRAMFlat_Texture<u8>(vramaddr);
+            u8 pixel = PagedTexture<u8>(gpu, page, vramaddr);
             if (s & 0x1) pixel >>= 4;
             else         pixel &= 0xF;
 
             texpal <<= 4;
-            *color = gpu.ReadVRAMFlat_TexPal<u16>(texpal + (pixel<<1));
+            *color = PagedPalette<u16>(gpu, page, texpal + (pixel<<1));
             *alpha = (pixel==0) ? alpha0 : 31;
         }
         break;
@@ -246,10 +282,10 @@ void SoftRenderer::TextureLookup(const GPU& gpu, u32 texparam, u32 texpal, s16 s
     case 4: // 256-color
         {
             vramaddr += ((t * width) + s);
-            u8 pixel = gpu.ReadVRAMFlat_Texture<u8>(vramaddr);
+            u8 pixel = PagedTexture<u8>(gpu, page, vramaddr);
 
             texpal <<= 4;
-            *color = gpu.ReadVRAMFlat_TexPal<u16>(texpal + (pixel<<1));
+            *color = PagedPalette<u16>(gpu, page, texpal + (pixel<<1));
             *alpha = (pixel==0) ? alpha0 : 31;
         }
         break;
@@ -269,31 +305,31 @@ void SoftRenderer::TextureLookup(const GPU& gpu, u32 texparam, u32 texpal, s16 s
                 val = 0;
             else
             {
-                val = gpu.ReadVRAMFlat_Texture<u8>(vramaddr);
+                val = PagedTexture<u8>(gpu, page, vramaddr);
                 val >>= (2 * (s & 0x3));
             }
 
-            u16 palinfo = gpu.ReadVRAMFlat_Texture<u16>(slot1addr);
+            u16 palinfo = PagedTexture<u16>(gpu, page, slot1addr);
             u32 paloffset = (palinfo & 0x3FFF) << 2;
             texpal <<= 4;
 
             switch (val & 0x3)
             {
             case 0:
-                *color = gpu.ReadVRAMFlat_TexPal<u16>(texpal + paloffset);
+                *color = PagedPalette<u16>(gpu, page, texpal + paloffset);
                 *alpha = 31;
                 break;
 
             case 1:
-                *color = gpu.ReadVRAMFlat_TexPal<u16>(texpal + paloffset + 2);
+                *color = PagedPalette<u16>(gpu, page, texpal + paloffset + 2);
                 *alpha = 31;
                 break;
 
             case 2:
                 if ((palinfo >> 14) == 1)
                 {
-                    u16 color0 = gpu.ReadVRAMFlat_TexPal<u16>(texpal + paloffset);
-                    u16 color1 = gpu.ReadVRAMFlat_TexPal<u16>(texpal + paloffset + 2);
+                    u16 color0 = PagedPalette<u16>(gpu, page, texpal + paloffset);
+                    u16 color1 = PagedPalette<u16>(gpu, page, texpal + paloffset + 2);
 
                     u32 r0 = color0 & 0x001F;
                     u32 g0 = color0 & 0x03E0;
@@ -310,8 +346,8 @@ void SoftRenderer::TextureLookup(const GPU& gpu, u32 texparam, u32 texpal, s16 s
                 }
                 else if ((palinfo >> 14) == 3)
                 {
-                    u16 color0 = gpu.ReadVRAMFlat_TexPal<u16>(texpal + paloffset);
-                    u16 color1 = gpu.ReadVRAMFlat_TexPal<u16>(texpal + paloffset + 2);
+                    u16 color0 = PagedPalette<u16>(gpu, page, texpal + paloffset);
+                    u16 color1 = PagedPalette<u16>(gpu, page, texpal + paloffset + 2);
 
                     u32 r0 = color0 & 0x001F;
                     u32 g0 = color0 & 0x03E0;
@@ -327,20 +363,20 @@ void SoftRenderer::TextureLookup(const GPU& gpu, u32 texparam, u32 texpal, s16 s
                     *color = r | g | b;
                 }
                 else
-                    *color = gpu.ReadVRAMFlat_TexPal<u16>(texpal + paloffset + 4);
+                    *color = PagedPalette<u16>(gpu, page, texpal + paloffset + 4);
                 *alpha = 31;
                 break;
 
             case 3:
                 if ((palinfo >> 14) == 2)
                 {
-                    *color = gpu.ReadVRAMFlat_TexPal<u16>(texpal + paloffset + 6);
+                    *color = PagedPalette<u16>(gpu, page, texpal + paloffset + 6);
                     *alpha = 31;
                 }
                 else if ((palinfo >> 14) == 3)
                 {
-                    u16 color0 = gpu.ReadVRAMFlat_TexPal<u16>(texpal + paloffset);
-                    u16 color1 = gpu.ReadVRAMFlat_TexPal<u16>(texpal + paloffset + 2);
+                    u16 color0 = PagedPalette<u16>(gpu, page, texpal + paloffset);
+                    u16 color1 = PagedPalette<u16>(gpu, page, texpal + paloffset + 2);
 
                     u32 r0 = color0 & 0x001F;
                     u32 g0 = color0 & 0x03E0;
@@ -369,10 +405,10 @@ void SoftRenderer::TextureLookup(const GPU& gpu, u32 texparam, u32 texpal, s16 s
     case 6: // A5I3
         {
             vramaddr += ((t * width) + s);
-            u8 pixel = gpu.ReadVRAMFlat_Texture<u8>(vramaddr);
+            u8 pixel = PagedTexture<u8>(gpu, page, vramaddr);
 
             texpal <<= 4;
-            *color = gpu.ReadVRAMFlat_TexPal<u16>(texpal + ((pixel&0x7)<<1));
+            *color = PagedPalette<u16>(gpu, page, texpal + ((pixel&0x7)<<1));
             *alpha = (pixel >> 3);
         }
         break;
@@ -380,7 +416,7 @@ void SoftRenderer::TextureLookup(const GPU& gpu, u32 texparam, u32 texpal, s16 s
     case 7: // direct color
         {
             vramaddr += (((t * width) + s) << 1);
-            *color = gpu.ReadVRAMFlat_Texture<u16>(vramaddr);
+            *color = PagedTexture<u16>(gpu, page, vramaddr);
             *alpha = (*color & 0x8000) ? 31 : 0;
         }
         break;
@@ -504,7 +540,11 @@ u32 SoftRenderer::RenderPixel(const GPU& gpu, const Polygon* polygon, u8 vr, u8 
         u8 tr, tg, tb;
 
         u16 tcolor; u8 talpha;
-        TextureLookup(gpu, polygon->TexParam, polygon->TexPalette, s, t, &tcolor, &talpha);
+        {
+            u32 page = TexPageOfAttr(polygon->Attr);
+            if (page && !gpu.GPU3D.TexPageData) page = 0;
+            TextureLookup(gpu, page, polygon->TexParam, polygon->TexPalette, s, t, &tcolor, &talpha);
+        }
 
         tr = (tcolor << 1) & 0x3E; if (tr) tr++;
         tg = (tcolor >> 4) & 0x3E; if (tg) tg++;

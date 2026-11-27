@@ -25,7 +25,7 @@
 #include "types.h"
 
 #define SAVESTATE_MAJOR 12
-#define SAVESTATE_MINOR 2
+#define SAVESTATE_MINOR 3
 
 namespace melonDS
 {

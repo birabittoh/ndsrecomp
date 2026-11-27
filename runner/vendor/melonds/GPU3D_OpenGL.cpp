@@ -1273,7 +1273,7 @@ void GLRenderer::RenderFrame(GPU& gpu)
         glDrawArrays(GL_TRIANGLES, 0, 2*3);
     }
 
-    if (gpu.GPU3D.RenderNumPolygons)
+    if (std::min<u32>(gpu.GPU3D.RenderNumPolygons, kHwPolygons))
     {
         // render shit here
         u32 flags = 0;
@@ -1281,7 +1281,7 @@ void GLRenderer::RenderFrame(GPU& gpu)
 
         int npolys = 0;
         int firsttrans = -1;
-        for (u32 i = 0; i < gpu.GPU3D.RenderNumPolygons; i++)
+        for (u32 i = 0; i < std::min<u32>(gpu.GPU3D.RenderNumPolygons, kHwPolygons); i++)
         {
             if (gpu.GPU3D.RenderPolygonRAM[i]->Degenerate) continue;
 

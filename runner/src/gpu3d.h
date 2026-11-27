@@ -139,6 +139,11 @@ void nds_gpu3d_debug_history_reset();
 bool nds_gpu3d_reg_addr(uint32_t addr);
 uint32_t nds_gpu3d_read(uint32_t addr, uint32_t width);
 void nds_gpu3d_write(uint32_t addr, uint32_t value, uint32_t width);
+// Texture page `page` (1..31, see melonDS::kTexPages) := the texture bytes
+// [tex_lo, tex_lo + tex_size) and palette bytes [pal_lo, pal_lo + pal_size)
+// of live texture VRAM. Sizes 0 clear the page. False when they do not fit.
+bool nds_gpu3d_texture_page_capture(uint32_t page, uint32_t tex_lo, uint32_t tex_size,
+                                    uint32_t pal_lo, uint32_t pal_size);
 // Build-selected MPH geometry stream: one page-bounded scheduler slice of
 // contiguous Main RAM. Returns consumed words, stopping on real FIFO stall.
 uint32_t nds_gpu3d_command_batch(uint32_t source, uint32_t words,

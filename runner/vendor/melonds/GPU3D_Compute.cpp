@@ -650,7 +650,7 @@ void ComputeRenderer::RenderFrame(GPU& gpu)
 
     bool enableTextureMaps = gpu.GPU3D.RenderDispCnt & (1<<0);
 
-    for (int i = 0; i < gpu.GPU3D.RenderNumPolygons; i++)
+    for (int i = 0; i < std::min<u32>(gpu.GPU3D.RenderNumPolygons, kHwPolygons); i++)
     {
         Polygon* polygon = gpu.GPU3D.RenderPolygonRAM[i];
 
@@ -878,7 +878,7 @@ void ComputeRenderer::RenderFrame(GPU& gpu)
         glBufferSubData(GL_TEXTURE_BUFFER, 0, numSetupIndices*4*2, YSpanIndices.data());
 
         glBindBuffer(GL_SHADER_STORAGE_BUFFER, RenderPolygonMemory);
-        glBufferSubData(GL_SHADER_STORAGE_BUFFER, 0, gpu.GPU3D.RenderNumPolygons*sizeof(RenderPolygon), RenderPolygons);
+        glBufferSubData(GL_SHADER_STORAGE_BUFFER, 0, std::min<u32>(gpu.GPU3D.RenderNumPolygons, kHwPolygons)*sizeof(RenderPolygon), RenderPolygons);
         // we haven't accessed image data yet, so we don't need to invalidate anything
     }
 
@@ -896,7 +896,7 @@ void ComputeRenderer::RenderFrame(GPU& gpu)
 
     MetaUniform meta;
     meta.DispCnt = gpu.GPU3D.RenderDispCnt;
-    meta.NumPolygons = gpu.GPU3D.RenderNumPolygons;
+    meta.NumPolygons = std::min<u32>(gpu.GPU3D.RenderNumPolygons, kHwPolygons);
     meta.NumVariants = numVariants;
     meta.AlphaRef = gpu.GPU3D.RenderAlphaRef;
     {
@@ -969,7 +969,7 @@ void ComputeRenderer::RenderFrame(GPU& gpu)
 
         // bin polygons
         glUseProgram(ShaderBinCombined);
-        glDispatchCompute(((gpu.GPU3D.RenderNumPolygons + 31) / 32), ScreenWidth/CoarseTileW, ScreenHeight/CoarseTileH);
+        glDispatchCompute(((std::min<u32>(gpu.GPU3D.RenderNumPolygons, kHwPolygons) + 31) / 32), ScreenWidth/CoarseTileW, ScreenHeight/CoarseTileH);
         glMemoryBarrier(GL_SHADER_STORAGE_BARRIER_BIT | GL_COMMAND_BARRIER_BIT);
 
         // calculate list offsets

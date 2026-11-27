@@ -28,7 +28,7 @@ struct InterpState {
     NdsGxRecorder recorder;
     NdsGxStream last, incoming, halfway;
     std::unique_ptr<NdsGxReplayer> replayer;
-    std::vector<Polygon*> real = std::vector<Polygon*>(2048);
+    std::vector<Polygon*> real = std::vector<Polygon*>(melonDS::kMaxPolygons);
     size_t real_count = 0;
     bool last_valid = false;
     bool showing_blend = false;

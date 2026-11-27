@@ -122,9 +122,10 @@ bool validate_gpu3d_device(const melonDS::GPU3D& gpu,
         if (error) *error = message;
         return false;
     };
-    if (gpu.CurRAMBank > 1u || gpu.NumVertices > 6144u ||
-        gpu.NumPolygons > 2048u || gpu.NumOpaquePolygons > gpu.NumPolygons ||
-        gpu.RenderNumPolygons > 2048u)
+    if (gpu.CurRAMBank > 1u || gpu.NumVertices > melonDS::kMaxVertices ||
+        gpu.NumPolygons > melonDS::kMaxPolygons ||
+        gpu.NumOpaquePolygons > gpu.NumPolygons ||
+        gpu.RenderNumPolygons > melonDS::kMaxPolygons)
         return fail("savestate GPU3D RAM state is invalid");
     if (gpu.ProjMatrixStackPointer < 0 ||
         gpu.ProjMatrixStackPointer > 1 ||
@@ -140,27 +141,30 @@ bool validate_gpu3d_device(const melonDS::GPU3D& gpu,
         gpu.ParamCount > 32u || gpu.TotalParams > 32u)
         return fail("savestate GPU3D command state is invalid");
     const melonDS::Vertex* expected_vertex =
-        &gpu.VertexRAM[gpu.CurRAMBank ? 6144u : 0u];
+        &gpu.VertexRAM[gpu.CurRAMBank ? melonDS::kMaxVertices : 0u];
     const melonDS::Polygon* expected_polygon =
-        &gpu.PolygonRAM[gpu.CurRAMBank ? 2048u : 0u];
+        &gpu.PolygonRAM[gpu.CurRAMBank ? melonDS::kMaxPolygons : 0u];
     if (gpu.CurVertexRAM != expected_vertex ||
         gpu.CurPolygonRAM != expected_polygon)
         return fail("savestate GPU3D active RAM pointer is invalid");
     if (gpu.LastStripPolygon &&
-        !pointer_in_array(gpu.LastStripPolygon, gpu.PolygonRAM, 4096u,
+        !pointer_in_array(gpu.LastStripPolygon, gpu.PolygonRAM,
+                          std::size(gpu.PolygonRAM),
                           sizeof(gpu.PolygonRAM[0])))
         return fail("savestate GPU3D strip pointer is invalid");
     for (const melonDS::Polygon& polygon : gpu.PolygonRAM) {
         if (polygon.NumVertices > 10u)
             return fail("savestate GPU3D polygon vertex count is invalid");
         for (uint32_t i = 0; i < polygon.NumVertices; ++i) {
-            if (!pointer_in_array(polygon.Vertices[i], gpu.VertexRAM, 12288u,
+            if (!pointer_in_array(polygon.Vertices[i], gpu.VertexRAM,
+                                  std::size(gpu.VertexRAM),
                                   sizeof(gpu.VertexRAM[0])))
                 return fail("savestate GPU3D vertex pointer is invalid");
         }
     }
     for (uint32_t i = 0; i < gpu.RenderNumPolygons; ++i) {
-        if (!pointer_in_array(gpu.RenderPolygonRAM[i], gpu.PolygonRAM, 4096u,
+        if (!pointer_in_array(gpu.RenderPolygonRAM[i], gpu.PolygonRAM,
+                              std::size(gpu.PolygonRAM),
                               sizeof(gpu.PolygonRAM[0])))
             return fail("savestate GPU3D render pointer is invalid");
     }
@@ -1224,7 +1228,7 @@ bool gpu3d_savestate_validate(const NdsGpu3dSaveState& in,
     const uint16_t minor = static_cast<uint16_t>(in.device[6]) |
         (static_cast<uint16_t>(in.device[7]) << 8u);
     if (std::memcmp(in.device.data(), "MELN", 4u) != 0 || major != 12u ||
-        minor > 2u || read_le32(8u) != in.device.size() ||
+        minor > 3u || read_le32(8u) != in.device.size() ||
         std::memcmp(in.device.data() + 16u, "GP3D", 4u) != 0 ||
         read_le32(20u) != in.device.size() - 16u) {
         if (error) *error = "savestate GPU3D section envelope is invalid";
@@ -2035,4 +2039,20 @@ void nds_gpu3d_start_frame() {
             compute_finish_readback();
     }
 #endif
+}
+
+bool nds_gpu3d_texture_page_capture(uint32_t page, uint32_t tex_lo, uint32_t tex_size,
+                                    uint32_t pal_lo, uint32_t pal_size) {
+    auto& g3 = g_nds.GPU.GPU3D;
+    if (!tex_size && !pal_size) {
+        if (page == 0 || page >= melonDS::kTexPages) return false;
+        g3.TexPages[page] = {};
+        ++g3.TexPageGeneration;
+        return true;
+    }
+    static uint8_t texture[512 * 1024];
+    static uint8_t palette[128 * 1024];
+    nds_vram_copy_texture(texture);
+    nds_vram_copy_texpal(palette);
+    return g3.SetTexPage(page, tex_lo, tex_size, pal_lo, pal_size, texture, palette);
 }
