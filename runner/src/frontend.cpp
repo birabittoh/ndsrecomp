@@ -1053,6 +1053,28 @@ SDL_GameController* open_first_controller() {
 std::atomic<float> g_touch_ui_scale{1.0f};
 std::atomic<float> g_touch_ui_anchor_x{0.0f};
 std::atomic<float> g_touch_ui_anchor_y{0.0f};
+// Where the fixed-size layer has a pixel (in its own unscaled DS pixels), so a
+// point on the shrunken UI is the UI's even where the second screen is drawn
+// under it. Written by the presenter, read by the event loop.
+std::mutex g_touch_ui_alpha_mutex;
+std::vector<uint8_t> g_touch_ui_alpha;
+
+// Whether the shrunken UI is drawn at (x, y), the main screen's native DS
+// pixels as displayed.
+bool touch_ui_layer_hit(float x, float y) {
+    const float s = g_touch_ui_scale.load(std::memory_order_relaxed);
+    if (s >= 1.0f || s <= 0.0f) return false;
+    const float ax = g_touch_ui_anchor_x.load(std::memory_order_relaxed);
+    const float ay = g_touch_ui_anchor_y.load(std::memory_order_relaxed);
+    const int lx = static_cast<int>(std::floor(ax + (x - ax) / s));
+    const int ly = static_cast<int>(std::floor(ay + (y - ay) / s));
+    if (lx < 0 || lx >= kScreenWidth || ly < 0 || ly >= kScreenHeight)
+        return false;
+    std::lock_guard<std::mutex> lock(g_touch_ui_alpha_mutex);
+    return g_touch_ui_alpha.size() ==
+               size_t(kScreenWidth) * kScreenHeight &&
+           g_touch_ui_alpha[size_t(ly) * kScreenWidth + size_t(lx)] != 0;
+}
 
 // Maps a point on the touchscreen (DS pixels, as displayed) back to the DS
 // pixel of the unscaled layer under it. False when the point is outside the
@@ -2831,6 +2853,15 @@ void convert_mouse_event_to_logical_coordinates(
                 in_inset = tx >= 0.0f && tx < inset_content_w &&
                            ty >= 0.0f && ty < kScreenHeight;
             }
+            // The shrunken UI is drawn over the inset: a point on it is the
+            // UI's.
+            if (in_inset &&
+                touch_ui_layer_hit(
+                    cx - static_cast<float>(
+                             std::max(content_w - kScreenWidth, 0) / 2),
+                    cy - static_cast<float>(
+                             std::max(content_h - kScreenHeight, 0) / 2)))
+                in_inset = false;
             g_top_logical_hit = {in_inset, tx, ty};
             if (in_inset) {
                 cx = -1.0f;
@@ -3933,6 +3964,12 @@ PresentationTicks present_single_screen(FrontendPresentation& presentation,
         if (layer_set && shown == 1 &&
             (packet ? (fixed_shown = packet->fixed, true)
                     : nds_gpu2d_fixed_layers_frame(&fixed_shown))) {
+            {
+                std::lock_guard<std::mutex> lock(g_touch_ui_alpha_mutex);
+                g_touch_ui_alpha.resize(size_t(kScreenWidth) * kScreenHeight);
+                for (size_t i = 0; i < g_touch_ui_alpha.size(); ++i)
+                    g_touch_ui_alpha[i] = (fixed_shown.layer[i] >> 24) != 0;
+            }
             g_touch_ui_anchor_x.store(float(fixed_shown.anchor_x));
             g_touch_ui_anchor_y.store(float(fixed_shown.anchor_y));
             g_touch_ui_scale.store(fixed_shown.scale);

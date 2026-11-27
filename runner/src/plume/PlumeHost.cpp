@@ -1425,27 +1425,6 @@ bool nds_compute_host_present_top(const unsigned int* fallback_pixels,
         record_blit(slot, kMain, band, bilinear && !box_resolve,
                     box_resolve ? kBlitBoxResolve : 0u, fb_width, fb_height);
     }
-    if (layer) {
-        // Size and position each rounded to whole drawable pixels, so a
-        // layer drawn at an integer magnification stays pixel exact
-        // wherever it sits.
-        const auto pixels = [](int size, float fraction) {
-            return int(std::lround(double(size) * fraction));
-        };
-        // The layer's native 256 columns, centred in a wider image.
-        const int native_x = int(int64_t(band.w) * ((width - int(kNativeWidth)) / 2) / width);
-        const NdsPresentRect native{band.x + native_x, band.y,
-                                    std::max(int(int64_t(band.w) * kNativeWidth / width), 1),
-                                    band.h};
-        const NdsPresentRect layer_rect{
-            native.x + pixels(native.w, g_layer_rect[0]),
-            native.y + pixels(native.h, g_layer_rect[1]),
-            std::max(pixels(native.w, g_layer_rect[2]), 1),
-            std::max(pixels(native.h, g_layer_rect[3]), 1)};
-        // The main filter, on a premultiplied image. No box resolve.
-        record_blit(slot, kLayer, layer_rect, bilinear,
-                    kBlitKeepAlpha | kBlitPremultiplied, fb_width, fb_height);
-    }
     if (inset && layout.inset.w > 0 && layout.inset.h > 0) {
         // Point sampling a shrunk inset drops whole rows of text.
         const bool linear = bilinear || layout.inset.w < int(g_inset_width);
@@ -1469,6 +1448,28 @@ bool nds_compute_host_present_top(const unsigned int* fallback_pixels,
             record_blit(slot, kInset, layout.inset, linear,
                         over ? kBlitKeepAlpha : 0u, fb_width, fb_height);
         }
+    }
+    // The fixed-size UI goes over the inset too, so it is never hidden by it.
+    if (layer) {
+        // Size and position each rounded to whole drawable pixels, so a
+        // layer drawn at an integer magnification stays pixel exact
+        // wherever it sits.
+        const auto pixels = [](int size, float fraction) {
+            return int(std::lround(double(size) * fraction));
+        };
+        // The layer's native 256 columns, centred in a wider image.
+        const int native_x = int(int64_t(band.w) * ((width - int(kNativeWidth)) / 2) / width);
+        const NdsPresentRect native{band.x + native_x, band.y,
+                                    std::max(int(int64_t(band.w) * kNativeWidth / width), 1),
+                                    band.h};
+        const NdsPresentRect layer_rect{
+            native.x + pixels(native.w, g_layer_rect[0]),
+            native.y + pixels(native.h, g_layer_rect[1]),
+            std::max(pixels(native.w, g_layer_rect[2]), 1),
+            std::max(pixels(native.h, g_layer_rect[3]), 1)};
+        // The main filter, on a premultiplied image. No box resolve.
+        record_blit(slot, kLayer, layer_rect, bilinear,
+                    kBlitKeepAlpha | kBlitPremultiplied, fb_width, fb_height);
     }
     if (overlay)
         record_blit(slot, kOverlay, band, bilinear, kBlitKeepAlpha, fb_width,
