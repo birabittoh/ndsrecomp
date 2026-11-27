@@ -211,6 +211,14 @@ struct Targets {
     std::unique_ptr<RenderTexture> color, attr, depth_copy, depth, output;
     std::unique_ptr<RenderFramebuffer> main, final;
     uint32_t width = 0, height = 0;
+
+    // The framebuffers hold views of the textures, so they go first
+    // (assigning a fresh Targets would free the textures first).
+    void release() {
+        main.reset();
+        final.reset();
+        *this = Targets{};
+    }
 };
 
 struct Renderer {
@@ -454,7 +462,7 @@ bool resize_targets(Renderer& r, uint32_t width, uint32_t height) {
     wait_all(r);
     r.valid = false;
     Targets& t = r.targets;
-    t = Targets{};
+    t.release();
     t.color = device().createTexture(RenderTextureDesc::ColorTarget(width, height, kColorFormat));
     t.attr = device().createTexture(RenderTextureDesc::ColorTarget(width, height, kAttrFormat));
     t.depth_copy = device().createTexture(
@@ -463,7 +471,7 @@ bool resize_targets(Renderer& r, uint32_t width, uint32_t height) {
     t.output = device().createTexture(
         RenderTextureDesc::ColorTarget(width, height, kOutputFormat));
     if (!t.color || !t.attr || !t.depth_copy || !t.depth || !t.output) {
-        t = Targets{};
+        t.release();
         return false;
     }
     const RenderTexture* main_colors[] = {t.color.get(), t.attr.get(), t.depth_copy.get()};
@@ -471,7 +479,7 @@ bool resize_targets(Renderer& r, uint32_t width, uint32_t height) {
     const RenderTexture* final_colors[] = {t.output.get()};
     t.final = device().createFramebuffer(RenderFramebufferDesc(final_colors, 1));
     if (!t.main || !t.final) {
-        t = Targets{};
+        t.release();
         return false;
     }
     t.width = width;
