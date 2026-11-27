@@ -1194,6 +1194,7 @@ void GPU3D::SubmitPolygon() noexcept
 
     if (NumPolygons >= 2048 || NumVertices+nverts > 6144)
     {
+        ++RamFullRejects;
         LastStripPolygon = NULL;
         DispCnt |= (1<<13);
         return;
@@ -2729,6 +2730,17 @@ void GPU3D::VBlank() noexcept
 
         if (FlushRequest)
         {
+            // Polygon / vertex RAM use, reported when it gets near the
+            // limits (or past them) at most every 300 frames.
+            RamPeakPolygons = std::max<u32>(RamPeakPolygons, NumPolygons);
+            RamPeakVertices = std::max<u32>(RamPeakVertices, NumVertices);
+            if (++RamReportFrames >= 300)
+            {
+                if (RamFullRejects || RamPeakPolygons > 1800 || RamPeakVertices > 5400)
+                    fprintf(stderr, "[gpu3d] last %u frames: peak %u polygons, %u vertices, %u rejected\n",
+                            RamReportFrames, RamPeakPolygons, RamPeakVertices, RamFullRejects);
+                RamReportFrames = RamPeakPolygons = RamPeakVertices = RamFullRejects = 0;
+            }
             RenderBatchWidth = RenderWidth;
             RenderBatchHeight = RenderHeight;
             CurRAMBank = CurRAMBank?0:1;

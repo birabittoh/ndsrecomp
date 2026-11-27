@@ -31,6 +31,10 @@ struct NdsBusMemorySnapshot {
     std::vector<uint32_t> dtcm_generation;
     std::vector<uint32_t> shared_wram_generation;
     std::vector<uint32_t> arm7_wram_generation;
+
+    // nds_bus_map_title_ram's block; empty when none is mapped.
+    uint32_t title_ram_base = 0;
+    std::vector<uint8_t> title_ram;
 };
 
 struct NdsSchedulerSaveState {

@@ -380,6 +380,14 @@ bool     nds_io_cartridge_file(const char* path, const uint8_t** data,
 // block at a time; emulation thread only.
 bool     nds_bus_map_title_rom(uint32_t base, const uint8_t* data,
                                uint32_t size);
+// Read/write RAM a title adds for the ARM9, for state that does not fit main
+// RAM: `size` zeroed bytes at `base`, in the slot-2 ROM range like the block
+// above (where both are mapped, this one wins). It costs main RAM's access
+// time, DMA reaches it, resets zero it and savestates carry it. Mapping the
+// same base and size again keeps the contents; size 0 unmaps it. Emulation
+// thread only.
+bool     nds_bus_map_title_ram(uint32_t base, uint32_t size);
+bool     nds_bus_title_ram_contains(uint32_t addr);
 // Interactive play defaults to a battery-save file derived from the ROM.
 // Serve/batch gates leave this path empty unless explicitly requested. A
 // historical savestate load restores guest bytes session-locally and blocks

@@ -817,6 +817,8 @@ DmaTiming dma_timing(int cpu, uint32_t addr, uint32_t width) {
         t = {1u, 1u, DmaRegion::Vram, 16u};
     else if (addr >= 0x07000000u && addr < 0x08000000u)
         t = {1u, 1u, DmaRegion::Oam, 32u};
+    else if (cpu == 0 && nds_bus_title_ram_contains(addr))
+        t = {8u, 1u, DmaRegion::Main, 16u};
     else if (addr >= 0x08000000u && addr < 0x0A000000u) {
         const bool owner = ((g_exmemcnt[0] & 0x0080u) != 0u) == (cpu == 1);
         if (owner) {

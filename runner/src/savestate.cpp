@@ -314,6 +314,8 @@ std::vector<uint8_t> encode_memory(const NdsBusMemorySnapshot& mem) {
     put_vec32(out, mem.dtcm_generation);
     put_vec32(out, mem.shared_wram_generation);
     put_vec32(out, mem.arm7_wram_generation);
+    put_u32(out, mem.title_ram_base);
+    put_vec8(out, mem.title_ram);
     return out;
 }
 
@@ -337,6 +339,10 @@ bool decode_memory(const std::vector<uint8_t>& payload,
         read_vec32(payload, pos, &mem->dtcm_generation) &&
         read_vec32(payload, pos, &mem->shared_wram_generation) &&
         read_vec32(payload, pos, &mem->arm7_wram_generation) &&
+        // Title RAM trails the section; states from before it end here.
+        (pos == payload.size() ||
+         (read_u32(payload, pos, &mem->title_ram_base) &&
+          read_vec8(payload, pos, &mem->title_ram))) &&
         pos == payload.size();
 }
 

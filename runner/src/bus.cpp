@@ -547,6 +547,18 @@ bool title_rom_read(uint32_t addr, uint32_t width, uint32_t* value) {
     return true;
 }
 
+// nds_bus_map_title_ram: plain RAM a title adds for the ARM9 in the slot-2
+// ROM range, served by resolve() whatever EXMEMCNT says.
+std::vector<uint8_t> g_title_ram;
+uint32_t g_title_ram_base = 0;
+
+inline uint8_t* title_ram_resolve(uint32_t addr, uint32_t len) {
+    if (g_title_ram.empty() || g_nds_active != NDS_ARM9) return nullptr;
+    const uint32_t o = addr - g_title_ram_base;
+    if (o >= g_title_ram.size() || o + len > g_title_ram.size()) return nullptr;
+    return g_title_ram.data() + o;
+}
+
 bool gba_slot_read(uint32_t addr, uint32_t width, uint32_t* value) {
     if (addr < 0x08000000u || addr >= 0x0B000000u) return false;
     if (title_rom_read(addr, width, value)) return true;
@@ -677,6 +689,8 @@ uint8_t* resolve(uint32_t addr, uint32_t len) {
         uint32_t o = addr & 0x00003FFFu;
         if (o + len <= g_arm7_bios.size()) return g_arm7_bios.data() + o;
     }
+    if (addr >= 0x08000000u && addr < 0x0A000000u)
+        return title_ram_resolve(addr, len);
     return nullptr;
 }
 
@@ -725,6 +739,24 @@ bool nds_bus_map_title_rom(uint32_t base, const uint8_t* data, uint32_t size) {
     return true;
 }
 
+bool nds_bus_map_title_ram(uint32_t base, uint32_t size) {
+    if (size == 0u) {
+        g_title_ram.clear();
+        g_title_ram.shrink_to_fit();
+        g_title_ram_base = 0;
+        return true;
+    }
+    if (base < 0x08000000u || base > 0x0A000000u - size) return false;
+    if (g_title_ram_base == base && g_title_ram.size() == size) return true;
+    g_title_ram.assign(size, 0u);
+    g_title_ram_base = base;
+    return true;
+}
+
+bool nds_bus_title_ram_contains(uint32_t addr) {
+    return !g_title_ram.empty() && addr - g_title_ram_base < g_title_ram.size();
+}
+
 // Per-CPU last code-fetch PC, for the sequential/non-sequential distinction in
 // runtime_code_cycles (a sequential fetch is far cheaper than a branch/refill).
 uint32_t g_last_code_pc[2] = {0xFFFFFFFFu, 0xFFFFFFFFu};
@@ -747,6 +779,7 @@ void bus_init() {
     g_arm7_wram.assign(64u * 1024, 0);
     g_arm9_bios.assign(4u * 1024, 0);
     g_arm7_bios.assign(16u * 1024, 0);
+    std::fill(g_title_ram.begin(), g_title_ram.end(), uint8_t{0});
     g_main_ram_generation.assign(g_main_ram.size() / kExecPageSize, 0u);
     g_itcm_generation.assign(g_itcm.size() / kExecPageSize, 0u);
     g_dtcm_generation.assign(g_dtcm.size() / kExecPageSize, 0u);
@@ -995,6 +1028,8 @@ bool bus_savestate_export(NdsBusMemorySnapshot* out) {
     out->dtcm_generation = g_dtcm_generation;
     out->shared_wram_generation = g_shared_wram_generation;
     out->arm7_wram_generation = g_arm7_wram_generation;
+    out->title_ram_base = g_title_ram_base;
+    out->title_ram = g_title_ram;
     return true;
 }
 
@@ -1007,6 +1042,10 @@ bool bus_savestate_import(const NdsBusMemorySnapshot& in, std::string* error) {
         if (error) *error = message;
         return false;
     };
+    if (!in.title_ram.empty() &&
+        (in.title_ram_base < 0x08000000u ||
+         in.title_ram_base > 0x0A000000u - in.title_ram.size()))
+        return fail("savestate title RAM out of range");
     if (in.main_ram.size() != 4u * 1024u * 1024u ||
         in.itcm.size() != 32u * 1024u ||
         in.dtcm.size() != 16u * 1024u ||
@@ -1047,6 +1086,14 @@ bool bus_savestate_import(const NdsBusMemorySnapshot& in, std::string* error) {
     g_dtcm_generation = in.dtcm_generation;
     g_shared_wram_generation = in.shared_wram_generation;
     g_arm7_wram_generation = in.arm7_wram_generation;
+    // A state without title RAM is one taken before the title mapped it:
+    // nothing in it points there, so the block keeps its mapping, emptied.
+    if (!in.title_ram.empty()) {
+        g_title_ram = in.title_ram;
+        g_title_ram_base = in.title_ram_base;
+    } else {
+        std::fill(g_title_ram.begin(), g_title_ram.end(), uint8_t{0});
+    }
     reset_arm9_code_timing();
     bus_fast_refresh();
     runtime_note_code_write();
@@ -1548,6 +1595,11 @@ Arm9CodeTiming arm9_latch_code_timing(uint32_t addr) {
 // and the unselected CPU sees a fast 32-bit void region instead.
 inline uint32_t arm9_gba_slot_cycles(uint32_t addr, uint32_t width,
                                      bool sequential) {
+    // Title RAM is not a slot device: it costs what main RAM does.
+    if (addr - g_title_ram_base < g_title_ram.size()) {
+        if (sequential) return 4u;
+        return width >= 4u ? 18u : 16u;
+    }
     const bool arm9_owns = (nds_exmemcnt(0) & 0x0080u) == 0u;
     if (!arm9_owns) {
         // SetARM9RegionTimings(..., region=void, buswidth=32, N=1, S=1).

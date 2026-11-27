@@ -412,6 +412,8 @@ public:
     u32 CurRAMBank = 0;
 
     std::array<Polygon*,2048> RenderPolygonRAM {};
+    // Host-side diagnostics only (not in savestates).
+    u32 RamFullRejects = 0, RamPeakPolygons = 0, RamPeakVertices = 0, RamReportFrames = 0;
     u32 RenderNumPolygons = 0;
 
     u32 FlushRequest = 0;
