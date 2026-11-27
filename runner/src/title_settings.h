@@ -253,6 +253,15 @@ int nds_title_inset_overlay(int screen, const uint32_t* pixels, int width,
                             uint32_t* out, NdsTitleInsetPiece* pieces,
                             int* piece_count);
 
+// Where the see-through second screen sits in the main screen: 0 bottom-left
+// (the default and with no query), 1 bottom-right, 2 top-left, 3 top-right.
+// Asked each presented frame, before the layout, on the frontend thread; same
+// rules as the overlay query. It does not apply to a cut-up inset (the pieces
+// have their own dst).
+typedef int (*NdsTitleInsetCornerQuery)();
+void nds_title_set_inset_corner_query(NdsTitleInsetCornerQuery query);
+int nds_title_inset_corner();
+
 // Widescreen owned by the title, in the single-screen layout: while the query
 // returns true the main screen takes the window's shape. Wider than 4:3 it
 // gains columns (Hor+, up to 448x192, or any width up to

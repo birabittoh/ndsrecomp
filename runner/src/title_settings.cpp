@@ -207,6 +207,20 @@ int nds_title_inset_overlay(int screen, const uint32_t* pixels, int width,
 }
 
 namespace {
+std::atomic<NdsTitleInsetCornerQuery> g_inset_corner_query{nullptr};
+}  // namespace
+
+void nds_title_set_inset_corner_query(NdsTitleInsetCornerQuery query) {
+    g_inset_corner_query.store(query, std::memory_order_relaxed);
+}
+
+int nds_title_inset_corner() {
+    const NdsTitleInsetCornerQuery query =
+        g_inset_corner_query.load(std::memory_order_relaxed);
+    return std::clamp(query ? query() : 0, 0, 3);
+}
+
+namespace {
 std::atomic<NdsTitleWideQuery> g_wide_query{nullptr};
 }  // namespace
 

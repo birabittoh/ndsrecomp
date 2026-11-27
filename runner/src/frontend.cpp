@@ -3859,6 +3859,8 @@ PresentationTicks present_single_screen(FrontendPresentation& presentation,
         last = state;
     }
     nds_inset_overlay_flag().store(overlay, std::memory_order_relaxed);
+    nds_inset_corner_flag().store(overlay > 0 ? nds_title_inset_corner() : 0,
+                                  std::memory_order_relaxed);
     const bool stylus =
         virtual_stylus_visible && shown == g_virtual_stylus_screen;
     // On the inset, the cursor is drawn on a copy of its LCD.

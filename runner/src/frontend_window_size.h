@@ -160,10 +160,19 @@ inline std::atomic<bool>& nds_inset_below_flag() {
 // Set while the title draws the second screen over the main one (see
 // title_settings.h, nds_title_inset_overlay): the inset's size as a percent
 // of the main screen, 0 for the inset beside it. The main screen then takes
-// the whole drawable and the inset sits in its bottom-left corner.
+// the whole drawable and the inset sits in its bottom-left corner (or the one
+// nds_inset_corner_flag names).
 inline std::atomic<int>& nds_inset_overlay_flag() {
     static std::atomic<int> percent{0};
     return percent;
+}
+
+// The corner of the main screen the overlaid inset sits in: 0 bottom-left,
+// 1 bottom-right, 2 top-left, 3 top-right (title_settings.h,
+// nds_title_inset_corner).
+inline std::atomic<int>& nds_inset_corner_flag() {
+    static std::atomic<int> corner{0};
+    return corner;
 }
 
 // The main screen's view height in LCD lines for this frame: 192, or more
@@ -305,8 +314,12 @@ inline NdsSingleLayout nds_single_layout(NdsWindowMode mode,
         layout.inset.h = std::max(static_cast<int>(
             static_cast<long long>(main.h) * 192 * overlay /
             (100LL * content_h)), 1);
-        layout.inset.x = main.x + margin;
-        layout.inset.y = main.y + main.h - layout.inset.h - margin;
+        const int corner =
+            nds_inset_corner_flag().load(std::memory_order_relaxed);
+        layout.inset.x = corner & 1
+            ? main.x + main.w - layout.inset.w - margin : main.x + margin;
+        layout.inset.y = corner & 2
+            ? main.y + margin : main.y + main.h - layout.inset.h - margin;
         return layout;
     }
     if (stack_vertically || drawable_h > drawable_w) {
