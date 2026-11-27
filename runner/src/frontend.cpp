@@ -2711,6 +2711,9 @@ TopLogicalHit g_top_logical_hit;
 // centred columns and middle rows are 0..255 and 0..191, the rest of the
 // view outside them. Not valid off the view or on an inset over it.
 TopLogicalHit g_wide_touch_hit;
+// The same, but also over an inset drawn on the widened touchscreen: a stick
+// already held follows the pointer there, though a press there is no touch.
+TopLogicalHit g_wide_touch_drag_hit;
 // A left drag that started on the top screen is under way
 // (nds_title_top_drag).
 bool g_top_dragging = false;
@@ -2718,6 +2721,7 @@ bool g_top_dragging = false;
 void convert_mouse_event_to_logical_coordinates(
     SDL_Event& event, const FrontendPresentation& presentation) {
     g_wide_touch_hit = {};
+    g_wide_touch_drag_hit = {};
     auto screen_for_window = [&](uint32_t window_id) -> int {
         // The second display's touches come converted already.
         if (presentation.dual && window_id == kSecondDisplayWindowId)
@@ -2768,6 +2772,15 @@ void convert_mouse_event_to_logical_coordinates(
         const int rect_content_h = inset_is_rect ? kScreenHeight : content_h;
         nds_present_rect_to_content(rect, rect_content_w, rect_content_h, px,
                                     py, &cx, &cy);
+        if (presentation.single && presentation.shown_screen == 1 &&
+            (content_w > kScreenWidth || content_h > kScreenHeight) &&
+            cx >= 0.0f && cx < content_w && cy >= 0.0f && cy < content_h)
+            g_wide_touch_drag_hit = {
+                true,
+                cx - static_cast<float>(
+                         std::max(content_w - kScreenWidth, 0) / 2),
+                cy - static_cast<float>(
+                         std::max(content_h - kScreenHeight, 0) / 2)};
         g_top_logical_hit = {};
         if (presentation.single && presentation.shown_screen == 0 &&
             presentation.inset_percent > 0) {
@@ -6935,12 +6948,11 @@ int nds_run_interactive_frontend(const NdsFrontendOptions& initial_options) {
                     // went from its own, shortened only as far as it must
                     // to stay on the screen: never released by the drag,
                     // whichever side of the screen's edge it starts or ends.
-                    // Off the view (or over an inset) it stays.
-                    if (g_wide_touch_hit.valid) {
-                        const float vx =
-                            g_wide_touch_hit.x - touch_stick_press_x;
-                        const float vy =
-                            g_wide_touch_hit.y - touch_stick_press_y;
+                    // Over an inset it goes on; off the view it stays.
+                    const TopLogicalHit& hit = g_wide_touch_drag_hit;
+                    if (hit.valid) {
+                        const float vx = hit.x - touch_stick_press_x;
+                        const float vy = hit.y - touch_stick_press_y;
                         float s = 1.0f;
                         auto fit = [&s](float from, float v, float limit) {
                             if (v > 0.0f && from + v * s > limit)
@@ -6961,8 +6973,8 @@ int nds_run_interactive_frontend(const NdsFrontendOptions& initial_options) {
                             true,
                             static_cast<int>(std::floor(touch_stick_press_x)),
                             static_cast<int>(std::floor(touch_stick_press_y)),
-                            static_cast<int>(std::floor(g_wide_touch_hit.x)),
-                            static_cast<int>(std::floor(g_wide_touch_hit.y)));
+                            static_cast<int>(std::floor(hit.x)),
+                            static_cast<int>(std::floor(hit.y)));
                     }
                     last_touch_event_x = bottom_content_left + touch_stick_x;
                     last_touch_event_y = touch_stick_y;
@@ -7027,7 +7039,7 @@ int nds_run_interactive_frontend(const NdsFrontendOptions& initial_options) {
                                                : event.button.windowID;
                 const bool top_shown =
                     window == presentation.window_ids[0] &&
-                    g_top_logical_hit.valid &&
+                    g_top_logical_hit.valid && !mouse_down &&
                     !relative_mouse.captured() && !virtual_stylus_active() &&
                     (!presentation.single ||
                      (!presentation.stacked &&
