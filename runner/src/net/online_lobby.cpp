@@ -20,6 +20,7 @@
 #include <cstring>
 #include <map>
 #include <mutex>
+#include <optional>
 #include <thread>
 
 #ifdef _WIN32
@@ -65,6 +66,20 @@ constexpr size_t kMaxReplayedLobbies = 8;
 // while the lobby is joined and the relay comes up.
 constexpr auto kJoinBeaconHold = std::chrono::seconds(20);
 constexpr size_t kMaxBeaconBytes = 1024;
+
+// Tag mode (NdsNetplayHostInfo::tag): the game turns host and client by
+// turns every few seconds, far too fast for a lobby per host window. While
+// it is on, the runner sits in a shared tag room instead, which puts every
+// member in range of every other for as long as they keep at it. Tag
+// rooms carry their own game_version, so lists and joins of ordinary
+// lobbies (older clients included) never see them.
+constexpr const char* kTagVersionSuffix = "+tag";
+constexpr const char* kTagRoomName = "Tag mode";
+// Tag mode counts as on this long after the last tag beacon: a round is a
+// host window, a client scan, then several seconds with the radio off.
+constexpr auto kTagLinger = std::chrono::seconds(30);
+// Between attempts to find or open a tag room.
+constexpr auto kTagRetry = std::chrono::seconds(2);
 
 std::string HexEncode(const std::vector<uint8_t>& bytes) {
     static const char kDigits[] = "0123456789abcdef";
@@ -120,6 +135,7 @@ struct Room {
     std::string lobby_id;
     std::string name;
     bool is_host = false;
+    bool tag = false;  // a tag room
     int local_slot = -1;
     std::string host_player_id;
     int max_slots = 0;
@@ -476,14 +492,18 @@ private:
         if (!join.empty()) RequestJoin(join);
         SendChat();
         if (!ws_.IsOpen()) return;
-        if ((browsing_now_ || BeaconScanActive()) &&
+        TagTick(now);
+        if ((browsing_now_ || BeaconScanActive() || tag_active_) &&
             now - last_list_ >= kListInterval) {
-            Send(JsonOp("list").Str("game_name", config_.game_name)
-                     .Str("game_version", config_.game_version)
-                     .Text());
+            // Tag rooms have a version of their own: list the whole game.
+            JsonOp list("list");
+            list.Str("game_name", config_.game_name);
+            if (!tag_active_) list.Str("game_version", config_.game_version);
+            Send(list.Text());
             last_list_ = now;
         }
         HostLogic(now);
+        TagLogic(now);
         BeaconLogic(now);
         LinkLogic(now);
         PublishRoom();
@@ -657,11 +677,14 @@ private:
 
     void OnList(const Json& msg) {
         std::vector<NdsOnlineLobbyRow> rows;
+        std::vector<NdsOnlineLobbyRow> tag_rows;
+        const std::string tag_version = TagVersion();
         const Json& lobbies = msg["lobbies"];
         for (size_t i = 0; i < lobbies.size(); ++i) {
             const Json& l = lobbies[i];
+            const std::string version = l.Str("game_version", "");
             if (l.Str("game_name", "") != config_.game_name ||
-                l.Str("game_version", "") != config_.game_version ||
+                (version != config_.game_version && version != tag_version) ||
                 l.Bool("has_password", false))
                 continue;
             NdsOnlineLobbyRow row;
@@ -671,7 +694,13 @@ private:
             row.players = l.Int("player_count", 0);
             row.max_slots = l.Int("max_slots", 0);
             if (row.lobby_id.empty()) continue;
-            rows.push_back(std::move(row));
+            (version == tag_version ? tag_rows : rows).push_back(std::move(row));
+        }
+        // A list filtered by version (sent while not in tag mode) says
+        // nothing about tag rooms.
+        if (!tag_rows.empty() || tag_active_) {
+            tag_rows_ = std::move(tag_rows);
+            tag_list_at_ = Clock::now();
         }
         {
             std::lock_guard<std::mutex> lock(mu_);
@@ -712,6 +741,7 @@ private:
         room_.lobby_id = msg.Str("lobby_id", "");
         room_.name = pending_name_;
         room_.is_host = true;
+        room_.tag = pending_tag_;
         room_.local_slot = msg.Int("local_slot", 0);
         room_.host_player_id = player_id_;
         room_.max_slots = msg.Int("max_slots", 0);
@@ -733,6 +763,7 @@ private:
         room_.lobby_id = id;
         room_.name = pending_name_;
         room_.is_host = false;
+        room_.tag = pending_tag_;
         room_.local_slot = msg.Int("local_slot", -1);
         std::fprintf(stderr, "[online] joined \"%s\", seat %d\n",
                      room_.name.c_str(), room_.local_slot);
@@ -826,6 +857,8 @@ private:
     }
 
     void HostLogic(Clock::time_point now) {
+        // Tag mode has its own rooms (TagLogic).
+        if (tag_active_ || room_.tag) return;
         NdsNetplayHostInfo info;
         const bool hosting = nds_netplay_host_info(&info);
         if (hosting) host_seen_ = now;
@@ -858,6 +891,7 @@ private:
         const std::string name = LobbyName(info);
         if (name == create_refused_name_) return;
         pending_name_ = name;
+        pending_tag_ = false;
         create_pending_ = true;
         const int max_slots = std::min(1 + info.free_slots, mpnet::kMaxSeats);
         std::fprintf(stderr, "[online] opening lobby \"%s\" (%d seats)\n",
@@ -887,6 +921,7 @@ private:
             for (const auto& row : rows_)
                 if (row.lobby_id == id) pending_name_ = row.name;
         }
+        pending_tag_ = false;
         join_pending_ = true;
         std::fprintf(stderr, "[online] joining \"%s\"\n", pending_name_.c_str());
         Send(JsonOp("join")
@@ -914,13 +949,97 @@ private:
         if (link_ref_) link_ref_->ClearRoom();
     }
 
+    // ---- tag mode -------------------------------------------------------------
+
+    std::string TagVersion() const {
+        return config_.game_version + kTagVersionSuffix;
+    }
+
+    // Whether the game is in tag mode, from its host beacons.
+    void TagTick(Clock::time_point now) {
+        NdsNetplayHostInfo info;
+        if (nds_netplay_host_info(&info) && info.tag) {
+            if (!tag_active_) {
+                std::fprintf(stderr, "[online] tag mode: looking for a tag "
+                             "room\n");
+                tag_since_ = now;
+                tag_next_try_ = {};
+            }
+            tag_active_ = true;
+            tag_seen_ = now;
+        } else if (tag_active_ && now - tag_seen_ > kTagLinger) {
+            std::fprintf(stderr, "[online] tag mode ended\n");
+            tag_active_ = false;
+        }
+    }
+
+    // In tag mode: sit in the fullest tag room with a free seat, or open
+    // one when there is none. Out of it: leave.
+    void TagLogic(Clock::time_point now) {
+        if (!tag_active_) {
+            if (room_.tag) LeaveRoom("tag mode ended");
+            return;
+        }
+        // The game left whatever it was doing in an ordinary lobby.
+        if (!room_.lobby_id.empty() && !room_.tag) {
+            LeaveRoom("tag mode");
+            return;
+        }
+        if (create_pending_ || join_pending_ || !turn_ok_ ||
+            now < tag_next_try_)
+            return;
+        // Wait for a list that knows about tag rooms.
+        if (tag_list_at_ < tag_since_) return;
+        std::optional<NdsOnlineLobbyRow> best;
+        for (const auto& r : tag_rows_) {
+            if (r.lobby_id == room_.lobby_id || r.players >= r.max_slots)
+                continue;
+            if (!best || r.players > best->players ||
+                (r.players == best->players && r.lobby_id < best->lobby_id))
+                best = r;
+        }
+        if (!room_.lobby_id.empty()) {
+            // Runners that found no room at the same time open one each:
+            // a host still alone moves to a fuller room, or between two
+            // lone hosts the one with the greater lobby id moves.
+            if (!room_.is_host || room_.members.size() > 1 || !best ||
+                (best->players <= 1 && best->lobby_id > room_.lobby_id))
+                return;
+            LeaveRoom("moving to a fuller tag room");
+        }
+        tag_next_try_ = now + kTagRetry;
+        pending_tag_ = true;
+        if (best) {
+            pending_name_ = best->name;
+            join_pending_ = true;
+            std::fprintf(stderr, "[online] joining tag room %s (%d/%d)\n",
+                         best->lobby_id.c_str(), best->players,
+                         best->max_slots);
+            Send(JsonOp("join")
+                     .Str("lobby_id", best->lobby_id)
+                     .Str("game_name", config_.game_name)
+                     .Str("game_version", TagVersion())
+                     .Text());
+        } else {
+            pending_name_ = kTagRoomName;
+            create_pending_ = true;
+            std::fprintf(stderr, "[online] opening a tag room\n");
+            Send(JsonOp("create")
+                     .Str("name", kTagRoomName)
+                     .Str("game_name", config_.game_name)
+                     .Str("game_version", TagVersion())
+                     .Int("max_slots", mpnet::kMaxSeats)
+                     .Text());
+        }
+    }
+
     // ---- lobby beacons -----------------------------------------------------
 
     // In no lobby, not hosting, the radio on: the game may be looking for
     // hosts, so the open lobbies are put in range as beacons.
     bool BeaconScanActive() const {
         return welcomed_ && turn_ok_ && room_.lobby_id.empty() &&
-               !join_pending_ && !create_pending_ &&
+               !join_pending_ && !create_pending_ && !tag_active_ &&
                nds_wifi_local_mp_radio_on() && !nds_netplay_host_info(nullptr);
     }
 
@@ -1130,6 +1249,9 @@ private:
             } else if (create_pending_) {
                 Publish(NdsOnlineState::Hosting,
                         "Opening lobby \"" + pending_name_ + "\"");
+            } else if (tag_active_ && turn_ok_) {
+                Publish(NdsOnlineState::Idle,
+                        "Online: tag mode, looking for players");
             } else if (!turn_ok_) {
                 if (turn_error_.empty())
                     Publish(NdsOnlineState::Connecting, "Waiting for the relay");
@@ -1148,7 +1270,15 @@ private:
         char count[32];
         std::snprintf(count, sizeof(count), " (%d/%d)", players,
                       room_.max_slots);
-        if (room_.is_host) {
+        if (room_.tag) {
+            char text[96];
+            std::snprintf(text, sizeof(text),
+                          "Online: tag mode, %d other player%s in range",
+                          players - 1, players == 2 ? "" : "s");
+            Publish(room_.is_host ? NdsOnlineState::Hosting
+                                  : NdsOnlineState::Guest,
+                    text, players, linked);
+        } else if (room_.is_host) {
             Publish(NdsOnlineState::Hosting,
                     "Hosting \"" + room_.name + "\"" + count, players,
                     linked);
@@ -1240,7 +1370,15 @@ private:
     bool create_pending_ = false;
     bool join_pending_ = false;
     std::string pending_name_;
+    bool pending_tag_ = false;  // the pending create / join is a tag room
     std::string create_refused_name_;
+    // Tag mode: whether the game is in it, and the tag rooms listed.
+    bool tag_active_ = false;
+    Clock::time_point tag_seen_{};   // the last tag beacon
+    Clock::time_point tag_since_{};  // tag mode turned on
+    Clock::time_point tag_next_try_{};
+    std::vector<NdsOnlineLobbyRow> tag_rows_;
+    Clock::time_point tag_list_at_{};
     bool host_while_guest_logged_ = false;
     std::vector<int> linked_seats_;
     bool peers_set_ = false;

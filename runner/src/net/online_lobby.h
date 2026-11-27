@@ -10,6 +10,11 @@
 // consoles in range; the player then joins in the game's own menus.
 // The room's chat goes through the server too (net/netplay_chat.h).
 //
+// Tag mode (NdsNetplayHostInfo::tag), where the game swaps data with
+// whoever is in range, is joined automatically too: the runner sits in a
+// shared tag room of this game (up to 8 seats, its own game_version)
+// while the game is in it, and leaves when it stops.
+//
 // One thread owns the lobby server connection (WebSocket, JSON ops) and
 // the ICE link's signalling. The lobby server requires Discord sign-in
 // (recomp-net auth.h): sign-in opens the browser once and stores a device

@@ -2825,6 +2825,7 @@ private:
         const bool same = valid == host_valid_ &&
             (!valid || (info.accepting == host_info_.accepting &&
                         info.free_slots == host_info_.free_slots &&
+                        info.tag == host_info_.tag &&
                         std::strcmp(info.host_name,
                                     host_info_.host_name) == 0));
         const bool was_valid = host_valid_;
@@ -2839,10 +2840,10 @@ private:
         }
         std::fprintf(stderr,
             "[netplay] host %s inst=%u accepting=%d free_slots=%d "
-            "name=\"%s\"\n",
+            "tag=%d name=\"%s\"\n",
             was_valid ? "changed" : "open",
             static_cast<unsigned>(instance_), info.accepting ? 1 : 0,
-            info.free_slots, info.host_name);
+            info.free_slots, info.tag ? 1 : 0, info.host_name);
     }
 
     void LogBeacon(const char* what,

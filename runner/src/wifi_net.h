@@ -331,6 +331,10 @@ struct NdsNetplayHostInfo {
     bool accepting = false;   // the game takes new players
     int free_slots = 0;       // player slots still free
     char host_name[64] = "";  // UTF-8, the hosting player's name
+    // Tag mode: the game swaps data with whoever comes in range, turning
+    // host and client by turns, instead of taking players. The online
+    // lobby then puts it in a shared tag room (net/online_lobby.h).
+    bool tag = false;
 };
 
 // Returns false when the beacon is not this title's (other GGID, malformed).
