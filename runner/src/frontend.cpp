@@ -8570,9 +8570,6 @@ int nds_run_interactive_frontend(const NdsFrontendOptions& initial_options) {
         if (counter - fps_start >= frequency) {
             const double seconds = static_cast<double>(counter - fps_start) /
                                    static_cast<double>(frequency);
-            const double fps = static_cast<double>(fps_frames) / seconds;
-            const std::string fps_text =
-                std::to_string(fps).substr(0, 4) + " FPS";
             NdsGpu3dProfile gpu3d_profile{};
             nds_gpu3d_profile(&gpu3d_profile);
             // Loading a savestate resets the profile.
@@ -8585,6 +8582,8 @@ int nds_run_interactive_frontend(const NdsFrontendOptions& initial_options) {
                           "3D %.1f FPS",
                           static_cast<double>(new_images) / seconds);
             fps_counter = fps_counter_text;
+            // The title bar shows the same 3D rate as the in-game counter.
+            const std::string fps_text = fps_counter_text;
             fps_images = images;
             const std::string governor_text =
                 perf_governor.apply_failed
