@@ -223,6 +223,8 @@ NdsScalingFilter g_scaling = NdsScalingFilter::Integer;
 const uint32_t* g_overlay_pixels = nullptr;
 unsigned g_overlay_width = 0;
 unsigned g_overlay_height = 0;
+unsigned g_overlay_margin_up = 0;
+unsigned g_overlay_margin_down = 0;
 // nds_compute_host_set_layer: the layer (native 256 wide), the image
 // without it (g_layer_width wide), and where the layer goes, as fractions
 // of the main rect's native middle.
@@ -1191,14 +1193,18 @@ bool nds_compute_host_read_presented(std::vector<uint32_t>& pixels,
 }
 
 void nds_compute_host_set_overlay(const uint32_t* argb, unsigned width,
-                                  unsigned height)
+                                  unsigned height, unsigned margin_up,
+                                  unsigned margin_down)
 {
     const bool ok = width > 0 && height > 0 &&
                     width <= kMaxWidth * kOverlayMaxScale &&
-                    height <= kHeight * kOverlayMaxScale;
+                    height <= kHeight * kOverlayMaxScale &&
+                    margin_up + margin_down < height;
     g_overlay_pixels = ok ? argb : nullptr;
     g_overlay_width = ok ? width : 0;
     g_overlay_height = ok ? height : 0;
+    g_overlay_margin_up = ok ? margin_up : 0;
+    g_overlay_margin_down = ok ? margin_down : 0;
 }
 
 unsigned nds_compute_host_overlay_max_scale()
@@ -1471,9 +1477,22 @@ bool nds_compute_host_present_top(const unsigned int* fallback_pixels,
         record_blit(slot, kLayer, layer_rect, bilinear,
                     kBlitKeepAlpha | kBlitPremultiplied, fb_width, fb_height);
     }
-    if (overlay)
-        record_blit(slot, kOverlay, band, bilinear, kBlitKeepAlpha, fb_width,
+    if (overlay) {
+        // Grown by its margin rows, out into the window's bars.
+        NdsPresentRect grown = band;
+        const int rows = int(g_overlay_height - g_overlay_margin_up -
+                             g_overlay_margin_down);
+        if (rows > 0 && (g_overlay_margin_up || g_overlay_margin_down)) {
+            const int up = int((int64_t(g_overlay_margin_up) * band.h +
+                                rows / 2) / rows);
+            const int down = int((int64_t(g_overlay_margin_down) * band.h +
+                                  rows / 2) / rows);
+            grown.y = band.y - up;
+            grown.h = band.h + up + down;
+        }
+        record_blit(slot, kOverlay, grown, bilinear, kBlitKeepAlpha, fb_width,
                     fb_height);
+    }
     commands.barriers(RenderBarrierStage::NONE,
                       RenderTextureBarrier(backbuffer, RenderTextureLayout::PRESENT));
     commands.end();

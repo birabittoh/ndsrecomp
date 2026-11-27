@@ -15,8 +15,9 @@ using Clock = std::chrono::steady_clock;
 
 constexpr const char* kSection = "Netplay";
 constexpr const char* kEnabledKey = "netplay.enabled";
-// Local, Online (the relay), Online (unsafe) (direct connections).
-constexpr const char* kModeChoices[] = {"Local", "Online", "Online (unsafe)"};
+// Local, Online (direct connections through a public STUN server), Online
+// (unsafe) (shown "Online (alt)": the relay).
+constexpr const char* kModeChoices[] = {"Local", "Online", "Online (alt)"};
 constexpr const char* kAccountKey = "netplay.account";
 // Signing out takes a second press within this time.
 constexpr auto kConfirmTime = std::chrono::seconds(3);
@@ -116,13 +117,13 @@ bool nds_netplay_menu_owns(const NdsMenuItem* item) {
 
 int nds_netplay_menu_get_value(const NdsMenuItem* item, int* value) {
     if (!is(item, kEnabledKey)) return 0;
-    *value = !nds_online_enabled() ? 0 : nds_online_direct() ? 2 : 1;
+    *value = !nds_online_enabled() ? 0 : nds_online_direct() ? 1 : 2;
     return 1;
 }
 
 int nds_netplay_menu_set_value(const NdsMenuItem* item, int value) {
     if (!is(item, kEnabledKey) || value < 0 || value > 2) return 0;
-    nds_online_set_direct(value == 2);
+    nds_online_set_direct(value == 1);
     nds_online_set_enabled(value != 0);
     state().dirty = true;
     std::fprintf(stderr, "[online] Netplay %s from the menu\n",

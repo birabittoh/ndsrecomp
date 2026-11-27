@@ -94,7 +94,8 @@ struct Box {
 };
 
 // The shown buttons and where they sit; returns how many.
-int Boxes(int ds_width, Box out[kNdsTouchButtonMax]) {
+int Boxes(int ds_width, const NdsTouchButtonFrame& frame,
+          Box out[kNdsTouchButtonMax]) {
     const int count = g_count.load(std::memory_order_acquire);
     int n = 0, row = 0;
     for (int id = 0; id < count && id < kNdsTouchButtonMax; ++id) {
@@ -102,13 +103,21 @@ int Boxes(int ds_width, Box out[kNdsTouchButtonMax]) {
             g_specs[id].load(std::memory_order_acquire);
         if (!spec || !g_shown[id].load(std::memory_order_acquire)) continue;
         int x = kNdsTouchButtonMargin;
-        int y = (kScreenHeight - kNdsTouchButtonHeight) / 2;
+        // Left and right ones sit a third of the way down, not halfway.
+        int y = kScreenHeight / 3 - kNdsTouchButtonHeight / 2;
         switch (spec->place) {
             case NdsTouchButtonPlace::BottomRight:
                 x = ds_width - (++row) * (kNdsTouchButtonWidth +
                                           kNdsTouchButtonMargin);
-                y = kScreenHeight - kNdsTouchButtonMargin -
+                y = frame.bottom - kNdsTouchButtonMargin -
                     kNdsTouchButtonHeight;
+                // Over the inset: above it.
+                if (frame.inset_w > 0 && x < frame.inset_x + frame.inset_w &&
+                    x + kNdsTouchButtonWidth > frame.inset_x &&
+                    y < frame.inset_y + frame.inset_h &&
+                    y + kNdsTouchButtonHeight > frame.inset_y)
+                    y = frame.inset_y - kNdsTouchButtonMargin -
+                        kNdsTouchButtonHeight;
                 break;
             case NdsTouchButtonPlace::LeftMiddle:
                 break;
@@ -121,17 +130,17 @@ int Boxes(int ds_width, Box out[kNdsTouchButtonMax]) {
                 // two never move.
                 x = (ds_width - 2 * kNdsTouchButtonWidth -
                      kNdsTouchButtonMargin) / 2;
-                y = kNdsTouchButtonMargin;
+                y = frame.top + kNdsTouchButtonMargin;
                 break;
             case NdsTouchButtonPlace::TopCenterNext:
                 x = (ds_width - 2 * kNdsTouchButtonWidth -
                      kNdsTouchButtonMargin) / 2 +
                     kNdsTouchButtonWidth + kNdsTouchButtonMargin;
-                y = kNdsTouchButtonMargin;
+                y = frame.top + kNdsTouchButtonMargin;
                 break;
             case NdsTouchButtonPlace::BottomCenter:
                 x = (ds_width - kNdsTouchButtonWidth) / 2;
-                y = kScreenHeight - kNdsTouchButtonMargin -
+                y = frame.bottom - kNdsTouchButtonMargin -
                     kNdsTouchButtonHeight;
                 break;
         }
@@ -213,8 +222,13 @@ void nds_touch_buttons_update() {
 
 void nds_touch_buttons_layout(int ds_width,
                               std::vector<NdsTouchButtonRect>* out) {
+    nds_touch_buttons_layout(ds_width, NdsTouchButtonFrame{}, out);
+}
+
+void nds_touch_buttons_layout(int ds_width, const NdsTouchButtonFrame& frame,
+                              std::vector<NdsTouchButtonRect>* out) {
     Box boxes[kNdsTouchButtonMax];
-    const int n = Boxes(ds_width, boxes);
+    const int n = Boxes(ds_width, frame, boxes);
     for (int i = 0; i < n; ++i) {
         const Box& b = boxes[i];
         const bool active = g_active[b.id].load(std::memory_order_acquire);
@@ -268,10 +282,16 @@ int nds_touch_buttons_extent() {
 }
 
 int nds_touch_buttons_hit(int ds_width, float x, float y) {
-    if (x < 0.0f || x >= ds_width || y < 0.0f || y >= kScreenHeight)
+    return nds_touch_buttons_hit(ds_width, NdsTouchButtonFrame{}, x, y);
+}
+
+int nds_touch_buttons_hit(int ds_width, const NdsTouchButtonFrame& frame,
+                          float x, float y) {
+    if (x < 0.0f || x >= ds_width || y < static_cast<float>(frame.top) ||
+        y >= static_cast<float>(frame.bottom))
         return -1;
     Box boxes[kNdsTouchButtonMax];
-    const int n = Boxes(ds_width, boxes);
+    const int n = Boxes(ds_width, frame, boxes);
     int best = -1;
     float best_distance = 0.0f;
     for (int i = 0; i < n; ++i) {

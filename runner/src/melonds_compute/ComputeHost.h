@@ -71,8 +71,14 @@ void nds_compute_host_set_fast_forward(bool enabled);
 // drawn over the image in the same rect. It may be finer than the screen:
 // up to nds_compute_host_overlay_max_scale() times 256-or-wider x 192. The
 // pointer is read during that present only; pass nullptr to clear.
+// `margin_up` and `margin_down` are rows of `height` that lie above and below
+// the screen's own (height - margin_up - margin_down of them, 192 at screen
+// pixels): the overlay is drawn over the rect grown by them, out into the
+// window's bars, for what must sit at the window's edges.
 void nds_compute_host_set_overlay(const uint32_t* argb, unsigned width,
-                                  unsigned height = 192);
+                                  unsigned height = 192,
+                                  unsigned margin_up = 0,
+                                  unsigned margin_down = 0);
 // How many times finer than the screen an overlay may be (1 = screen
 // pixels only).
 unsigned nds_compute_host_overlay_max_scale();

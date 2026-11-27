@@ -100,9 +100,26 @@ struct NdsTouchButtonRect {
     uint32_t argb = 0;
 };
 
+// What the buttons are laid out against, in the screen's DS pixels (y 0 is
+// its top line, 192 the one below its last): the window's top and bottom
+// edges, which lie beyond the screen's own where the window has bars above or
+// below it (a portrait phone), so the top-center buttons sit at the top of the
+// window and the bottom-right ones at its bottom; and the rect the title's
+// inset (the map, the other screen) covers, which a bottom button moves up
+// above rather than hide behind (inset_w 0: none).
+struct NdsTouchButtonFrame {
+    int top = 0;
+    int bottom = 192;
+    int inset_x = 0, inset_y = 0, inset_w = 0, inset_h = 0;
+};
+
 // The shown buttons over a `ds_width` x 192 screen, in DS pixels. Appends
 // to `out`.
 void nds_touch_buttons_layout(int ds_width,
+                              std::vector<NdsTouchButtonRect>* out);
+// The same against a frame: y goes below 0 or past 192 for a button in the
+// bars.
+void nds_touch_buttons_layout(int ds_width, const NdsTouchButtonFrame& frame,
                               std::vector<NdsTouchButtonRect>* out);
 
 // Whether any button shows, wherever it sits.
@@ -116,3 +133,5 @@ int nds_touch_buttons_extent();
 // with some room around each for a finger (the nearest one wins); -1 when
 // none.
 int nds_touch_buttons_hit(int ds_width, float x, float y);
+int nds_touch_buttons_hit(int ds_width, const NdsTouchButtonFrame& frame,
+                          float x, float y);

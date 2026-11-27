@@ -3305,11 +3305,98 @@ void draw_chat_overlay(const DsTarget& target) {
 // canvas in DS pixels. Whether any shows, for the presenter's overlay.
 bool touch_buttons_wanted() { return nds_touch_buttons_any(); }
 
-void draw_touch_buttons(const DsTarget& target) {
+// The window's top and bottom edges and the inset against the screen the
+// buttons are on (touch_buttons.h), in that screen's DS pixels: the buttons
+// sit at the window's edges, not the screen's, where bars lie between (a
+// portrait phone has the screen mid-window).
+NdsTouchButtonFrame touch_button_frame(const FrontendPresentation& presentation,
+                                       int ds_width) {
+    NdsTouchButtonFrame frame;
+    if (!presentation.windows[0]) return frame;
+    int drawable_w = 0, drawable_h = 0;
+    window_drawable_size(presentation, 0, &drawable_w, &drawable_h);
+    int content_w = 0, content_h = 0;
+    window_content_size(presentation, 0, &content_w, &content_h);
+    if (drawable_w <= 0 || drawable_h <= 0 || content_w <= 0 ||
+        content_h <= 0)
+        return frame;
+    NdsPresentRect main{}, inset{};
+    int lines = content_h;  // the lines the main rect shows
+    bool bottom_free = true;
+    if (presentation.single) {
+        const NdsSingleLayout layout = nds_single_layout(
+            presentation.window_mode, presentation.scaling, drawable_w,
+            drawable_h, content_w, content_h, presentation.inset_percent,
+            presentation.stacked);
+        main = layout.main;
+        inset = layout.inset;
+    } else {
+        main = window_present_rect(presentation, 0, drawable_w, drawable_h);
+        if (!presentation.separate && !presentation.gl_top) {
+            // Both screens in the one window: the top one is the upper half.
+            lines = kScreenHeight * 2;
+            bottom_free = false;
+        }
+    }
+    if (main.w <= 0 || main.h <= 0 || lines <= 0) return frame;
+    const double scale = double(main.h) / lines;
+    // A taller view: its 2D is the middle 192 lines.
+    const int extra = bottom_free ? std::max(content_h - kScreenHeight, 0) / 2
+                                  : 0;
+    frame.top = std::min(
+        0, -static_cast<int>(std::floor(std::max(main.y, 0) / scale)) - extra);
+    if (bottom_free)
+        frame.bottom = std::max(
+            kScreenHeight,
+            kScreenHeight +
+                static_cast<int>(std::floor(
+                    std::max(drawable_h - main.y - main.h, 0) / scale)) +
+                extra);
+    if (!bottom_free) return frame;
+    // Where the inset lies on the screen (only what sits over it can be hit).
+    const double kx = double(main.w) / content_w;
+    const int xoff = std::max(content_w - ds_width, 0) / 2;
+    double x0 = 0, y0 = 0, x1 = 0, y1 = 0;
+    bool have_inset = false;
+    const NdsInsetPieces& pieces = nds_inset_pieces();
+    if (pieces.count > 0 &&
+        nds_inset_overlay_flag().load(std::memory_order_relaxed) > 0) {
+        // Cut into pieces: their dst is in the main screen's view pixels.
+        for (int i = 0; i < pieces.count; ++i) {
+            const NdsTitleInsetPiece& p = pieces.piece[i];
+            if (p.dst_w <= 0.0f || p.dst_h <= 0.0f) continue;
+            const double px0 = p.dst_x - xoff, py0 = p.dst_y - extra;
+            const double px1 = px0 + p.dst_w, py1 = py0 + p.dst_h;
+            if (!have_inset) {
+                x0 = px0; y0 = py0; x1 = px1; y1 = py1;
+                have_inset = true;
+            } else {
+                x0 = std::min(x0, px0); y0 = std::min(y0, py0);
+                x1 = std::max(x1, px1); y1 = std::max(y1, py1);
+            }
+        }
+    } else if (inset.w > 0 && inset.h > 0) {
+        x0 = (inset.x - main.x) / kx - xoff;
+        y0 = (inset.y - main.y) / scale - extra;
+        x1 = x0 + inset.w / kx;
+        y1 = y0 + inset.h / scale;
+        have_inset = true;
+    }
+    if (have_inset) {
+        frame.inset_x = static_cast<int>(std::floor(x0));
+        frame.inset_y = static_cast<int>(std::floor(y0));
+        frame.inset_w = static_cast<int>(std::ceil(x1)) - frame.inset_x;
+        frame.inset_h = static_cast<int>(std::ceil(y1)) - frame.inset_y;
+    }
+    return frame;
+}
+
+void draw_touch_buttons(const DsTarget& target,
+                        const NdsTouchButtonFrame& frame) {
     if (!target.renderer && !target.pixels) return;
     static std::vector<NdsTouchButtonRect> rects;
     rects.clear();
-    nds_touch_buttons_layout(target.canvas.width, &rects);
+    nds_touch_buttons_layout(target.canvas.width, frame, &rects);
     if (rects.empty()) return;
     DsTarget t = target;
     if (t.renderer) SDL_SetRenderDrawBlendMode(t.renderer, SDL_BLENDMODE_BLEND);
@@ -3325,20 +3412,52 @@ void draw_touch_buttons(const DsTarget& target) {
 // the chat's finer pixels while the chat shows and the presenter takes them.
 // Returns the target to draw into (canvas in DS pixels); empty pixels =
 // nothing to show. `want` says whether something besides the chat shows.
+// `frame` is the buttons' (touch_button_frame): its top and bottom grow the
+// buffer by rows above and below the screen's, to what fits, and come back as
+// what they got; those rows show only while a button does, and keep the chat
+// at the screen's own pixels.
 DsTarget overlay_target(int ds_width, bool want, ChatFrame* chat,
-                        bool* want_chat, std::vector<uint32_t>* buffer) {
+                        bool* want_chat, std::vector<uint32_t>* buffer,
+                        NdsTouchButtonFrame* frame) {
+    const bool grown = nds_touch_buttons_any() &&
+                       (frame->top < 0 || frame->bottom > kScreenHeight);
+    if (!grown) {
+        frame->top = 0;
+        frame->bottom = kScreenHeight;
+    }
     *want_chat = chat_overlay_rects(
-        ds_width, nds_compute_host_overlay_max_scale() > 1, chat);
+        ds_width, nds_compute_host_overlay_max_scale() > 1 && !grown, chat);
     DsTarget target{};
     if (!want && !*want_chat) return target;
     const int w = *want_chat ? chat->width : ds_width;
     const int h = *want_chat ? chat->height : kScreenHeight;
-    buffer->assign(size_t(w) * h, 0u);
+    int up = (-frame->top * h + kScreenHeight - 1) / kScreenHeight;
+    int down = ((frame->bottom - kScreenHeight) * h + kScreenHeight - 1) /
+               kScreenHeight;
+    const int room = std::max(
+        int(nds_compute_host_overlay_max_scale()) * kScreenHeight - h, 0);
+    if (up + down > room) {
+        up = up * room / (up + down);
+        down = room - up > down ? down : room - up;
+    }
+    // What the rows cover, in lines, so the buttons stay inside them.
+    frame->top = -(up * kScreenHeight / h);
+    frame->bottom = kScreenHeight + down * kScreenHeight / h;
+    buffer->assign(size_t(w) * (up + h + down), 0u);
     target.pixels = buffer->data();
     target.pixels_width = w;
-    target.pixels_height = h;
-    target.canvas = {SDL_Rect{0, 0, w, h}, ds_width, kScreenHeight};
+    target.pixels_height = up + h + down;
+    target.canvas = {SDL_Rect{0, up, w, h}, ds_width, kScreenHeight};
     return target;
+}
+
+// The rows of an overlay_target buffer above and below the screen's.
+unsigned overlay_margin_up(const DsTarget& target) {
+    return static_cast<unsigned>(target.canvas.dest.y);
+}
+unsigned overlay_margin_down(const DsTarget& target) {
+    return static_cast<unsigned>(target.pixels_height - target.canvas.dest.y -
+                                 target.canvas.dest.h);
 }
 #endif
 
@@ -3831,7 +3950,8 @@ void draw_separate_screen(FrontendPresentation& presentation, int screen,
         draw_virtual_stylus(target, virtual_stylus_x, virtual_stylus_y);
     if (screen == 0) {
         draw_chat_overlay(target);
-        draw_touch_buttons(target);
+        draw_touch_buttons(target, touch_button_frame(
+            presentation, presentation.screen_widths[0]));
     }
     draw_savestate_notice(target, savestate_notice);
     draw_fps_counter(target, fps_counter);
@@ -3927,25 +4047,27 @@ PresentationTicks present_single_screen(FrontendPresentation& presentation,
         static std::vector<uint32_t> overlay;
         static ChatFrame chat;
         bool want_chat = false;
+        NdsTouchButtonFrame buttons = touch_button_frame(presentation, width);
         const DsTarget target = overlay_target(
             width,
             stylus || (savestate_notice && *savestate_notice) ||
                 (fps_counter && *fps_counter) || touch_buttons_wanted(),
-            &chat, &want_chat, &overlay);
+            &chat, &want_chat, &overlay, &buttons);
         const bool want_overlay = target.pixels != nullptr;
         if (want_overlay) {
             if (stylus)
                 draw_virtual_stylus(target, virtual_stylus_x,
                                     virtual_stylus_y);
             if (want_chat) draw_chat_overlay(target, chat);
-            draw_touch_buttons(target);
+            draw_touch_buttons(target, buttons);
             draw_savestate_notice(target, savestate_notice);
             draw_fps_counter(target, fps_counter);
         }
         nds_compute_host_set_overlay(
             want_overlay ? overlay.data() : nullptr,
             static_cast<unsigned>(target.pixels_width),
-            static_cast<unsigned>(target.pixels_height));
+            static_cast<unsigned>(target.pixels_height),
+            overlay_margin_up(target), overlay_margin_down(target));
         NdsComputePresentTicks gl_ticks{};
         gl_ticks.diagnostic =
             nds_frontend_latency::enabled.load(std::memory_order_relaxed);
@@ -4054,7 +4176,7 @@ PresentationTicks present_single_screen(FrontendPresentation& presentation,
     if (stylus)
         draw_virtual_stylus(target, virtual_stylus_x, virtual_stylus_y);
     draw_chat_overlay(target);
-    draw_touch_buttons(target);
+    draw_touch_buttons(target, touch_button_frame(presentation, width));
     draw_savestate_notice(target, savestate_notice);
     draw_fps_counter(target, fps_counter);
     ticks.draw += SDL_GetPerformanceCounter() - start;
@@ -4233,19 +4355,22 @@ PresentationTicks present_screens(FrontendPresentation& presentation,
         bool want_chat = false;
         const bool top_stylus =
             virtual_stylus_visible && g_virtual_stylus_screen == 0;
+        NdsTouchButtonFrame buttons =
+            touch_button_frame(presentation, top_width);
         const DsTarget top_target =
             overlay_target(top_width, touch_buttons_wanted() || top_stylus,
-                           &chat, &want_chat, &top_overlay);
+                           &chat, &want_chat, &top_overlay, &buttons);
         const bool want_top_overlay = top_target.pixels != nullptr;
         if (top_stylus && want_top_overlay)
             draw_virtual_stylus(top_target, virtual_stylus_x,
                                 virtual_stylus_y);
         if (want_chat) draw_chat_overlay(top_target, chat);
-        draw_touch_buttons(top_target);
+        draw_touch_buttons(top_target, buttons);
         nds_compute_host_set_overlay(
             want_top_overlay ? top_overlay.data() : nullptr,
             static_cast<unsigned>(top_target.pixels_width),
-            static_cast<unsigned>(top_target.pixels_height));
+            static_cast<unsigned>(top_target.pixels_height),
+            overlay_margin_up(top_target), overlay_margin_down(top_target));
         const bool top_ok = nds_compute_host_present_top(
                 top_pixels, static_cast<uint16_t>(top_width),
                 direct ? &direct_frame : nullptr, &gl_ticks,
@@ -4313,7 +4438,8 @@ PresentationTicks present_screens(FrontendPresentation& presentation,
             draw_virtual_stylus(top_target, virtual_stylus_x,
                                 virtual_stylus_y);
         draw_chat_overlay(top_target);
-        draw_touch_buttons(top_target);
+        draw_touch_buttons(top_target, touch_button_frame(
+            presentation, presentation.screen_widths[0]));
         const DsTarget target = sdl_ds_target(
             renderer, bottom_rect, presentation.screen_widths[1]);
         if (virtual_stylus_visible && g_virtual_stylus_screen == 1)
@@ -5832,7 +5958,8 @@ int nds_run_interactive_frontend(const NdsFrontendOptions& initial_options) {
             // with the 256 native columns centred: back to the canvas's.
             const int width = presentation.screen_widths[1];
             return right_ok(nds_touch_buttons_hit(
-                width, float(event.button.x) + float((width - kScreenWidth) / 2),
+                width, touch_button_frame(presentation, width),
+                float(event.button.x) + float((width - kScreenWidth) / 2),
                 float(event.button.y)));
         }
         if (!g_top_logical_hit.valid) return -1;
@@ -5845,8 +5972,8 @@ int nds_run_interactive_frontend(const NdsFrontendOptions& initial_options) {
                 ? std::max(presentation.main_view_width - width, 0) / 2
                 : 0;
         return right_ok(nds_touch_buttons_hit(
-            width, g_top_logical_hit.x - left - canvas_left,
-            g_top_logical_hit.y));
+            width, touch_button_frame(presentation, width),
+            g_top_logical_hit.x - left - canvas_left, g_top_logical_hit.y));
     };
     auto show_savestate_result = [&](const NdsSavestateSlotResult& result) {
         savestate_notice = result.message;

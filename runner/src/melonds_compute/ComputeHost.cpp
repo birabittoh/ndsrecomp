@@ -49,8 +49,11 @@ int g_compose_width = 0;
 int g_compose_height = 0;
 GLuint g_overlay_texture = 0;
 int g_overlay_texture_width = 0;
+int g_overlay_texture_height = 0;
 const uint32_t* g_overlay_pixels = nullptr;
 unsigned g_overlay_width = 0;
+unsigned g_overlay_margin_up = 0;
+unsigned g_overlay_margin_down = 0;
 GLuint g_inset_texture = 0;
 int g_inset_texture_width = 0;
 const uint32_t* g_inset_pixels = nullptr;
@@ -212,6 +215,7 @@ void stop_presenter()
     if (g_overlay_texture) glDeleteTextures(1, &g_overlay_texture);
     g_overlay_texture = 0;
     g_overlay_texture_width = 0;
+    g_overlay_texture_height = 0;
     if (g_inset_texture) glDeleteTextures(1, &g_inset_texture);
     g_inset_texture = 0;
     g_inset_texture_width = 0;
@@ -477,11 +481,16 @@ bool nds_compute_host_read_presented(std::vector<uint32_t>& pixels,
 }
 
 void nds_compute_host_set_overlay(const uint32_t* argb, unsigned width,
-                                  unsigned height)
+                                  unsigned height, unsigned margin_up,
+                                  unsigned margin_down)
 {
     g_overlay_pixels =
-        width > 0 && width <= 448 && height == 192 ? argb : nullptr;
+        width > 0 && width <= 448 && margin_up <= 2048 &&
+        margin_down <= 2048 && height == 192 + margin_up + margin_down
+            ? argb : nullptr;
     g_overlay_width = g_overlay_pixels ? width : 0;
+    g_overlay_margin_up = g_overlay_pixels ? margin_up : 0;
+    g_overlay_margin_down = g_overlay_pixels ? margin_down : 0;
 }
 
 unsigned nds_compute_host_overlay_max_scale()
@@ -780,22 +789,32 @@ bool nds_compute_host_present_top(const unsigned int* fallback_pixels,
     }
     if (g_overlay_pixels) {
         glBindFramebuffer(GL_FRAMEBUFFER, 0);
-        glViewport(rect.x, viewport_y, rect.w, rect.h);
+        // Grown by its margin rows, out into the window's bars.
+        const int up = static_cast<int>(g_overlay_margin_up);
+        const int down = static_cast<int>(g_overlay_margin_down);
+        const int up_px = (up * rect.h + 96) / 192;
+        const int down_px = (down * rect.h + 96) / 192;
+        glViewport(rect.x, viewport_y - down_px, rect.w,
+                   rect.h + up_px + down_px);
         glActiveTexture(GL_TEXTURE7);
         glBindTexture(GL_TEXTURE_2D, g_overlay_texture);
         const int overlay_width = static_cast<int>(g_overlay_width);
-        if (g_overlay_texture_width != overlay_width) {
+        const int overlay_height = 192 + up + down;
+        if (g_overlay_texture_width != overlay_width ||
+            g_overlay_texture_height != overlay_height) {
             glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S,
                             GL_CLAMP_TO_EDGE);
             glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T,
                             GL_CLAMP_TO_EDGE);
-            glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, overlay_width, 192, 0,
-                         GL_BGRA, GL_UNSIGNED_BYTE, nullptr);
+            glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, overlay_width,
+                         overlay_height, 0, GL_BGRA, GL_UNSIGNED_BYTE,
+                         nullptr);
             g_overlay_texture_width = overlay_width;
+            g_overlay_texture_height = overlay_height;
         }
         glPixelStorei(GL_UNPACK_ALIGNMENT, 4);
-        glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, overlay_width, 192, GL_BGRA,
-                        GL_UNSIGNED_BYTE, g_overlay_pixels);
+        glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, overlay_width, overlay_height,
+                        GL_BGRA, GL_UNSIGNED_BYTE, g_overlay_pixels);
         const GLint filter = g_scaling == NdsScalingFilter::Bilinear
             ? GL_LINEAR : GL_NEAREST;
         glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, filter);
