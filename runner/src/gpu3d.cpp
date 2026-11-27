@@ -10,8 +10,10 @@
 #include "host_profile.h"
 #include "cpu_render_handoff.h"
 
+#include <algorithm>
 #include <atomic>
 #include <cerrno>
+#include <cmath>
 #include <chrono>
 #include <condition_variable>
 #include <cstdarg>
@@ -1787,7 +1789,33 @@ const uint32_t* nds_gpu3d_capture_line(int line) {
         return g_capture_reference.GetLine(line,
             g_nds.GPU.GPU3D.GetRenderXPos(), g_nds.GPU.GPU3D.AbortFrame);
 #endif
-    return nds_gpu3d_line(line);
+    // A taller view (Ver+), or one wider than the lines hold, is squeezed
+    // into 192 lines of at most 448 columns (GPU3D.h), but a capture goes
+    // back to the game, which drew for the hardware's 256x192 (DQ9 shows
+    // its inn guests as captured pictures). Each native pixel is taken from
+    // where the squeeze put it. Only full-screen viewports are squeezed,
+    // and the picture is coarser in the squeezed direction.
+    const auto& g3 = g_nds.GPU.GPU3D;
+    const uint32_t height = g3.GetShownHeight();
+    const uint32_t columns = g3.GetShownWidth();
+    const uint32_t view = g3.GetShownViewWidth();
+    if (height <= 192u && view <= columns) return nds_gpu3d_line(line);
+    int src = line;
+    if (height > 192u) {
+        src = static_cast<int>(std::floor(
+            96.0 + (line + 0.5 - 96.0) * 192.0 / height));
+        src = std::clamp(src, 0, 191);
+    }
+    const uint32_t* row = nds_gpu3d_line(src);
+    if (view <= columns) return row;
+    static uint32_t unsqueezed[256];
+    const uint32_t* const base = row - (columns - 256u) / 2u;
+    for (int x = 0; x < 256; ++x) {
+        const int col = static_cast<int>(std::floor(
+            ((view - 256u) / 2.0 + x + 0.5) * columns / view));
+        unsqueezed[x] = base[std::clamp(col, 0, static_cast<int>(columns) - 1)];
+    }
+    return unsqueezed;
 }
 
 const uint32_t* nds_gpu3d_line(int line) {
