@@ -2811,6 +2811,7 @@ private:
         default:
             break;
         }
+        if (host_valid_ && host_info_.tag) nds_netplay_chat_note_tag_mode();
     }
 
     // The title's view of the current beacon; one line whenever it changes.

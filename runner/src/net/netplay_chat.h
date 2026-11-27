@@ -71,7 +71,8 @@ std::string nds_netplay_chat_name();
 // title nor a signed-in account has given one.
 std::string nds_netplay_chat_known_name();
 
-// True when a line would reach somebody now.
+// True when a line would reach somebody now, and the game is not in tag
+// mode.
 bool nds_netplay_chat_reachable();
 
 // The title's own text entry: the title registers a function the runner
@@ -98,6 +99,12 @@ void nds_netplay_chat_push(NdsChatLine line);
 // them. Lines queued while nobody was there are not kept.
 void nds_netplay_chat_set_lan_peers(int count);
 bool nds_netplay_chat_take_lan(std::string* from, std::string* text);
+
+// wifi_net.cpp, on the emulation thread: the game sent a tag-mode beacon
+// (NdsNetplayHostInfo::tag). Nobody chats while the game swaps data with
+// whoever passes by, so the chat is unreachable until a while after the
+// last one (it turns host only by turns).
+void nds_netplay_chat_note_tag_mode();
 
 // online_lobby.cpp, on its thread: whether it sits in a room it can chat
 // in, and the lines to send there.

@@ -44,6 +44,18 @@ ChatState& State() {
 std::atomic<int> g_lan_peers{0};
 std::atomic<bool> g_online_room{false};
 
+// Tag mode lasts this long after its last beacon: the game is a client
+// between its host turns, and stops beaconing for good when it ends.
+constexpr auto kTagLinger = std::chrono::seconds(30);
+std::atomic<int64_t> g_tag_seen{0};  // Clock ticks, 0 for never
+
+bool InTagMode() {
+    const int64_t seen = g_tag_seen.load(std::memory_order_acquire);
+    if (seen == 0) return false;
+    return Clock::now().time_since_epoch() - Clock::duration(seen) <
+           kTagLinger;
+}
+
 // Length of the UTF-8 sequence starting at s[i], 0 when malformed.
 size_t SequenceLength(const std::string& s, size_t i) {
     const unsigned char c = static_cast<unsigned char>(s[i]);
@@ -206,8 +218,14 @@ std::string nds_netplay_chat_name() {
 }
 
 bool nds_netplay_chat_reachable() {
-    return g_online_room.load(std::memory_order_acquire) ||
-           g_lan_peers.load(std::memory_order_acquire) > 0;
+    return (g_online_room.load(std::memory_order_acquire) ||
+            g_lan_peers.load(std::memory_order_acquire) > 0) &&
+           !InTagMode();
+}
+
+void nds_netplay_chat_note_tag_mode() {
+    const int64_t now = Clock::now().time_since_epoch().count();
+    g_tag_seen.store(now ? now : 1, std::memory_order_release);
 }
 
 namespace {
