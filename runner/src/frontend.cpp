@@ -5576,6 +5576,13 @@ int nds_run_interactive_frontend(const NdsFrontendOptions& initial_options) {
     bool turbo_pad_pressed = false;
     // Fast-forward turned on with the on-screen button (touch_buttons.h).
     bool turbo_toggled = false;
+    // Fast-forward switched on by Tab or the pad's right trigger, when the
+    // title makes them toggle (nds_title_turbo_toggle), and the trigger's
+    // last state for its press edge.
+    bool turbo_key_toggled = false;
+    bool turbo_pad_down = false;
+    // When the next frame may start while fast-forward is capped.
+    uint64_t turbo_pace_next = 0;
     bool turbo_active = false;
     bool turbo_audio = false;  // turbo_active with fast_forward_volume > 0
     bool focus_release_pending = false;
@@ -6359,7 +6366,8 @@ int nds_run_interactive_frontend(const NdsFrontendOptions& initial_options) {
         // Lit while it is on, from the toggle, a held Tab or RT.
         nds_touch_button_set_active(
             nds_touch_button_fast_forward(),
-            turbo_toggled || turbo_pressed || turbo_pad_pressed);
+            turbo_toggled || turbo_key_toggled || turbo_pressed ||
+                turbo_pad_pressed);
         if (touch_button_latch_frames > 0 && --touch_button_latch_frames == 0)
             release_touch_latch();
 #if defined(NDS_SECOND_DISPLAY)
@@ -6657,7 +6665,10 @@ int nds_run_interactive_frontend(const NdsFrontendOptions& initial_options) {
                     // Consumed by the MPH-specific keyboard/mouse layer.
                 } else if (static_cast<int>(scancode) ==
                            options.fast_forward_key) {
-                    turbo_pressed = true;
+                    if (nds_title_turbo_toggle())
+                        turbo_key_toggled = !turbo_key_toggled;
+                    else
+                        turbo_pressed = true;
                 } else if (mph_prime_active()) {
                     // Prime Controls replaces the normal keyboard keypad map;
                     // unbound keys must not leak through as DS buttons.
@@ -7393,9 +7404,18 @@ int nds_run_interactive_frontend(const NdsFrontendOptions& initial_options) {
                 !virtual_stylus_active()) {
                 const int rt = SDL_GameControllerGetAxis(
                     controller, SDL_CONTROLLER_AXIS_TRIGGERRIGHT);
-                turbo_pad_pressed = rt > (turbo_pad_pressed ? 6554 : 9830);
+                const bool down = rt > (turbo_pad_down ? 6554 : 9830);
+                if (nds_title_turbo_toggle()) {
+                    if (down && !turbo_pad_down)
+                        turbo_key_toggled = !turbo_key_toggled;
+                    turbo_pad_pressed = false;
+                } else {
+                    turbo_pad_pressed = down;
+                }
+                turbo_pad_down = down;
             } else {
                 turbo_pad_pressed = false;
+                turbo_pad_down = false;
             }
 
             // Right stick up/down -> a title's zoom (title_settings.h): up
@@ -7573,9 +7593,12 @@ int nds_run_interactive_frontend(const NdsFrontendOptions& initial_options) {
                 MphPrimeAction::VirtualStylus)];
         const bool generic_virtual_stylus = virtual_stylus_active();
 
+        // Back to Hold: a latched toggle does not stay on.
+        if (turbo_key_toggled && !nds_title_turbo_toggle())
+            turbo_key_toggled = false;
         const bool turbo_want =
             turbo_pressed || turbo_pad_pressed || turbo_toggled ||
-            nds_debug_turbo();
+            turbo_key_toggled || nds_debug_turbo();
         if (turbo_want != turbo_active) {
             turbo_active = turbo_want;
             turbo_audio = turbo_active && options.audio_fast_forward_volume > 0;
@@ -8247,6 +8270,30 @@ int nds_run_interactive_frontend(const NdsFrontendOptions& initial_options) {
             audio_pace_floor = kAudioQueueFrames;
             audio_min_queue = std::numeric_limits<uint32_t>::max();
             queued = 0;
+        }
+        // A capped fast-forward (nds_title_turbo_limit): hold each frame to
+        // 1/limit of a DS frame's time, counted from the last one so a slow
+        // frame is made up by the next. Falling more than 100 ms behind
+        // (the host cannot keep up) restarts the count.
+        if (turbo_active) {
+            const int limit = nds_title_turbo_limit();
+            if (limit > 0) {
+                const uint64_t period =
+                    frequency / (60u * static_cast<uint64_t>(limit));
+                uint64_t now = SDL_GetPerformanceCounter();
+                if (turbo_pace_next == 0 || now > turbo_pace_next + frequency / 10u)
+                    turbo_pace_next = now;
+                turbo_pace_next += period;
+                while (now < turbo_pace_next) {
+                    if (turbo_pace_next - now > frequency / 500u)
+                        SDL_Delay(1);
+                    now = SDL_GetPerformanceCounter();
+                }
+            } else {
+                turbo_pace_next = 0;
+            }
+        } else {
+            turbo_pace_next = 0;
         }
         // Real-time audio: while the game runs behind (the drain did not
         // have to wait), the guest's sound driver makes up what the device

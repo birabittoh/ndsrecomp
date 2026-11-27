@@ -300,6 +300,20 @@ void nds_title_set_smooth_3d_query(NdsTitleSmooth3dQuery query);
 bool nds_title_smooth_3d_owned();
 bool nds_title_smooth_3d_wanted();
 
+// Fast-forward, for a title that has settings for it. Both queries run on the
+// frontend thread (once per frame, and per key press) and may only read
+// settings or guest memory. Call from a static initializer, like a setting.
+// The limit: the most times real time fast-forward may run at right now
+// (2, 3...), or 0 for no limit (the default and with no query). The toggle:
+// true when Tab and the pad's right trigger switch fast-forward on and off
+// instead of holding it (the on-screen button always toggles).
+typedef int (*NdsTitleTurboLimitQuery)();
+void nds_title_set_turbo_limit_query(NdsTitleTurboLimitQuery query);
+int nds_title_turbo_limit();
+typedef bool (*NdsTitleTurboToggleQuery)();
+void nds_title_set_turbo_toggle_query(NdsTitleTurboToggleQuery query);
+bool nds_title_turbo_toggle();
+
 // Binds the frontend's zoom inputs (mouse wheel, gamepad right stick up/down,
 // two-finger pinch on a touchscreen)
 // to a number setting: an add changes `value_id`, but only while the

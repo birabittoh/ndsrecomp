@@ -258,6 +258,31 @@ bool nds_title_smooth_3d_owned() {
     return g_smooth_3d_query.load(std::memory_order_relaxed) != nullptr;
 }
 
+namespace {
+std::atomic<NdsTitleTurboLimitQuery> g_turbo_limit_query{nullptr};
+std::atomic<NdsTitleTurboToggleQuery> g_turbo_toggle_query{nullptr};
+}  // namespace
+
+void nds_title_set_turbo_limit_query(NdsTitleTurboLimitQuery query) {
+    g_turbo_limit_query.store(query, std::memory_order_relaxed);
+}
+
+int nds_title_turbo_limit() {
+    const NdsTitleTurboLimitQuery query =
+        g_turbo_limit_query.load(std::memory_order_relaxed);
+    return query ? query() : 0;
+}
+
+void nds_title_set_turbo_toggle_query(NdsTitleTurboToggleQuery query) {
+    g_turbo_toggle_query.store(query, std::memory_order_relaxed);
+}
+
+bool nds_title_turbo_toggle() {
+    const NdsTitleTurboToggleQuery query =
+        g_turbo_toggle_query.load(std::memory_order_relaxed);
+    return query && query();
+}
+
 bool nds_title_smooth_3d_wanted() {
     const NdsTitleSmooth3dQuery query =
         g_smooth_3d_query.load(std::memory_order_relaxed);
